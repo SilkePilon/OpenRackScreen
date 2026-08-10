@@ -112,15 +112,68 @@ def test_a_threshold_entry_may_be_an_inline_gradient():
 
 
 # --- non-finite gauge values --------------------------------------------------
+#
+# The rule both functions obey (see the module docstring of `palettes.py`):
+# +inf is a reading off the *top* of the scale and paints the high end of the
+# gradient / the top threshold band, exactly like any finite over-range value.
+# -inf is off the bottom, and NaN is no reading at all; both paint the low end
+# / the first band.
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_non_finite_value_renders_the_low_end_of_the_gradient(value):
+_LADDER = ThresholdPalette.model_validate(
+    {
+        "kind": "threshold",
+        "thresholds": [
+            {"at": 0, "palette": "green"},
+            {"at": 70, "palette": "amber"},
+            {"at": 90, "palette": "red"},
+        ],
+    }
+)
+
+
+@pytest.mark.parametrize("value", [math.nan, -math.inf])
+def test_nan_and_negative_infinity_render_the_low_end_of_the_gradient(value):
     # NaN used to clamp to 1.0 and render "full"; a sensor that reported nothing
-    # must not paint a full/critical gauge. All non-finite values read as empty.
+    # must not paint a full/critical gauge. -inf is genuinely below the scale.
     palette = NAMED_PALETTES["cyan"]
     assert gradient_color(palette, value) == hex_to_rgb(palette.stops[0].color)
 
 
-def test_non_finite_value_does_not_pick_the_top_threshold():
-    assert resolve_palette(_STEPS, math.nan) == NAMED_PALETTES["green"]
+def test_positive_infinity_renders_the_high_end_of_the_gradient():
+    # +inf is not a missing reading, it is one off the top of the scale, so it
+    # renders like any other over-range value rather than like an empty gauge.
+    palette = NAMED_PALETTES["cyan"]
+    assert gradient_color(palette, math.inf) == hex_to_rgb(palette.stops[-1].color)
+    assert gradient_color(palette, math.inf) == gradient_color(palette, 200.0)
+
+
+@pytest.mark.parametrize("value", [math.nan, -math.inf])
+def test_nan_and_negative_infinity_do_not_pick_the_top_threshold(value):
+    assert resolve_palette(_STEPS, value) == NAMED_PALETTES["green"]
+
+
+def test_positive_infinity_picks_the_top_threshold():
+    assert resolve_palette(_STEPS, math.inf) == NAMED_PALETTES["red"]
+    assert resolve_palette(_STEPS, math.inf) == resolve_palette(_STEPS, 200.0)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_palette", "expected_stop"),
+    [
+        (math.nan, "green", 0),
+        (-math.inf, "green", 0),
+        (math.inf, "red", -1),
+        (200.0, "red", -1),
+        (50.0, "green", -1),
+    ],
+)
+def test_composed_lookup_is_consistent_for_non_finite_values(
+    value, expected_palette, expected_stop
+):
+    # The two functions are always used together: pick a band by value, then
+    # pick a colour inside it by the same value. Composing them must never
+    # produce the mixed state where the *top* band renders its *low* stop.
+    palette = resolve_palette(_LADDER, value)
+    assert palette == NAMED_PALETTES[expected_palette]
+    assert gradient_color(palette, value) == hex_to_rgb(palette.stops[expected_stop].color)

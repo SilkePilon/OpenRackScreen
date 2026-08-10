@@ -1,3 +1,26 @@
+"""Palette lookup for gauges: pick a band by value, then a colour inside it.
+
+`resolve_palette` and `gradient_color` are always used together and are keyed
+off the same reading, so they share one rule for non-finite values:
+
+* ``+inf`` is a **reading off the top of the scale**, not a missing one -- a
+  Prometheus counter ratio genuinely produces it -- so it behaves exactly like
+  any finite over-range value: the top threshold band, and the high end of that
+  band's gradient.
+* ``-inf`` is off the bottom of the scale: the first band, low end.
+* ``NaN`` is **no reading at all** and must never paint a full or critical
+  gauge, so it also reads as empty: the first band, low end.
+
+Colour is therefore monotone in the reading across the whole extended real
+line, and the two functions can never disagree -- in particular they can never
+produce the mixed state where the most severe band renders its least severe
+stop. The alternative (all non-finite values read as "no reading") was
+rejected because it makes an off-the-scale reading render green: a gauge that
+looks healthy is the one failure direction that is never recoverable by eye,
+and the ring's *sweep* is computed separately from its colour, so colour is the
+only channel that carries severity here.
+"""
+
 from __future__ import annotations
 
 import math
@@ -30,12 +53,18 @@ def hex_to_rgb(color: str) -> tuple[int, int, int]:
 
 
 def gradient_color(palette: GradientPalette, t: float) -> tuple[int, int, int]:
-    if not math.isfinite(t):
-        # A non-finite t is a missing reading, not a full one. NaN in particular
-        # would otherwise survive `max(0.0, min(1.0, t))` as 1.0 and render the
-        # top of the gradient -- a red "critical" alarm on the threshold
-        # palettes -- for a sensor that reported nothing at all. Render the low
-        # end for NaN and both infinities alike: none of them is a measurement.
+    """Colour at position ``t`` of ``palette``, clamped to the 0..1 stop range.
+
+    ``t`` is clamped on the *extended* real line: ``+inf`` renders the high end
+    and ``-inf`` the low end, the limits of the finite clamp. Only ``NaN`` is
+    special-cased, to the low end, because it is not a position at all -- it is
+    a sensor that reported nothing, and must not paint a full gauge. See the
+    module docstring; `resolve_palette` follows the same rule.
+    """
+    if math.isnan(t):
+        # NaN would otherwise survive `max(0.0, min(1.0, t))` as 1.0 and render
+        # the top of the gradient -- a red "critical" alarm on the threshold
+        # palettes -- for a reading that never arrived.
         t = 0.0
     t = max(0.0, min(1.0, t))
     stops = palette.stops
@@ -51,6 +80,15 @@ def gradient_color(palette: GradientPalette, t: float) -> tuple[int, int, int]:
 
 
 def resolve_palette(ref: PaletteRef, value_pct: float = 0.0) -> GradientPalette:
+    """Resolve a palette reference, picking a threshold band by ``value_pct``.
+
+    The last entry whose ``at`` the value reaches wins, so ``+inf`` reaches
+    every entry and selects the top (most severe) band, matching what
+    `gradient_color` does with it. ``NaN`` compares false against every ``at``
+    and ``-inf`` reaches none of them, so both fall through to the seeded first
+    band -- the same "no reading / below the scale" answer `gradient_color`
+    gives. See the module docstring.
+    """
     if isinstance(ref, str):
         return NAMED_PALETTES.get(ref, NAMED_PALETTES["mono"])
     if isinstance(ref, ThresholdPalette):

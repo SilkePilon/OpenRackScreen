@@ -11,6 +11,29 @@ The comparison therefore uses two bounds, both of which must hold:
 1. ``MAX_CHANNEL_DELTA``  — how wrong any single pixel may be.
 2. ``MAX_DIFFERING_FRACTION`` — how many pixels may differ at all.
 
+Which bound binds depends on the *shape* of the failure, and it is worth being
+blunt about it because the two are ANDed:
+
+* A **displaced, deleted or recoloured element** trips ``MAX_CHANNEL_DELTA``
+  first: it flips its pixels by 100+ levels against any usable background
+  contrast, so it fails even when it is far too small to spend the pixel
+  budget.
+* **Benign cross-version rasteriser drift** trips ``MAX_DIFFERING_FRACTION``
+  first, not ``MAX_CHANNEL_DELTA``. Text is dense in antialiased pixels (see
+  that constant's docstring for measured counts), so a drift of only a few
+  coverage levels — comfortably inside the per-pixel bound — still moves
+  hundreds of pixels and blows the count budget on any panel carrying a label.
+
+So a maintainer whose first failure is a wall of low-amplitude text drift must
+not reach for ``MAX_CHANNEL_DELTA``: raising it changes nothing, because it was
+never the bound that failed. The correct response to a genuine Pillow or
+freetype bump is to regenerate the goldens deliberately — ``UPDATE_GOLDEN=1 uv
+run pytest``, then eyeball the diff and say in the commit message which
+dependency moved — not to loosen either threshold. Pillow is pinned in
+``uv.lock`` and CI syncs against that lock, so such a bump is always a
+deliberate, reviewable change rather than something that drifts in on its own;
+that is what makes these strict values safe to keep.
+
 A mean over the whole panel is deliberately *not* used: a rendered element
 covers a tiny fraction of a 240x240 canvas, so deleting a whole text label
 barely moves the mean while being exactly the regression these tests exist to
@@ -35,31 +58,88 @@ MAX_CHANNEL_DELTA = 8
 pixel's coverage slightly differently, far too little to hide an element that
 moved, vanished or changed colour (those flip pixels by 100+ levels against any
 usable background contrast).
+
+This is the bound that catches **element-sized** defects, and it catches them
+regardless of how few pixels they cover. It is *not* the bound that a benign
+antialiasing drift fails on — see ``MAX_DIFFERING_FRACTION`` — so raising this
+number is never the fix for a drift failure.
 """
 
 MAX_DIFFERING_FRACTION = 0.001
 """Largest fraction of pixels that may differ at all, at any magnitude.
 
-0.1% is 57 pixels of a 240x240 panel — room for antialiasing drift scattered
-along a few edges, but not for a re-rendered element or a whole-canvas shade
-change. The smallest regression we must catch (a 16 px tick mark) already
-exceeds a third of this budget on its own, so this bound is not load-bearing
-for element-sized defects; ``MAX_CHANNEL_DELTA`` catches those. Its job is the
-*low-amplitude, wide-area* defect: a background shade off by two, a gradient
-computed slightly wrong, a supersample factor changed.
+0.1% is 57 pixels of a 240x240 panel. That is roughly the antialiased edge of a
+single 18 px *glyph* — measured with the bundled DejaVu face, one 18 px glyph
+carries 43 ("4") to 112 ("%") partially-covered pixels — and nowhere near a
+whole label. Measured antialiased-pixel counts for realistic content:
+
+===========================================  ======
+one 18 px ``CPU 42%`` label                     372
+one 36 px ``42`` readout                        193
+one 12 px ``MEM 61%  NET 12M`` line             466
+a panel: ring + 18 px label + 12 px sub-label   600-800
+the same panel supersampled 4x, then downscaled  ~5700
+===========================================  ======
+
+Two consequences follow, and the second is the one that bites:
+
+* This budget is not load-bearing for **element-sized** defects. A 16x2 px tick
+  mark spends 32 of the 57 pixels, so it can sit inside the budget;
+  ``MAX_CHANNEL_DELTA`` is what fails it.
+* This budget **is** the bound that binds for **benign low-amplitude drift**.
+  A Pillow/freetype bump that shifts every antialiased pixel by a few coverage
+  levels stays inside ``MAX_CHANNEL_DELTA`` (measured: a uniform 4-level shift
+  on the labels above yields max delta 4, half the limit) yet moves every one
+  of those 372 / 193 / 466 pixels — 3x to 8x over this budget. Any golden with
+  text on it fails here first.
+
+So the count bound is strict *by design* for text panels: it says "text
+rendered identically", which is exactly what a pinned Pillow guarantees and
+what a Pillow bump legitimately breaks. Regenerate goldens for such a bump; do
+not raise this number to absorb it. Its other job is the genuinely wide-area
+defect: a background shade off by two, a gradient computed slightly wrong, a
+supersample factor changed.
 """
 
 _UPDATE_GOLDEN_OFF = frozenset({"", "0", "false"})
 
 
-def _update_golden_enabled() -> bool:
-    """True only when ``UPDATE_GOLDEN`` is set to something that means "yes".
+def _flag(name: str) -> bool:
+    """True when env var ``name`` is set to something that means "yes".
 
-    ``UPDATE_GOLDEN=0`` and ``UPDATE_GOLDEN=false`` are how a developer turns a
-    flag off; treating them as truthy would silently rewrite every reference
-    image instead of comparing against it.
+    ``0`` and ``false`` are how a developer turns a flag off; treating them as
+    truthy would silently rewrite every reference image instead of comparing
+    against it.
     """
-    return os.environ.get("UPDATE_GOLDEN", "").strip().lower() not in _UPDATE_GOLDEN_OFF
+    return os.environ.get(name, "").strip().lower() not in _UPDATE_GOLDEN_OFF
+
+
+def _update_golden_enabled() -> bool:
+    """True only when ``UPDATE_GOLDEN`` means "yes"; hard error under CI.
+
+    ``UPDATE_GOLDEN`` turns every ``assert_golden`` call into a no-op that
+    overwrites its own reference, so a run with it set proves nothing about the
+    renderer. That is the point locally — but if it ever leaks into CI, which
+    runs a bare ``uv run pytest``, the whole visual suite goes green while
+    rewriting the very files it was supposed to check, and nothing in the log
+    says so.
+
+    Refusing to run is chosen over merely printing a warning banner: a banner is
+    only as loud as its reader, and nobody reads the log of a *green* CI job,
+    which is precisely the case that must not go unnoticed. Locally the mode is
+    already self-announcing — the rewritten goldens show up in ``git status``
+    — so CI is the only place the silence is dangerous, and a red build is the
+    one signal that cannot be scrolled past.
+    """
+    if not _flag("UPDATE_GOLDEN"):
+        return False
+    if _flag("CI"):
+        raise RuntimeError(
+            "UPDATE_GOLDEN is set in a CI environment. It would rewrite every "
+            "golden and pass the visual suite vacuously. Regenerate goldens "
+            "locally, commit them, and let CI compare against them."
+        )
+    return True
 
 
 def _diff_stats(image: Image.Image, reference: Image.Image) -> tuple[int, int, int]:

@@ -22,12 +22,18 @@ ACCENT = (0, 229, 255)
 
 
 def _redirect_golden_dir(assert_golden, monkeypatch, tmp_path) -> Path:
-    """Point the fixture at a throwaway golden root and clear UPDATE_GOLDEN.
+    """Point the fixture at a throwaway golden root and clear the env flags.
+
+    ``CI`` is cleared alongside ``UPDATE_GOLDEN`` so these tests behave the same
+    on a developer's laptop and inside the CI job that runs them: the tests that
+    exercise the update path must not trip the CI guard just because the runner
+    exports ``CI=true``.
 
     Returns the *module-namespaced* directory the fixture will actually read,
     i.e. ``<root>/test_golden_harness``.
     """
     monkeypatch.delenv("UPDATE_GOLDEN", raising=False)
+    monkeypatch.delenv("CI", raising=False)
     root = tmp_path / "golden"
     monkeypatch.setitem(assert_golden.__globals__, "GOLDEN_DIR", root)
     return root / Path(__file__).stem
@@ -117,6 +123,35 @@ def test_update_golden_creates_the_namespaced_directory(assert_golden, monkeypat
     monkeypatch.setenv("UPDATE_GOLDEN", "1")
     assert_golden(_solid((1, 2, 3)), "fresh")
     assert (directory / "fresh.png").is_file()
+
+
+@pytest.mark.parametrize("ci", ["1", "true", "TRUE"])
+def test_update_golden_under_ci_is_a_hard_error(assert_golden, monkeypatch, tmp_path, ci):
+    # Otherwise the whole visual suite would pass vacuously while overwriting
+    # the references it exists to compare against, and say nothing about it.
+    directory = _redirect_golden_dir(assert_golden, monkeypatch, tmp_path)
+    monkeypatch.setenv("UPDATE_GOLDEN", "1")
+    monkeypatch.setenv("CI", ci)
+    with pytest.raises(RuntimeError, match="UPDATE_GOLDEN is set in a CI environment"):
+        assert_golden(_solid((0, 0, 0)), "ci")
+    assert not directory.exists()
+
+
+@pytest.mark.parametrize("ci", ["", "0", "false"])
+def test_falsey_ci_does_not_block_update_golden(assert_golden, monkeypatch, tmp_path, ci):
+    directory = _redirect_golden_dir(assert_golden, monkeypatch, tmp_path)
+    monkeypatch.setenv("UPDATE_GOLDEN", "1")
+    monkeypatch.setenv("CI", ci)
+    assert_golden(_solid((1, 2, 3)), "notci")
+    assert (directory / "notci.png").is_file()
+
+
+def test_ci_alone_leaves_comparison_untouched(assert_golden, monkeypatch, tmp_path):
+    # The guard fires on the *combination*; CI on its own is the normal case.
+    directory = _redirect_golden_dir(assert_golden, monkeypatch, tmp_path)
+    monkeypatch.setenv("CI", "true")
+    _solid((12, 34, 56)).save(_made(directory) / "plain.png")
+    assert_golden(_solid((12, 34, 56)), "plain")
 
 
 def test_a_regression_still_fails_once_update_golden_is_unset(assert_golden, monkeypatch, tmp_path):
