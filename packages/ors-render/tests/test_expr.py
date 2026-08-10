@@ -1,7 +1,11 @@
-import time
-
 import pytest
-from ors_render.expr import MAX_EXPRESSION_LENGTH, ExpressionError, evaluate, truthy
+from ors_render.expr import (
+    MAX_EXPRESSION_LENGTH,
+    MAX_ROUND_NDIGITS,
+    ExpressionError,
+    evaluate,
+    truthy,
+)
 
 DATA = {
     "prom": {"cpu": 42.5, "nodes_ready": 3, "nodes_total": 3, "alerts": 0, "hot": None},
@@ -202,19 +206,81 @@ def test_truthy_on_disallowed_construct_raises():
     ],
 )
 def test_round_with_out_of_range_ndigits_is_rejected(expr):
-    start = time.monotonic()
+    # No wall-clock assertion here on purpose: a regression to the unbounded
+    # path hangs (or runs for minutes) *inside* pytest.raises for these inputs,
+    # so any timing check placed after it would never execute - it would look
+    # like a hung suite rather than a failure, while adding flakiness on a
+    # loaded Pi. `pytest.raises` is the real contract: the guard must reject
+    # before ever calling the built-in `round`.
     with pytest.raises(ExpressionError):
         evaluate(expr, DATA)
-    # A regression back to the unbounded path would take seconds (or hang
-    # forever) for these inputs; the guard must reject before ever calling
-    # the real `round`.
-    assert time.monotonic() - start < 1.0
 
 
 def test_round_still_works_for_ordinary_arguments():
     assert evaluate("round(3.14159, 2)", DATA) == 3.14
     assert evaluate("round(3.7)", DATA) == 4
     assert evaluate("round(prom.cpu)", DATA) == 42
+
+
+# --- Fix round 3, Finding 2: the MAX_ROUND_NDIGITS boundary itself must be
+# pinned, so an off-by-one in the guard (or a silent change to the constant)
+# cannot pass unnoticed.
+
+
+def test_max_round_ndigits_stays_within_a_cheap_order_of_magnitude():
+    # The boundary tests below are written against the constant rather than a
+    # hardcoded 100, which makes them immune to a change of the constant. This
+    # assertion pins what actually matters: `round(int, -N)` computes
+    # `10 ** abs(N)`, so the cap has to keep that allocation trivially cheap.
+    # The exact value is a policy choice; the order of magnitude is not.
+    assert isinstance(MAX_ROUND_NDIGITS, int)
+    assert 0 < MAX_ROUND_NDIGITS <= 1000
+
+
+@pytest.mark.parametrize(
+    "ndigits",
+    [-MAX_ROUND_NDIGITS, -(MAX_ROUND_NDIGITS - 1), 0, MAX_ROUND_NDIGITS - 1, MAX_ROUND_NDIGITS],
+)
+def test_round_accepts_ndigits_on_the_boundary(ndigits):
+    # round(1, n) is 1 for n >= 0 and 0 for n < 0; either way it must be
+    # computed rather than rejected anywhere inside the permitted range.
+    assert evaluate(f"round(1, {ndigits})", DATA) == (1 if ndigits >= 0 else 0)
+
+
+@pytest.mark.parametrize(
+    "ndigits",
+    [-(MAX_ROUND_NDIGITS + 1), MAX_ROUND_NDIGITS + 1],
+)
+def test_round_rejects_ndigits_one_past_the_boundary(ndigits):
+    with pytest.raises(ExpressionError):
+        evaluate(f"round(1, {ndigits})", DATA)
+
+
+# --- Fix round 3, Finding 3: the ndigits guard must not be gated on the
+# concrete `int` type. Any object with `__index__` is accepted by the built-in
+# `round`, so an `isinstance(ndigits, int)` check lets such an object walk
+# straight into the unbounded `10 ** abs(ndigits)` path.
+
+
+class _EvilIndex:
+    """A non-int that the built-in round() still accepts as ndigits."""
+
+    def __index__(self) -> int:
+        return -(10**7)
+
+
+def test_round_ndigits_via_dunder_index_is_bounded():
+    with pytest.raises(ExpressionError):
+        evaluate("round(1, evil)", {**DATA, "evil": _EvilIndex()})
+
+
+@pytest.mark.parametrize("bad", [2.5, "2"])
+def test_round_still_rejects_non_integer_ndigits(bad):
+    # These have no __index__, so they stay a TypeError from the real round()
+    # and surface as ExpressionError exactly as they did before the guard was
+    # widened beyond `isinstance(ndigits, int)`.
+    with pytest.raises(ExpressionError):
+        evaluate("round(1, bad)", {**DATA, "bad": bad})
 
 
 # --- Fix round 2, Finding 2: evaluate() must raise ExpressionError, not

@@ -29,8 +29,17 @@ MAX_ROUND_NDIGITS = 100
 
 def _round(*args: Any) -> Any:
     if len(args) >= 2:
-        ndigits = args[1]
-        if isinstance(ndigits, int) and abs(ndigits) > MAX_ROUND_NDIGITS:
+        # The built-in `round` accepts any object with `__index__` as ndigits,
+        # not just `int`, so gating this bound on `isinstance(ndigits, int)`
+        # would let such an object walk straight into the unbounded
+        # `10 ** abs(ndigits)` path. Convert the same way `round` does, and
+        # treat "not an integer at all" (TypeError) as out of scope for the
+        # bound - the real `round` then rejects it as it always has.
+        try:
+            ndigits = operator.index(args[1])
+        except TypeError:
+            ndigits = None
+        if ndigits is not None and abs(ndigits) > MAX_ROUND_NDIGITS:
             raise ExpressionError(
                 f"round() ndigits out of range (abs must be <= {MAX_ROUND_NDIGITS})"
             )
