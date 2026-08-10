@@ -56,3 +56,49 @@ def test_gradient_stops_must_be_ordered_and_nonempty():
         GradientPalette(stops=[])
     with pytest.raises(ValidationError):
         GradientPalette(stops=[{"at": 1.0, "color": "#000000"}, {"at": 0.0, "color": "#ffffff"}])
+
+
+def test_threshold_entries_must_be_ordered_and_nonempty():
+    with pytest.raises(ValidationError):
+        ThresholdPalette(thresholds=[])
+    with pytest.raises(ValidationError):
+        ThresholdPalette(
+            thresholds=[
+                {"at": 90, "palette": "red"},
+                {"at": 70, "palette": "amber"},
+                {"at": 0, "palette": "green"},
+            ]
+        )
+
+
+def test_threshold_palette_with_inline_palette_entries():
+    tp = ThresholdPalette(
+        thresholds=[
+            {
+                "at": 0,
+                "palette": {
+                    "kind": "gradient",
+                    "stops": [
+                        {"at": 0.0, "color": "#00e5ff"},
+                        {"at": 1.0, "color": "#2979ff"},
+                    ],
+                },
+            },
+            {
+                "at": 50,
+                "palette": {
+                    "kind": "threshold",
+                    "thresholds": [
+                        {"at": 0, "palette": "green"},
+                        {"at": 90, "palette": "red"},
+                    ],
+                },
+            },
+            {"at": 100, "palette": "named_palette"},
+        ]
+    )
+    assert isinstance(tp.thresholds[0].palette, GradientPalette)
+    assert tp.thresholds[0].palette.stops[1].color == "#2979ff"
+    assert isinstance(tp.thresholds[1].palette, ThresholdPalette)
+    assert isinstance(tp.thresholds[2].palette, str)
+    assert tp.thresholds[2].palette == "named_palette"
