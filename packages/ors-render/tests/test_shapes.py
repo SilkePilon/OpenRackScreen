@@ -185,6 +185,25 @@ def test_pixel_width_degrades_a_non_finite_width_to_the_thinnest_stroke(width: f
     assert pixel_width(Geometry(), width) == 1
 
 
+@pytest.mark.parametrize("width", [1.0, 2.0, 1e6, 1e9, 1e17])
+def test_pixel_width_clamps_a_giant_width_to_the_canvas(width: float):
+    # Guarding only the non-finite case left the *finite* giants through, and
+    # `round` hands those to Pillow as a Python int wider than a C long. A
+    # stroke as wide as the canvas already covers it end to end from any point
+    # on the shape, so the canvas size is the ceiling past which no wider number
+    # can add a pixel -- the same clamp `ors_render.elements.media._box_px`
+    # applies to an over-large image box.
+    #
+    # 1e308 is deliberately not in this list: `span` overflows it to infinity,
+    # so it is the *non-finite* case above and keeps landing on the 1 px floor.
+    # Both are safe degradations; which one a number gets is decided after the
+    # scaling, not before it.
+    geometry = Geometry()
+    assert pixel_width(geometry, width) == geometry.px
+    # A wide-but-drawable width is still passed through untouched.
+    assert pixel_width(geometry, 0.5) == geometry.px // 2
+
+
 @pytest.mark.parametrize(
     "element",
     [
@@ -200,3 +219,27 @@ def test_a_non_finite_stroke_width_still_draws_the_element(element: dict[str, An
     # for no stroke, so it lands on the same 1 px floor a zero width does --
     # and, either way, it must not take the screen down.
     assert _render(element).getbbox() is not None
+
+
+@pytest.mark.parametrize("width", [1e9, 1e17, 1e308])
+@pytest.mark.parametrize(
+    "element",
+    [
+        {"type": "line"},
+        {"type": "rect", "fill": None, "stroke": "#00ff00", "radius": 0.0},
+        {"type": "rect", "fill": None, "stroke": "#00ff00", "radius": 0.1},
+    ],
+    ids=["line", "rectangle", "rounded_rectangle"],
+)
+def test_a_giant_stroke_width_still_draws_the_element(element: dict[str, Any], width: float):
+    # `LineElement.width` and `RectElement.stroke_width` are unbounded floats, so
+    # every one of these is schema-valid scene JSON -- and every one of them used
+    # to raise out of `render_scene`: `OverflowError: Python int too large to
+    # convert to C long` from `ImageDraw.line`, and `OverflowError: signed
+    # integer is greater than maximum` from `rectangle` at only 1e9. Both rect
+    # paths are covered because `rectangle` and `rounded_rectangle` are separate
+    # Pillow entry points, and an earlier audit missed the rect case entirely by
+    # never setting `stroke`, which defaults to `None` and leaves `stroke_width`
+    # dead. A saturating stroke, not a blank panel, is the right degradation.
+    key = "width" if element["type"] == "line" else "stroke_width"
+    assert _render({**element, key: width}).getbbox() is not None

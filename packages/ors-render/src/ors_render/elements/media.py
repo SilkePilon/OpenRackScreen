@@ -101,6 +101,15 @@ def render_sparkline(
         # for the reason `ors_render.elements.shapes` skips an empty rect: there
         # is nothing to show, and a degenerate polygon still leaves a hairline.
         return
+    if left + width <= 0 or top + height <= 0 or left >= geometry.px or top >= geometry.px:
+        # Wholly off the canvas. Finiteness is not enough on its own: a *finite*
+        # `cx` of 1e7 is schema-valid and lands the box ten million panel widths
+        # away, and Pillow's rasteriser wraps such a coordinate rather than
+        # clipping it -- measured, a full-width band of ink across the middle of
+        # the panel at every magnitude from 1e7 to 1e300 and on both signs. Same
+        # cull, for the same reason, as `render_image` below and
+        # `ors_render.elements.text`.
+        return
 
     low, high = min(points), max(points)
     span = high - low

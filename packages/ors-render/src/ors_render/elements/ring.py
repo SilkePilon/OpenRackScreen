@@ -49,6 +49,31 @@ draw calls. Past a full circle the extra sweep only paints over what is already
 there, so capping costs nothing a scene can see.
 """
 
+_MAX_RADIUS_CANVASES = 2.0
+"""Ceiling on a ring's radius, as a multiple of the canvas size.
+
+`r` is an unbounded float and `ImageDraw.arc` costs time proportional to the
+perimeter of its bounding box, so a radius the panel cannot contain buys
+unbounded work for a picture nobody sees: measured, ``{"type": "ring", "r":
+100}`` takes 0.68 s and ``r: 1000`` 6.7 s against 0.01 s for an ordinary ring,
+and ``r: 5000`` was killed after 20 s. Nothing raises, so the "never crashes"
+rule held while the panel simply stopped refreshing -- which on a screen that
+redraws several times a second is the same outage.
+
+Two canvases is the bound because the farthest apart two points on the panel can
+be is its diagonal, ``sqrt(2)`` canvases: a circle of any larger radius, centred
+anywhere on the panel, passes entirely outside it, and 2 leaves margin for a
+centre placed somewhat off the edge. At the bound one arc costs 0.04 s, still
+inside a refresh.
+
+Past it the ring is *skipped*, not clamped, for the reason `_circle` skips a
+non-finite thickness: the radius **is** the ring. A clamped one would come back
+as a perfectly ordinary-looking gauge at a size the scene never asked for --
+indistinguishable from a correct render, and so a lie about the reading --
+whereas a missing element is visibly missing. Same purpose as `_MAX_SEGMENTS`:
+a bound the scene cannot see, so untrusted input cannot buy unbounded work.
+"""
+
 _SEAM_OVERLAP_DEGREES = 1.2
 """How far each step is extended into its successor, which then paints over it.
 
@@ -87,14 +112,18 @@ def _circle(canvas: Canvas, element: ArcElement | RingElement) -> tuple[Box, flo
     never away to nothing.
 
     ``None`` means there is nothing drawable here. Neither field is bounded by
-    the schema, and both bounds are Pillow's or Python's rather than ours: an
-    inverted bounding box is rejected outright, and `round` raises on a
-    non-finite number.
+    the schema, so every bound is this renderer's to make: an inverted or empty
+    bounding box has no ring, `round` raises on a non-finite thickness, and a
+    radius past `_MAX_RADIUS_CANVASES` is off the panel and costs unbounded time
+    to draw. The radius test is written as a positive range rather than as
+    ``radius <= 0 or radius > limit`` so that a NaN -- for which *both* of those
+    comparisons are false -- is skipped here instead of reaching Pillow as a NaN
+    bounding box.
     """
     geometry = canvas.geometry
     radius = geometry.radial(element.r)
     thickness = geometry.radial(element.thickness)
-    if radius <= 0 or not math.isfinite(thickness):
+    if not 0.0 < radius <= geometry.px * _MAX_RADIUS_CANVASES or not math.isfinite(thickness):
         return None
     cx, cy = geometry.x(element.cx), geometry.y(element.cy)
     box = (cx - radius, cy - radius, cx + radius, cy + radius)

@@ -1,3 +1,5 @@
+import time
+
 import pytest
 from ors_render.context import RenderContext
 from ors_render.render import render_scene
@@ -225,6 +227,8 @@ def test_thickness_beyond_the_radius_fills_the_disc():
     [
         {"type": "ring", "r": 0.0},
         {"type": "ring", "r": -0.5},
+        {"type": "ring", "r": float("nan")},
+        {"type": "ring", "r": float("inf")},
         {"type": "ring", "value": 50, "min": float("nan"), "max": float("nan")},
         {"type": "ring", "value": 50, "start_angle": float("inf"), "cap": "dot"},
         {"type": "ring", "value": 50, "thickness": float("nan")},
@@ -241,3 +245,30 @@ def test_degenerate_rings_and_arcs_render_rather_than_raise(element):
     # number reaching `round` or `math.cos`, `@palette` where a hex track is
     # expected, and an angle span large enough to be a step count of its own.
     render_scene(Scene.model_validate({"elements": [element]}), CTX)
+
+
+@pytest.mark.parametrize(
+    "element",
+    [
+        {"type": "ring", "value": 42, "r": 5000.0},
+        {"type": "ring", "value": 42, "r": 5000.0, "thickness": 5000.0, "cap": "dot"},
+        {"type": "ring", "value": 42, "r": 1e6},
+        {"type": "ring", "value": 42, "r": 1e300},
+        {"type": "arc", "r": 5000.0, "from_angle": 0, "to_angle": 180},
+    ],
+    ids=str,
+)
+def test_a_wild_radius_degrades_promptly_rather_than_stalling_the_panel(element):
+    # `r` is an unbounded float, and `arc` costs time proportional to the
+    # perimeter of its bounding box: measured before the bound, `r: 100` took
+    # 0.68 s, `r: 1000` took 6.7 s and `r: 5000` was killed after 20 s. Nothing
+    # raises, so the "never crashes" rule held while the panel simply stopped
+    # refreshing -- which on a screen that redraws several times a second is the
+    # same outage. The one-second budget is deliberately loose: a correct render
+    # of these is a skip costing about ten milliseconds, so anything near the
+    # limit is the unbounded arc coming back rather than a slow machine.
+    start = time.perf_counter()
+    image = render_scene(Scene.model_validate({"elements": [element]}), CTX)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 1.0, f"{element} took {elapsed:.2f}s"
+    assert image.getbbox() is None, "a ring whose stroke cannot land on the panel draws nothing"

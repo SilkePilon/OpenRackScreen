@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 from typing import Any
 
+import pytest
 from ors_render.context import RenderContext
 from ors_render.render import render_scene
 from ors_schema.scene import Scene
@@ -118,6 +119,23 @@ def test_sparkline_with_an_unusable_position_or_size_is_skipped():
     ):
         image = _render({"type": "sparkline", "values": "{{h.cpu}}", "fill": True, **element}, ctx)
         assert image.tobytes() == blank.tobytes(), element
+
+
+@pytest.mark.parametrize("axis", ["cx", "cy"])
+@pytest.mark.parametrize("offset", [2.0, 1e7, 1e9, 1e30, 1e300, -1e9, -1e30])
+def test_a_sparkline_wholly_off_the_canvas_draws_nothing(axis: str, offset: float):
+    # A *finite* but huge centre is schema-valid -- `cx`/`cy` are unbounded
+    # floats -- and it is not caught by the finiteness test above. Pillow's
+    # rasteriser indexes with a C integer and wraps rather than clipping such a
+    # coordinate, so before the cull a sparkline positioned ten million panel
+    # widths away painted a full-width band across the middle of the panel
+    # (measured from 1e7 upward, at every magnitude to 1e300 and on both signs).
+    # The small offset is the ordinary case the cull also has to get right: two
+    # panel widths out is off screen, and off screen means no ink.
+    ctx = RenderContext(data={"h": {"cpu": [10, 40, 20, 80, 35, 90, 60, 75, 30]}})
+    element = {"type": "sparkline", "values": "{{h.cpu}}", "fill": True, axis: offset}
+    image = _render(element, ctx)
+    assert image.getbbox() is None, f"{axis}={offset:g} painted at {image.getbbox()}"
 
 
 def test_image_draws_from_assets():

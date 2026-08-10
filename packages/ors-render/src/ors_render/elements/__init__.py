@@ -81,9 +81,25 @@ def pixel_width(geometry: Geometry, width: float) -> int:
     itself -- still appears. Contrast `ors_render.elements.ring`, which skips a
     ring whose `thickness` is non-finite: there the thickness *is* the element,
     so there is nothing left to draw at any width. Here there is.
+
+    *Capped at the canvas.* Guarding only the non-finite case still let the
+    finite giants through, and `round` hands those to Pillow as a Python int
+    wider than a C long: `{"type": "line", "width": 1e17}` raised ``OverflowError:
+    Python int too large to convert to C long``, and a rect with a `stroke` set
+    raised ``OverflowError: signed integer is greater than maximum`` from as low
+    as 1e9 -- through `rectangle` and, via its corner arcs, `rounded_rectangle`
+    alike. `Geometry.px` is the ceiling because a stroke as wide as the canvas
+    already covers it end to end from any point on the shape it outlines, so no
+    larger number can add a pixel: the excess was never visible, exactly as for
+    the over-large image box `ors_render.elements.media._box_px` clamps the same
+    way. Capping rather than skipping keeps the degradation in the same
+    direction as the 1 px floor -- the scene asked for a stroke and still gets
+    one, here a saturating one, rather than an element that quietly vanishes.
     """
     scaled = geometry.span(width)
-    return max(1, round(scaled)) if math.isfinite(scaled) else 1
+    if not math.isfinite(scaled):
+        return 1
+    return max(1, min(geometry.px, round(scaled)))
 
 
 def resolve_color(
