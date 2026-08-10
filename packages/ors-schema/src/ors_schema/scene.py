@@ -51,6 +51,11 @@ class TextElement(BaseElement):
     size: float = 13
     font: Literal["regular", "bold"] = "bold"
     color: Color = "#ffffff"
+    # What `"color": "@palette"` resolves against, so a title can track its
+    # gauge's colour: a template sets the same palette on the ring and on the
+    # label. `mono` is the renderer's own fallback for a palette-less element,
+    # so a text element that names none renders exactly as it always has.
+    palette: PaletteRef = "mono"
     align: Literal["center", "left", "right"] = "center"
     max_width: float | None = None
     ellipsis: bool = True

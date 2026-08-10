@@ -65,16 +65,73 @@ def test_threshold_palette_changes_colour_with_value():
     assert low.getpixel(TOP) != high.getpixel(TOP)
 
 
+def test_threshold_bands_are_matched_as_a_percentage_of_the_scale():
+    # `resolve_palette` matches a 0..100 percentage against the `at` of each
+    # band, so the reading has to be scaled by the element's own `min`/`max`
+    # first. A fan at 500 rpm on a 0..8000 scale is 6.25% of the way up its
+    # scale, not "500 percent": it is green, and it renders exactly as the same
+    # fraction of a plain green ring does. Handing the raw reading over instead
+    # pins any such gauge to its top band forever.
+    palette = {
+        "kind": "threshold",
+        "thresholds": [
+            {"at": 0, "palette": "green"},
+            {"at": 70, "palette": "amber"},
+            {"at": 90, "palette": "red"},
+        ],
+    }
+    low = render_scene(_ring(value=500, min=0, max=8000, palette=palette), CTX)
+    high = render_scene(_ring(value=7600, min=0, max=8000, palette=palette), CTX)
+    green = render_scene(_ring(value=6.25, palette="green"), CTX)
+    assert low.tobytes() == green.tobytes(), "6.25% of a fan's scale is the first band"
+    assert low.getpixel(TOP) != high.getpixel(TOP), "and 95% of it is not"
+
+
+def test_a_non_finite_scale_leaves_the_gauge_empty():
+    # `min(1.0, nan)` is 1.0, so an unguarded clamp turns a scale that is not a
+    # scale into a *saturated* gauge at the accent colour -- the one reading
+    # `ors_render.palettes` says must never paint a full or critical gauge.
+    empty = render_scene(_ring(value=0, cap="dot"), CTX)
+    image = render_scene(_ring(value=50, min=float("nan"), max=float("nan"), cap="dot"), CTX)
+    assert image.tobytes() == empty.tobytes()
+    assert max(high for _low, high in image.getextrema()) < 64, (
+        "nothing anywhere near the accent colour is painted, only the dark track"
+    )
+
+
 def test_palette_token_in_text_uses_the_elements_palette(assert_golden):
+    # A text element carries its own palette, so a title written `@palette`
+    # tracks the gauge when the scene gives both the same one -- rather than
+    # silently falling back to `mono` and rendering mid-grey.
     scene = Scene.model_validate(
         {
             "elements": [
                 {"type": "ring", "value": 80, "palette": "amber", "cap": "dot"},
-                {"type": "text", "cy": 0.28, "size": 15, "text": "MEM", "color": "@palette"},
+                {
+                    "type": "text",
+                    "cy": 0.28,
+                    "size": 15,
+                    "text": "MEM",
+                    "color": "@palette",
+                    "palette": "amber",
+                },
             ]
         }
     )
-    assert_golden(render_scene(scene, CTX), "ring_palette_token")
+    image = render_scene(scene, CTX)
+    # Probed on a crop that holds the label and none of the ring, which at this
+    # height runs through x=41 and x=199 -- otherwise the ring's own amber dot
+    # cap would satisfy the assertion on its own. The peak is compared by *hue*
+    # rather than against amber's accent `#ff9100` exactly: no pixel of a 15 px
+    # glyph is fully covered, and `Canvas.finish` downsamples with LANCZOS,
+    # which overshoots (measured: the brightest label pixel is (255, 171, 0)).
+    # Amber is red-dominant with no blue at all, which no shade of the `#9e9e9e`
+    # grey the `mono` fallback would draw can be.
+    label = image.crop((90, 55, 150, 82)).getcolors(maxcolors=1 << 16)
+    peak = max((color for _count, color in label), key=sum)
+    red, green, blue = peak
+    assert red > green > blue, f"the title is drawn in amber, not grey; peak was {peak}"
+    assert_golden(image, "ring_palette_token")
 
 
 def test_arc_renders_explicit_angles(assert_golden):

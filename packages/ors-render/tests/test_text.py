@@ -48,6 +48,29 @@ def test_text_element_renders_centered(assert_golden):
     assert_golden(render_scene(scene, _ctx()), "text_basic")
 
 
+def test_palette_token_resolves_against_the_text_elements_own_palette():
+    # A title written `"color": "@palette"` is how a template makes a label
+    # track its gauge's colour; the text element carries the palette itself, so
+    # a template sets the same one on the ring and on the title rather than the
+    # text inheriting a sibling's.
+    scene = Scene.model_validate(
+        {
+            "elements": [
+                {
+                    "type": "text",
+                    "size": 52,
+                    "text": "X",
+                    "color": "@palette",
+                    "palette": "amber",
+                }
+            ]
+        }
+    )
+    colors = {color for _count, color in render_scene(scene, _ctx()).getcolors(maxcolors=1 << 16)}
+    assert (255, 145, 0) in colors, "amber's accent, `gradient_color(amber, 1.0)`"
+    assert (158, 158, 158) not in colors, "not the grey accent of the `mono` fallback"
+
+
 def test_element_when_false_is_skipped():
     shown = render_scene(
         Scene.model_validate({"elements": [{"type": "text", "size": 52, "text": "X"}]}), _ctx()

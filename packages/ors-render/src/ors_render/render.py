@@ -38,9 +38,22 @@ def draw_element(canvas: Canvas, element: Element, ctx: RenderContext) -> None:
     # A renderer always receives a *gradient*, so the threshold band is picked
     # here, from the element's own reading -- the ring is the only family with
     # one today, and it is the family whose colour is supposed to change with
-    # it. The reading is compared against the thresholds in the element's own
-    # units (`min`/`max` are the ring's business, not the palette's), and an
-    # element with no `value` at all resolves to the first band.
+    # it. `resolve_palette` matches a 0..100 *percentage* against each band's
+    # `at`, so the reading is scaled by the element's own range first: a fan on
+    # a 0..8000 rpm scale would otherwise sit in the top band from 90 rpm up,
+    # and a 0..8 load ring could never leave the first one. The `getattr`
+    # defaults are the schema's own, so an element with no `value`/`min`/`max`
+    # at all resolves to 0% -- the first band -- exactly as before.
     palette_ref = getattr(element, "palette", None) or "mono"
-    value = resolve_number(getattr(element, "value", 0.0), ctx.data)
-    renderer(canvas, element, ctx, resolve_palette(palette_ref, value))
+    low = getattr(element, "min", 0.0)
+    high = getattr(element, "max", 100.0)
+    # `default=low` matches what `ring.render_ring` uses when it resolves the
+    # same binding for the sweep. The two resolutions cannot be collapsed into
+    # one without giving every renderer a fifth parameter it has no use for, so
+    # they are kept in step by sharing the default instead: a reading that never
+    # arrived has to pick the band of an *empty* gauge, and on a scale starting
+    # below zero a bare 0.0 would be a mid-scale -- possibly critical -- band
+    # under a visibly empty ring.
+    value = resolve_number(getattr(element, "value", low), ctx.data, default=low)
+    percent = 100.0 * (value - low) / ((high - low) or 1.0)
+    renderer(canvas, element, ctx, resolve_palette(palette_ref, percent))

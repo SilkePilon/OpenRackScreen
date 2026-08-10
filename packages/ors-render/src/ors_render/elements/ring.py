@@ -140,7 +140,16 @@ def render_ring(
     # ring, say) would be a plausible-looking mid-gauge value instead.
     value = resolve_number(element.value, ctx.data, default=element.min)
     span = (element.max - element.min) or 1.0
-    fraction = max(0.0, min(1.0, (value - element.min) / span))
+    fraction = (value - element.min) / span
+    if not math.isfinite(fraction):
+        # `min(1.0, nan)` returns 1.0, so an unguarded clamp would turn a scale
+        # that is not a scale (`min`/`max` are unbounded floats from scene JSON,
+        # and NaN - NaN is NaN) into a *saturated* gauge at the accent colour.
+        # `ors_render.palettes` is explicit that a non-reading must never paint a
+        # full or critical gauge, so a fraction that is not a number renders as
+        # the empty gauge it is.
+        return
+    fraction = max(0.0, min(1.0, fraction))
     if fraction <= 0.0:
         return
 

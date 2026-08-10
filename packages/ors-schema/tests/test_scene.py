@@ -52,6 +52,15 @@ def test_group_nests_elements_and_carries_repeat():
     assert isinstance(group.elements[0], RingElement)
 
 
+def test_text_carries_its_own_palette_for_the_palette_token():
+    # `"color": "@palette"` on a title has to resolve against *something*, and a
+    # text element's palette is its own rather than a sibling ring's: a template
+    # sets the same palette on both, which keeps the reference local.
+    assert TextElement(type="text").palette == "mono"
+    title = TextElement.model_validate({"type": "text", "color": "@palette", "palette": "amber"})
+    assert title.palette == "amber"
+
+
 def test_unknown_element_type_is_rejected():
     with pytest.raises(ValidationError):
         Scene.model_validate({"elements": [{"type": "hologram"}]})
