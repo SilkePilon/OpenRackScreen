@@ -7,11 +7,11 @@ from ors_render.bindings import resolve_number
 from ors_render.canvas import Canvas
 from ors_render.context import RenderContext
 from ors_render.elements import RENDERERS
-from ors_render.elements import group as _group  # noqa: F401 - registers the renderer
 from ors_render.elements import media as _media  # noqa: F401 - registers the renderers
 from ors_render.elements import ring as _ring  # noqa: F401 - registers the renderers
 from ors_render.elements import shapes as _shapes  # noqa: F401 - registers the renderers
 from ors_render.elements import text as _text  # noqa: F401 - registers the renderer
+from ors_render.elements.group import work_budget  # this import registers the group renderer
 from ors_render.expr import ExpressionError, truthy
 from ors_render.geometry import Geometry
 from ors_render.palettes import resolve_palette
@@ -21,8 +21,12 @@ def render_scene(
     scene: Scene, ctx: RenderContext, size: int = 240, supersample: int = 2
 ) -> Image.Image:
     canvas = Canvas(Geometry(size=size, supersample=supersample), scene.background)
-    for element in scene.elements:
-        draw_element(canvas, element, ctx)
+    # One work budget for the whole scene, so nested `repeat` groups cannot
+    # multiply their way to a frame that takes minutes. See
+    # `ors_render.elements.group._MAX_CHILD_DRAWS`.
+    with work_budget():
+        for element in scene.elements:
+            draw_element(canvas, element, ctx)
     return canvas.finish()
 
 

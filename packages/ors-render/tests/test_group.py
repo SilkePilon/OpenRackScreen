@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
+import pytest
 from ors_render.context import RenderContext
+from ors_render.elements import group
 from ors_render.elements.group import _stepped
 from ors_render.render import render_scene
 from ors_schema.scene import RectElement, RingElement, Scene, TextElement
@@ -203,6 +206,93 @@ def test_deeply_nested_groups_render_without_blowing_the_stack():
     for _ in range(254):
         node = {"type": "group", "elements": [node]}
     assert _render(node).getpixel((120, 120)) == (255, 0, 0)
+
+
+def test_a_pathological_nest_of_repeat_groups_completes_quickly():
+    # Every nesting level multiplies the leaf count by the schema's per-level
+    # `limit` cap of 32, so four levels is 1 048 576 draws -- measured at 14.1 s
+    # for a single frame, on a panel that refreshes several times a second.
+    # Nothing raises, so "degrades, never crashes" is technically upheld while
+    # the screen simply stops. Scene JSON comes from the web UI, so the nesting
+    # depth is an input rather than a template bug.
+    wide = RenderContext(data={"many": list(range(32))})
+    node: dict[str, Any] = {"type": "rect", "w": 0.01, "h": 0.01, "fill": "#ff0000"}
+    for _ in range(4):
+        node = {
+            "type": "group",
+            "repeat": {"over": "{{many}}", "as": "t", "limit": 32},
+            "elements": [node],
+        }
+    scene = Scene.model_validate({"elements": [node]})
+    started = time.perf_counter()
+    image = render_scene(scene, wide)
+    elapsed = time.perf_counter() - started
+    # Generous by two orders of magnitude against the unbudgeted 14.1 s, so the
+    # bound says "the budget is in force" rather than "this machine is fast".
+    assert elapsed < 2.0, f"took {elapsed:.2f}s"
+    # And it still draws: the budget stops the render, it does not blank it.
+    assert image.getbbox() is not None
+
+
+def test_the_work_budget_stops_drawing_rather_than_raising(monkeypatch: pytest.MonkeyPatch):
+    # Four rects side by side, one per iteration, with room for only two draws.
+    # The first two land; the rest are dropped in silence rather than raising.
+    monkeypatch.setattr(group, "_MAX_CHILD_DRAWS", 2)
+    scene = {
+        "type": "group",
+        "repeat": {"over": "{{qbit.active}}", "as": "t", "limit": 4},
+        "step": {"cx": 0.2},
+        "elements": [{"type": "rect", "cx": 0.2, "w": 0.1, "h": 0.5, "fill": "#ff0000"}],
+    }
+    image = _render(scene)
+    assert image.getpixel((48, 120)) == (255, 0, 0)
+    assert image.getpixel((96, 120)) == (255, 0, 0)
+    assert image.getpixel((144, 120)) == (0, 0, 0)
+    assert image.getpixel((192, 120)) == (0, 0, 0)
+
+
+def test_the_work_budget_is_shared_by_the_whole_scene(monkeypatch: pytest.MonkeyPatch):
+    # One budget per `render_scene` call, not one per top-level group: a scene
+    # holds as many sibling groups as its JSON has room for, and a per-group
+    # budget would multiply the ceiling by that count. Four draws is exactly
+    # what the first group needs, so the marker after it gets nothing.
+    monkeypatch.setattr(group, "_MAX_CHILD_DRAWS", 4)
+    spender = {
+        "type": "group",
+        "repeat": {"over": "{{qbit.active}}", "as": "t", "limit": 4},
+        "elements": [{"type": "rect", "cx": 0.2, "w": 0.1, "h": 0.5, "fill": "#0000ff"}],
+    }
+    marker = {
+        "type": "group",
+        "repeat": {"over": "{{qbit.active}}", "as": "t", "limit": 1},
+        "elements": [{"type": "rect", "cx": 0.8, "w": 0.1, "h": 0.5, "fill": "#ff0000"}],
+    }
+    image = _render(spender, marker)
+    assert image.getpixel((48, 120)) == (0, 0, 255)
+    assert image.getpixel((192, 120)) == (0, 0, 0)
+
+
+def test_a_fresh_budget_starts_with_every_render(monkeypatch: pytest.MonkeyPatch):
+    # The budget belongs to the call, not to the process: a scene that spends
+    # all of it must render identically on the next frame rather than fading
+    # out as a leaked counter runs down.
+    monkeypatch.setattr(group, "_MAX_CHILD_DRAWS", 2)
+    scene = Scene.model_validate(
+        {
+            "elements": [
+                {
+                    "type": "group",
+                    "repeat": {"over": "{{qbit.active}}", "as": "t", "limit": 4},
+                    "step": {"cx": 0.2},
+                    "elements": [{"type": "rect", "cx": 0.2, "w": 0.1, "h": 0.5}],
+                }
+            ]
+        }
+    )
+    first = render_scene(scene, CTX)
+    assert first.getbbox() is not None
+    for _ in range(3):
+        assert render_scene(scene, CTX).tobytes() == first.tobytes()
 
 
 def test_palette_cycling_wraps_and_replaces_the_child_palette():

@@ -32,11 +32,21 @@ scene that ever reaches this module is ~254 groups (measured), which costs a few
 hundred stack frames. A scene is untrusted JSON from a web UI, so that bound is
 load-bearing -- but it belongs to the parse, and duplicating it as a depth
 counter here would be a second number to keep in step with pydantic's.
+
+*Total work* is a different bound, and the schema does not supply it. `limit`
+caps one repeat at 32 items, but nesting multiplies: three levels is 32 768 leaf
+draws (measured at 0.45 s), four is 1 048 576 (14.1 s), five about seven and a
+half minutes. Nothing raises, so "degrades, never crashes" is upheld to the
+letter while a panel refreshing several times a second simply stops. Hence
+`work_budget`: see `_MAX_CHILD_DRAWS`.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from ors_schema.palette import GradientPalette, PaletteRef
 from ors_schema.scene import Element, GroupElement
@@ -45,6 +55,75 @@ from ors_render.bindings import resolve_list
 from ors_render.canvas import Canvas
 from ors_render.context import RenderContext
 from ors_render.elements import register
+
+_MAX_CHILD_DRAWS = 2048
+"""Ceiling on the elements one `render_scene` call may draw from inside groups.
+
+The number a *real* scene needs is tiny: the torrent screen repeats three rings,
+and a busy dashboard a few dozen elements. A 240x240 panel cannot show a
+thousand distinct things, so 2048 leaves every honest scene two to three orders
+of magnitude of headroom while cutting the four-level pathological nest from
+1 048 576 draws to 0.2% of that.
+
+It counts *every* child a group draws, not just the ones inside a `repeat`, and
+that is what makes it a bound rather than a suggestion: a repeat whose child is
+a plain container group would otherwise multiply that container's contents
+freely while spending one unit per iteration.
+
+Same purpose as `ors_render.elements.ring`'s `_MAX_SEGMENTS` -- a ceiling the
+scene cannot see, so untrusted JSON cannot buy unbounded work -- and the same
+failure mode: past it, drawing stops. It does not raise. A scene over the
+ceiling is already nothing a person authored on purpose, and half a panel is a
+better answer than a traceback.
+"""
+
+
+class _Budget:
+    """How many more child elements this render may draw."""
+
+    __slots__ = ("remaining",)
+
+    def __init__(self, remaining: int) -> None:
+        self.remaining = remaining
+
+    def spend(self) -> bool:
+        """Claim one draw, or answer ``False`` when there are none left."""
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+
+_BUDGET: ContextVar[_Budget | None] = ContextVar("ors_render_group_budget", default=None)
+"""The budget the current render is spending, if one has been opened.
+
+A `ContextVar` rather than an argument because the recursion runs through
+`ors_render.render.draw_element`, whose signature is the element-renderer
+contract every family shares -- threading a counter through it would put a
+parameter on every renderer for the benefit of exactly one. A plain module
+global would do the same job for a single-threaded render and then silently
+share one counter between two panels rendered concurrently; a `ContextVar` is
+per-thread and per-task without the caller having to know.
+"""
+
+
+@contextmanager
+def work_budget() -> Iterator[_Budget]:
+    """Open a fresh work budget for the duration of one render.
+
+    `ors_render.render.render_scene` wraps a whole scene in one of these, so
+    every group in it shares a single ceiling: a scene holds as many sibling
+    groups as its JSON has room for, and a budget per group would multiply the
+    ceiling by that count. The token is reset on the way out, so the budget
+    belongs to the call rather than to the process -- a scene that spends all of
+    it renders identically on the next frame.
+    """
+    budget = _Budget(_MAX_CHILD_DRAWS)
+    token = _BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        _BUDGET.reset(token)
 
 
 def _stepped(
@@ -105,12 +184,35 @@ def _stepped(
 def render_group(
     canvas: Canvas, element: GroupElement, ctx: RenderContext, palette: GradientPalette
 ) -> None:
+    budget = _BUDGET.get()
+    if budget is not None:
+        _draw_children(canvas, element, ctx, budget)
+        return
+    # A group reached without a budget open -- a caller driving `draw_element`
+    # itself rather than going through `render_scene` -- still gets a ceiling,
+    # just one scoped to this subtree instead of to a whole scene.
+    with work_budget() as fresh:
+        _draw_children(canvas, element, ctx, fresh)
+
+
+def _draw_children(
+    canvas: Canvas, element: GroupElement, ctx: RenderContext, budget: _Budget
+) -> None:
+    """Draw the group's children once, or once per `repeat` item.
+
+    Every child costs one unit of `budget`, and an exhausted budget ends the
+    render's group drawing outright rather than skipping one child and carrying
+    on: nothing further can be drawn anyway, and returning here is what stops
+    the enclosing levels from spinning through their own iterations.
+    """
     # Imported here rather than at module scope: `render` imports this module
     # for its registration side effect, so a top-level import would be a cycle.
     from ors_render.render import draw_element
 
     if element.repeat is None:
         for child in element.elements:
+            if not budget.spend():
+                return
             draw_element(canvas, child, ctx)
         return
 
@@ -121,4 +223,6 @@ def render_group(
         child_ctx = ctx.child({element.repeat.as_: item, "index": index})
         override = element.palettes[index % len(element.palettes)] if element.palettes else None
         for child in element.elements:
+            if not budget.spend():
+                return
             draw_element(canvas, _stepped(child, element.step, index, override), child_ctx)
