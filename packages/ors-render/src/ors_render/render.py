@@ -6,6 +6,7 @@ from PIL import Image
 from ors_render.canvas import Canvas
 from ors_render.context import RenderContext
 from ors_render.elements import RENDERERS
+from ors_render.elements import shapes as _shapes  # noqa: F401 - registers the renderers
 from ors_render.elements import text as _text  # noqa: F401 - registers the renderer
 from ors_render.expr import ExpressionError, truthy
 from ors_render.geometry import Geometry
