@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from ors_schema.palette import GradientPalette, PaletteRef, ThresholdPalette
 
 
@@ -28,6 +30,13 @@ def hex_to_rgb(color: str) -> tuple[int, int, int]:
 
 
 def gradient_color(palette: GradientPalette, t: float) -> tuple[int, int, int]:
+    if not math.isfinite(t):
+        # A non-finite t is a missing reading, not a full one. NaN in particular
+        # would otherwise survive `max(0.0, min(1.0, t))` as 1.0 and render the
+        # top of the gradient -- a red "critical" alarm on the threshold
+        # palettes -- for a sensor that reported nothing at all. Render the low
+        # end for NaN and both infinities alike: none of them is a measurement.
+        t = 0.0
     t = max(0.0, min(1.0, t))
     stops = palette.stops
     if len(stops) == 1 or t <= stops[0].at:
