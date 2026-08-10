@@ -10,12 +10,33 @@ class ExpressionError(Exception):
     """Raised for any expression that is malformed or not on the allow-list."""
 
 
+# Real `when` expressions (attribute chains, comparisons, small boolean
+# combinations) are well under a hundred characters. This cap is generous for
+# that use case while sitting far below the size needed to stress the ast
+# parser's recursion/stack limits (see test_deeply_chained_arithmetic_source_
+# becomes_expression_error and test_long_unary_chain_source_becomes_
+# expression_error).
+MAX_EXPRESSION_LENGTH = 512
+
+
+def _mul(left: Any, right: Any) -> Any:
+    if isinstance(left, str | list | tuple) or isinstance(right, str | list | tuple):
+        raise ExpressionError("multiplication of strings, lists, or tuples is not allowed")
+    return operator.mul(left, right)
+
+
+def _mod(left: Any, right: Any) -> Any:
+    if not isinstance(left, int | float) or not isinstance(right, int | float):
+        raise ExpressionError("modulo is only allowed on numbers")
+    return operator.mod(left, right)
+
+
 _BIN_OPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
+    ast.Mult: _mul,
     ast.Div: operator.truediv,
-    ast.Mod: operator.mod,
+    ast.Mod: _mod,
 }
 
 _CMP_OPS = {
@@ -42,15 +63,25 @@ _LITERALS = {"null": None, "true": True, "false": False}
 
 
 def evaluate(expr: str, data: Mapping[str, Any]) -> Any:
+    if len(expr) > MAX_EXPRESSION_LENGTH:
+        raise ExpressionError(
+            f"expression too long ({len(expr)} > {MAX_EXPRESSION_LENGTH} characters)"
+        )
     try:
         tree = ast.parse(expr, mode="eval")
     except SyntaxError as exc:
         raise ExpressionError(f"syntax error in {expr!r}: {exc}") from exc
+    except (ValueError, RecursionError, MemoryError) as exc:
+        # ValueError: e.g. a NUL byte in the source (raised instead of
+        # SyntaxError on Python 3.11+). RecursionError/MemoryError: defense
+        # in depth beyond the length cap above, in case some other input
+        # shape stresses the parser's C stack.
+        raise ExpressionError(f"failed to parse expression {expr!r}: {exc}") from exc
     try:
         return _eval(tree.body, data)
     except ExpressionError:
         raise
-    except Exception as exc:  # noqa: BLE001 - any runtime failure is an expression failure
+    except Exception as exc:  # any runtime failure is an expression failure
         raise ExpressionError(f"failed to evaluate {expr!r}: {exc}") from exc
 
 
@@ -77,22 +108,24 @@ def _eval(node: ast.AST, data: Mapping[str, Any]) -> Any:
         if node.attr.startswith("_"):
             raise ExpressionError(f"attribute not allowed: {node.attr}")
         value = _eval(node.value, data)
-        if value is None:
-            return None
+        # A base that isn't a mapping (None, or a shape mismatch such as an
+        # upstream field that changed from an object to a scalar) degrades to
+        # None like any other missing field, rather than raising. No getattr
+        # is ever performed here, so this cannot expose Python attributes.
         if not isinstance(value, Mapping):
-            raise ExpressionError("attribute access is only allowed on mappings")
+            return None
         return value.get(node.attr)
 
     if isinstance(node, ast.Subscript):
         value = _eval(node.value, data)
         key = _eval(node.slice, data)
-        if value is None:
-            return None
         if isinstance(value, Mapping):
             return value.get(key)
         if isinstance(value, Sequence) and not isinstance(value, str) and isinstance(key, int):
             return value[key] if -len(value) <= key < len(value) else None
-        raise ExpressionError("subscript is only allowed on mappings and lists")
+        # Same reasoning as Attribute above: a base that is neither a mapping
+        # nor a list is a data shape mismatch, not a disallowed construct.
+        return None
 
     if isinstance(node, ast.UnaryOp):
         operand = _eval(node.operand, data)
@@ -111,10 +144,21 @@ def _eval(node: ast.AST, data: Mapping[str, Any]) -> Any:
         return op(_eval(node.left, data), _eval(node.right, data))
 
     if isinstance(node, ast.BoolOp):
-        values = [_eval(v, data) for v in node.values]
+        # Short-circuit like Python: stop evaluating operands as soon as the
+        # result is decided, so `qbit.speed != 0 and 100 / qbit.speed > 1`
+        # doesn't evaluate the division when the guard is False. Unlike
+        # Python, this returns a bool rather than the deciding operand -
+        # consistent with Compare below, which already normalizes chained
+        # comparisons to True/False instead of returning an operand.
         if isinstance(node.op, ast.And):
-            return all(values)
-        return any(values)
+            for value in node.values:
+                if not _eval(value, data):
+                    return False
+            return True
+        for value in node.values:
+            if _eval(value, data):
+                return True
+        return False
 
     if isinstance(node, ast.Compare):
         left = _eval(node.left, data)
