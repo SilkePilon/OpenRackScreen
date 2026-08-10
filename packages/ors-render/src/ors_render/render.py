@@ -7,6 +7,7 @@ from ors_render.bindings import resolve_number
 from ors_render.canvas import Canvas
 from ors_render.context import RenderContext
 from ors_render.elements import RENDERERS
+from ors_render.elements import group as _group  # noqa: F401 - registers the renderer
 from ors_render.elements import ring as _ring  # noqa: F401 - registers the renderers
 from ors_render.elements import shapes as _shapes  # noqa: F401 - registers the renderers
 from ors_render.elements import text as _text  # noqa: F401 - registers the renderer
