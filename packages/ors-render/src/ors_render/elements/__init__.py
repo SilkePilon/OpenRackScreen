@@ -52,10 +52,12 @@ def register(type_name: str) -> Callable[[ElementRenderer], ElementRenderer]:
 def pixel_width(geometry: Geometry, width: float) -> int:
     """Convert a normalized stroke width to whole supersampled pixels.
 
-    Widths are fractions of the full panel size, so `Geometry.span` is what maps
-    them -- never `radial`, not even for a ring's thickness. Shared rather than
-    written out per call site because every stroked element needs the same two
-    decisions, and both are easy to get quietly wrong:
+    Stroke and line widths are fractions of the full panel size, so `Geometry.span`
+    is what maps them. A ring's `thickness` is not one of these: like `r`, it is a
+    fraction of the panel *radius* and goes through `Geometry.radial` instead, so
+    a ring renderer rounds `radial(thickness)` itself rather than calling this.
+    Shared rather than written out per call site because every stroked element
+    needs the same two decisions, and both are easy to get quietly wrong:
 
     *Rounded, not truncated.* `RectElement.stroke_width` defaults to 0.004, which
     is 1.92 px on the 2x supersampled canvas. `int` cuts that to 1 px -- 0.5 px
