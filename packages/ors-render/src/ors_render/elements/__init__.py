@@ -7,6 +7,7 @@ knowing which families exist.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -69,8 +70,20 @@ def pixel_width(geometry: Geometry, width: float) -> int:
 
     *Floored at 1.* A width the scene asked for stays visible instead of rounding
     away to an invisible zero, which Pillow would draw as nothing.
+
+    A *non-finite* width lands on that same floor. `RectElement.stroke_width`
+    and `LineElement.width` are plain unbounded floats, so `{"type": "line",
+    "width": Infinity}` is schema-valid scene JSON -- and `round` raises on it
+    (``ValueError`` for NaN, ``OverflowError`` for either infinity), which took
+    the whole screen down. 1 px rather than "draw nothing" because the number is
+    what is broken, not the intent: the scene asked for a stroke, so it gets the
+    thinnest honest one, and the element around it -- a rect's fill, the line
+    itself -- still appears. Contrast `ors_render.elements.ring`, which skips a
+    ring whose `thickness` is non-finite: there the thickness *is* the element,
+    so there is nothing left to draw at any width. Here there is.
     """
-    return max(1, round(geometry.span(width)))
+    scaled = geometry.span(width)
+    return max(1, round(scaled)) if math.isfinite(scaled) else 1
 
 
 def resolve_color(

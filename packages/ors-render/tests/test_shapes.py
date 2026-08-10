@@ -174,3 +174,29 @@ def test_pixel_width_rounds_rather_than_truncating():
     # the thinnest line Pillow can, exactly as `max(1, ...)` did before.
     assert pixel_width(geometry, 0.0001) == 1
     assert pixel_width(geometry, 0.0) == 1
+
+
+@pytest.mark.parametrize("width", [float("nan"), float("inf"), float("-inf")])
+def test_pixel_width_degrades_a_non_finite_width_to_the_thinnest_stroke(width: float):
+    # `round` raises on a non-finite number -- ValueError for NaN, OverflowError
+    # for either infinity -- and `stroke_width`/`width` are plain unbounded
+    # floats in the schema, so `{"type": "line", "width": Infinity}` is valid
+    # scene JSON that used to take the whole screen down.
+    assert pixel_width(Geometry(), width) == 1
+
+
+@pytest.mark.parametrize(
+    "element",
+    [
+        {"type": "rect", "fill": None, "stroke": "#ff0000", "stroke_width": float("nan")},
+        {"type": "rect", "fill": None, "stroke": "#ff0000", "stroke_width": float("inf")},
+        {"type": "line", "width": float("nan")},
+        {"type": "line", "width": float("-inf")},
+    ],
+)
+def test_a_non_finite_stroke_width_still_draws_the_element(element: dict[str, Any]):
+    # Each of these draws *only* a stroke, so a blank panel would mean the width
+    # had degraded to nothing. A broken width is a broken number, not a request
+    # for no stroke, so it lands on the same 1 px floor a zero width does --
+    # and, either way, it must not take the screen down.
+    assert _render(element).getbbox() is not None
