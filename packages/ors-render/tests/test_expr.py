@@ -1,3 +1,5 @@
+import time
+
 import pytest
 from ors_render.expr import MAX_EXPRESSION_LENGTH, ExpressionError, evaluate, truthy
 
@@ -183,3 +185,44 @@ def test_truthy_on_missing_field_is_false():
 def test_truthy_on_disallowed_construct_raises():
     with pytest.raises(ExpressionError):
         truthy("__import__('os')", DATA)
+
+
+# --- Fix round 2, Finding 1: round() with an out-of-range ndigits is an
+# unbounded allocator (round(1, -N) computes 10**N internally) and must be
+# rejected promptly instead of burning CPU/memory or hanging forever.
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "round(1, -1000000)",
+        "round(1, -10000000)",
+        "round(1, -99999999999999999999)",
+        "round(1, 1000000)",
+    ],
+)
+def test_round_with_out_of_range_ndigits_is_rejected(expr):
+    start = time.monotonic()
+    with pytest.raises(ExpressionError):
+        evaluate(expr, DATA)
+    # A regression back to the unbounded path would take seconds (or hang
+    # forever) for these inputs; the guard must reject before ever calling
+    # the real `round`.
+    assert time.monotonic() - start < 1.0
+
+
+def test_round_still_works_for_ordinary_arguments():
+    assert evaluate("round(3.14159, 2)", DATA) == 3.14
+    assert evaluate("round(3.7)", DATA) == 4
+    assert evaluate("round(prom.cpu)", DATA) == 42
+
+
+# --- Fix round 2, Finding 2: evaluate() must raise ExpressionError, not
+# TypeError, for a non-str expression (e.g. a scene JSON's `when` field that
+# is a number, null, or a list because of malformed upstream data).
+
+
+@pytest.mark.parametrize("bad_expr", [123, None, ["1+1"], b"1+1"])
+def test_evaluate_rejects_non_string_expression(bad_expr):
+    with pytest.raises(ExpressionError):
+        evaluate(bad_expr, DATA)

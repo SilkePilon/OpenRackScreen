@@ -18,6 +18,24 @@ class ExpressionError(Exception):
 # expression_error).
 MAX_EXPRESSION_LENGTH = 512
 
+# `round(int, ndigits)` computes `10 ** abs(ndigits)` internally when rounding
+# an int, so a tiny expression like `round(1, -99999999999999999999)` can burn
+# unbounded CPU/memory (or never terminate) even though the source is a few
+# bytes. A display-rendering language never needs to round outside a small
+# range around the decimal point, so any `ndigits` magnitude beyond this is
+# rejected rather than computed.
+MAX_ROUND_NDIGITS = 100
+
+
+def _round(*args: Any) -> Any:
+    if len(args) >= 2:
+        ndigits = args[1]
+        if isinstance(ndigits, int) and abs(ndigits) > MAX_ROUND_NDIGITS:
+            raise ExpressionError(
+                f"round() ndigits out of range (abs must be <= {MAX_ROUND_NDIGITS})"
+            )
+    return round(*args)
+
 
 def _mul(left: Any, right: Any) -> Any:
     if isinstance(left, str | list | tuple) or isinstance(right, str | list | tuple):
@@ -53,7 +71,7 @@ _FUNCS = {
     "abs": abs,
     "min": min,
     "max": max,
-    "round": round,
+    "round": _round,
     "int": int,
     "float": float,
     "str": str,
@@ -63,6 +81,21 @@ _LITERALS = {"null": None, "true": True, "false": False}
 
 
 def evaluate(expr: str, data: Mapping[str, Any]) -> Any:
+    """Evaluate a sandboxed `when` expression against `data`.
+
+    Raises `ExpressionError` and only `ExpressionError` for any malformed,
+    disallowed, or otherwise unevaluable expression - including a non-`str`
+    `expr`. A missing field (an absent key or an attribute/subscript on a
+    shape that doesn't support it) evaluates to `None` rather than raising.
+
+    Boolean operators (`and`/`or`) always return `bool`, not the deciding
+    operand as in ordinary Python - e.g. `0 or 5` is `True`, not `5`. Callers
+    that want the deciding-operand idiom (`qbit.speed or 0`) must not rely on
+    this function for that; it is intentionally normalized for consistency
+    with `Compare`, which likewise collapses chained comparisons to `bool`.
+    """
+    if not isinstance(expr, str):
+        raise ExpressionError(f"expression must be a string, got {type(expr).__name__}")
     if len(expr) > MAX_EXPRESSION_LENGTH:
         raise ExpressionError(
             f"expression too long ({len(expr)} > {MAX_EXPRESSION_LENGTH} characters)"
