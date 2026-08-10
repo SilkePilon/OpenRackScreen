@@ -362,8 +362,10 @@ def test_step_ignores_fields_the_child_does_not_have_or_cannot_offset():
 def test_step_drops_an_offset_that_comes_out_non_finite():
     # `step` is a `dict[str, float]`, so a NaN delta is schema-valid -- and even
     # two finite ones overflow. A group is the one thing here that can invent a
-    # number no scene wrote, and `elements/text.py` converts `cx` to an int
-    # without a guard, so an unchecked offset is a crashed screen.
+    # number no scene wrote, so dropping the offset here is what keeps the
+    # element where the scene put it rather than nowhere in particular --
+    # `elements/text.py` does now refuse to draw at a non-finite position, but
+    # refusing is a blank label where this is the authored one.
     child = TextElement(text="hi", cx=0.5)
     assert _stepped(child, {"cx": float("nan")}, 1, None).cx == 0.5
     assert _stepped(child, {"cx": float("inf")}, 1, None).cx == 0.5
@@ -380,10 +382,10 @@ def test_a_step_that_would_go_non_finite_does_not_crash_the_render():
         "elements": [{"type": "text", "text": "{{t.name}}", "size": 20}],
     }
     # Every label stays where the scene put it, so they stack up as one blob in
-    # the middle of the panel -- ugly, but on screen and not a traceback. (A
-    # *finite* but absurd coordinate, `cy: 1e308`, still overflows inside
-    # `elements/text.py`; that is reachable by authoring one directly, with no
-    # group involved, and is not something `step` can be made to prevent.)
+    # the middle of the panel -- ugly, but on screen and not a traceback. A
+    # *finite* but absurd coordinate, `cy: 1e308`, is skipped by
+    # `elements/text.py` instead; that is reachable by authoring one directly,
+    # with no group involved, and is not something `step` can prevent.
     assert _render(scene).getbbox() is not None
 
 

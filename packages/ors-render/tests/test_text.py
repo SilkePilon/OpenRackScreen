@@ -152,6 +152,72 @@ def test_empty_text_draws_nothing():
     assert image.tobytes() == blank.tobytes()
 
 
+def test_text_with_an_unusable_position_or_size_is_skipped():
+    # `cx`, `cy` and `size` are plain unbounded floats in the schema, so every
+    # one of these is valid scene JSON reachable by authoring it directly --
+    # and each one used to come straight out of `render_scene` as a traceback.
+    # Measured before the guard: NaN raised ValueError and an infinity
+    # OverflowError out of the int conversion; `cy: 1e17` reached Pillow's C
+    # rasteriser and raised SystemError; `size: 1e4` tripped Pillow's own
+    # decompression-bomb guard and `size: 1e5` freetype's "invalid pixel size".
+    blank = render_scene(Scene(), _ctx())
+    for field, value in (
+        ("cx", float("nan")),
+        ("cy", float("nan")),
+        ("cx", float("inf")),
+        ("cy", float("-inf")),
+        ("cx", 1e308),
+        ("cy", 1e308),
+        ("cy", 1e17),
+        ("cy", 1e30),
+        ("size", float("nan")),
+        ("size", float("inf")),
+    ):
+        image = render_scene(
+            Scene.model_validate({"elements": [{"type": "text", "text": "X", field: value}]}),
+            _ctx(),
+        )
+        assert image.tobytes() == blank.tobytes(), (field, value)
+
+
+def test_an_absurdly_large_size_is_clamped_rather_than_skipped():
+    # A size is still a size, however silly: the element keeps its position and
+    # its string, so it renders at the largest size the panel can show rather
+    # than vanishing. Only a size that is not a number at all is skipped.
+    for size in (1e4, 1e5, 1e9, 1e300):
+        image = render_scene(
+            Scene.model_validate({"elements": [{"type": "text", "text": "X", "size": size}]}),
+            _ctx(),
+        )
+        assert image.getbbox() is not None, size
+
+
+def test_the_size_clamp_is_two_sided():
+    # `Geometry.font_px` floors a negative size at one pixel, but it gets there
+    # through a `round` that raises on the -inf that scaling -1e308 produces,
+    # so the clamp has to happen first. A hugely negative size therefore
+    # renders exactly as a merely negative one always did.
+    def _render(size: float) -> object:
+        return render_scene(
+            Scene.model_validate({"elements": [{"type": "text", "text": "X", "size": size}]}),
+            _ctx(),
+        ).tobytes()
+
+    assert _render(-1e308) == _render(-5.0) == _render(0.0)
+
+
+def test_text_placed_off_the_panel_draws_nothing():
+    blank = render_scene(Scene(), _ctx())
+    for element in ({"cx": -2.0}, {"cx": 3.0}, {"cy": -2.0}, {"cy": 3.0}):
+        image = render_scene(
+            Scene.model_validate(
+                {"elements": [{"type": "text", "text": "X", "size": 20, **element}]}
+            ),
+            _ctx(),
+        )
+        assert image.tobytes() == blank.tobytes(), element
+
+
 def test_left_and_right_aligned_text_land_on_opposite_sides():
     def _render(align: str) -> object:
         return render_scene(
