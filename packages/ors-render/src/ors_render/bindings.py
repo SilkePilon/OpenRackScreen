@@ -10,6 +10,7 @@ renders as the `default` filter's value, or empty.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -67,7 +68,14 @@ def _f_trunc(value: Any, length: str = "12") -> Any:
         return None
     text = str(value)
     limit = int(length)
-    return text if len(text) <= limit else text[: limit - 1] + "."
+    if len(text) <= limit:
+        return text
+    # The limit is a width the scene layout budgets for, so the result must
+    # never exceed it: at a limit of 1 only the ellipsis fits, and at zero or
+    # below nothing does. `limit - 1` alone would overflow for those.
+    if limit <= 0:
+        return ""
+    return text[: limit - 1] + "."
 
 
 def _f_default(value: Any, fallback: str = "") -> Any:
@@ -130,7 +138,11 @@ def _whole_binding(spec: str) -> str | None:
 
 
 def resolve(spec: Any, data: Mapping[str, Any]) -> Any:
-    """Resolve a scene field: raw value for a whole-string binding, else text."""
+    """Resolve a scene field: raw value for a whole-string binding, else text.
+
+    A container returned by the raw-value mode is the live object held in
+    `data`, not a copy - callers must not mutate it in place.
+    """
     if not isinstance(spec, str):
         return spec
     whole = _whole_binding(spec)
@@ -148,9 +160,14 @@ def resolve_text(spec: Any, data: Mapping[str, Any]) -> str:
 def resolve_number(spec: Any, data: Mapping[str, Any], default: float = 0.0) -> float:
     value = resolve(spec, data)
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return default
+    # Prometheus emits NaN, and `float()` also parses the literals "nan",
+    # "inf" and "-inf" out of scene text. A non-finite number is not a usable
+    # coordinate or angle, so it degrades to the fallback like any other
+    # uncoercible value rather than propagating into the geometry.
+    return number if math.isfinite(number) else default
 
 
 def resolve_list(spec: Any, data: Mapping[str, Any]) -> list[Any]:

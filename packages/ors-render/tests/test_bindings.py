@@ -59,10 +59,33 @@ def test_resolve_number_coerces_and_falls_back():
     assert resolve_number("not a number", DATA, default=7.0) == 7.0
 
 
+def test_resolve_number_rejects_non_finite_values():
+    # Prometheus emits NaN, and float() happily parses "nan"/"inf"/"-inf". A
+    # non-finite number would propagate silently into sweep angles and
+    # positions as garbage geometry, so it must degrade to the default.
+    assert resolve_number("nan", DATA, default=-1.0) == -1.0
+    assert resolve_number("NaN", DATA, default=-1.0) == -1.0
+    assert resolve_number("inf", DATA, default=-1.0) == -1.0
+    assert resolve_number("-inf", DATA, default=-1.0) == -1.0
+    assert resolve_number(float("nan"), DATA, default=-1.0) == -1.0
+    assert resolve_number(float("inf"), DATA, default=-1.0) == -1.0
+    # Ordinary numbers are untouched.
+    assert resolve_number("42.4", DATA, default=-1.0) == 42.4
+    assert resolve_number("{{prom.cpu}}", DATA, default=-1.0) == 42.4
+    assert resolve_number("{{prom.mem_total}}", DATA, default=-1.0) == 32.0
+    assert resolve_number(0, DATA, default=-1.0) == 0.0
+
+
+def test_resolve_number_coerces_a_bool_like_a_number():
+    assert resolve_number("{{prom.cpu > 40}}", DATA, default=-1.0) == 1.0
+    assert resolve_number("{{prom.cpu < 40}}", DATA, default=-1.0) == 0.0
+
+
 def test_resolve_list_always_returns_a_list():
     assert resolve_list("{{qbit.active}}", DATA) == DATA["qbit"]["active"]
     assert resolve_list("{{prom.nope}}", DATA) == []
     assert resolve_list("{{prom.cpu}}", DATA) == []
+    assert resolve_list("{{prom.hot}}", DATA) == []  # a mapping is not a list
 
 
 def test_bad_expression_inside_binding_renders_empty_not_raises():
@@ -133,6 +156,21 @@ def test_unknown_filter_is_ignored_and_leaves_the_value_untouched():
 )
 def test_each_filter_formats_its_own_units(name, args, value, expected):
     assert FILTERS[name](value, *args) == expected
+
+
+@pytest.mark.parametrize("limit", ["0", "-5", "1", "3", "12"])
+def test_trunc_never_exceeds_its_limit(limit):
+    # The scene layout budgets a width from this limit, so overshooting it is
+    # silent overflow rather than a visible error.
+    text = resolve_text(f"{{{{qbit.active[0].name | trunc:{limit}}}}}", DATA)
+    assert len(text) <= max(int(limit), 0)
+
+
+def test_trunc_at_or_below_zero_yields_nothing():
+    assert FILTERS["trunc"]("42.4", "0") == ""
+    assert FILTERS["trunc"]("42.4", "-5") == ""
+    assert resolve_text("{{prom.cpu | trunc:0}}", DATA) == ""
+    assert resolve_text("{{prom.cpu | trunc:-5}}", DATA) == ""
 
 
 @pytest.mark.parametrize("name", [n for n in sorted(FILTERS) if n != "default"])
