@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from ors_schema.scene import Element, Scene
 from PIL import Image
 
@@ -15,6 +17,47 @@ from ors_render.elements.group import work_budget  # this import registers the g
 from ors_render.expr import ExpressionError, truthy
 from ors_render.geometry import Geometry
 from ors_render.palettes import resolve_palette
+
+
+def select_scene(scenes: Sequence[Scene], ctx: RenderContext) -> Scene | None:
+    """The first scene whose `when` passes, or None when none of them do.
+
+    A scene without a `when` always passes, which is what makes it the screen's
+    fallback -- and also means every scene after it is unreachable, so a
+    template has to author its catch-all last. That ordering is a property of
+    the scene list, not something this function can check: "no condition" and
+    "a condition that happens to hold" are indistinguishable here.
+
+    Selecting nothing is a legitimate state (a screen whose conditions all
+    describe situations that aren't happening), not an error; `render_screen`
+    turns it into a blank panel.
+    """
+    for scene in scenes:
+        try:
+            if truthy(scene.when, ctx.data):
+                return scene
+        except ExpressionError:
+            # Same bargain as `draw_element`: a malformed condition in
+            # user-authored JSON skips its scene and lets the next one -- in
+            # practice the unconditional fallback -- take the screen, rather
+            # than taking the whole display down.
+            continue
+    return None
+
+
+def render_screen(
+    scenes: Sequence[Scene], ctx: RenderContext, size: int = 240, supersample: int = 2
+) -> Image.Image:
+    """Render the screen's active scene, or a blank panel when none is active.
+
+    The blank panel is built through the same `Canvas` as a real render, so it
+    is identical in size and mode to every other frame and needs no special
+    handling from the caller pushing it to a panel.
+    """
+    scene = select_scene(scenes, ctx)
+    if scene is None:
+        return Canvas(Geometry(size=size, supersample=supersample), "#000000").finish()
+    return render_scene(scene, ctx, size=size, supersample=supersample)
 
 
 def render_scene(
