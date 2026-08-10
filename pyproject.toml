@@ -27,7 +27,7 @@ line-length = 100
 target-version = "py311"
 # ruff >=0.16 formats fenced code blocks inside Markdown by default; docs/ holds
 # planning prose with illustrative (non-authoritative) snippets, not source.
-extend-exclude = ["docs"]
+extend-exclude = ["docs/**/*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
