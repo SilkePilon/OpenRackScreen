@@ -15,6 +15,7 @@ from ors_schema.palette import GradientPalette
 from ors_render.bindings import resolve_text
 from ors_render.canvas import Canvas, parse_hex_color
 from ors_render.context import RenderContext
+from ors_render.geometry import Geometry
 from ors_render.palettes import gradient_color
 
 ElementRenderer = Callable[[Canvas, Any, RenderContext, GradientPalette], None]
@@ -48,6 +49,28 @@ def register(type_name: str) -> Callable[[ElementRenderer], ElementRenderer]:
     return decorator
 
 
+def pixel_width(geometry: Geometry, width: float) -> int:
+    """Convert a normalized stroke width to whole supersampled pixels.
+
+    Widths are fractions of the full panel size, so `Geometry.span` is what maps
+    them -- never `radial`, not even for a ring's thickness. Shared rather than
+    written out per call site because every stroked element needs the same two
+    decisions, and both are easy to get quietly wrong:
+
+    *Rounded, not truncated.* `RectElement.stroke_width` defaults to 0.004, which
+    is 1.92 px on the 2x supersampled canvas. `int` cuts that to 1 px -- 0.5 px
+    on the final panel -- so the default stroke comes out at half the weight the
+    scene asked for, while `round` gives the 2 px (1.0 final px) it meant. The
+    error is worst exactly where it is most visible, on sub-2px strokes; wide
+    strokes barely notice either way (a ring thickness of 22.08 px differs by
+    0.4%).
+
+    *Floored at 1.* A width the scene asked for stays visible instead of rounding
+    away to an invisible zero, which Pillow would draw as nothing.
+    """
+    return max(1, round(geometry.span(width)))
+
+
 def resolve_color(
     color: str | None, palette: GradientPalette, data: Mapping[str, Any] | None = None
 ) -> tuple[int, int, int] | None:
@@ -55,12 +78,18 @@ def resolve_color(
 
     ``None`` resolves to ``None``, meaning *no colour at all*. The schema models
     a genuinely absent colour that way -- `RectElement.fill` and `.stroke`,
-    `RingElement.track` -- and Pillow reads a ``None`` ink as "do not draw this
-    part", so the absence travels from scene JSON to the draw call untouched.
-    Handling it here rather than at each call site keeps every caller of a
-    nullable colour field on one rule; the alternative, an ``if element.fill``
-    guard repeated per call, is a line each new element family must remember to
-    write and silently mis-handles any falsy-but-present value.
+    `RingElement.track` -- so the absence travels from scene JSON to the renderer
+    untouched. Handling it here rather than at each call site keeps every caller
+    of a nullable colour field on one rule; the alternative, an ``if
+    element.fill`` guard repeated per call, is a line each new element family
+    must remember to write and silently mis-handles any falsy-but-present value.
+
+    What ``None`` does **not** do is travel on into Pillow as "skip this part".
+    `ImageDraw._getink(outline, fill)` falls back to the draw object's *default*
+    ink when both arguments are ``None`` -- white -- so ``rectangle(box,
+    fill=None, outline=None)`` paints a white outline rather than nothing.
+    Deciding that an element with no colours left has nothing to draw is the
+    renderer's job, before the draw call; see `ors_render.elements.shapes`.
     """
     if color is None:
         return None

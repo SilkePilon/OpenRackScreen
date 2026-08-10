@@ -3,6 +3,17 @@ name = "ors-render"
 version = "0.1.0"
 description = "Scene JSON to image renderer for OpenRackScreen"
 requires-python = ">=3.11"
+# The Pillow floor is a *security* floor, not a feature one: 10.3.0 is the
+# release that fixed CVE-2024-28219. Nothing this renderer draws needs a Pillow
+# newer than that. `ImageDraw.rounded_rectangle` has capped an over-large corner
+# radius since it was added in 8.2.0 (via its `full_x`/`full_y` branches), so no
+# schema-valid radius has ever raised out of it -- verified by rendering
+# `radius` 0.5 and 0.9 on a 0.6x0.12 bar under 8.2.0 and 10.3.0. What *is* new is
+# the exact form `d = min(x1 - x0, y1 - y0, radius * 2)`, which landed in 12.3.0
+# and made an over-large radius render byte-identically to an exactly-half one;
+# under 10.3.0-12.2.0 the two take different paths (ellipse vs joined halves) and
+# differ by a few pixels. `render_rect` therefore caps the radius itself, and its
+# output for those radii is byte-identical on 10.3.0, 11.0.0, 12.0.0 and 12.3.0.
 dependencies = ["ors-schema", "pillow>=10.3"]
 
 [build-system]

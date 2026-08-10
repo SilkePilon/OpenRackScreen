@@ -6,8 +6,9 @@ from typing import Any
 
 import pytest
 from ors_render.context import RenderContext
-from ors_render.elements import RENDERERS, register, resolve_color
+from ors_render.elements import RENDERERS, pixel_width, register, resolve_color
 from ors_render.elements.shapes import render_rect
+from ors_render.geometry import Geometry
 from ors_render.palettes import resolve_palette
 from ors_render.render import render_scene
 from ors_schema.scene import Scene
@@ -79,17 +80,37 @@ def test_stroke_only_rect_outlines_inside_the_box():
             "stroke_width": 0.02,
         }
     )
-    # The box spans x 60..180 inclusive. Pillow draws the outline inward from
-    # each edge, so a 0.02 stroke (9 supersampled px, 4.5 after downsampling)
-    # gives two bands *inside* those edges and nothing between them. The >128
-    # threshold ignores the sub-pixel LANCZOS bleed either side of each band.
+    # The box spans supersampled x 120..360, i.e. final x 60..180. Pillow draws
+    # the outline inward from each edge, so a 0.02 stroke (9.6 supersampled px,
+    # rounded to 10 by `pixel_width`, 5 after downsampling) gives two bands
+    # *inside* those edges and nothing between them. The bands are not mirror
+    # images: Pillow's box is inclusive of x1, so the left band covers
+    # supersampled 120..129 -- five whole final pixels -- while the right one
+    # covers 351..360, straddling final pixels 175 and 180 by half each. The
+    # >128 threshold keeps the whole left band and those two half-lit edges out,
+    # along with the sub-pixel LANCZOS bleed either side of each band.
     lit = [x for x in range(240) if image.getpixel((x, 120))[0] > 128]
-    assert lit == [60, 61, 62, 63, 176, 177, 178, 179]
+    assert lit == [60, 61, 62, 63, 64, 176, 177, 178, 179]
+
+
+@pytest.mark.parametrize("shape", [{}, {"radius": 0.02}])
+def test_rect_with_neither_fill_nor_stroke_draws_nothing(shape):
+    # `fill` and `stroke` are both `Color | None`, so "no fill, no stroke" is
+    # valid scene JSON -- and it must not paint anything. Passing both through as
+    # `None` does paint: `ImageDraw._getink(outline, fill)` reads a `None` ink as
+    # "use the draw object's *default* ink", which is white, not as "draw
+    # nothing". Both the square and the rounded call are checked because they are
+    # separate Pillow entry points.
+    blank = render_scene(Scene(), RenderContext())
+    image = _render({"type": "rect", "w": 0.3, "h": 0.1, "fill": None, **shape})
+    assert image.tobytes() == blank.tobytes()
 
 
 def test_radius_larger_than_half_the_box_renders_a_stadium():
-    # Pillow limits the radius to half the box's smallest dimension, so anything
-    # past that is the same fully-rounded shape rather than a distorted box.
+    # `render_rect` clamps the radius to half the box's smallest dimension, so
+    # anything past that is the same fully-rounded shape rather than a distorted
+    # box. Pillow caps it too, but only its 12.3.0 form of the cap gives a result
+    # byte-identical to the exactly-half radius, so the clamp is ours to make.
     bar = {"type": "rect", "w": 0.6, "h": 0.12, "fill": "#2979ff"}
     half = _render({**bar, "radius": 0.06})
     assert _render({**bar, "radius": 0.5}).tobytes() == half.tobytes()
@@ -131,7 +152,25 @@ def test_register_rejects_a_duplicate_type(monkeypatch):
 
 def test_resolve_color_maps_none_to_no_colour():
     # `RectElement.fill` and `.stroke` are `Color | None`; absence has to survive
-    # the shared helper as absence, which is what Pillow reads as "do not draw".
+    # the shared helper as absence, so that each renderer can see it and decide
+    # what to skip. (Pillow will *not* decide for it -- see
+    # `test_rect_with_neither_fill_nor_stroke_draws_nothing`.)
     palette = resolve_palette("mono")
     assert resolve_color(None, palette) is None
     assert resolve_color("#ff0000", palette) == (255, 0, 0)
+
+
+def test_pixel_width_rounds_rather_than_truncating():
+    # Stroke widths are fractions of the panel, so the schema's default 0.004 is
+    # 1.92 px on the 480 px supersampled canvas. Truncating gives 1 px, which is
+    # half a pixel on the final 240 px panel -- a visible halving of every thin
+    # stroke -- where rounding gives the 2 px (1.0 final px) the scene asked for.
+    geometry = Geometry()
+    assert pixel_width(geometry, 0.004) == 2
+    assert pixel_width(geometry, 0.008) == 4
+    assert pixel_width(geometry, 0.01) == 5
+    assert pixel_width(geometry, 0.02) == 10
+    # A positive width never rounds away to nothing, and a zero one still draws
+    # the thinnest line Pillow can, exactly as `max(1, ...)` did before.
+    assert pixel_width(geometry, 0.0001) == 1
+    assert pixel_width(geometry, 0.0) == 1
