@@ -6,10 +6,12 @@ import time
 from typing import Any
 
 import pytest
+from ors_render.canvas import Canvas
 from ors_render.context import RenderContext
 from ors_render.elements import group
 from ors_render.elements.group import _stepped
-from ors_render.render import render_scene
+from ors_render.geometry import Geometry
+from ors_render.render import draw_element, render_scene
 from ors_schema.scene import RectElement, RingElement, Scene, TextElement
 from PIL import Image
 
@@ -270,6 +272,31 @@ def test_the_work_budget_is_shared_by_the_whole_scene(monkeypatch: pytest.Monkey
     image = _render(spender, marker)
     assert image.getpixel((48, 120)) == (0, 0, 255)
     assert image.getpixel((192, 120)) == (0, 0, 0)
+
+
+def test_a_group_drawn_outside_render_scene_still_gets_a_budget(monkeypatch: pytest.MonkeyPatch):
+    # `draw_element` is reachable on its own, so the ceiling cannot live only in
+    # `render_scene`: a group that finds no budget open opens one for itself.
+    monkeypatch.setattr(group, "_MAX_CHILD_DRAWS", 2)
+    element = Scene.model_validate(
+        {
+            "elements": [
+                {
+                    "type": "group",
+                    "repeat": {"over": "{{qbit.active}}", "as": "t", "limit": 4},
+                    "step": {"cx": 0.2},
+                    "elements": [
+                        {"type": "rect", "cx": 0.2, "w": 0.1, "h": 0.5, "fill": "#ff0000"}
+                    ],
+                }
+            ]
+        }
+    ).elements[0]
+    canvas = Canvas(Geometry())
+    draw_element(canvas, element, CTX)
+    image = canvas.finish()
+    assert image.getpixel((48, 120)) == (255, 0, 0)
+    assert image.getpixel((144, 120)) == (0, 0, 0)
 
 
 def test_a_fresh_budget_starts_with_every_render(monkeypatch: pytest.MonkeyPatch):

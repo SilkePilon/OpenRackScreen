@@ -101,9 +101,12 @@ def test_sparkline_with_no_area_draws_nothing():
         assert image.tobytes() == blank.tobytes(), box
 
 
-def test_sparkline_with_an_unusable_position_or_size_does_not_crash():
-    # `cx`, `cy`, `w` and `h` are plain unbounded floats in the schema.
+def test_sparkline_with_an_unusable_position_or_size_is_skipped():
+    # `cx`, `cy`, `w` and `h` are plain unbounded floats in the schema, and the
+    # last case is a series whose own *range* overflows even though every point
+    # in it is finite.
     ctx = RenderContext(data={"h": {"cpu": [10, 90], "wild": [1e308, -1e308]}})
+    blank = render_scene(Scene(), ctx)
     for element in (
         {"cx": float("nan")},
         {"cy": float("inf")},
@@ -114,7 +117,7 @@ def test_sparkline_with_an_unusable_position_or_size_does_not_crash():
         {"values": "{{h.wild}}"},
     ):
         image = _render({"type": "sparkline", "values": "{{h.cpu}}", "fill": True, **element}, ctx)
-        assert image.size == (240, 240), element
+        assert image.tobytes() == blank.tobytes(), element
 
 
 def test_image_draws_from_assets():

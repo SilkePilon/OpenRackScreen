@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import io
 import math
+from typing import Literal
 
 from ors_schema.palette import GradientPalette
 from ors_schema.scene import ImageElement, SparklineElement
@@ -238,7 +239,9 @@ def _decode(blob: bytes) -> Image.Image | None:
         return None
 
 
-def _fit(source: Image.Image, fit: str, width: int, height: int) -> Image.Image:
+def _fit(
+    source: Image.Image, fit: Literal["contain", "cover", "stretch"], width: int, height: int
+) -> Image.Image:
     """Map `source` onto a `width` x `height` box according to `fit`.
 
     `source` is the private RGBA copy `_decode` just made, which is what makes
