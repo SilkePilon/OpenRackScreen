@@ -5,7 +5,7 @@ from collections.abc import Mapping, Sequence
 from ors_schema.scene import Element, Scene
 from PIL import Image
 
-from ors_render.bindings import resolve, resolve_number
+from ors_render.bindings import resolve, resolve_number, resolve_text
 from ors_render.canvas import Canvas
 from ors_render.context import RenderContext
 from ors_render.elements import RENDERERS
@@ -31,6 +31,12 @@ def select_scene(scenes: Sequence[Scene], ctx: RenderContext) -> Scene | None:
     Selecting nothing is a legitimate state (a screen whose conditions all
     describe situations that aren't happening), not an error; `render_screen`
     turns it into a blank panel.
+
+    The concrete case a screen has to get right today: the built-in `torrent`
+    scene must be ordered **before** `node-health`'s scene, which carries no
+    `when` and therefore always matches. A screen composing the pair the other
+    way round renders the node readout forever and never switches to the
+    download view, with nothing failing to say so.
     """
     for scene in scenes:
         try:
@@ -69,16 +75,40 @@ def expand_params(ctx: RenderContext) -> RenderContext:
     The parameters are resolved against the *unexpanded* data, so a parameter
     referring to another parameter reads its raw value, and one referring to a
     ``repeat`` alias sees nothing -- the alias only exists inside the group, far
-    below here. Both are limits of a single pass and neither is something a
-    built-in template does.
+    below here. Both are limits of a single pass.
+
+    So a value that still contains ``{{`` after its pass is **blanked**. That is
+    the residue guard, and it is what makes the single pass defensible rather
+    than merely cheap: ``big = "{{params.inner}}"`` over ``inner =
+    "{{prom.cpu}}"`` would otherwise leave the literal text ``{{prom.cpu}}`` in
+    a parameter, and a scene drawing ``{{params.big}}`` at 52 px paints that
+    source straight across the panel and out past the bezel -- precisely the
+    visible garbage this function exists to prevent. Blank is the right
+    degradation because there is no reading to show: the operator's config is
+    wrong, and an empty field says so more honestly than its own source code
+    does. Note the guard fires on the *resolved* value, so a parameter can still
+    carry braces a screen genuinely wants drawn only if they arrive from live
+    data, which is exactly what the second pass below must not evaluate.
+
+    That also makes this function **idempotent**: expanding twice renders what
+    expanding once does. It matters because `expand_params` is public and
+    `render_scene` calls it internally, so a caller that pre-expands -- a daemon
+    inspecting resolved parameters before it renders -- gets two passes. Without
+    the guard the second pass would evaluate a binding that came out of a param
+    resolving to *upstream* data: a torrent named ``{{prom.cpu}}`` would print a
+    reading, which is the trust boundary above collapsing. With it, one pass
+    leaves nothing for a second to find.
     """
     params = ctx.data.get("params")
     if not isinstance(params, Mapping):
         return ctx
-    expanded = {
-        key: resolve(value, ctx.data) if isinstance(value, str) and "{{" in value else value
-        for key, value in params.items()
-    }
+    expanded = {}
+    for key, value in params.items():
+        if isinstance(value, str) and "{{" in value:
+            value = resolve(value, ctx.data)
+        if isinstance(value, str) and "{{" in value:
+            value = ""
+        expanded[key] = value
     return ctx.child({"params": expanded})
 
 
@@ -90,6 +120,15 @@ def render_screen(
     The blank panel is built through the same `Canvas` as a real render, so it
     is identical in size and mode to every other frame and needs no special
     handling from the caller pushing it to a panel.
+
+    This is *scene selection*, so it is the wrong entry point for the built-in
+    `system` template: none of its four scenes (`connecting`, `stale`, `error`,
+    `identify`) carries a `when`, so the first one always wins and
+    ``render_screen(system.scenes, ctx)`` can only ever draw `connecting`. Those
+    scenes describe states the daemon knows about and the scene JSON cannot --
+    an integration that has not connected yet, data that has gone stale, a
+    physical identify request -- so the daemon picks one **by name** and renders
+    it alone (``render_screen([scene], ctx)`` or `render_scene`).
     """
     ctx = expand_params(ctx)
     scene = select_scene(scenes, ctx)
@@ -114,7 +153,17 @@ def _draw_scene(
     values its elements will -- rather than once for the selection and again for
     the render.
     """
-    canvas = Canvas(Geometry(size=size, supersample=supersample), scene.background)
+    # `Scene.background` is a schema `Color`, so it may be a binding --
+    # `"background": "{{params.bg}}"` is a themed screen supplying its own panel
+    # colour, the same way `text-only` supplies a text one. Resolved here rather
+    # than in `Canvas` because this is where the data is; unresolved it would
+    # reach `parse_hex_color` as literal binding source and paint black without
+    # anything saying why. An unreadable result still lands on that black, which
+    # is the panel's own default.
+    background = scene.background
+    if "{{" in background:
+        background = resolve_text(background, ctx.data)
+    canvas = Canvas(Geometry(size=size, supersample=supersample), background)
     # One work budget for the whole scene, so nested `repeat` groups cannot
     # multiply their way to a frame that takes minutes. See
     # `ors_render.elements.group._MAX_CHILD_DRAWS`.

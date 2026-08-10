@@ -8,7 +8,7 @@
   "scenes": [
     {
       "name": "downloads",
-      "when": "len(qbit.active) > 0 and not prom.alerts and prom.nodes_ready == prom.nodes_total",
+      "when": "len(qbit.active) > 0 and prom.alerts == 0 and prom.nodes_ready != null and prom.nodes_total != null and prom.nodes_ready == prom.nodes_total",
       "background": "#000000",
       "elements": [
         { "type": "group",

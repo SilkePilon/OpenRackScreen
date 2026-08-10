@@ -24,8 +24,11 @@ only channel that carries severity here.
 from __future__ import annotations
 
 import math
+import re
 
 from ors_schema.palette import GradientPalette, PaletteRef, ThresholdPalette
+
+_HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
 
 
 def _grad(*colors: str) -> GradientPalette:
@@ -48,8 +51,38 @@ NAMED_PALETTES: dict[str, GradientPalette] = {
 
 
 def hex_to_rgb(color: str) -> tuple[int, int, int]:
+    """Parse a `#rrggbb` literal, raising on anything else.
+
+    The unchecked primitive. Nothing on the render path may call it directly on
+    a colour that came out of scene JSON -- use `parse_hex_color`, which is the
+    same parse with a fallback.
+    """
     value = color.lstrip("#")
     return (int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16))
+
+
+def parse_hex_color(color: str, fallback: tuple[int, int, int] = (0, 0, 0)) -> tuple[int, int, int]:
+    """Parse a ``#rrggbb`` literal, degrading to ``fallback`` for anything else.
+
+    The single place that decides what counts as a colour *literal*, shared by
+    the canvas background (which re-exports it), `ors_render.elements.resolve_color`
+    and `gradient_color`. `hex_to_rgb` alone is not enough: the schema's
+    ``Color`` type also admits ``@palette`` and ``{{binding}}``, either of which
+    would make `hex_to_rgb` raise. Rendering degrades rather than crashing, so a
+    value this function cannot read becomes ``fallback``.
+
+    It lives here rather than in `ors_render.canvas` because a *gradient stop*
+    is a `Color` too, and a palette module that imported the canvas to say so
+    would close an import cycle.
+    """
+    if not _HEX_COLOR.fullmatch(color):
+        return fallback
+    return hex_to_rgb(color)
+
+
+def _stop_rgb(color: str) -> tuple[int, int, int]:
+    """One gradient stop, degrading to white. See `gradient_color`."""
+    return parse_hex_color(color, (255, 255, 255))
 
 
 def gradient_color(palette: GradientPalette, t: float) -> tuple[int, int, int]:
@@ -60,6 +93,16 @@ def gradient_color(palette: GradientPalette, t: float) -> tuple[int, int, int]:
     special-cased, to the low end, because it is not a position at all -- it is
     a sensor that reported nothing, and must not paint a full gauge. See the
     module docstring; `resolve_palette` follows the same rule.
+
+    A *stop* is read through `parse_hex_color`, not `hex_to_rgb`. `Stop.color`
+    is the schema's ``Color``, so ``@palette`` and ``{{params.c}}`` are both
+    schema-valid there and neither is resolvable from inside a palette: a stop
+    carries no data to resolve a binding against, and ``@palette`` naming the
+    palette it sits in is circular. So they degrade to white, the same fallback
+    `ors_render.elements.resolve_color` uses for an unreadable colour -- white
+    rather than the parser's default black because a black arc on the black
+    panel is an *invisible* one, and a gauge that looks empty is the failure
+    direction this module exists to avoid.
     """
     if math.isnan(t):
         # NaN would otherwise survive `max(0.0, min(1.0, t))` as 1.0 and render
@@ -69,14 +112,14 @@ def gradient_color(palette: GradientPalette, t: float) -> tuple[int, int, int]:
     t = max(0.0, min(1.0, t))
     stops = palette.stops
     if len(stops) == 1 or t <= stops[0].at:
-        return hex_to_rgb(stops[0].color)
+        return _stop_rgb(stops[0].color)
     for first, second in zip(stops, stops[1:], strict=False):
         if first.at <= t <= second.at:
             span = (second.at - first.at) or 1.0
             f = (t - first.at) / span
-            a, b = hex_to_rgb(first.color), hex_to_rgb(second.color)
+            a, b = _stop_rgb(first.color), _stop_rgb(second.color)
             return tuple(int(a[i] + (b[i] - a[i]) * f) for i in range(3))  # type: ignore[return-value]
-    return hex_to_rgb(stops[-1].color)
+    return _stop_rgb(stops[-1].color)
 
 
 def resolve_palette(ref: PaletteRef, value_pct: float = 0.0) -> GradientPalette:

@@ -1,28 +1,15 @@
 from __future__ import annotations
 
-import re
-
 from PIL import Image, ImageDraw
 
 from ors_render.geometry import Geometry
-from ors_render.palettes import hex_to_rgb
+from ors_render.palettes import parse_hex_color
 
-_HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
-
-
-def parse_hex_color(color: str, fallback: tuple[int, int, int] = (0, 0, 0)) -> tuple[int, int, int]:
-    """Parse a ``#rrggbb`` literal, degrading to ``fallback`` for anything else.
-
-    The single place that decides what counts as a colour *literal*, shared by
-    the canvas background and `ors_render.elements.resolve_color`. `hex_to_rgb`
-    alone is not enough: the schema's ``Color`` type also admits ``@palette``,
-    and a binding can resolve to arbitrary text, either of which would make
-    `hex_to_rgb` raise. Rendering degrades rather than crashing, so a value this
-    function cannot read becomes ``fallback``.
-    """
-    if not _HEX_COLOR.fullmatch(color):
-        return fallback
-    return hex_to_rgb(color)
+# `parse_hex_color` used to be defined here and is still imported from here by
+# the element renderers. It moved to `ors_render.palettes` when `gradient_color`
+# needed it too: a gradient *stop* is a schema `Color` like any other, and a
+# palette module importing the canvas to say so would close an import cycle.
+__all__ = ["Canvas", "parse_hex_color"]
 
 
 class Canvas:
@@ -34,6 +21,10 @@ class Canvas:
     """
 
     def __init__(self, geometry: Geometry, background: str = "#000000") -> None:
+        # `background` is a colour *literal* by the time it gets here: a scene's
+        # may be a binding, and `ors_render.render` resolves it before building
+        # the canvas, because an unresolved one would land on `parse_hex_color`'s
+        # fallback and paint black without saying so.
         self.geometry = geometry
         self.image = Image.new("RGB", (geometry.px, geometry.px), parse_hex_color(background))
         self.draw = ImageDraw.Draw(self.image)

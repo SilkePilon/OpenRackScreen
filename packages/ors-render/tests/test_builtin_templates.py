@@ -100,7 +100,11 @@ def test_every_declared_param_has_a_label():
             {"prom": PROM},
         ),
         ("screen_nodes", "node-health", {"title": "NODES"}, {"prom": PROM}),
-        ("screen_torrent", "torrent", {"title": "TORRENT"}, {"qbit": QBIT}),
+        # The torrent view is gated on a *healthy* cluster, so its data carries
+        # a healthy `prom` as well as the downloads it draws: the scene reads
+        # nothing out of that namespace, but it refuses to take the screen
+        # without one. See `when` in templates/builtin/torrent.json.
+        ("screen_torrent", "torrent", {"title": "TORRENT"}, {"prom": PROM, "qbit": QBIT}),
     ],
 )
 def test_builtin_templates_reproduce_the_original_screens(
@@ -135,6 +139,35 @@ def test_downloads_does_not_hide_an_unhealthy_cluster():
 
 
 @pytest.mark.parametrize(
+    ("label", "data"),
+    [
+        # Prometheus is down or was never configured: no namespace at all.
+        ("absent", {"qbit": QBIT, "params": {}}),
+        # The namespace exists but every query failed.
+        ("empty", {"prom": {}, "qbit": QBIT, "params": {}}),
+        # The node queries failed while the alerts query answered -- the case
+        # that matters, because the panel would otherwise show torrents with no
+        # node readout at all, exactly when the cluster needs watching.
+        ("nodes missing", {"prom": {"alerts": 0}, "qbit": QBIT, "params": {}}),
+        # ...and the mirror image: nodes answered, alerts did not, so "no alerts
+        # firing" is an assumption rather than a reading.
+        ("alerts missing", {"prom": {"nodes_ready": 3, "nodes_total": 3}, "qbit": QBIT}),
+    ],
+)
+def test_unknown_health_is_not_healthy_enough_for_the_torrent_view(label, data):
+    """A missing health reading must not read as a healthy cluster.
+
+    `not prom.alerts` is true for `None`, and `prom.nodes_ready ==
+    prom.nodes_total` is true when *both* are `None`, so a partial or absent
+    `prom` used to satisfy the gate on the strength of data nobody supplied.
+    For a rack monitor the safe direction is the other one.
+    """
+    templates = load_builtin_templates()
+    scenes = (templates["node-health"].scenes + templates["torrent"].scenes)[::-1]
+    assert select_scene(scenes, RenderContext(data=data)).name == "nodes", label
+
+
+@pytest.mark.parametrize(
     ("count", "probe_y"),
     [
         # The second ring's mid-radius: absent with one download, drawn with two.
@@ -149,11 +182,15 @@ def test_torrent_draws_exactly_three_rings_at_most(count, probe_y):
     item = {"name": "x", "progress": 50.0, "eta": 60, "speed": 1000}
     ctx = RenderContext(
         data={
+            # A healthy cluster, or the scene declines the screen and the probe
+            # below passes against a blank panel without proving anything.
+            "prom": PROM,
             "qbit": {"active": [item] * count, "min_eta": 60, "total_speed": 1000, "count": count},
             "params": {"title": "TORRENT"},
         }
     )
     image = render_screen(template.scenes, ctx)
+    assert image.convert("L").getextrema()[1] > 0, "the torrent scene did not take the screen"
     assert image.getpixel((120, probe_y)) == (0, 0, 0)
 
 

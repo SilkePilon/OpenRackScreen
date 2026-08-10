@@ -177,3 +177,35 @@ def test_composed_lookup_is_consistent_for_non_finite_values(
     palette = resolve_palette(_LADDER, value)
     assert palette == NAMED_PALETTES[expected_palette]
     assert gradient_color(palette, value) == hex_to_rgb(palette.stops[expected_stop].color)
+
+
+# --- stops that are not hex literals -----------------------------------------
+
+# `ors_schema.palette.Color` admits `@palette` and `{{binding}}` as well as
+# `#rrggbb`, and `Stop.color` is that type, so both forms reach `gradient_color`
+# out of schema-valid scene JSON. Neither can be resolved *here* -- a stop has no
+# data to resolve a binding against, and `@palette` inside a palette is circular
+# -- so both degrade to the same visible white `resolve_color` falls back to,
+# rather than raising out of the render.
+
+
+@pytest.mark.parametrize("color", ["{{params.c}}", "@palette"])
+def test_a_stop_that_is_not_a_hex_literal_degrades_instead_of_raising(color):
+    palette = GradientPalette(stops=[{"at": 0.0, "color": color}, {"at": 1.0, "color": "#000000"}])
+    assert gradient_color(palette, 0.0) == (255, 255, 255)
+    assert gradient_color(palette, 1.0) == (0, 0, 0)
+    # ...and it interpolates from the fallback rather than raising on the way.
+    assert gradient_color(palette, 0.5) == (127, 127, 127)
+
+
+@pytest.mark.parametrize("color", ["{{params.c}}", "@palette"])
+def test_a_lone_unreadable_stop_degrades_instead_of_raising(color):
+    # The single-stop short circuit and the past-the-last-stop tail are separate
+    # returns from the interpolating path above, and each had its own raise.
+    assert gradient_color(GradientPalette(stops=[{"at": 0.0, "color": color}]), 0.5) == (
+        255,
+        255,
+        255,
+    )
+    tail = GradientPalette(stops=[{"at": 0.0, "color": "#000000"}, {"at": 0.5, "color": color}])
+    assert gradient_color(tail, 1.0) == (255, 255, 255)
