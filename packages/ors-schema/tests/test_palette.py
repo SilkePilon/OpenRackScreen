@@ -102,3 +102,9 @@ def test_threshold_palette_with_inline_palette_entries():
     assert isinstance(tp.thresholds[1].palette, ThresholdPalette)
     assert isinstance(tp.thresholds[2].palette, str)
     assert tp.thresholds[2].palette == "named_palette"
+
+
+def test_binding_is_a_legal_color():
+    # A template parameterises its centre colour as `"color": "{{params.color}}"`,
+    # so the pattern has to admit a binding the renderer resolves later.
+    assert Holder(color="{{params.color}}", palette="cyan").color == "{{params.color}}"

@@ -118,3 +118,52 @@ def test_importing_the_package_alone_populates_the_element_registry() -> None:
     import in this process would have already filled the registry.
     """
     subprocess.run([sys.executable, "-c", _REGISTRY_PROBE], check=True)
+
+
+def _param_ctx(params: dict[str, object]) -> RenderContext:
+    return RenderContext(data={"prom": {"cpu": 42.4}, "params": params})
+
+
+def _text_scene(text: str) -> Scene:
+    return Scene.model_validate({"elements": [{"type": "text", "size": 40, "text": text}]})
+
+
+def test_a_param_holding_a_binding_is_resolved_against_the_data() -> None:
+    """`ParamSpec(type="binding")` means the *value* of the param is a binding.
+
+    A screen supplies `big = "{{prom.cpu | round:0}}%"` for a template that draws
+    `{{params.big}}`, so the field resolves to another binding and has to be
+    resolved a second time. Without that, every gauge on the rack paints its own
+    source text across the panel.
+    """
+    bound = render_screen([_text_scene("{{params.big}}")], _param_ctx({"big": "{{prom.cpu}}%"}))
+    literal = render_screen([_text_scene("42.4%")], _param_ctx({}))
+    assert bound.tobytes() == literal.tobytes()
+
+
+def test_a_param_holding_a_binding_reaches_a_numeric_field() -> None:
+    scene = Scene.model_validate(
+        {"elements": [{"type": "ring", "value": "{{params.value}}", "track": None}]}
+    )
+    bound = render_screen([scene], _param_ctx({"value": "{{prom.cpu}}"}))
+    literal = render_screen([scene], _param_ctx({"value": 42.4}))
+    assert bound.tobytes() == literal.tobytes()
+
+
+def test_param_expansion_runs_once_so_data_cannot_inject_a_binding() -> None:
+    """Only the operator's own params are treated as bindings, never live data.
+
+    A torrent name, a Kubernetes node label or a Prometheus label value can
+    contain anything at all, `{{...}}` included. Expanding a param once means
+    such a string is drawn as the text it is; expanding repeatedly would let
+    upstream data name a namespace and have it evaluated.
+    """
+    ctx = RenderContext(
+        data={"prom": {"cpu": 42.4, "note": "{{prom.cpu}}"}, "params": {"big": "{{prom.note}}"}}
+    )
+    injected = render_screen([_text_scene("{{params.big}}")], ctx)
+    evaluated = render_screen([_text_scene("{{prom.cpu}}")], _param_ctx({}))
+    # The panel shows the source text the upstream field contained, not the
+    # reading naming it would have produced.
+    assert injected.tobytes() != evaluated.tobytes()
+    assert injected.convert("L").getextrema()[1] > 0

@@ -236,3 +236,11 @@ def test_left_and_right_aligned_text_land_on_opposite_sides():
     assert left.getpixel((105, 120)) == (0, 0, 0)
     assert right.getpixel((110, 120)) != (0, 0, 0)
     assert right.getpixel((135, 120)) == (0, 0, 0)
+
+
+def test_bound_color_is_resolved():
+    scene = Scene.model_validate(
+        {"elements": [{"type": "rect", "w": 1.0, "h": 1.0, "fill": "{{params.color}}"}]}
+    )
+    image = render_scene(scene, RenderContext(data={"params": {"color": "#00ff00"}}))
+    assert image.getpixel((120, 120)) == (0, 255, 0)

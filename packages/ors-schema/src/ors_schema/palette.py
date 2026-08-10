@@ -6,8 +6,16 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 PALETTE_TOKEN = "@palette"
 
-Color = Annotated[str, Field(pattern=r"^(#[0-9a-fA-F]{6}|@palette)$")]
-"""A `#rrggbb` color, or the literal `@palette` meaning the element's palette accent."""
+Color = Annotated[str, Field(pattern=r"^(#[0-9a-fA-F]{6}|@palette|\{\{.*\}\})$")]
+"""A `#rrggbb` color, the literal `@palette`, or a binding resolving to either.
+
+A binding is admitted because a colour is a *parameter* of a template as much as
+a title is -- `text-only` writes `"color": "{{params.color}}"` -- and the value
+only exists at render time. What the binding resolves to is not this pattern's
+business: `ors_render.elements.resolve_color` reads the result through the same
+literal parser as any other colour and falls back rather than raising, so a
+binding pointing at nothing renders white instead of taking a panel down.
+"""
 
 
 class Stop(BaseModel):
