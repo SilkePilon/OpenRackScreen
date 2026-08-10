@@ -1,0 +1,34 @@
+{
+  "name": "system",
+  "category": "system",
+  "builtin": true,
+  "params_schema": {
+    "message": { "type": "string", "label": "Error message",  "default": "" },
+    "ordinal": { "type": "string", "label": "Identify digit", "default": "1" }
+  },
+  "scenes": [
+    { "name": "connecting", "background": "#000000", "elements": [
+      { "type": "ring", "r": 0.875, "thickness": 0.092, "value": 0, "track": "#12121e" },
+      { "type": "text", "cy": 0.517, "size": 52, "font": "bold", "text": "WAIT", "color": "#325aa0" },
+      { "type": "text", "cy": 0.708, "size": 13, "font": "bold", "text": "connecting",
+        "color": "#284682" } ] },
+
+    { "name": "stale", "background": "#000000", "elements": [
+      { "type": "ring", "r": 0.875, "thickness": 0.092, "value": 0, "track": "#151515" },
+      { "type": "text", "cy": 0.39, "size": 44, "font": "bold", "text": "NO", "color": "#414141" },
+      { "type": "text", "cy": 0.61, "size": 44, "font": "bold", "text": "DATA",
+        "color": "#414141" } ] },
+
+    { "name": "error", "background": "#000000", "elements": [
+      { "type": "ring", "r": 0.875, "thickness": 0.092, "value": 100, "palette": "red",
+        "track": "#1a0d0d" },
+      { "type": "text", "cy": 0.4, "size": 34, "font": "bold", "text": "ERR", "color": "#ff5252" },
+      { "type": "text", "cy": 0.62, "size": 11, "font": "bold", "max_width": 0.7,
+        "text": "{{params.message}}", "color": "#8c96a5" } ] },
+
+    { "name": "identify", "background": "#000000", "elements": [
+      { "type": "ring", "r": 0.875, "thickness": 0.092, "value": 100, "palette": "cyan",
+        "track": "#16181e" },
+      { "type": "text", "cy": 0.5, "size": 110, "font": "bold", "text": "{{params.ordinal}}" } ] }
+  ]
+}

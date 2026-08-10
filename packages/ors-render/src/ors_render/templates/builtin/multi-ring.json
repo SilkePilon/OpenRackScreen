@@ -1,0 +1,34 @@
+{
+  "name": "multi-ring",
+  "category": "gauge",
+  "builtin": true,
+  "params_schema": {
+    "title":    { "type": "string",  "label": "Title",         "default": "RINGS" },
+    "items":    { "type": "binding", "label": "List binding",  "default": "" },
+    "field":    { "type": "string",  "label": "Progress field", "default": "progress" },
+    "big":      { "type": "binding", "label": "Centre text",   "default": "" },
+    "subtitle": { "type": "binding", "label": "Subtitle",      "default": "" }
+  },
+  "scenes": [
+    {
+      "name": "default",
+      "background": "#000000",
+      "elements": [
+        { "type": "group",
+          "repeat": { "over": "{{params.items}}", "as": "item", "limit": 3 },
+          "step": { "r": -0.125, "thickness": -0.017 },
+          "palettes": ["blue", "orange", "violet"],
+          "elements": [
+            { "type": "ring", "r": 0.858, "thickness": 0.083,
+              "value": "{{item[params.field]}}", "track": "#16181e" }
+          ] },
+        { "type": "text", "cy": 0.33, "size": 15, "font": "bold",
+          "text": "{{params.title}}", "color": "#38bdf8" },
+        { "type": "text", "cy": 0.5, "size": 30, "font": "bold", "max_width": 0.55,
+          "text": "{{params.big}}" },
+        { "type": "text", "cy": 0.63, "size": 13, "font": "bold", "max_width": 0.55,
+          "text": "{{params.subtitle}}", "color": "#8c96a5" }
+      ]
+    }
+  ]
+}

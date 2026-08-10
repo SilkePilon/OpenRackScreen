@@ -1,0 +1,32 @@
+{
+  "name": "torrent",
+  "category": "status",
+  "builtin": true,
+  "params_schema": {
+    "title": { "type": "string", "label": "Title", "default": "TORRENT" }
+  },
+  "scenes": [
+    {
+      "name": "downloads",
+      "when": "len(qbit.active) > 0 and not prom.alerts and prom.nodes_ready == prom.nodes_total",
+      "background": "#000000",
+      "elements": [
+        { "type": "group",
+          "repeat": { "over": "{{qbit.active}}", "as": "t", "limit": 3 },
+          "step": { "r": -0.125, "thickness": -0.017 },
+          "palettes": ["blue", "orange", "violet"],
+          "elements": [
+            { "type": "ring", "r": 0.858, "thickness": 0.083,
+              "value": "{{t.progress}}", "track": "#16181e" } ] },
+        { "type": "text", "cy": 0.33, "size": 15, "font": "bold",
+          "text": "{{params.title}}", "color": "#38bdf8" },
+        { "type": "text", "cy": 0.5, "size": 26, "font": "bold", "max_width": 0.55,
+          "text": "{{qbit.min_eta | duration}}" },
+        { "type": "text", "cy": 0.63, "size": 13, "font": "bold", "color": "#8c96a5",
+          "text": "{{qbit.total_speed | bytes}}/s" },
+        { "type": "text", "cy": 0.71, "size": 10, "font": "bold", "color": "#3f6f8f",
+          "max_width": 0.28, "text": "{{qbit.active[0].name | trunc:10}}" }
+      ]
+    }
+  ]
+}
