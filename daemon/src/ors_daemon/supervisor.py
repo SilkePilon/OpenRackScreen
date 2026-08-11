@@ -444,23 +444,26 @@ class Supervisor:
                 # be -- and they do not need to be: their lease is revoked, so
                 # the only thread that can still reach this panel is this one.
                 slot.panel.revoke()
-                self._shut_down_panel(slot)
+                self._shut_down_panel(slot.panel.backend, slot.screen.config.name)
 
-    def _shut_down_panel(self, slot: _Slot) -> None:
+    def _shut_down_panel(self, backend: DisplayBackend, name: str) -> None:
         """Blank one panel and let go of it. Raises nothing.
+
+        Takes a backend rather than a slot because a panel can need blanking
+        before it has one: see `_start_screen`, where a worker that would not
+        start leaves an open panel with nowhere yet to record it.
 
         Each call is guarded separately: a `sleep` that fails is a panel that
         will stay lit, and a `close` skipped because of it is a serial device
         left open for as long as the process lives.
         """
-        backend = slot.panel.backend
         for action, call in (("sleep", backend.sleep), ("close", backend.close)):
             try:
                 call()
             except Exception as exc:
                 log.warning(
                     "could not shut a panel down cleanly",
-                    extra={"screen": slot.screen.config.name, "action": action, "error": str(exc)},
+                    extra={"screen": name, "action": action, "error": str(exc)},
                 )
 
     def _check(self, slot: _Slot, now: float) -> None:
@@ -545,8 +548,23 @@ class Supervisor:
             return
         panel = _Panel(backend)
         worker = self._make_worker(screen, panel)
-        # Started before the slot records it, for the reason `_replace` gives.
-        worker.start()
+        try:
+            # Started before the slot records it, for the reason `_replace` gives.
+            worker.start()
+        except BaseException:
+            # The same class of bug as the signal landing mid-start below, one
+            # line further along, and with the same cost. Between the backend
+            # opening and the slot existing there is a panel nothing else can
+            # reach: `stop` walks `_slots`, so a `RuntimeError("can't start new
+            # thread")` from a Pi under memory pressure would leave this one lit,
+            # its init sequence ended in DISPLAY_ON, with its serial device open
+            # for as long as the process lived. It is still in hand here, so it
+            # is blanked here. The lease is revoked first because the worker may
+            # or may not have got as far as running; revoking is what settles it.
+            panel.revoke()
+            log.error("could not start a worker; blanking its panel", extra={"screen": name})
+            self._shut_down_panel(backend, name)
+            raise
         self._slots.append(_Slot(screen=screen, panel=panel, worker=worker))
         # Recorded first, *then* the flag is read -- never the other way round.
         # `_stopped` only ever goes from false to true, so a stop that has begun

@@ -11,6 +11,7 @@ from ors_daemon.clock import FakeClock
 from ors_daemon.config import resolve_screens
 from ors_daemon.displays import DisplayError
 from ors_daemon.screen import _NIGHT_PARK_CHUNK as NIGHT_PARK_CHUNK
+from ors_daemon.screen import ScreenWorker
 from ors_daemon.snapshot import SnapshotStore
 from ors_daemon.supervisor import _MAX_RESTARTS as MAX_RESTARTS
 from ors_daemon.supervisor import SHUTDOWN_BUDGET, Supervisor, _Panel, _Slot
@@ -671,6 +672,36 @@ def test_a_screen_whose_backend_cannot_be_built_does_not_stop_the_others(tmp_pat
         assert [worker.name for worker in supervisor.workers] == ["screen-S2"]
     finally:
         supervisor.stop()
+
+
+def test_a_panel_whose_worker_will_not_start_is_blanked_on_the_spot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same class of bug as a signal landing mid-start, one line further along.
+
+    Between the backend opening and the slot recording it there is a panel
+    `stop` cannot reach, because `stop` walks the slots. A Pi too short of
+    memory to fork answers `worker.start()` with `RuntimeError("can't start new
+    thread")`, and this panel -- whose init sequence has just ended in
+    DISPLAY_ON -- was left lit, with its serial device open, for as long as the
+    process lived.
+    """
+    supervisor, _, displays = make(tmp_path, screens=3)
+    started = ScreenWorker.start
+
+    def start(self: ScreenWorker) -> None:
+        if self.screen_name == "S2":
+            raise RuntimeError("can't start new thread")
+        started(self)
+
+    monkeypatch.setattr(ScreenWorker, "start", start)
+
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        supervisor.run_forever(interval=0.0)
+
+    assert displays["S2"].calls == ["sleep", "close"], "the panel it had just opened"
+    assert displays["S1"].calls[-2:] == ["sleep", "close"], "and the one before it"
+    assert "S3" not in displays, "nothing is opened after a failure this bad"
 
 
 def test_a_tick_survives_a_status_path_it_cannot_write(tmp_path: Path) -> None:
