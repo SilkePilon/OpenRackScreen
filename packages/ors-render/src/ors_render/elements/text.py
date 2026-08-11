@@ -203,12 +203,14 @@ def _truncate(
         return draw.textlength(candidate, font=font) <= limit
 
     # The full string is known not to fit, so both searches stop one short of it.
-    plain = _longest_fitting(lambda n: text[:n], fits, len(text) - 1)
+    # "Nothing fits" folds into the empty string: a negative `max_width` is the
+    # only way there, and the walk emptied the string for it too.
+    plain = _longest_fitting(lambda n: text[:n], fits, len(text) - 1) or 0
     if ellipsis:
         dotted = _longest_fitting(lambda n: text[: n - 1] + ".", fits, len(text) - 1, low=1)
-        if dotted is not None and dotted >= (plain or 0):
+        if dotted is not None and dotted >= plain:
             return text[: dotted - 1] + "."
-    return text[: plain or 0]
+    return text[:plain]
 
 
 def _longest_fitting(
