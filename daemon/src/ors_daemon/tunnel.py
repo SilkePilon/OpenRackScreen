@@ -150,6 +150,17 @@ class Tunnel(threading.Thread):
     process usually survives while the tunnel underneath it is dead. So every
     cycle probes the local URL, and repeated probe failures tear the process
     down -- freeing the local port -- rather than waiting for it to exit.
+
+    Whether the tunnel is working at this instant is deliberately not published.
+    It used to be, as a `ready` event, on the design that an integration behind a
+    tunnel would be held back from polling until the probe passed -- and that
+    gate was never built, so five sites maintained a flag nothing read. Building
+    it now would be worse than the absence: the poller already tries, fails,
+    backs off and reports the failure as the integration's own health, so a gate
+    would only replace an `unhealthy` carrying `connection refused` with a screen
+    saying `connecting` and no reason at all. What is happening to a tunnel is
+    read off that health line in the status file, and off this module's own log
+    lines, both of which name the namespace and say why.
     """
 
     def __init__(
@@ -173,7 +184,6 @@ class Tunnel(threading.Thread):
         self._process: Any | None = None
         self._service: str | None = None if config.service == "auto" else config.service
         self._failures = 0
-        self.ready = threading.Event()
         self.base_url = f"http://localhost:{config.local_port}"
 
     def tick(self) -> None:
@@ -187,7 +197,6 @@ class Tunnel(threading.Thread):
         process = self._process
         returncode = None if process is None else process.poll()
         if process is None or returncode is not None:
-            self.ready.clear()
             if process is not None:
                 # The one number that says *why* a launch failed -- 1 for a
                 # kubeconfig kubectl cannot read, for an RBAC denial, for a local
@@ -203,11 +212,9 @@ class Tunnel(threading.Thread):
 
         if self._probe_ok():
             self._failures = 0
-            self.ready.set()
             return
 
         self._failures += 1
-        self.ready.clear()
         if self._failures >= _FAILURES_BEFORE_RELAUNCH:
             log.warning(
                 "tunnel probes failing, relaunching",
@@ -234,11 +241,12 @@ class Tunnel(threading.Thread):
                 try:
                     self.tick()
                 except Exception:
-                    # `ready` is what releases the integrations behind this tunnel
-                    # to poll, and a cycle that blew up is no evidence the tunnel
-                    # works. Keeping the previous value would let a pathological
-                    # launcher leave it set with nothing behind it.
-                    self.ready.clear()
+                    # Logged and gone round again, because a cycle that blew up
+                    # says nothing about the next one: an injected callable that
+                    # raised once may well answer the second time, and the
+                    # process, if there is one, is still supervised. What must
+                    # not happen is the thread ending -- see this method's
+                    # docstring.
                     log.exception(
                         "tunnel cycle failed", extra={"namespace": self._config.namespace}
                     )

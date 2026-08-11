@@ -87,15 +87,16 @@ def test_the_first_tick_launches_kubectl_with_the_configured_arguments():
     assert "19090:9090" in argv
 
 
-def test_ready_is_set_only_once_a_probe_succeeds():
-    harness = Harness([False, True])
+def test_one_failed_probe_is_not_enough_to_tear_a_tunnel_down():
+    """A single miss is a slow cluster, not a dead tunnel: relaunching on it
+    would cost the local port and a kubectl start every interval."""
+    harness = Harness([False, True, True])
     tunnel = make(harness)
+    for _ in range(3):
+        tunnel.tick()
 
-    tunnel.tick()
-    assert tunnel.ready.is_set() is False
-    tunnel.tick()
-    tunnel.tick()
-    assert tunnel.ready.is_set() is True
+    assert harness.processes[0].terminated is False
+    assert len(harness.processes) == 1
 
 
 def test_two_failed_probes_tear_the_tunnel_down_and_relaunch_it():
@@ -108,16 +109,15 @@ def test_two_failed_probes_tear_the_tunnel_down_and_relaunch_it():
     assert len(harness.processes) >= 2, "a dead tunnel must be relaunched, not left alive"
 
 
-def test_a_dead_process_clears_ready_and_relaunches():
+def test_a_dead_process_is_relaunched():
     harness = Harness([True, True])
     tunnel = make(harness)
     tunnel.tick()
     tunnel.tick()
-    assert tunnel.ready.is_set() is True
+    assert len(harness.processes) == 1
 
     harness.processes[0].die()
     tunnel.tick()
-    assert tunnel.ready.is_set() is False
     assert len(harness.processes) == 2
 
 
@@ -153,7 +153,6 @@ def test_a_service_that_cannot_be_discovered_does_not_launch_or_crash():
     tunnel.tick()
 
     assert harness.argvs == []
-    assert tunnel.ready.is_set() is False
 
 
 def test_stopping_terminates_the_subprocess():
@@ -307,11 +306,11 @@ def test_a_launcher_that_raises_is_survived_and_retried():
 
     tunnel = make(harness, launcher=launcher)
     tunnel.tick()
-    assert tunnel.ready.is_set() is False
+    assert harness.processes == [], "the launch that raised handed back nothing"
 
     tunnel.tick()
     tunnel.tick()
-    assert tunnel.ready.is_set() is True
+    assert len(harness.processes) == 1, "and the next cycle tried again"
 
 
 def test_a_probe_that_raises_counts_as_a_failed_probe():
@@ -320,7 +319,6 @@ def test_a_probe_that_raises_counts_as_a_failed_probe():
     for _ in range(3):
         tunnel.tick()
 
-    assert tunnel.ready.is_set() is False
     assert harness.processes[0].terminated is True
 
 
@@ -330,7 +328,6 @@ def test_a_discoverer_that_raises_does_not_launch_or_crash():
     tunnel.tick()
 
     assert harness.argvs == []
-    assert tunnel.ready.is_set() is False
 
 
 def test_run_leaves_no_tunnel_behind_when_it_is_stopped():
@@ -340,7 +337,6 @@ def test_run_leaves_no_tunnel_behind_when_it_is_stopped():
     tunnel.run()
 
     assert harness.processes[0].terminated is True
-    assert tunnel.ready.is_set() is False
 
 
 def test_run_survives_a_sleeper_that_raises():
@@ -357,11 +353,11 @@ def test_run_survives_a_sleeper_that_raises():
     assert harness.processes[0].terminated is True
 
 
-def test_run_clears_ready_when_a_cycle_raises():
-    # A cycle that blew up is no evidence the tunnel works, and `ready` is what
-    # releases an integration to poll: leaving it set behind a pathological
-    # launcher is the silent wedge this module exists to prevent. Observed
-    # *during* the run, because the teardown in `run`'s `finally` clears it too.
+def test_run_keeps_turning_when_a_cycle_raises():
+    # `tick` absorbs what the injected callables do; this is what it cannot --
+    # a launcher that handed back an object whose `poll` raises. An exception
+    # out of `run` would end the supervision of this tunnel until the process
+    # restarted, with nothing anywhere saying why, so the loop goes round again.
     class PollExploder(FakeProcess):
         polls = 0
 
@@ -376,14 +372,14 @@ def test_run_clears_ready_when_a_cycle_raises():
     seen = []
 
     def sleeper(seconds):
-        seen.append(tunnel.ready.is_set())
+        seen.append(len(harness.processes))
         if len(seen) >= 3:
             stop.set()
 
     tunnel = make(harness, stop=stop, sleeper=sleeper, launcher=launching(harness, PollExploder))
     tunnel.run()
 
-    assert seen == [False, True, False], "a raising cycle must not leave `ready` set"
+    assert seen == [1, 1, 1], "the raising cycle was survived, not answered with a relaunch"
 
 
 # --- reaching the right cluster ----------------------------------------------
@@ -501,8 +497,8 @@ def test_the_kubeconfig_reaches_kubectl_with_its_home_expanded(monkeypatch):
 
 def test_a_dead_process_logs_the_exit_code_it_died_with(caplog):
     # Without this, a kubectl that dies at launch -- bad kubeconfig, RBAC denial,
-    # local port already bound -- looks exactly like every other failure: `ready`
-    # never sets and one info line a cycle says nothing about why.
+    # local port already bound -- looks exactly like every other failure: one
+    # info line a cycle, saying nothing about why.
     harness = Harness([True, True])
     tunnel = make(harness)
     tunnel.tick()
@@ -559,7 +555,6 @@ def test_shutdown_is_safe_before_a_start_and_twice_over():
     tunnel.shutdown()
 
     assert harness.processes == []
-    assert tunnel.ready.is_set() is False
 
 
 def test_a_tunnel_can_be_joined():
