@@ -319,3 +319,101 @@ def test_an_open_that_never_succeeds_does_not_end_the_thread() -> None:
     assert escaped == []
     assert integration.opened >= 2, "a failing open must be retried, not fatal"
     assert store.read().health["prom"].state is Health.CONNECTING
+
+
+class BreakingStore(SnapshotStore):
+    """A store that publishes once, then refuses every write."""
+
+    def __init__(self, fail_put_after=1, fail_fail=False):
+        super().__init__()
+        self._puts = 0
+        self._fail_put_after = fail_put_after
+        self._fail_fail = fail_fail
+
+    def put(self, name, fields, latency_ms, now):
+        self._puts += 1
+        if self._puts > self._fail_put_after:
+            raise RuntimeError("store is wedged")
+        super().put(name, fields, latency_ms, now)
+
+    def fail(self, name, reason, now):
+        if self._fail_fail:
+            raise RuntimeError("store is wedged")
+        super().fail(name, reason, now)
+
+
+def test_a_store_that_breaks_after_publishing_still_shows_up_as_unhealthy():
+    # Driven through `run`, not `poll_once`: the recovery belongs to the loop,
+    # because `poll_once` stays loud so a CLI dry-run sees the real error.
+    store = BreakingStore()
+    store.register("prom")
+    stop = threading.Event()
+    cycles = []
+
+    def sleeper(seconds):
+        cycles.append(seconds)
+        if len(cycles) >= 4:
+            stop.set()
+
+    Poller(
+        integration=FakeIntegration(),
+        store=store,
+        interval=5.0,
+        stop=stop,
+        clock=lambda: NOW,
+        sleeper=sleeper,
+    ).run()
+
+    assert store.read().health["prom"].state is Health.UNHEALTHY
+    assert store.read().health["prom"].stale is True
+
+
+def test_a_store_refusing_both_paths_still_backs_off_instead_of_spinning():
+    store = BreakingStore(fail_put_after=0, fail_fail=True)
+    store.register("prom")
+    stop = threading.Event()
+    delays = []
+    integration = FakeIntegration()
+
+    def sleeper(seconds):
+        delays.append(seconds)
+        if len(delays) >= 4:
+            stop.set()
+
+    poller = Poller(
+        integration=integration,
+        store=store,
+        interval=5.0,
+        stop=stop,
+        clock=lambda: NOW,
+        backoff_cap=30.0,
+        sleeper=sleeper,
+    )
+    poller.run()
+
+    assert delays == [5.0, 10.0, 20.0, 30.0]
+
+
+def test_a_sleeper_that_raises_does_not_take_the_thread_down():
+    store = SnapshotStore()
+    store.register("prom")
+    stop = threading.Event()
+    calls = []
+
+    def sleeper(seconds):
+        calls.append(seconds)
+        if len(calls) >= 3:
+            stop.set()
+        raise RuntimeError("sleeper exploded")
+
+    poller = Poller(
+        integration=FakeIntegration(),
+        store=store,
+        interval=0.0,
+        stop=stop,
+        clock=lambda: NOW,
+        sleeper=sleeper,
+    )
+    poller.run()
+
+    assert len(calls) == 3

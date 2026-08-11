@@ -86,13 +86,32 @@ class Poller(threading.Thread):
             while not self._stop.is_set():
                 try:
                     self.poll_once()
-                except Exception:
-                    # Only the store can get here, and a store that cannot record
-                    # a poll cannot record a backoff either: keep the pace we had
-                    # and let the next cycle try again.
+                except Exception as exc:
+                    # Only the store can get here. Try to record it as a failure
+                    # anyway: a store that publishes once and then breaks would
+                    # otherwise leave health reading `healthy` with a frozen
+                    # version forever -- a panel showing confident numbers that
+                    # stopped updating, with nothing on the snapshot saying so.
                     name = self._integration.name
                     log.exception("poll cycle failed", extra={"integration": name})
-                self._sleeper(self.next_delay)
+                    try:
+                        self._failed(f"{type(exc).__name__}: {exc}")
+                    except Exception:
+                        # The store is refusing both paths. Back off anyway, so a
+                        # broken store cannot pin the loop at its fastest pace.
+                        self.next_delay = min(
+                            self._backoff_cap,
+                            self.next_delay * 2 if self._backing_off else self._interval,
+                        )
+                        self._backing_off = True
+                try:
+                    self._sleeper(self.next_delay)
+                except Exception:
+                    # A caller-supplied sleeper is not covered by any contract, and
+                    # the default `stop.wait` cannot raise. Losing the pace is
+                    # survivable; losing the thread is not.
+                    log.exception("sleeper failed", extra={"integration": self._integration.name})
+                    self._stop.wait(self.next_delay)
         finally:
             try:
                 self._integration.close()
