@@ -57,8 +57,18 @@ def pixel_width(geometry: Geometry, width: float) -> int:
     is what maps them. A ring's `thickness` is not one of these: like `r`, it is a
     fraction of the panel *radius* and goes through `Geometry.radial` instead, so
     a ring renderer rounds `radial(thickness)` itself rather than calling this.
+    That renderer is `ors_render.elements.ring._circle`, and it owes this
+    docstring **all three** of the decisions below -- floor, rounding *and*
+    ceiling -- differing only in the units it starts from and in where its
+    ceiling sits (`_MAX_THICKNESS_DIAMETERS`, for the reason given there). Any
+    fourth family that measures a stroke in radii owes them the same. Copying
+    two of the three is exactly the slip that shipped: `_circle` took the floor
+    and the rounding, left the cap behind, and `{"type": "ring", "thickness":
+    1e9}` raised out of `ImageDraw.arc` for the same reason a 1e9 rect stroke
+    did.
+
     Shared rather than written out per call site because every stroked element
-    needs the same two decisions, and both are easy to get quietly wrong:
+    needs the same three decisions, and each is easy to get quietly wrong:
 
     *Rounded, not truncated.* `RectElement.stroke_width` defaults to 0.004, which
     is 1.92 px on the 2x supersampled canvas. `int` cuts that to 1 px -- 0.5 px

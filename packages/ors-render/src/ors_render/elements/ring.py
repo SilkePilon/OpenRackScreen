@@ -74,6 +74,34 @@ whereas a missing element is visibly missing. Same purpose as `_MAX_SEGMENTS`:
 a bound the scene cannot see, so untrusted input cannot buy unbounded work.
 """
 
+_MAX_THICKNESS_DIAMETERS = 2.0
+"""Ceiling on a ring's stroke width, as a multiple of its own radius.
+
+`thickness` is a plain unbounded float in the schema, so ``{"type": "ring",
+"thickness": 1e9}`` is valid scene JSON -- and `ImageDraw.arc` converts the
+width to a C integer: measured, 1e9 raised ``OverflowError: signed integer is
+greater than maximum`` and 1e17 and 1e300 ``Python int too large to convert to C
+long``, out of both the ring and the arc renderer. The `math.isfinite` guard in
+`_circle` caught the infinities and missed every finite giant behind them.
+
+This is the ceiling `ors_render.elements.pixel_width` applies to a rect or line
+stroke, at the scale this element works in. Its *value* is deliberately not that
+helper's `Geometry.px`, and the difference is load-bearing rather than cosmetic:
+a stroked rect is a shape on the canvas, so a canvas-wide stroke covers it from
+any point on it, whereas a ring's box may be up to `_MAX_RADIUS_CANVASES`
+canvases across and Pillow draws the stroke **inward** from that box. A
+canvas-wide cap would therefore erase the middle of a ring larger than the panel
+-- the filled disc `test_thickness_beyond_the_radius_fills_the_disc` pins would
+come back as a blank panel for ``r: 4.0``.
+
+Two radii is where the stroke, running inward from the outer edge, has reached
+the centre and continued out the far side, so no wider one can add a pixel
+anywhere. Measured: every thickness from 1.1 radii to 1e300 renders
+byte-identically to this cap at ``r`` 0.05, 0.2, 0.875, 1.0, 1.7, 2.0, 3.0 and
+4.0. Same purpose as `_MAX_SEGMENTS` and `_MAX_RADIUS_CANVASES`: a bound the
+scene cannot see, so untrusted input cannot buy a traceback or unbounded work.
+"""
+
 _SEAM_OVERLAP_DEGREES = 1.2
 """How far each step is extended into its successor, which then paints over it.
 
@@ -108,8 +136,11 @@ def _circle(canvas: Canvas, element: ArcElement | RingElement) -> tuple[Box, flo
     through `Geometry.radial`, not the `Geometry.span` that
     `ors_render.elements.pixel_width` applies to a rect or line stroke -- half
     the scale, and a ring exactly twice as thick as the scene asked for if the
-    two are confused. The rounding is `pixel_width`'s: nearest whole pixel,
-    never away to nothing.
+    two are confused. Only the *units* differ: the width this returns makes all
+    three of `pixel_width`'s decisions, and for the same reasons it gives.
+    Rounded to the nearest whole pixel, never away to nothing, and **capped** --
+    see `_MAX_THICKNESS_DIAMETERS` for why the ceiling here is the ring's own
+    diameter rather than the canvas that helper uses.
 
     ``None`` means there is nothing drawable here. Neither field is bounded by
     the schema, so every bound is this renderer's to make: an inverted or empty
@@ -127,7 +158,7 @@ def _circle(canvas: Canvas, element: ArcElement | RingElement) -> tuple[Box, flo
         return None
     cx, cy = geometry.x(element.cx), geometry.y(element.cy)
     box = (cx - radius, cy - radius, cx + radius, cy + radius)
-    return box, radius, max(1, round(thickness))
+    return box, radius, max(1, round(min(thickness, radius * _MAX_THICKNESS_DIAMETERS)))
 
 
 def _sweep(

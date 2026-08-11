@@ -213,6 +213,31 @@ def test_start_angle_moves_where_the_sweep_begins():
     assert image.getpixel(TOP) == TRACK
 
 
+@pytest.mark.parametrize("thickness", [1e9, 1e17, 1e300])
+@pytest.mark.parametrize("kind", ["ring", "arc"])
+def test_a_giant_thickness_renders_rather_than_overflowing_pillow(kind, thickness):
+    # `thickness` is a plain unbounded float in the schema, so each of these is
+    # schema-valid JSON someone can author directly. Measured before the cap:
+    # `ImageDraw.arc` raised `OverflowError: signed integer is greater than
+    # maximum` from 1e9 and `Python int too large to convert to C long` from
+    # 1e17 -- the `math.isfinite` guard caught the infinities and missed every
+    # finite giant behind them.
+    extra = {"value": 100, "track": None} if kind == "ring" else {"to_angle": 180}
+    scene = Scene.model_validate({"elements": [{"type": kind, "thickness": thickness, **extra}]})
+    render_scene(scene, CTX)
+
+
+@pytest.mark.parametrize("thickness", [1.8, 2.0, 1e9, 1e17, 1e300])
+def test_capping_the_thickness_changes_no_picture_a_scene_could_see(thickness):
+    # The cap is the ring's own diameter, which is where the stroke -- drawn
+    # inward from the bounding box -- has already crossed the centre and out the
+    # far side. So every thickness at or past it draws the same filled disc, and
+    # the cap is invisible rather than merely cheap.
+    full = render_scene(_ring(value=100, thickness=0.875 * 2, r=0.875, track=None), CTX)
+    image = render_scene(_ring(value=100, thickness=thickness, r=0.875, track=None), CTX)
+    assert image.tobytes() == full.tobytes()
+
+
 def test_thickness_beyond_the_radius_fills_the_disc():
     # `thickness` is not bounded by the schema and Pillow draws a stroke inward
     # from the bounding box, so an over-thick ring is a filled disc rather than
