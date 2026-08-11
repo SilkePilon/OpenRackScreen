@@ -8,6 +8,43 @@ WAIT = 5.0
 """Generous on purpose: a passing test never spends it, only a broken one does."""
 
 
+class _ObservableCondition(threading.Condition):
+    """A condition that reports, from inside the lock, each time a thread parks.
+
+    The handshake is exact rather than approximate, which is why nothing here
+    sleeps to wait for a thread to get going: `wait()` gives the store lock up
+    only once its caller is genuinely parked, so a test that has seen the
+    semaphore and then reaches for that lock -- through `put`, or `with
+    condition` -- cannot possibly get there first.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parked = threading.Semaphore(0)
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.parked.release()
+        return super().wait(timeout)
+
+
+def _watched_store() -> tuple[SnapshotStore, _ObservableCondition]:
+    """A store whose condition variable the test can watch workers park on.
+
+    Reaching past the public surface is the point: whether a worker is parked or
+    merely about to be is exactly the difference these tests are about, and no
+    public method can answer it.
+    """
+    store = SnapshotStore()
+    condition = _ObservableCondition()
+    store._condition = condition
+    return store, condition
+
+
+def _await_parks(condition: _ObservableCondition, count: int) -> None:
+    for _ in range(count):
+        assert condition.parked.acquire(timeout=WAIT), "a worker never parked in wait()"
+
+
 def test_a_registered_integration_starts_connecting_with_no_data():
     store = SnapshotStore()
     store.register("prom")
@@ -163,21 +200,26 @@ def test_registering_an_integration_twice_keeps_the_health_it_has():
 def test_a_reader_never_sees_the_data_and_the_version_disagree():
     store = SnapshotStore()
     store.register("prom")
-    done = threading.Event()
+    store.put("prom", {"n": 0}, latency_ms=1.0, now=NOW)
+    reading, done = threading.Event(), threading.Event()
     torn: list[tuple[int, int]] = []
-
-    def writer() -> None:
-        for value in range(200):
-            store.put("prom", {"n": value}, latency_ms=1.0, now=NOW)
-        done.set()
+    reads = [0]
 
     def reader() -> None:
         while not done.is_set():
             snap = store.read()
+            reads[0] += 1
+            reading.set()
             # The n-th publish carries n-1, so any other pairing is a snapshot
             # assembled from two different versions of the store.
-            if snap.version and snap.data["prom"]["n"] != snap.version - 1:
+            if snap.data["prom"]["n"] != snap.version - 1:
                 torn.append((snap.version, snap.data["prom"]["n"]))
+
+    def writer() -> None:
+        reading.wait(timeout=WAIT)  # overlap the reader rather than race it to the end
+        for value in range(1, 201):
+            store.put("prom", {"n": value}, latency_ms=1.0, now=NOW)
+        done.set()
 
     threads = [threading.Thread(target=target, daemon=True) for target in (reader, writer)]
     for thread in threads:
@@ -186,36 +228,7 @@ def test_a_reader_never_sees_the_data_and_the_version_disagree():
         thread.join(timeout=WAIT)
 
     assert torn == []
-
-
-class _ObservableCondition(threading.Condition):
-    """A condition that reports, from inside the lock, each time a thread parks.
-
-    The handshake is exact rather than approximate, which is why nothing here
-    sleeps to wait for a thread to get going: `wait()` gives the store lock up
-    only once its caller is genuinely parked, so a test that has seen the
-    semaphore and then reaches for that lock -- through `put`, or `with
-    condition` -- cannot possibly get there first.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.parked = threading.Semaphore(0)
-
-    def wait(self, timeout: float | None = None) -> bool:
-        self.parked.release()
-        return super().wait(timeout)
-
-
-def _watched_store() -> tuple[SnapshotStore, _ObservableCondition]:
-    store = SnapshotStore()
-    store._condition = condition = _ObservableCondition()
-    return store, condition
-
-
-def _await_parks(condition: _ObservableCondition, count: int) -> None:
-    for _ in range(count):
-        assert condition.parked.acquire(timeout=WAIT), "a worker never parked in wait()"
+    assert reads[0] > 0, "the reader never ran, so this proved nothing"
 
 
 def test_a_publish_wakes_a_worker_already_blocked_in_wait():
