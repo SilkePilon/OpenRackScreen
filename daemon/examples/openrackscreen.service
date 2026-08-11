@@ -1,0 +1,87 @@
+# OpenRackScreen daemon.
+#
+#   sudo install -m0644 openrackscreen.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now openrackscreen
+#
+# Adjust ExecStart and User to match where you installed it. Everything else is
+# load-bearing; the comments say why.
+
+[Unit]
+Description=OpenRackScreen: drives the rack's round SPI panels
+Documentation=https://github.com/SilkePilon/OpenRackScreen
+
+# The daemon survives a cluster it cannot reach entirely on its own -- the
+# poller backs off, the tunnel relaunches `kubectl port-forward`, and the panels
+# show `connecting` and then `NO DATA` rather than going dark -- so nothing here
+# waits for the cluster, and no dependency of this unit may ever be able to keep
+# the rack unlit. `network-online` is here only so the first kubectl launch
+# after a boot is not guaranteed to fail; the daemon is fine if it does.
+Wants=network-online.target
+After=network-online.target
+
+# systemd's default start rate limit is 5 starts in 10s, after which the unit
+# enters `failed` and *stays there* until a human runs `systemctl reset-failed`.
+# A daemon that cannot open a panel exits quickly, so five quick exits would
+# take the rack dark permanently over something a later retry might fix (an SD
+# card still settling, a kubeconfig not yet restored). Disabled: for a screen,
+# retrying forever every RestartSec is strictly better than giving up.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=openrackscreen
+Group=openrackscreen
+# How a non-root user reaches the panels: on Raspberry Pi OS /dev/spidev* is
+# group `spi` and /dev/gpiochip* is group `gpio`. Without both, every screen
+# comes up `unavailable` and the rack stays dark.
+SupplementaryGroups=spi gpio
+
+ExecStart=/opt/openrackscreen/.venv/bin/ors-daemon run \
+          --config /etc/openrackscreen/rack.yaml \
+          --status /run/openrackscreen/status.json
+
+# `always`, not `on-failure`: a clean exit is not something this program is
+# supposed to do, so exiting 0 is as much a reason to come back as crashing.
+Restart=always
+RestartSec=5
+
+# Creates /run/openrackscreen owned by User=, on every start, and removes it on
+# stop. That is what makes the status path above work after a reboot with no
+# tmpfiles.d rule to maintain -- and keeps a file rewritten every second off the
+# SD card.
+RuntimeDirectory=openrackscreen
+RuntimeDirectoryMode=0755
+
+# Shutdown joins every thread (5s each, worst case) and only then blanks, sleeps
+# and closes four panels. Comfortably inside 30s; past whatever this is, systemd
+# sends SIGKILL and the panels stay lit -- the one outcome the whole shutdown
+# path exists to prevent. Raise it, never lower it.
+TimeoutStopSec=30
+
+# The tunnel shells out to `kubectl`, which is usually in /usr/local/bin -- not
+# on the PATH systemd would otherwise hand a system unit on every distribution.
+# `~` in the config's kubeconfig path expands against this user's home, which
+# systemd sets from User= (and which the daemon resolves itself if it does not).
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Modest hardening. Deliberately NOT PrivateDevices=yes: it hides /dev/spidev*
+# and /dev/gpiochip*, and the daemon would come up reporting four unavailable
+# screens with a permission error nobody would connect to this line.
+NoNewPrivileges=yes
+# `full` leaves /dev alone while making /usr, /boot and /etc read-only. The
+# config is read, never written.
+ProtectSystem=full
+# The kubeconfig lives in the daemon user's home and is only ever read.
+ProtectHome=read-only
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+
+# One JSON object per line on stdout, which journald keeps as-is:
+#   journalctl -u openrackscreen -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
