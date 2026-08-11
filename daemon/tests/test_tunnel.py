@@ -199,10 +199,21 @@ class ExplodingProcess(FakeProcess):
         raise OSError("no such process")
 
 
+def launching(harness, factory):
+    """The harness's launcher, but handing out `factory()` instead of a `FakeProcess`."""
+
+    def launcher(argv):
+        harness.argvs.append(argv)
+        process = factory()
+        harness.processes.append(process)
+        return process
+
+    return launcher
+
+
 def test_a_process_that_ignores_sigterm_is_killed_and_reaped():
     harness = Harness([True])
-    harness.launcher = lambda argv: _remember(harness, argv, StubbornProcess())
-    tunnel = make(harness)
+    tunnel = make(harness, launcher=launching(harness, StubbornProcess))
     tunnel.tick()
     tunnel.shutdown()
 
@@ -216,19 +227,12 @@ def test_a_process_that_ignores_sigterm_is_killed_and_reaped():
 
 def test_a_process_that_cannot_be_stopped_at_all_is_still_let_go_of():
     harness = Harness([True, True])
-    harness.launcher = lambda argv: _remember(harness, argv, ExplodingProcess())
-    tunnel = make(harness)
+    tunnel = make(harness, launcher=launching(harness, ExplodingProcess))
     tunnel.tick()
     harness.processes[0].die()
     tunnel.tick()
 
     assert len(harness.processes) == 2, "a process it cannot kill must not block a relaunch"
-
-
-def _remember(harness, argv, process):
-    harness.argvs.append(argv)
-    harness.processes.append(process)
-    return process
 
 
 # --- nothing gets out of a supervision cycle ---------------------------------
