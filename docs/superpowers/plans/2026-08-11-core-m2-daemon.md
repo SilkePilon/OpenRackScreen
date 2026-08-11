@@ -13,6 +13,16 @@
 
 ## Global Constraints
 
+> **Naming correction, learned during execution.** Every `self._stop` in this
+> plan's reference code is wrong and the shipped daemon does not use it.
+> `threading.Thread._stop` is a real method that `join()` calls, so a subclass
+> storing its stop event under that name makes every join raise
+> `TypeError: 'Event' object is not callable` — invisible until something joins,
+> which is exactly what SIGTERM does. The shipped code names it `_stop_event`
+> throughout. Anyone reading this plan for M3 should carry that name, not this
+> one.
+
+
 - **Research before implementing.** Spec §0 applies to every task. Verify luma.lcd's current `spi()` signature and framebuffer API, GC9A01 sleep/wake timing (the datasheet requires ≥120 ms after sleep-out), Prometheus's `/api/v1/query` response shapes including how `NaN` appears on the wire, `kubectl port-forward` behaviour on connection loss, and whether `tzdata` must be installed explicitly on Raspberry Pi OS. Where research contradicts this plan, the research wins — raise it, then implement.
 - **TDD.** Failing test first, watch it fail for the expected reason, minimal implementation, watch it pass, commit. No exceptions.
 - **No test may sleep to wait for time to pass.** The clock is injected everywhere. Night transitions, backoff and pacing are tested by advancing a fake clock. A test that calls `time.sleep` to let a thread progress is a plan failure — use `threading.Event` handshakes.

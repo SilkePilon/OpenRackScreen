@@ -119,7 +119,7 @@ wake() -> None                        # sleep-out, wait, display-on
 close() -> None
 ```
 
-Two implementations: `GC9A01SPI`, holding the extracted driver and its init sequence, and `VirtualDisplay`, which writes PNGs to a directory. Backend selection is a config field, so the whole daemon runs on a laptop.
+Two implementations: `GC9A01Display`, holding the extracted driver and its init sequence, and `VirtualDisplay`, which writes PNGs to a directory. Backend selection is a config field, so the whole daemon runs on a laptop.
 
 Rotation and horizontal flip are applied by the screen worker before `show`, never inside the backend — the same rule M1 established for scenes.
 
@@ -219,7 +219,9 @@ After 3 consecutive failed cycles the namespace is marked **stale**. Screens ref
 
 A tunnel is its own thread, ported from `k8s_monitor.py`'s `PortForward` with its health-probe restart intact — the behaviour that fixes "kubectl process alive, tunnel dead after a cluster reboot". It supervises the subprocess, actively probes the local URL, and tears down and relaunches when probes keep failing, freeing the local port.
 
-It exposes a `ready` event and a base URL. An integration configured with `tunnel:` takes its base URL from the tunnel and stays `connecting` until the probe passes. Nothing else about the integration differs between tunnelled and direct.
+It exposes a base URL, read at poll time so it can move underneath a running integration. An integration configured with `tunnel:` takes its base URL from there; nothing else about it differs between tunnelled and direct.
+
+This originally specified a `ready` event gating polling until the probe passed. It was built and then removed: a poll against a tunnel that is not up yet already fails, and the poller's backoff and health machinery already turn that into `connecting` plus a reason in the status file. A second gate would have been a second source of truth for one fact, and it never acquired a reader.
 
 ## 7. The screen worker
 
@@ -260,7 +262,7 @@ Per the Core spec §9, made concrete:
 - **Config** — validated in full before anything starts; a config that fails validation is rejected with a message naming the field, and on reload the previous config keeps running.
 - **Poller** — failure is scoped to one integration. Backoff, a health flag with a reason, and staleness after 3 misses.
 - **Render** — an exception paints the `error` scene on that panel with a short message; the worker survives; the error is logged once per distinct message, not per frame.
-- **SPI** — a write failure re-initialises that device up to 3 times with backoff, then marks the screen faulted and skips it. Siblings are unaffected.
+- **SPI** — three *consecutive* write failures fault the screen, which is then skipped entirely: no further `show`, `sleep` or `wake` reaches that backend. A success in between resets the count. The device is not re-initialised — a panel whose bus is failing is rarely one a reset recovers, and re-running an init sequence on a wedged bus is how one bad panel takes a shared bus down with it. Siblings are unaffected either way.
 - **Watchdog** — each worker publishes a heartbeat; the supervisor restarts a wedged one.
 - **Shutdown** — SIGTERM blanks and sleeps every panel before exit.
 
