@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 PALETTE_TOKEN = "@palette"
 """The colour that means "whatever this element's palette resolves to".
@@ -29,11 +29,20 @@ binding pointing at nothing renders white instead of taking a panel down.
 
 
 class Stop(BaseModel):
+    # `extra="forbid"`, as on every other model in the package. It matters most
+    # here: these four are the deepest models a `DaemonConfig` reaches, via an
+    # inline template's scenes, and a colour is the one field a rack owner hand-
+    # types. Ignoring `colour` for `color` would drop the value and render the
+    # element's default, on a panel that has no way to report the difference.
+    model_config = ConfigDict(extra="forbid")
+
     at: float = Field(ge=0.0, le=1.0)
     color: Color
 
 
 class GradientPalette(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     kind: Literal["gradient"] = "gradient"
     stops: list[Stop] = Field(min_length=1)
 
@@ -47,11 +56,15 @@ class GradientPalette(BaseModel):
 
 
 class ThresholdEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     at: float
     palette: PaletteRef
 
 
 class ThresholdPalette(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     kind: Literal["threshold"] = "threshold"
     thresholds: list[ThresholdEntry] = Field(min_length=1)
 

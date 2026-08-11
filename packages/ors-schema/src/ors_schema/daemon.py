@@ -68,9 +68,12 @@ class FieldSpec(BaseModel):
     # Which series label identifies a `top` result -- the row's name, not its
     # value. Ignored under `reduce: scalar`, where there is nothing to name.
     label: str = "instance"
-    # `last_octet` shortens `10.0.0.42:9100` to `42`: an instance label is
-    # routinely wider than the panel, and truncating it from the left is what
-    # keeps the digits that differ between hosts.
+    # `last_octet` shortens `192.168.1.5:9100` to `.5` -- the leading dot kept,
+    # because that is what `k8s_monitor.py` put on the glass and what M1's parity
+    # goldens show. An instance label is routinely wider than the panel, and
+    # truncating it from the left is what keeps the digits that differ between
+    # hosts; the dot is what says the rest was truncated. It renders as
+    # `peak: .5 71%`.
     strip: Literal["none", "last_octet"] = "none"
 
 
@@ -107,13 +110,17 @@ class DisplayConfig(BaseModel):
     union because switching a screen between the two is a one-key edit during
     development, and a union would make it a rewrite of the whole block.
 
-    Only the `virtual`-needs-`out_dir` rule is enforced. The SPI numbers are
-    deliberately unvalidated beyond their types: which buses, chip selects and
-    GPIO lines exist is a fact about the specific board, unknown to a schema that
-    the M3 server also parses on a different machine entirely -- and since every
-    pin defaults to 0, any cross-field rule here (`dc != rst`, say) would reject
-    this model's own defaults. The backend touches the hardware and gets the real
-    error; guessing earlier only produces a worse one.
+    Two rules are enforced, and they are the same rule seen from either end: a
+    backend's own required field must be present. `virtual` needs `out_dir`, and
+    `gc9a01` needs `dc` and `rst` -- both are statements about the document
+    alone, decidable by anyone holding it.
+
+    Nothing beyond that. The pin *numbers* are deliberately unvalidated: which
+    buses, chip selects and GPIO lines exist is a fact about the specific board,
+    unknown to a schema that the M3 server also parses on a different machine
+    with no view of the rack's wiring. No range check, and no `dc != rst` rule.
+    The backend touches the hardware and gets the real error; guessing earlier
+    only produces a worse one.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -121,15 +128,25 @@ class DisplayConfig(BaseModel):
     backend: Literal["gc9a01", "virtual"]
     spi_bus: int = 0
     spi_cs: int = 0
-    dc: int = 0
-    rst: int = 0
+    # No default, unlike the bus and chip select: those have one obviously right
+    # value (SPI0.0) and a wrong one only misaddresses a device, while DC and RST
+    # are wired wherever the builder had a free header pin. Defaulting both to 0
+    # described a panel driving data/command and reset off GPIO0 -- a board that
+    # does not exist -- and made `DisplayConfig(backend="gc9a01")` a valid
+    # description of nothing, failing hours later as an SPI error on the Pi.
+    dc: int | None = None
+    rst: int | None = None
     hz: int = 40_000_000
     out_dir: str | None = None
 
     @model_validator(mode="after")
-    def _virtual_needs_a_directory(self) -> DisplayConfig:
+    def _backend_carries_its_own_requirements(self) -> DisplayConfig:
         if self.backend == "virtual" and not self.out_dir:
             raise ValueError("a virtual display needs out_dir")
+        if self.backend == "gc9a01":
+            missing = [name for name in ("dc", "rst") if getattr(self, name) is None]
+            if missing:
+                raise ValueError(f"a gc9a01 display needs {' and '.join(missing)}")
         return self
 
 
@@ -138,11 +155,14 @@ class ScreenConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str
-    # Which physical panel in the rack, left to right. Distinct from the list
-    # index so reordering the YAML, or disabling a screen, does not move the
-    # remaining ones.
-    position: int
+    name: str = Field(min_length=1)
+    # Which physical panel in the rack, left to right, counted from 1: the rack
+    # has a first panel, not a zeroth one, and every example config and every
+    # log line written so far says 1. Distinct from the list index so reordering
+    # the YAML, or disabling a screen, does not move the remaining ones.
+    # Uniqueness across `DaemonConfig.screens` is not checked here -- that is a
+    # rule about the set, and it belongs to whatever assigns panels to hardware.
+    position: int = Field(ge=1)
     display: DisplayConfig
     # Quarter turns only: a panel is bolted in at whatever angle its ribbon cable
     # allows, and the worker corrects for that by transposing pixels. An
@@ -150,7 +170,11 @@ class ScreenConfig(BaseModel):
     rotation: Literal[0, 90, 180, 270] = 0
     hflip: bool = False
     enabled: bool = True
-    template: str
+    # Resolved against the built-ins `ors-render` ships and against the *keys* of
+    # `DaemonConfig.templates` -- not against `Template.name`, which the key may
+    # disagree with and which nothing here reconciles. Empty names no built-in
+    # and no key, so it is rejected rather than deferred to a lookup miss.
+    template: str = Field(min_length=1)
     params: dict[str, Any] = Field(default_factory=dict)
     # `None` means "follow `DaemonConfig.night`". A screen sets its own only to
     # differ from the rack -- a lights-out NAS panel that never sleeps, say --
@@ -175,5 +199,7 @@ class DaemonConfig(BaseModel):
     integrations: list[IntegrationConfig] = Field(default_factory=list)
     screens: list[ScreenConfig] = Field(default_factory=list)
     # User-defined templates, by name, alongside the built-ins that `ors-render`
-    # ships. A screen's `template` resolves against both.
+    # ships. A screen's `template` resolves against both -- and against *this
+    # dict's key*, not the `Template.name` inside the value, which may differ and
+    # which nothing here reconciles.
     templates: dict[str, Template] = Field(default_factory=dict)

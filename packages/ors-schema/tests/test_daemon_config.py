@@ -6,6 +6,7 @@ from ors_schema.daemon import (
     NightWindow,
     PrometheusConfig,
     ScreenConfig,
+    TunnelConfig,
 )
 from pydantic import ValidationError
 
@@ -154,9 +155,118 @@ def test_unknown_key_is_rejected_rather_than_ignored():
         DaemonConfig.model_validate({**MINIMAL, "tiemzone": "UTC"})
 
 
+def test_unknown_key_deep_inside_a_template_is_rejected_too():
+    # The root's `extra="forbid"` says nothing about the models below it, and a
+    # config's deepest reachable models are the palettes inside an inline
+    # template's scenes. A typo there is exactly the one a hand-written YAML
+    # makes -- `colour` for `color` -- and ignoring it drops a colour silently:
+    # the panel renders, in the wrong colour, with nothing anywhere saying why.
+    typo = {
+        **MINIMAL,
+        "templates": {
+            "mine": {
+                "name": "mine",
+                "scenes": [
+                    {
+                        "elements": [
+                            {
+                                "type": "ring",
+                                "palette": {
+                                    "kind": "gradient",
+                                    "stops": [{"at": 0.0, "color": "#000000", "colour": "#ffffff"}],
+                                },
+                            }
+                        ]
+                    }
+                ],
+            }
+        },
+    }
+    with pytest.raises(ValidationError) as excinfo:
+        DaemonConfig.model_validate(typo)
+    assert any(error["type"] == "extra_forbidden" for error in excinfo.value.errors())
+
+
 def test_virtual_display_requires_an_out_dir():
     with pytest.raises(ValidationError):
         DisplayConfig.model_validate({"backend": "virtual"})
+
+
+GC9A01 = {"backend": "gc9a01", "spi_bus": 0, "spi_cs": 0, "dc": 6, "rst": 5, "hz": 40_000_000}
+
+
+def test_a_fully_wired_gc9a01_display_needs_no_out_dir():
+    # The other half of the `virtual`/`out_dir` rule: `out_dir` is the virtual
+    # backend's field alone, and demanding it from a real panel would reject
+    # every production screen in the spec's own example config.
+    display = DisplayConfig.model_validate(GC9A01)
+    assert display.out_dir is None
+    assert (display.dc, display.rst) == (6, 5)
+
+
+@pytest.mark.parametrize("missing", ["dc", "rst", None])
+def test_gc9a01_display_requires_its_data_command_and_reset_pins(missing):
+    # No board wires DC and RST to the same line, so a default of 0 for both
+    # describes a panel that cannot exist -- and the mistake surfaces as an SPI
+    # error on the Pi hours later instead of as a config error at load. Which
+    # pins a board has is not this schema's business; that the document names
+    # them at all is.
+    pins = dict(GC9A01)
+    for key in ["dc", "rst"] if missing is None else [missing]:
+        del pins[key]
+    with pytest.raises(ValidationError):
+        DisplayConfig.model_validate(pins)
+
+
+def test_an_integration_that_queries_nothing_is_rejected():
+    with pytest.raises(ValidationError):
+        PrometheusConfig.model_validate(
+            {"name": "prom", "url": "http://localhost:19090", "fields": {}}
+        )
+
+
+@pytest.mark.parametrize("key", ["remote_port", "local_port"])
+@pytest.mark.parametrize("bad", [0, -1, 65536, 70000])
+def test_tunnel_rejects_a_port_outside_the_tcp_range(key, bad):
+    tunnel = {
+        "kubeconfig": "~/k8s-monitor.yaml",
+        "namespace": "monitoring",
+        "remote_port": 9090,
+        "local_port": 19090,
+        key: bad,
+    }
+    with pytest.raises(ValidationError):
+        TunnelConfig.model_validate(tunnel)
+
+
+@pytest.mark.parametrize("key", ["poll_interval", "timeout"])
+@pytest.mark.parametrize("bad", [0, -1.5])
+def test_polling_intervals_and_timeouts_must_be_positive(key, bad):
+    # Zero is not a fast poll or a patient timeout -- it is a busy loop and an
+    # instantly-failing request -- so it is a config mistake, not a limit case.
+    with pytest.raises(ValidationError):
+        PrometheusConfig.model_validate(
+            {
+                "name": "prom",
+                "url": "http://localhost:19090",
+                "fields": {"cpu": {"query": "up"}},
+                key: bad,
+            }
+        )
+
+
+@pytest.mark.parametrize("bad", [0, -3])
+def test_screen_position_counts_panels_from_one(bad):
+    with pytest.raises(ValidationError):
+        ScreenConfig.model_validate({**MINIMAL["screens"][0], "position": bad})
+
+
+@pytest.mark.parametrize("key", ["name", "template"])
+def test_screen_rejects_an_empty_name_or_template(key):
+    # An empty `template` resolves against no built-in and no entry of
+    # `templates`, and an empty `name` labels nothing in a log or in M3's UI.
+    with pytest.raises(ValidationError):
+        ScreenConfig.model_validate({**MINIMAL["screens"][0], key: ""})
 
 
 def test_config_round_trips_through_json():
