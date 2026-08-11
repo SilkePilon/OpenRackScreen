@@ -220,14 +220,22 @@ class ScreenWorker(threading.Thread):
         absorbs what the renderer and the backend do; this catches what it
         cannot -- a store that has broken, a clock that raises.
 
-        Shutdown costs at most one `floor`: the loop is parked in
-        `wait_for_change`, which wakes on new data or on its own timeout and
-        knows nothing about the stop event. That is bounded and quiet, and the
-        alternative -- teaching the store to wake every waiter on shutdown -- is
-        the supervisor's to arrange, since it owns both.
+        Two things end it, and the second is not decoration. The stop event is
+        the ordinary one. A *closed store* is the other: `wait_for_change`
+        answers True the moment a store closes and goes on answering it, which
+        is what releases a worker parked there when the daemon is shutting down
+        -- so a loop that only watched the stop event would come straight back
+        round, find nothing to render, park, be released again, and spin. It
+        costs a whole core per screen with no backend call behind it, which is
+        to say nothing in the status file or the logs would ever show it. Today
+        the supervisor always sets the event first and the window never opens;
+        M3 closing or swapping a store under a running daemon is the caller that
+        opens it, and four pegged cores on a Pi 3B+ is not a symptom anyone
+        could chase back to here. A closed store means no further data is
+        coming, and a worker with nothing left to draw leaves.
         """
         try:
-            while not self._stop_event.is_set():
+            while not self._stop_event.is_set() and not self._store.closed:
                 try:
                     self.tick()
                 except Exception:

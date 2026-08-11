@@ -118,6 +118,26 @@ class SnapshotStore:
                 health=dict(self._health),
             )
 
+    @property
+    def closed(self) -> bool:
+        """Whether this store is finished: no further data will arrive through it.
+
+        Public because a waiter cannot act on `wait_for_change` alone. That call
+        answers "there may be something to do", and for a closed store the honest
+        answer is yes and immediately -- so a loop that treats it as its only
+        signal spins at the speed of the condition variable. Measured at 0.502s
+        of CPU in 0.5s of wall clock, one whole core per screen, with no backend
+        call and no render behind it: nothing in the status file, the logs or the
+        render counters would show it.
+
+        So the flag itself is readable, and a loop that has nothing to draw
+        without new data reads it and leaves. `close` is sticky and one-way,
+        which is what makes that safe to act on: a store that has closed cannot
+        re-open, so there is nothing to wait around for.
+        """
+        with self._condition:
+            return self._closed
+
     def close(self) -> None:
         """Release every waiter, now and for good. Idempotent.
 
@@ -152,10 +172,14 @@ class SnapshotStore:
         condition which prompted the notify() call may no longer hold true" --
         a bare `wait` would report that non-event as a change and cost a render.
 
-        A closed store answers True as well. The caller is a loop that re-tests
-        its own stop condition on the way round, so "there may be something to
-        do" is the honest answer to give it; returning False would send a worker
-        that is shutting down back round for another full timeout.
+        A closed store answers True as well, and immediately, for as long as it
+        exists -- that stickiness is what releases a worker parked here when the
+        daemon is shutting down, and it cannot be traded away without giving the
+        shutdown back its four-second delay. It is therefore *not* a signal a
+        caller may loop on: "there may be something to do" is true here forever,
+        so a loop that comes straight back gets a busy wait rather than a wait.
+        `closed` is the flag such a caller reads on its way round, and the
+        screen worker's loop does exactly that.
         """
         with self._condition:
             return self._condition.wait_for(

@@ -187,6 +187,17 @@ def test_close_stays_closed_so_a_release_cannot_be_missed():
     assert store.wait_for_change(version=0, timeout=0.0) is True
 
 
+def test_a_store_says_whether_it_has_been_closed():
+    """Public because `wait_for_change` alone cannot be looped on: it answers
+    True for a closed store immediately and forever, so a caller that treats
+    that as news busy-waits. This is the flag such a caller reads instead."""
+    store = SnapshotStore()
+    assert store.closed is False
+
+    store.close()
+    assert store.closed is True
+
+
 def test_close_leaves_the_store_readable_and_writable():
     """It ends the waiting, not the data: a status write outlives the threads."""
     store = SnapshotStore()

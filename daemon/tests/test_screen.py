@@ -633,6 +633,50 @@ def test_a_wait_that_blows_up_does_not_take_the_thread_down() -> None:
     assert display.closed == 1
 
 
+def test_a_worker_whose_store_is_closed_leaves_rather_than_spinning() -> None:
+    """A closed store is not a reason to go round again, and it never stops being one.
+
+    `wait_for_change` answers True the instant a store closes and goes on
+    answering it -- the stickiness is what releases a worker parked there on
+    shutdown -- so a loop watching only the stop event comes straight back,
+    finds nothing to render, parks, is released, and spins: 0.502s of CPU in
+    0.5s of wall clock, one whole core per screen, with no backend call and no
+    render behind it. Nothing in the status file, the logs or the render
+    counters would show it. Today only `Supervisor.stop` closes a store and it
+    sets the event first; M3 swapping a config under a running daemon is the
+    caller that closes one without stopping anything.
+    """
+    worker, store, display = make()
+    store.close()
+
+    worker.start()
+    worker.join(WAIT)
+
+    assert not worker.is_alive(), "the loop is still going round on a closed store"
+    assert display.closed == 1, "and it closed its panel on the way out, as ever"
+
+
+def test_closing_the_store_under_a_parked_worker_ends_it() -> None:
+    """The same thing from the other side: closed while the worker is already
+    parked in `wait_for_change`, which is where it spends nearly all its life."""
+    display = RecordingDisplay()
+    drawn = threading.Event()
+    display.on_show = drawn.set
+    worker, store, _ = make(display=display)
+
+    worker.start()
+    try:
+        publish(store)
+        assert drawn.wait(WAIT), "the loop never drew anything"
+        store.close()
+        worker.join(WAIT)
+
+        assert not worker.is_alive()
+    finally:
+        worker._stop_event.set()
+        worker.join(WAIT)
+
+
 def test_the_thread_draws_until_it_is_told_to_stop() -> None:
     display = RecordingDisplay()
     drawn = threading.Event()
