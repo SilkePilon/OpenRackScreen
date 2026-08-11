@@ -154,6 +154,49 @@ def test_wait_for_change_times_out_when_nothing_happens():
     assert store.wait_for_change(version=0, timeout=0.01) is False
 
 
+def test_close_releases_a_waiter_from_another_thread():
+    """Shutdown's release. A screen worker spends nearly all of its life parked
+    here, and nothing else can cut that wait short: the stop event it is holding
+    is not what it is waiting on."""
+    store = SnapshotStore()
+    woke = threading.Event()
+
+    def waiter() -> None:
+        if store.wait_for_change(version=0, timeout=5.0):
+            woke.set()
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    store.close()
+    thread.join(timeout=5.0)
+
+    assert woke.is_set()
+
+
+def test_close_stays_closed_so_a_release_cannot_be_missed():
+    """Sticky on purpose, and it is the whole reason this is not a notify.
+
+    A one-shot wake races the waiter it is meant to release: a worker that had
+    checked its stop event and not yet reached the condition would park for a
+    full floor afterwards, which is the delay this exists to remove.
+    """
+    store = SnapshotStore()
+    store.close()
+
+    assert store.wait_for_change(version=0, timeout=0.0) is True
+    assert store.wait_for_change(version=0, timeout=0.0) is True
+
+
+def test_close_leaves_the_store_readable_and_writable():
+    """It ends the waiting, not the data: a status write outlives the threads."""
+    store = SnapshotStore()
+    store.register("prom")
+    store.close()
+    store.put("prom", {"cpu": 1.0}, latency_ms=1.0, now=NOW)
+
+    assert store.read().data == {"prom": {"cpu": 1.0}}
+
+
 def test_a_failure_does_not_satisfy_a_worker_waiting_for_new_data():
     store = SnapshotStore()
     store.register("prom")
