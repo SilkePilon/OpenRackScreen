@@ -3,24 +3,33 @@ name = "openrackscreen"
 version = "0.1.0"
 description = "Configurable monitoring displays for server racks"
 requires-python = ">=3.11"
-dependencies = ["ors-schema", "ors-render"]
+dependencies = ["ors-schema", "ors-render", "ors-daemon"]
 
 [tool.uv]
 package = false
 
 [tool.uv.workspace]
-members = ["packages/*"]
+# `daemon/` sits outside the `packages/*` glob, so it needs its own entry.
+members = ["packages/*", "daemon"]
 
 [tool.uv.sources]
 ors-schema = { workspace = true }
 ors-render = { workspace = true }
+ors-daemon = { workspace = true }
 
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [tool.pytest.ini_options]
-testpaths = ["packages/ors-schema/tests", "packages/ors-render/tests"]
-addopts = "-q"
+testpaths = ["packages/ors-schema/tests", "packages/ors-render/tests", "daemon/tests"]
+# `packages/ors-render/tests/` and `daemon/tests/` both carry an `__init__.py`,
+# so under pytest's default `prepend` mode both resolve to a top-level package
+# literally named `tests`: whichever is imported first wins and the second's
+# modules raise `ModuleNotFoundError: No module named 'tests.test_logging'`.
+# `importlib` derives each module name from its full path instead, so the two
+# coexist and test-file basenames need not be unique across the workspace.
+# There is no ini key for it -- `--import-mode` is command-line only.
+addopts = "-q --import-mode=importlib"
 
 [tool.ruff]
 line-length = 100
