@@ -346,3 +346,14 @@ def test_build_display_reports_a_missing_hardware_dependency_clearly():
             build_display(config, "CPU")
     else:
         pytest.skip("luma is installed; the import-error path cannot be exercised here")
+
+
+def test_a_frame_that_is_not_panel_sized_is_refused_rather_than_written(fake_panel):
+    display = build_driver(fake_panel)
+    fake_panel.log.clear()
+
+    for size in ((120, 120), (240, 239), (480, 480)):
+        with pytest.raises(DisplayError, match="240x240"):
+            display.show(Image.new("RGB", size, (255, 0, 0)))
+
+    assert fake_panel.log == [], "a refused frame must not reach the bus at all"

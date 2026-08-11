@@ -62,6 +62,9 @@ _SLEEP_IN = 0x10
 _SLEEP_OUT = 0x11
 _DISPLAY_OFF = 0x28
 _DISPLAY_ON = 0x29
+_PANEL_SIZE = 240
+"""The panel is fixed at 240x240; the driver writes whole frames of that size."""
+
 _COLUMN_ADDRESS = 0x2A
 _PAGE_ADDRESS = 0x2B
 _MEMORY_WRITE = 0x2C
@@ -186,6 +189,14 @@ class GC9A01Display:
         # kept here and compared -- the protocol allows it, since a caller cannot
         # observe what reaches the bus -- but nothing needs it yet.
         width, height = image.size
+        if (width, height) != (_PANEL_SIZE, _PANEL_SIZE):
+            # Refuse rather than write: a smaller frame lands at the origin and
+            # leaves the rest of the glass holding the last one -- a quarter-blank
+            # panel in a rack, which reads as a hardware fault and is debugged as
+            # one. A larger frame runs the address window past the panel's bounds.
+            raise DisplayError(
+                f"expected a {_PANEL_SIZE}x{_PANEL_SIZE} frame, got {width}x{height}"
+            )
         self._command(_COLUMN_ADDRESS, 0, 0, (width - 1) >> 8, (width - 1) & 0xFF)
         self._command(_PAGE_ADDRESS, 0, 0, (height - 1) >> 8, (height - 1) & 0xFF)
         self._command(_MEMORY_WRITE)
