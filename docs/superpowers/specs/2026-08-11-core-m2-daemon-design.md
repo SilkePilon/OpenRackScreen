@@ -274,7 +274,7 @@ Per the Core spec §9, made concrete:
   "config_version": 1,
   "screens": [
     {"name": "CPU", "scene": "default", "state": "awake",
-     "last_render": "2026-08-11T21:14:02Z", "renders_per_s": 0.8}
+     "last_render": "2026-08-11T21:14:02Z", "renders": 4218}
   ],
   "integrations": [
     {"name": "prom", "state": "healthy", "latency_ms": 42,
@@ -284,6 +284,11 @@ Per the Core spec §9, made concrete:
 ```
 
 M3's link client reports this structure upstream verbatim.
+
+`renders` is a lifetime counter, not a rate. A rate needs history the daemon
+deliberately does not keep, and a lifetime average would read as a current
+figure while being dominated by whatever the panel did hours ago — two samples
+of a counter give a true rate to anyone who wants one, including M3.
 
 ## 9. Non-goals for M2
 
