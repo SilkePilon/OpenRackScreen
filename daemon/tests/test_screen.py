@@ -249,6 +249,28 @@ def test_leaving_the_night_window_wakes_the_panel_and_renders() -> None:
     assert len(display.images) == 1
 
 
+def test_a_night_window_narrower_than_the_floor_still_draws_on_the_way_out() -> None:
+    # A one-minute window under a five-minute floor: legal config, and exactly
+    # what someone testing their night window sets. Nothing else moves -- the
+    # version, the scene and the floor are all where they were before the
+    # window -- so waking is the only thing that can put a frame up.
+    clock = FakeClock(datetime(2026, 8, 11, 22, 59, 30, tzinfo=UTC))
+    worker, store, display = make(
+        night=NightWindow(start="23:00", end="23:01"), clock=clock, floor=300.0
+    )
+    publish(store)
+    worker.tick()
+    clock.advance(60)
+    worker.tick()
+    assert worker.asleep is True
+
+    clock.advance(60)
+    worker.tick()
+
+    assert display.wakes == 1
+    assert len(display.images) == 2, "leaving the window draws; it does not wait for the floor"
+
+
 def test_a_per_screen_override_replaces_the_global_window() -> None:
     clock = FakeClock(NIGHT)
     worker, store, display = make(night=NIGHT_WINDOW, clock=clock)

@@ -156,6 +156,13 @@ class ScreenWorker(threading.Thread):
                     # floor rather than on the next nightfall.
                     return
                 self.asleep = False
+                # Nothing is on the glass -- the panel has been dark -- so no
+                # selection stands behind it, and the next test cannot find one
+                # unchanged. Drawing on the way out is the stated behaviour of
+                # leaving the window, and it must not depend on the floor
+                # having elapsed: with a window narrower than the floor, and no
+                # new data across it, nothing else would put a frame up.
+                self._selected_scene = None
 
             snapshot = self._store.read()
             scene, name, context = self._select(snapshot)
