@@ -26,13 +26,25 @@ class FakeClock:
     """A clock that moves only when a test moves it."""
 
     def __init__(self, start: datetime) -> None:
+        if start.tzinfo is None:
+            raise ClockError("FakeClock needs an aware start; a naive one is no wall time anywhere")
         self._now = start
 
     def __call__(self) -> datetime:
         return self._now
 
     def advance(self, seconds: float) -> None:
-        self._now = self._now + timedelta(seconds=seconds)
+        """Move forward by `seconds` of *elapsed* time, not of wall clock.
+
+        The distinction only shows up across a DST transition, and that is
+        exactly where it matters: `seconds_until_boundary` returns elapsed
+        seconds, so a test that advances by its answer must land on the
+        boundary. Adding a `timedelta` to an aware datetime does naive
+        arithmetic that keeps the offset fixed -- advancing 25200s across the
+        spring-forward night would land an hour short of the configured wake.
+        """
+        zone = self._now.tzinfo
+        self._now = (self._now.astimezone(UTC) + timedelta(seconds=seconds)).astimezone(zone)
 
 
 def _parse(hhmm: str) -> time:

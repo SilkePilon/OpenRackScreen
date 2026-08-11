@@ -137,3 +137,24 @@ def test_system_clock_is_timezone_aware_and_rejects_a_bad_zone():
     assert system_clock("Europe/Amsterdam")().tzinfo is not None
     with pytest.raises(ClockError):
         system_clock("Mars/Olympus_Mons")
+
+
+def test_advancing_by_the_returned_wait_lands_on_the_boundary_across_a_dst_gap():
+    clock = FakeClock(datetime(2026, 3, 28, 23, 0, tzinfo=AMS))
+    clock.advance(seconds_until_boundary(clock(), WRAPS))
+
+    assert (clock().hour, clock().minute) == (7, 0)
+    assert in_window(clock(), WRAPS) is False
+
+
+def test_advancing_by_the_returned_wait_lands_on_the_boundary_across_a_dst_overlap():
+    clock = FakeClock(datetime(2026, 10, 24, 23, 0, tzinfo=AMS))
+    clock.advance(seconds_until_boundary(clock(), WRAPS))
+
+    assert (clock().hour, clock().minute) == (7, 0)
+    assert in_window(clock(), WRAPS) is False
+
+
+def test_a_fake_clock_refuses_a_naive_start():
+    with pytest.raises(ClockError):
+        FakeClock(datetime(2026, 8, 11, 12, 0))
