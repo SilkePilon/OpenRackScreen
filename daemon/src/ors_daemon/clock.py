@@ -11,7 +11,7 @@ Clock = Callable[[], datetime]
 
 
 class ClockError(Exception):
-    """Raised for a timezone the host cannot resolve."""
+    """Raised for a timezone the host cannot resolve, or a time carrying none."""
 
 
 def system_clock(timezone: str) -> Clock:
@@ -41,7 +41,13 @@ def _parse(hhmm: str) -> time:
 
 
 def in_window(now: datetime, window: NightWindow) -> bool:
-    """True when `now` falls inside the window. A start after the end wraps midnight."""
+    """True when `now` falls inside the window. A start after the end wraps midnight.
+
+    Compared on the wall clock, which is what the window is written in: across a
+    DST shift the repeated hour reads as night on both passes, and the skipped
+    hour simply never arrives. Neither needs a special case -- the panels are
+    dark whenever the clock on the wall says they should be.
+    """
     if not window.enabled:
         return False
     start, end = _parse(window.start), _parse(window.end)
@@ -54,12 +60,18 @@ def in_window(now: datetime, window: NightWindow) -> bool:
 
 
 def seconds_until_boundary(now: datetime, window: NightWindow) -> float:
-    """Seconds until the window is next entered or left. `inf` when disabled."""
+    """Seconds until the window is next entered or left, as elapsed time.
+
+    `inf` when there is no boundary to wait for: a disabled window, or one whose
+    start equals its end, both of which `in_window` reads as never night.
+    """
     if not window.enabled:
         return float("inf")
     start, end = _parse(window.start), _parse(window.end)
     if start == end:
         return float("inf")
+    if now.utcoffset() is None:
+        raise ClockError(f"need a timezone-aware time, got naive {now.isoformat()}")
     target = end if in_window(now, window) else start
     candidate = now.replace(hour=target.hour, minute=target.minute, second=0, microsecond=0)
     # Two comparisons on two different clocks, deliberately. *Which* occurrence of

@@ -118,6 +118,14 @@ def test_the_wait_is_always_positive_across_a_transition_day(day, window):
             assert seconds_until_boundary(now, window) > 0
 
 
+def test_a_naive_now_is_refused_rather_than_read_against_the_host_zone():
+    # The zone comes from config, never from the host. A naive `now` has no zone
+    # to answer an elapsed-time question with, and silently borrowing the host's
+    # is how the panels end up blanking an hour out on a mis-set machine.
+    with pytest.raises(ClockError):
+        seconds_until_boundary(datetime(2026, 8, 11, 2, 0), WRAPS)
+
+
 def test_fake_clock_advances_only_when_told():
     clock = FakeClock(at(12, 0))
     assert clock() == at(12, 0)
