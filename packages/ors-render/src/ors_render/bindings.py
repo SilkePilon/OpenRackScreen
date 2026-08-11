@@ -47,9 +47,20 @@ def _f_bytes(value: Any) -> Any:
 def _f_duration(value: Any) -> Any:
     if value is None:
         return None
-    seconds = int(value)
+    # Finiteness first, and through `float` rather than `int`. `+Inf` is what
+    # Prometheus emits for an ETA that has no horizon and what `json.loads`
+    # gives back for `Infinity`, so it is ordinary input for the very field
+    # `torrent.json` draws (`{{qbit.min_eta | duration}}`) -- and `int(inf)`
+    # raises `OverflowError` *before* the out-of-range branch written for
+    # exactly that reading can answer "inf". A NaN is not a long ETA but no
+    # reading at all, so it degrades to `None` like any other unusable value
+    # instead of claiming the horizon.
+    seconds = float(value)
+    if math.isnan(seconds):
+        return None
     if seconds < 0 or seconds > 864000:
         return "inf"
+    seconds = int(seconds)
     if seconds < 60:
         return f"{seconds}s"
     if seconds < 3600:
@@ -113,16 +124,28 @@ def _apply(inner: str, data: Mapping[str, Any]) -> Any:
         args = [a.strip() for a in raw_args.split(",")] if raw_args else []
         try:
             value = func(value, *args)
-        except (TypeError, ValueError):
+        except Exception:  # any failure of an untrusted input is bad input
             # Both inputs to a filter are untrusted: the value comes from live
             # upstream data whose shape can change, and the arguments are raw
             # text from the scene. So a wrong-type value (`{{list | round:0}}`),
             # an unparseable argument (`round:abc`) and a wrong arity
             # (`round:1,2,3`) are all bad input and degrade to empty. This does
-            # mean a genuine TypeError/ValueError bug inside a filter would
-            # render blank instead of crashing; that is accepted here because
-            # rendering must never take the screen down, and each filter's own
-            # behaviour is pinned by tests.
+            # mean a genuine bug inside a filter would render blank instead of
+            # crashing; that is accepted here because rendering must never take
+            # the screen down, and each filter's own behaviour is pinned by
+            # tests.
+            #
+            # The guard is written as "anything at all" rather than as a list of
+            # the exception types seen so far, because that argument is about the
+            # *provenance* of the inputs and not about which failures have been
+            # met yet. `ors_render.expr.evaluate` catches `Exception` around the
+            # evaluation of the same untrusted expression for the same reason,
+            # and the asymmetry between the two is what let `OverflowError`
+            # through here: it derives from `ArithmeticError`, not `ValueError`,
+            # so `{{1e308 + 1e308 | round:0}}` -- and every `+Inf` Prometheus
+            # emits, and every integer past 308 digits a feed can send -- used to
+            # leave this function as a traceback. `BaseException` is deliberately
+            # not caught: a `KeyboardInterrupt` is not bad data.
             value = None
     return value
 
@@ -161,7 +184,13 @@ def resolve_number(spec: Any, data: Mapping[str, Any], default: float = 0.0) -> 
     value = resolve(spec, data)
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except Exception:  # any failure of an untrusted input is bad input
+        # Same trust boundary, and the same reasoning, as `_apply` above: the
+        # value is whatever the feed sent. `TypeError`/`ValueError` covered the
+        # shapes seen at the time and missed the arithmetic ones -- a JSON
+        # integer past 308 digits gives `OverflowError: int too large to convert
+        # to float`, which reached `ring.value` and every other `NumberSpec`
+        # field as a traceback.
         return default
     # Prometheus emits NaN, and `float()` also parses the literals "nan",
     # "inf" and "-inf" out of scene text. A non-finite number is not a usable

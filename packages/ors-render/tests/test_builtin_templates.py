@@ -4,6 +4,8 @@ These goldens are M1's acceptance test: every screen the Python script on the Pi
 draws today has to come back out of JSON that ships in the wheel.
 """
 
+import json
+
 import pytest
 from ors_render import RenderContext, render_screen, select_scene
 from ors_render.templates import load_builtin_templates
@@ -113,6 +115,31 @@ def test_builtin_templates_reproduce_the_original_screens(
     template = load_builtin_templates()[template_name]
     ctx = RenderContext(data={**data, "params": params})
     assert_golden(render_screen(template.scenes, ctx), golden)
+
+
+def test_the_torrent_screen_survives_an_infinite_eta():
+    """A stalled download has no horizon, and `json.loads` parses `Infinity`.
+
+    `{{qbit.min_eta | duration}}` is a binding that *ships*, so an infinite ETA
+    is ordinary upstream input rather than something a caller had to construct:
+    it has to render the `inf` the filter's own out-of-range branch was written
+    for, which is exactly what an `int()` ahead of that branch made unreachable.
+    """
+    template = load_builtin_templates()["torrent"]
+
+    def _screen(min_eta):
+        ctx = RenderContext(
+            data={
+                "prom": PROM,
+                "qbit": {**QBIT, "min_eta": min_eta},
+                "params": {"title": "TORRENT"},
+            }
+        )
+        return render_screen(template.scenes, ctx).tobytes()
+
+    # 864001 seconds is over the ten-day horizon, so the two screens are the same
+    # panel: the word `inf` where the countdown goes.
+    assert _screen(json.loads("Infinity")) == _screen(864001)
 
 
 def test_health_template_switches_to_downloads_when_healthy_and_downloading():

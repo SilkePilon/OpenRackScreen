@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from ors_render.bindings import FILTERS, resolve, resolve_list, resolve_number, resolve_text
 
@@ -178,3 +180,115 @@ def test_every_filter_but_default_passes_a_missing_value_through(name):
     # Only `default` is allowed to turn None into something; the rest must stay
     # None so a later `| default:--` in the same chain can still fire.
     assert FILTERS[name](None) is None
+
+
+# `+Inf` is what Prometheus emits for a counter that has not been scraped long
+# enough to have a rate, and `json.loads` parses `Infinity` without complaint, so
+# a non-finite value in `data` is ordinary upstream input rather than something a
+# caller had to construct by hand. `OverflowError` is neither a `TypeError` nor a
+# `ValueError` -- it derives from `ArithmeticError` -- so it used to walk straight
+# out of the filter guard and take the whole panel down.
+INFINITE = json.loads('{"x": Infinity, "neg": -Infinity, "nan": NaN}')
+
+# 400 digits: a JSON integer larger than any float, which `float()` refuses with
+# `OverflowError: int too large to convert to float` rather than by returning
+# `inf`. Also reachable straight from a feed.
+HUGE_INT = json.loads('{"n": ' + "9" * 400 + "}")
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        # No data reference at all: the arithmetic is in the scene's own source.
+        "{{1e308 + 1e308 | round:0}}",
+        "{{-1e308 - 1e308 | round:0}}",
+    ],
+)
+def test_arithmetic_that_overflows_in_the_scene_source_renders_empty(spec):
+    assert resolve_text(spec, DATA) == ""
+
+
+@pytest.mark.parametrize("field", ["x", "neg", "nan"])
+@pytest.mark.parametrize("filter_spec", ["round:0", "round:-3"])
+def test_a_non_finite_reading_cannot_be_rounded_and_renders_empty(field, filter_spec):
+    # `round` returns an `int` at zero or fewer digits, and no infinity or NaN
+    # has one -- so there is no number to show and the field goes blank, exactly
+    # as a missing one does.
+    assert resolve_text(f"{{{{{field} | {filter_spec}}}}}", INFINITE) == ""
+
+
+@pytest.mark.parametrize("field", ["x", "neg", "nan"])
+@pytest.mark.parametrize("filter_spec", ["pct", "pct:2", "bytes", "round:1"])
+def test_a_non_finite_reading_never_raises_out_of_a_filter(field, filter_spec):
+    # The formatting filters have a float representation for these ("inf%",
+    # "nan GB"), which is not pretty but is a reading the panel can show and is
+    # not this fix's business to change. What matters is that none of them
+    # raises.
+    assert isinstance(resolve_text(f"{{{{{field} | {filter_spec}}}}}", INFINITE), str)
+
+
+@pytest.mark.parametrize("filter_spec", ["round:0", "round:-3", "pct", "bytes", "duration"])
+def test_an_integer_too_large_for_a_float_degrades_through_every_filter(filter_spec):
+    assert resolve_text(f"{{{{n | {filter_spec}}}}}", HUGE_INT) == ""
+
+
+def test_resolve_number_falls_back_for_a_number_no_float_can_hold():
+    # `ring.value` and every other `NumberSpec` field goes through here, so this
+    # is the path a 400-digit integer takes to the geometry.
+    assert resolve_number("{{n}}", HUGE_INT, default=-1.0) == -1.0
+
+
+def test_duration_reports_an_infinite_eta_as_inf():
+    # `torrent.json` draws `{{qbit.min_eta | duration}}`, and a torrent with no
+    # progress has an infinite ETA. The out-of-range branch was written for
+    # exactly this reading but sat *after* an `int()` that raised on it first.
+    assert FILTERS["duration"](float("inf")) == "inf"
+    assert FILTERS["duration"](float("-inf")) == "inf"
+    assert resolve_text("{{x | duration}}", INFINITE) == "inf"
+    assert resolve_text("{{neg | duration}}", INFINITE) == "inf"
+
+
+def test_duration_reports_a_reading_that_is_not_a_number_as_nothing():
+    # NaN is not "beyond the horizon", it is no reading at all, so it degrades to
+    # empty like any other unusable value rather than claiming an infinite ETA.
+    assert FILTERS["duration"](float("nan")) is None
+    assert resolve_text("{{nan | duration}}", INFINITE) == ""
+
+
+class _Hostile:
+    """A data value whose every dunder raises, as a stand-in for a broken feed."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("boom")
+
+    def __float__(self) -> float:
+        raise RuntimeError("boom")
+
+    def __eq__(self, other: object) -> bool:
+        raise RuntimeError("boom")
+
+    def __len__(self) -> int:
+        raise RuntimeError("boom")
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "{{bad | upper}}",  # _stringify -> str()
+        "{{bad | lower}}",
+        "{{bad | round:0}}",  # float()
+        "{{bad | pct}}",
+        "{{bad | bytes}}",
+        "{{bad | duration}}",
+        "{{bad | trunc:4}}",  # str() then len()
+        "{{bad | default:--}}",  # == ""
+    ],
+)
+def test_a_value_whose_dunders_raise_degrades_rather_than_taking_the_panel_down(spec):
+    # `_apply`'s guard is a *trust boundary*, not a list of the exceptions seen so
+    # far: both the value and the filter arguments are untrusted, which is the
+    # same argument `ors_render.expr.evaluate` makes when it catches `Exception`.
+    # Enumerating exception types is what let `OverflowError` through.
+    assert resolve_text(spec, {"bad": _Hostile()}) == ""
