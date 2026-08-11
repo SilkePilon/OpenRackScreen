@@ -16,6 +16,9 @@ from PIL import Image
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 NIGHT = datetime(2026, 8, 11, 23, 30, tzinfo=UTC)
+NIGHT_WINDOW = NightWindow(start="23:00", end="07:00")
+UNTIL_MORNING = 7.5 * 3600
+"""Seconds from `NIGHT` to the end of `NIGHT_WINDOW`."""
 WAIT = 5.0
 """Generous on purpose: a passing test never spends it, only a broken one does."""
 
@@ -23,12 +26,21 @@ RING_PARAMS = {"title": "CPU", "value": "{{prom.cpu}}", "big": "42%"}
 
 
 class RecordingDisplay:
-    def __init__(self, fail_times: int = 0) -> None:
+    """A panel that counts what it was asked to do, and can refuse any of it.
+
+    Every backend entry point can fail, because on real hardware every one of
+    them is the same SPI bus: `sleep` and `wake` reach it through the same
+    `_command` that `show` does, and raise the same `DisplayError`.
+    """
+
+    def __init__(self, fail_times: int = 0, fail_sleeps: int = 0, fail_wakes: int = 0) -> None:
         self.images: list[Image.Image] = []
         self.sleeps = 0
         self.wakes = 0
         self.closed = 0
         self.fail_times = fail_times
+        self.fail_sleeps = fail_sleeps
+        self.fail_wakes = fail_wakes
         self.on_show: Callable[[], None] | None = None
 
     def show(self, image: Image.Image) -> None:
@@ -41,12 +53,32 @@ class RecordingDisplay:
 
     def sleep(self) -> None:
         self.sleeps += 1
+        if self.fail_sleeps:
+            self.fail_sleeps -= 1
+            raise OSError("SPI command 0x10 failed")
 
     def wake(self) -> None:
         self.wakes += 1
+        if self.fail_wakes:
+            self.fail_wakes -= 1
+            raise OSError("SPI command 0x11 failed")
 
     def close(self) -> None:
         self.closed += 1
+
+
+class RecordingStop:
+    """A stop event that records what it was asked to wait for, and waits for none of it."""
+
+    def __init__(self) -> None:
+        self.waits: list[float | None] = []
+
+    def is_set(self) -> bool:
+        return False
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.waits.append(timeout)
+        return False
 
 
 class LockProbeDisplay(RecordingDisplay):
@@ -193,7 +225,7 @@ def test_a_clock_stepped_backwards_does_not_freeze_the_floor() -> None:
 
 def test_entering_the_night_window_sleeps_the_panel_and_stops_rendering() -> None:
     clock = FakeClock(NIGHT)
-    worker, store, display = make(night=NightWindow(start="23:00", end="07:00"), clock=clock)
+    worker, store, display = make(night=NIGHT_WINDOW, clock=clock)
     publish(store)
 
     worker.tick()
@@ -206,7 +238,7 @@ def test_entering_the_night_window_sleeps_the_panel_and_stops_rendering() -> Non
 
 def test_leaving_the_night_window_wakes_the_panel_and_renders() -> None:
     clock = FakeClock(NIGHT)
-    worker, store, display = make(night=NightWindow(start="23:00", end="07:00"), clock=clock)
+    worker, store, display = make(night=NIGHT_WINDOW, clock=clock)
     publish(store)
     worker.tick()
 
@@ -219,13 +251,58 @@ def test_leaving_the_night_window_wakes_the_panel_and_renders() -> None:
 
 def test_a_per_screen_override_replaces_the_global_window() -> None:
     clock = FakeClock(NIGHT)
-    worker, store, display = make(night=NightWindow(start="23:00", end="07:00"), clock=clock)
+    worker, store, display = make(night=NIGHT_WINDOW, clock=clock)
     worker._night = NightWindow(enabled=False)
     publish(store)
     worker.tick()
 
     assert display.sleeps == 0
     assert len(display.images) == 1
+
+
+def test_a_failing_sleep_faults_the_screen_instead_of_spinning() -> None:
+    clock = FakeClock(NIGHT)
+    display = RecordingDisplay(fail_sleeps=99)
+    worker, store, _ = make(display=display, night=NIGHT_WINDOW, clock=clock)
+    publish(store)
+
+    for _ in range(4):
+        worker.tick()
+
+    assert worker.faulted is True
+    assert worker.asleep is False, "a sleep that failed did not put the panel to sleep"
+    assert display.sleeps == 3, "retried up to the fault latch, then left alone"
+
+
+def test_a_failing_wake_faults_the_screen_rather_than_stranding_it_in_the_dark() -> None:
+    clock = FakeClock(NIGHT)
+    display = RecordingDisplay(fail_wakes=99)
+    worker, store, _ = make(display=display, night=NIGHT_WINDOW, clock=clock)
+    publish(store)
+    worker.tick()
+    clock.advance(9 * 3600)
+
+    for _ in range(4):
+        worker.tick()
+
+    assert worker.faulted is True, "a screen nobody can wake must not report as healthy"
+    assert display.wakes == 3
+    assert display.images == []
+
+
+def test_a_faulted_screen_is_not_even_put_to_sleep() -> None:
+    clock = FakeClock(NOW)
+    display = RecordingDisplay(fail_times=99)
+    worker, store, _ = make(display=display, night=NIGHT_WINDOW, clock=clock)
+    publish(store)
+    for _ in range(3):
+        worker.tick()
+    assert worker.faulted is True
+
+    clock.advance(11.5 * 3600)
+    worker.tick()
+
+    assert display.sleeps == 0, "sleep is the same bus write that just failed three times"
 
 
 def test_a_display_failure_retries_then_faults_the_screen_without_raising() -> None:
@@ -257,6 +334,19 @@ def test_identify_renders_the_ordinal_immediately() -> None:
 
     assert worker.current_scene == "identify"
     assert len(display.images) == 1
+
+
+def test_the_next_tick_takes_the_panel_back_off_the_identify_digit() -> None:
+    clock = FakeClock(NOW)
+    worker, store, display = make(clock=clock)
+    publish(store)
+    worker.tick()
+    worker.identify("2")
+
+    worker.tick()
+
+    assert worker.current_scene == "default", "the digit stands for one loop wait, not forever"
+    assert len(display.images) == 3
 
 
 def test_identify_leaves_a_faulted_backend_alone() -> None:
@@ -315,12 +405,44 @@ def test_the_same_render_failure_is_logged_once_not_once_per_frame(
     publish(store)
 
     with caplog.at_level(logging.ERROR, logger="ors_daemon.screen"):
-        worker.tick()
-        worker.tick()
-        worker.tick()
+        for cpu in (43.0, 44.0, 45.0):
+            worker.tick()
+            publish(store, cpu=cpu)
 
     assert len(display.images) == 3, "the error scene is repainted, so this is not deduplication"
     assert len(caplog.records) == 1
+
+
+def test_an_erroring_screen_is_paced_like_a_healthy_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    worker, store, display = make()
+    monkeypatch.setattr("ors_daemon.screen.render_scene", _breaks_on("default"))
+    publish(store)
+
+    worker.tick()
+    worker.tick()
+    worker.tick()
+
+    assert len(display.images) == 1, (
+        "the error frame is on the glass, but the selection that produced it has not moved"
+    )
+
+
+def test_repeated_identical_backend_failures_are_logged_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    display = RecordingDisplay(fail_times=99)
+    worker, store, _ = make(display=display)
+    publish(store)
+
+    with caplog.at_level(logging.WARNING, logger="ors_daemon.screen"):
+        for _ in range(3):
+            worker.tick()
+
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert [record.message for record in caplog.records if record.levelno == logging.ERROR] == [
+        "screen faulted"
+    ]
 
 
 def test_a_failure_that_comes_back_after_a_good_frame_is_logged_again(
@@ -333,12 +455,13 @@ def test_a_failure_that_comes_back_after_a_good_frame_is_logged_again(
         monkeypatch.setattr("ors_daemon.screen.render_scene", _breaks_on("default"))
         worker.tick()
         monkeypatch.setattr("ors_daemon.screen.render_scene", render_scene)
+        # New data before each of the two frames below: an erroring screen is
+        # paced like any other, so without a reason to redraw there is nothing
+        # to recover from and then nothing to fail again.
+        publish(store, cpu=43.0)
         worker.tick()
         monkeypatch.setattr("ors_daemon.screen.render_scene", _breaks_on("default"))
-        # New data, because the good frame above left the scene and the version
-        # where they were and the floor has not moved: without it there is
-        # nothing to redraw and so nothing to fail.
-        publish(store, cpu=43.0)
+        publish(store, cpu=44.0)
         worker.tick()
 
     assert len(caplog.records) == 2, "a recurrence after a recovery is a new incident"
@@ -380,6 +503,36 @@ def test_a_worker_that_cannot_draw_waits_on_the_clock_not_on_the_data(state: str
     worker._stop_event.set()
 
     worker._wait()
+
+
+def test_a_sleeping_worker_parks_until_the_window_closes() -> None:
+    clock = FakeClock(NIGHT)
+    worker, store, _ = make(night=NIGHT_WINDOW, clock=clock)
+    worker.tick()
+    assert worker.asleep is True
+    stop = RecordingStop()
+    worker._stop_event = stop  # type: ignore[assignment]
+    store.wait_for_change = _forbidden  # type: ignore[method-assign]
+
+    worker._wait()
+
+    assert stop.waits == [UNTIL_MORNING], "one park, not one per floor for eight hours"
+
+
+def test_a_wake_that_failed_is_retried_at_the_floor_not_at_the_next_nightfall() -> None:
+    clock = FakeClock(NIGHT)
+    display = RecordingDisplay(fail_wakes=99)
+    worker, store, _ = make(display=display, night=NIGHT_WINDOW, clock=clock)
+    worker.tick()
+    clock.advance(9 * 3600)
+    worker.tick()
+    assert worker.asleep is True, "the wake failed, so the panel is still dark"
+    stop = RecordingStop()
+    worker._stop_event = stop  # type: ignore[assignment]
+
+    worker._wait()
+
+    assert stop.waits == [5.0], "parking on the boundary would leave it dark until nightfall"
 
 
 def test_a_drawing_worker_waits_for_the_data_it_last_drew_to_change() -> None:

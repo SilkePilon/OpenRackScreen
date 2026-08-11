@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 from ors_render import RenderContext, render_scene, select_scene
@@ -92,8 +93,10 @@ class ScreenWorker(threading.Thread):
         # re-enters, and a plain lock keeps that provable.
         self._lock = threading.Lock()
         self._seen_version = -1
+        self._selected_scene: str | None = None
         self._failures = 0
         self._logged_error: str | None = None
+        self._logged_backend_error: str | None = None
 
         self.screen_name = screen.config.name
         """The panel's name. The thread's own `name` is prefixed, so status
@@ -116,27 +119,43 @@ class ScreenWorker(threading.Thread):
         """
 
     def tick(self) -> None:
-        """One loop iteration, without waiting. Total: nothing gets out of here.
+        """One loop iteration, without waiting.
 
-        Safe to call from a test, a one-shot render, or the loop below.
+        Absorbs everything the panel and the renderer do: a backend that refuses
+        any of `show`, `sleep` or `wake` is counted towards the fault latch here
+        rather than raising, and a scene that will not draw becomes the `error`
+        scene. What is *not* caught is the rest -- a store that has broken, a
+        clock that raises, an `error` scene that will not draw either -- because
+        those are bugs rather than states, and `run` is where they are logged
+        without costing the thread. So this is safe to call from a test or a
+        one-shot render, but it is not a promise that nothing can escape.
         """
         with self._lock:
             self.heartbeat = time.monotonic()
+
+            if self.faulted:
+                # Before the night check, not after it. A faulted panel is
+                # usually an unplugged one, and `sleep` and `wake` reach the bus
+                # through the same `_command` as the `show` that just failed
+                # three times -- so touching it here is the same write, and
+                # would land outside the fault latch that has already fired.
+                return
+
             now = self._clock()
 
             if in_window(now, self._night):
-                if not self.asleep:
-                    self._display.sleep()
+                if not self.asleep and self._backend("sleep", self._display.sleep):
                     self.asleep = True
                     log.info("night mode", extra={"screen": self.screen_name})
                 return
 
             if self.asleep:
-                self._display.wake()
+                if not self._backend("wake", self._display.wake):
+                    # The panel may still be dark, so nothing is drawn onto it.
+                    # `asleep` stays set, which is what puts the retry on the
+                    # floor rather than on the next nightfall.
+                    return
                 self.asleep = False
-
-            if self.faulted:
-                return
 
             snapshot = self._store.read()
             scene, name, context = self._select(snapshot)
@@ -149,9 +168,9 @@ class ScreenWorker(threading.Thread):
         """Paint the panel's ordinal, now, from whatever thread asked for it.
 
         Deliberately not sticky: the next tick draws the screen's real scene
-        again, because `current_scene` has moved and the change alone is a
-        reason to render. The digit therefore stands for at most one loop wait,
-        which is what someone counting panels in a rack needs it to do.
+        again, because `_selected_scene` now reads `identify` and the change
+        alone is a reason to render. The digit therefore stands for at most one
+        loop wait, which is what someone counting panels in a rack needs.
         """
         with self._lock:
             if self.faulted:
@@ -200,11 +219,26 @@ class ScreenWorker(threading.Thread):
         """Park until there is something new to draw, or until the floor elapses."""
         if self._stop_event.is_set():
             return
-        timeout = min(self._floor, seconds_until_boundary(self._clock(), self._night))
+        now = self._clock()
+        boundary = seconds_until_boundary(now, self._night)
+
+        if self.asleep and in_window(now, self._night):
+            # Park on the window itself. Nothing can produce a frame before it
+            # closes, and `seconds_until_boundary` exists precisely so this
+            # branch can wait once: capping it at the floor is ~5,400 wakeups
+            # across an eight-hour night to re-decide the same thing. Still the
+            # stop event, so shutdown is felt immediately rather than at dawn.
+            self._stop_event.wait(boundary)
+            return
+
+        timeout = min(self._floor, boundary)
         if self.asleep or self.faulted:
-            # No data change can produce a frame in either state, and the
-            # version has already moved past the one last drawn -- so waiting on
-            # it would return instantly, every lap, and spin a core all night.
+            # `asleep` outside the window is a wake that did not take, and it
+            # has to be retried at the floor -- parking on the boundary would
+            # leave the panel dark until nightfall. A faulted screen draws
+            # nothing either way. Neither may wait on the snapshot version: it
+            # has already moved past the one last drawn and the pollers keep
+            # moving it, so that wait returns instantly, every lap, forever.
             self._stop_event.wait(timeout)
             return
         self._store.wait_for_change(self._seen_version, timeout=timeout)
@@ -249,7 +283,12 @@ class ScreenWorker(threading.Thread):
     def _should_render(self, version: int, scene_name: str, now: datetime) -> bool:
         if version != self._seen_version:
             return True
-        if scene_name != self.current_scene:
+        # Against the *selection* behind the frame on the glass, not against the
+        # frame itself. They differ only when a render failed: `current_scene`
+        # is then `error` while the selection still names the template scene, so
+        # comparing the two would never agree and the screen would redraw --
+        # and fail, twice, once for each scene -- on every single lap.
+        if scene_name != self._selected_scene:
             return True
         if self.last_render is None:
             return True
@@ -283,12 +322,60 @@ class ScreenWorker(threading.Thread):
                 self._system["error"],
                 RenderContext(data={"params": {"message": message[:_ERROR_MESSAGE_CHARS]}}),
             )
-            name = "error"
-        else:
-            self._logged_error = None
+            self._show(image, "error", selected=name)
+            return
+        self._logged_error = None
         self._show(image, name)
 
-    def _show(self, image: Image.Image, name: str) -> None:
+    def _backend(self, action: str, call: Callable[[], None]) -> bool:
+        """Do one thing to the panel, counting a refusal towards the fault latch.
+
+        Every touch of the backend goes through here -- `show`, `sleep` and
+        `wake` alike -- because on the hardware they are all the same SPI bus:
+        `GC9A01Display.sleep` and `.wake` reach it through the same `_command`
+        as `show` does and raise the same `DisplayError`. A failure that escaped
+        instead of being counted would leave the loop in a state it cannot get
+        out of: a `sleep` that raised leaves `asleep` unlatched, which puts the
+        worker back on the data wait, which the pollers keep satisfying -- 45k
+        laps a second, one core, one traceback each, until morning. A `wake`
+        that raised is the mirror, and worse: the panel stays dark and nothing
+        anywhere says the screen is not fine.
+        """
+        try:
+            call()
+        except Exception as exc:
+            self._failures += 1
+            message = f"{action}: {type(exc).__name__}: {exc}"
+            if message != self._logged_backend_error:
+                # Once per distinct failure, for the same reason the render path
+                # dedupes: the fault latch bounds a *consecutive* run of them,
+                # but a panel failing every other frame never reaches it and
+                # would write a line at the loop's pace for as long as it flaps.
+                log.warning(
+                    "display command failed",
+                    extra={
+                        "screen": self.screen_name,
+                        "action": action,
+                        "error": str(exc),
+                        "attempt": self._failures,
+                    },
+                )
+                self._logged_backend_error = message
+            if self._failures >= _MAX_DISPLAY_RETRIES:
+                self.faulted = True
+                log.error("screen faulted", extra={"screen": self.screen_name, "action": action})
+            return False
+        self._failures = 0
+        self._logged_backend_error = None
+        return True
+
+    def _show(self, image: Image.Image, drawn: str, selected: str | None = None) -> None:
+        """Put a frame on the glass, and record which selection produced it.
+
+        `drawn` is what is on the panel and `selected` is what the scene
+        selection asked for; they differ only for the `error` scene, which is
+        drawn in place of a scene that would not render.
+        """
         rotation = self._screen.config.rotation
         if rotation:
             # Negative: the panel is bolted in rotated by `rotation`, and the
@@ -301,24 +388,10 @@ class ScreenWorker(threading.Thread):
         if self._screen.config.hflip:
             image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
 
-        try:
-            self._display.show(image)
-        except Exception as exc:
-            self._failures += 1
-            log.warning(
-                "display write failed",
-                extra={
-                    "screen": self.screen_name,
-                    "error": str(exc),
-                    "attempt": self._failures,
-                },
-            )
-            if self._failures >= _MAX_DISPLAY_RETRIES:
-                self.faulted = True
-                log.error("screen faulted", extra={"screen": self.screen_name})
+        if not self._backend("show", lambda: self._display.show(image)):
             return
 
-        self._failures = 0
-        self.current_scene = name
+        self.current_scene = drawn
+        self._selected_scene = drawn if selected is None else selected
         self.last_render = self._clock()
         self.renders += 1
