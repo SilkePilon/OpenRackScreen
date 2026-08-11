@@ -295,3 +295,33 @@ def test_a_wake_with_no_version_change_behind_it_does_not_end_the_wait():
     thread.join(timeout=WAIT)
 
     assert outcome == [True]
+
+
+def test_an_integration_that_has_never_succeeded_stays_connecting_however_often_it_fails():
+    store = SnapshotStore(stale_after=2)
+    store.register("prom")
+
+    for _ in range(5):
+        store.fail("prom", "connection refused", now=NOW)
+        assert store.read().health["prom"].state is Health.CONNECTING
+
+    assert store.read().health["prom"].stale is True, "staleness is independent of the state"
+    assert store.read().health["prom"].reason == "connection refused"
+
+
+def test_a_failure_after_a_success_is_unhealthy_not_connecting():
+    store = SnapshotStore()
+    store.register("prom")
+    store.put("prom", {"cpu": 1.0}, latency_ms=1.0, now=NOW)
+    store.fail("prom", "timeout", now=NOW)
+
+    assert store.read().health["prom"].state is Health.UNHEALTHY
+
+
+def test_the_health_mapping_a_reader_gets_cannot_reach_back_into_the_store():
+    store = SnapshotStore()
+    store.register("prom")
+    snap = store.read()
+    snap.health.clear()
+
+    assert "prom" in store.read().health

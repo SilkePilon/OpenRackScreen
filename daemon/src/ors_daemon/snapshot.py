@@ -78,7 +78,13 @@ class SnapshotStore:
             failures = previous.consecutive_failures + 1
             self._health[name] = replace(
                 previous,
-                state=Health.UNHEALTHY,
+                # The states are defined by history, not by the last event: an
+                # integration that has never succeeded is still *connecting*, however
+                # many times it has failed. The distinction reaches the glass -- a
+                # screen shows "WAIT / connecting" for one and "NO DATA" for the
+                # other -- and calling a cold start unhealthy would show neither,
+                # because there is no data yet for the normal scene to render.
+                state=Health.UNHEALTHY if previous.last_success else Health.CONNECTING,
                 reason=reason,
                 consecutive_failures=failures,
                 stale=failures >= self._stale_after,
@@ -87,6 +93,8 @@ class SnapshotStore:
             # did not move it. Waking four screens to have each re-read the same
             # version and go back to sleep is all cost and no news; they pick the
             # new health up at their heartbeat floor, which is what it is for.
+            # Anyone who later wants a health change to cut a worker's wait short
+            # must widen that predicate -- restoring a notify here would be inert.
 
     def read(self) -> Snapshot:
         """A snapshot no caller can write back through, data and version agreeing.
