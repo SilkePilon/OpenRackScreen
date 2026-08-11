@@ -13,7 +13,7 @@ from ors_daemon.displays import DisplayError
 from ors_daemon.screen import _NIGHT_PARK_CHUNK as NIGHT_PARK_CHUNK
 from ors_daemon.snapshot import SnapshotStore
 from ors_daemon.supervisor import _MAX_RESTARTS as MAX_RESTARTS
-from ors_daemon.supervisor import Supervisor, _Panel
+from ors_daemon.supervisor import SHUTDOWN_BUDGET, Supervisor, _Panel, _Slot
 from ors_schema.daemon import DaemonConfig, NightWindow, ScreenConfig
 from PIL import Image
 
@@ -111,11 +111,61 @@ class FakeTunnel:
     def start(self) -> None:
         self.started += 1
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         self.shutdowns += 1
 
     def join(self, timeout: float | None = None) -> None:
         self.joined += 1
+
+
+class FakeMonotonic:
+    """A monotonic clock a test can spend a shutdown budget on without waiting.
+
+    Started away from nought so that "how much has been spent" is a subtraction
+    rather than a reading, the same distinction `LONG_AGO` draws.
+    """
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class Wedged:
+    """A thread that never notices the stop event, and spends every second it is given.
+
+    Which is what a wedged one does: a worker halfway through an SPI write and a
+    `kubectl` stuck dialling the API server both sit there until whoever is
+    joining them gives up. Burning exactly the timeout it was granted is what
+    turns "the shutdown is bounded" into something a test can add up, without any
+    of it being real time.
+    """
+
+    def __init__(self, clock: FakeMonotonic, name: str) -> None:
+        self._clock = clock
+        self.screen_name = name
+        self.granted: list[float] = []
+
+    def join(self, timeout: float | None = None) -> None:
+        self._spend(timeout)
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        # A tunnel's teardown is not a wait on a thread -- it signals `kubectl`
+        # and waits for it to die -- so it spends the deadline too, and a
+        # shutdown that only bounded the joins would not bound this.
+        self._spend(timeout)
+
+    def is_alive(self) -> bool:
+        return True
+
+    def _spend(self, timeout: float | None) -> None:
+        assert timeout is not None, "a shutdown with no deadline is not a shutdown"
+        self.granted.append(timeout)
+        self._clock.advance(timeout)
 
 
 def integration_dict(name: str = "prom", local_port: int | None = None) -> dict[str, Any]:
@@ -165,6 +215,7 @@ def build(
     status_path: Path | None = None,
     poller_factory: Any = None,
     tunnel_factory: Any = None,
+    shutdown_clock: Any = None,
 ) -> tuple[Supervisor, SnapshotStore, dict[str, RecordingDisplay]]:
     store = SnapshotStore()
     displays: dict[str, RecordingDisplay] = {}
@@ -173,6 +224,7 @@ def build(
         displays[name] = display if display is not None else RecordingDisplay()
         return displays[name]
 
+    extra: dict[str, Any] = {} if shutdown_clock is None else {"shutdown_clock": shutdown_clock}
     supervisor = Supervisor(
         config=config,
         screens=resolve_screens(config),
@@ -182,6 +234,7 @@ def build(
         display_factory=display_factory,
         poller_factory=poller_factory or (lambda integration_config, url_provider: None),
         tunnel_factory=tunnel_factory,
+        **extra,
     )
     return supervisor, store, displays
 
@@ -192,6 +245,7 @@ def make(
     display: RecordingDisplay | None = None,
     status_path: Path | None = None,
     poller_factory: Any = None,
+    shutdown_clock: Any = None,
 ) -> tuple[Supervisor, SnapshotStore, dict[str, RecordingDisplay]]:
     config = DaemonConfig.model_validate(config_dict(tmp_path, screens))
     return build(
@@ -200,6 +254,7 @@ def make(
         display=display,
         status_path=status_path,
         poller_factory=poller_factory,
+        shutdown_clock=shutdown_clock,
     )
 
 
@@ -400,6 +455,95 @@ def test_stop_releases_a_worker_parked_on_the_snapshot(tmp_path: Path) -> None:
     supervisor.stop()
 
     assert store.wait_for_change(version=store.read().version, timeout=0.0) is True
+
+
+def wedged_rack(
+    tmp_path: Path, clock: FakeMonotonic, screens: int, tunnels: int = 1, pollers: int = 1
+) -> tuple[Supervisor, list[RecordingDisplay]]:
+    """A rack whose every thread is wedged, without one of them being real.
+
+    The slots are assembled rather than started, because what is under test is
+    the arithmetic of `stop` and not the threads: a real worker would leave the
+    moment the stop event was set, which is the case that never had a problem.
+    """
+    supervisor, _, _ = make(tmp_path, screens=screens, shutdown_clock=clock)
+    displays: list[RecordingDisplay] = []
+    for screen in supervisor._screens:
+        display = RecordingDisplay()
+        displays.append(display)
+        supervisor._slots.append(
+            _Slot(
+                screen=screen,
+                panel=_Panel(display),
+                worker=Wedged(clock, screen.config.name),  # type: ignore[arg-type]
+            )
+        )
+    supervisor.pollers = [Wedged(clock, f"poller-{n}") for n in range(pollers)]  # type: ignore[misc]
+    supervisor.tunnels = [Wedged(clock, f"tunnel-{n}") for n in range(tunnels)]  # type: ignore[misc]
+    return supervisor, displays
+
+
+@pytest.mark.parametrize("screens", [4, 16])
+def test_a_wedged_rack_is_shut_down_inside_one_budget_however_many_panels_it_has(
+    tmp_path: Path, screens: int
+) -> None:
+    """The bound the shipped unit file's `TimeoutStopSec` is derived from.
+
+    Four wedged workers, a wedged poller and a wedged tunnel used to cost five
+    seconds each and ten more for the tunnel's own SIGTERM-then-SIGKILL wait:
+    ~40s against a `TimeoutStopSec=30`, past which systemd sends SIGKILL, `stop`
+    never reaches the panels, and four GC9A01s stay lit until the rack is
+    power-cycled. A per-thread timeout cannot be made safe by choosing a smaller
+    number, because how many threads there are is a fact about the config -- so
+    the deadline is shared, and sixteen panels cost exactly what four do.
+    """
+    clock = FakeMonotonic()
+    supervisor, displays = wedged_rack(tmp_path, clock, screens=screens)
+    started = clock.now
+
+    supervisor.stop()
+
+    assert clock.now - started <= SHUTDOWN_BUDGET
+    for display in displays:
+        assert display.calls == ["sleep", "close"], "and the panels are blanked regardless"
+
+
+def test_a_second_stop_does_not_open_a_second_budget(tmp_path: Path) -> None:
+    """One deadline per shutdown, not per call. The CLI installs `stop` as the
+    SIGTERM handler *and* `run_forever` calls it from its `finally`, and an
+    impatient operator sends the signal twice -- so a wedged poller nothing can
+    join would otherwise cost its whole budget again on every call."""
+    clock = FakeMonotonic()
+    supervisor, _ = wedged_rack(tmp_path, clock, screens=4)
+    started = clock.now
+
+    supervisor.stop()
+    supervisor.stop()
+    supervisor.stop()
+
+    assert clock.now - started <= SHUTDOWN_BUDGET
+
+
+def test_a_wedged_thread_does_not_take_the_deadline_away_from_the_panels(
+    tmp_path: Path,
+) -> None:
+    """The deadline covers the joins and the tunnel teardown; the blanking is
+    what it is protecting, so it happens on the far side of the deadline
+    expiring. A panel nobody comes back to is the outcome all of this exists to
+    prevent, and it is worse than one late write on a bus about to lose power."""
+    clock = FakeMonotonic()
+    supervisor, displays = wedged_rack(tmp_path, clock, screens=4)
+
+    supervisor.stop()
+
+    granted = [
+        timeout
+        for thread in [*(slot.worker for slot in supervisor._slots), *supervisor.tunnels]
+        for timeout in thread.granted  # type: ignore[union-attr]
+    ]
+    assert granted[0] == SHUTDOWN_BUDGET, "the first wedged thread may spend the lot"
+    assert granted[-1] == 0.0, "and the last one is given nothing, rather than five more seconds"
+    assert all(display.calls == ["sleep", "close"] for display in displays)
 
 
 def test_stop_is_idempotent(tmp_path: Path) -> None:

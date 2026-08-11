@@ -3,6 +3,7 @@ import subprocess
 import threading
 
 import pytest
+from ors_daemon.tunnel import _STOP_TIMEOUT as STOP_TIMEOUT
 from ors_daemon.tunnel import Tunnel, select_service
 from ors_schema.daemon import TunnelConfig
 
@@ -225,6 +226,56 @@ def test_a_process_that_ignores_sigterm_is_killed_and_reaped():
     # second is what frees the local port before the next launch tries to bind
     # it -- SIGKILL only queues the death, it does not wait for it.
     assert process.waits == 2
+
+
+class TimingProcess(StubbornProcess):
+    """A stubborn kubectl that also records how long each wait was given."""
+
+    def __init__(self):
+        super().__init__()
+        self.timeouts = []
+
+    def wait(self, timeout=None):
+        self.timeouts.append(timeout)
+        return super().wait(timeout)
+
+
+def test_a_shutdown_left_to_itself_gives_each_signal_the_full_stop_timeout():
+    harness = Harness([True])
+    tunnel = make(harness, launcher=launching(harness, TimingProcess))
+    tunnel.tick()
+    tunnel.shutdown()
+
+    assert harness.processes[0].timeouts == [STOP_TIMEOUT, STOP_TIMEOUT]
+
+
+def test_a_hurried_shutdown_spends_no_more_than_it_was_given():
+    """A caller under a deadline this knows nothing about, which is the ordinary
+    case: the supervisor still has four panels to blank when this returns, and
+    `TimeoutStopSec` is counting the whole time. A `kubectl` that outlives the
+    daemon by a moment holds a port nobody is about to bind; a panel left lit
+    holds the rack until someone unplugs it."""
+    harness = Harness([True])
+    tunnel = make(harness, launcher=launching(harness, TimingProcess))
+    tunnel.tick()
+    tunnel.shutdown(timeout=1.0)
+
+    process = harness.processes[0]
+    assert sum(process.timeouts) <= 1.0, "both waits together, not each"
+    assert process.killed is True, "and it is still killed, not merely asked"
+
+
+def test_a_shutdown_with_nothing_left_still_signals_the_child():
+    """What a blown deadline costs is the *confirmation* that kubectl died, not
+    the signals: both are sent, and neither is waited on."""
+    harness = Harness([True])
+    tunnel = make(harness, launcher=launching(harness, TimingProcess))
+    tunnel.tick()
+    tunnel.shutdown(timeout=0.0)
+
+    process = harness.processes[0]
+    assert (process.terminated, process.killed) == (True, True)
+    assert process.timeouts == [0.0, 0.0]
 
 
 def test_a_process_that_cannot_be_stopped_at_all_is_still_let_go_of():

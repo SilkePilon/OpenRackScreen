@@ -57,10 +57,15 @@ RestartSec=5
 RuntimeDirectory=openrackscreen
 RuntimeDirectoryMode=0755
 
-# Shutdown joins every thread (5s each, worst case) and only then blanks, sleeps
-# and closes four panels. Comfortably inside 30s; past whatever this is, systemd
-# sends SIGKILL and the panels stay lit -- the one outcome the whole shutdown
-# path exists to prevent. Raise it, never lower it.
+# Derived, not guessed. The daemon spends at most `SHUTDOWN_BUDGET` seconds
+# (`ors_daemon.supervisor`, 10s today) on every thread join and tunnel teardown
+# together -- one deadline for all of them, so the cost does not grow with the
+# number of panels -- and only then blanks, sleeps and closes them. This is that
+# budget with room to spare for the blanking, which happens whether or not the
+# budget ran out. Past whatever this says, systemd sends SIGKILL, the panels are
+# never slept, and four GC9A01s stay lit until the rack is power-cycled -- the
+# one outcome the whole shutdown path exists to prevent. Raise it, never lower
+# it, and if `SHUTDOWN_BUDGET` ever goes up, raise this first.
 TimeoutStopSec=30
 
 # The tunnel shells out to `kubectl`, which is usually in /usr/local/bin -- not

@@ -253,7 +253,7 @@ class Tunnel(threading.Thread):
         finally:
             self.shutdown()
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         """Stop supervising and take the tunnel down. Idempotent, and safe before `start`.
 
         The stop event goes first, and it is the whole point: without it a
@@ -263,10 +263,18 @@ class Tunnel(threading.Thread):
         dies where it stands, orphaning a `kubectl` that still holds the local
         port. Setting it also ends the default sleeper's `stop.wait` at once, so
         the join is quick rather than up to an interval long.
+
+        `timeout` is the whole time this may spend on the child, both signals
+        together; `None` means the default two `_STOP_TIMEOUT` waits. It exists
+        because a caller can be under a deadline this knows nothing about: the
+        supervisor blanks four panels after taking the tunnels down, and ten
+        seconds spent here is ten seconds of systemd's `TimeoutStopSec` that the
+        panels do not get. Nothing here refuses to be hurried -- a `kubectl`
+        that outlives the daemon by a moment holds a local port nobody is about
+        to bind, while a panel left lit holds the rack until it is unplugged.
         """
         self._stop_event.set()
-        self.ready.clear()
-        self._kill()
+        self._kill(timeout)
 
     def _probe_ok(self) -> bool:
         try:
@@ -320,26 +328,34 @@ class Tunnel(threading.Thread):
             )
             return None
 
-    def _kill(self) -> None:
+    def _kill(self, timeout: float | None = None) -> None:
         """Stop the subprocess and free the local port. Raises nothing.
 
         Dropping the reference first is what keeps a failure here from leaving
         the tunnel believing it still has a live process: whatever happens
         below, the next cycle sees `None` and launches a new one.
 
-        SIGTERM, then SIGKILL for a `kubectl` wedged past `_STOP_TIMEOUT`.
+        SIGTERM, then SIGKILL for a `kubectl` wedged past the grace period.
         Both waits matter, and the second is the one that is easy to miss:
         `Popen.kill()` only *sends* SIGKILL and returns, so without waiting the
         relaunch can race the dying process for the local port and lose. It
         also reaps the child -- an unwaited one stays a zombie and earns a
         `ResourceWarning` when the `Popen` is collected.
+
+        `timeout` is both waits together, so a caller passing one gets what it
+        asked for rather than twice it; `None` is `_STOP_TIMEOUT` each, which is
+        what a relaunch mid-supervision wants and what `run` shuts down with. It
+        is halved rather than spent on the SIGTERM alone because the second wait
+        is the one that frees the port, and a grace period that leaves nothing
+        for it has bought a slower relaunch, not a faster shutdown.
         """
         process, self._process = self._process, None
         if process is None:
             return
+        grace = _STOP_TIMEOUT if timeout is None else max(timeout, 0.0) / 2.0
         try:
             process.terminate()
-            process.wait(timeout=_STOP_TIMEOUT)
+            process.wait(timeout=grace)
             return
         except Exception as exc:
             log.warning(
@@ -348,7 +364,7 @@ class Tunnel(threading.Thread):
             )
         try:
             process.kill()
-            process.wait(timeout=_STOP_TIMEOUT)
+            process.wait(timeout=grace)
         except Exception as exc:
             # Nothing else to try. The local port may still be held, in which
             # case the next launch fails to bind and says so in kubectl's own

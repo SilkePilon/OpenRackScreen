@@ -15,7 +15,8 @@ this whole path exists to prevent.
 *Shutdown is ordered, and the order is the point.* Stop event, release the
 workers parked on the snapshot, join every thread, then sleep and close the
 panels. Nothing touches a backend while a thread that might also touch it is
-still running.
+still running. All of it inside one deadline (`SHUTDOWN_BUDGET`), because the
+number of threads is a fact about the config and systemd's patience is not.
 
 *The watchdog watches screen workers and nothing else.* A poller backs off up to
 60s between polls, which is longer than the watchdog's timeout: watching one
@@ -79,15 +80,46 @@ something transient and few enough that the fourth failure is a fact about the
 hardware, which is what the log line then says.
 """
 
-_JOIN_TIMEOUT = 5.0
-"""How long each thread gets to notice the stop event, in seconds.
+SHUTDOWN_BUDGET = 10.0
+"""How long `stop` may spend getting the threads to leave, in seconds -- in total.
 
-Comfortably above what any of them needs. A screen worker parks on the snapshot,
-which `stop` releases; a poller and a tunnel park on the stop event itself. The
-timeout is the backstop for a thread that is stuck somewhere else entirely --
-and when it expires the panel is slept anyway, because a lit panel nobody is
-coming back to is worse than one late write on a bus that is about to lose power.
+One deadline shared by every wait, rather than a timeout each, and that is the
+difference between a bound and a hope. How many threads there are is what the
+config says it is: four panels, a poller and a tunnel today, and more the moment
+a rack grows a screen or M5 adds its second integration. A per-thread timeout is
+therefore multiplied by a number *this module does not choose* -- six threads at
+5s each is 30s, which was `TimeoutStopSec` exactly, and the tunnel's own
+SIGTERM-then-SIGKILL wait put the measured worst case at ~40s. Past that systemd
+sends SIGKILL, `stop` never reaches the panels, and four GC9A01s stay lit until
+the rack is power-cycled -- the one outcome this whole path exists to prevent.
+
+Ten seconds is what the whole shutdown costs at worst, whatever the config holds.
+The shipped unit's `TimeoutStopSec=30` is derived from this number and names it,
+so the two cannot drift apart silently; the margin between them is for what the
+deadline deliberately does not cover -- sleeping and closing the panels, which
+happens when the deadline has expired just as surely as when it has not.
+
+A healthy shutdown spends none of it. Every thread is parked on the stop event or
+on the store, and both are released before the first join, so the joins return in
+milliseconds. A thread that has already left is joined instantly whatever is left
+of the budget, which is why one wedged thread spending the lot costs a healthy
+one nothing: they have all been leaving since the first line of `stop`.
 """
+
+
+def _deadline(budget: float, monotonic: Callable[[], float]) -> Callable[[], float]:
+    """A function answering how much of `budget` is left. Never negative.
+
+    Passed around rather than recomputed from a stored end time, so every wait in
+    a shutdown provably reads the same deadline: there is only one, and it is
+    taken once.
+    """
+    end = monotonic() + budget
+
+    def remaining() -> float:
+        return max(0.0, end - monotonic())
+
+    return remaining
 
 
 def _url_of(tunnel: Tunnel) -> UrlProvider:
@@ -186,6 +218,8 @@ class Supervisor:
         poller_factory: PollerFactory | None = None,
         tunnel_factory: TunnelFactory | None = None,
         watchdog_timeout: float = DEFAULT_WATCHDOG_TIMEOUT,
+        shutdown_budget: float = SHUTDOWN_BUDGET,
+        shutdown_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if watchdog_timeout <= _NIGHT_PARK_CHUNK:
             raise ValueError(
@@ -203,6 +237,14 @@ class Supervisor:
         self._poller_factory = poller_factory
         self._tunnel_factory = tunnel_factory or (lambda cfg, stop: Tunnel(config=cfg, stop=stop))
         self._watchdog_timeout = watchdog_timeout
+        self._shutdown_budget = shutdown_budget
+        # The only injectable clock of the two this class reads, and deliberately
+        # so: the watchdog below compares against a heartbeat the *workers* stamp
+        # with `time.monotonic`, and a supervisor measuring that against anything
+        # else is a watchdog that restarts a rack which is perfectly fine. This
+        # one is measured against nothing but itself, so a test can prove the
+        # shutdown bound without spending it.
+        self._shutdown_clock = shutdown_clock
         # Never `_stop`: `threading.Thread._stop` is a real method that `join`
         # calls, and this event is handed to three classes that are threads.
         # They would each have to rename it back, so it is named right here.
@@ -211,6 +253,7 @@ class Supervisor:
         self._unavailable: list[UnavailableScreen] = []
         self._shutdown_lock = threading.RLock()
         self._stopped = False
+        self._shutdown_deadline: Callable[[], float] | None = None
         self._started_at = clock()
 
         self.pollers: list[Poller] = []
@@ -311,6 +354,15 @@ class Supervisor:
         Only once every thread has been joined are the leases revoked and the
         panels slept and closed, so no backend is ever touched by two threads.
 
+        Every join, and the tunnel teardown between them, shares one deadline --
+        one per *shutdown*, not one per call, so the two calls the paragraph
+        below describes cannot spend the budget twice over. The panels are slept
+        whether or not it expires: `SHUTDOWN_BUDGET` says why, and what the
+        number is derived from. What the deadline buys the threads it cannot
+        join is nothing -- but a lease is revoked before its panel is slept, so
+        the window a wedged worker could write into is the same narrow one a
+        joined worker leaves behind.
+
         It runs more than once by design: the CLI installs it as the SIGTERM
         handler *and* `run_forever` calls it from its `finally`, and an
         impatient operator sends the signal twice. So every step is written to
@@ -339,20 +391,31 @@ class Supervisor:
             # supervisor's to arrange, since the supervisor is what owns both.
             self._store.close()
 
+            # Taken after the event is set and the store is closed, so the
+            # threads have been leaving for as long as this has been running --
+            # and taken once. A second `stop` (SIGTERM twice, or the handler and
+            # then `run_forever`'s `finally`) inherits what is left of the first
+            # one's deadline rather than opening a second budget: a poller
+            # nobody can join would otherwise cost its ten seconds again on
+            # every call, which is the multiplication this exists to remove.
+            if self._shutdown_deadline is None:
+                self._shutdown_deadline = _deadline(self._shutdown_budget, self._shutdown_clock)
+            remaining = self._shutdown_deadline
+
             for slot in self._slots:
                 if slot.shut_down:
                     # Joined and slept by an earlier call; its worker is gone
                     # and its panel is off. Re-joining would be free, but
                     # re-warning about a wedged one would not be.
                     continue
-                slot.worker.join(_JOIN_TIMEOUT)
+                slot.worker.join(remaining())
                 if slot.worker.is_alive():
                     log.warning(
                         "worker did not stop; sleeping its panel anyway",
                         extra={"screen": slot.worker.screen_name},
                     )
             for poller in self.pollers:
-                poller.join(_JOIN_TIMEOUT)
+                poller.join(remaining())
             for tunnel in self.tunnels:
                 # Sets the stop event again on its way past, which is harmless
                 # and not worth working around: it is what makes `shutdown`
@@ -360,8 +423,13 @@ class Supervisor:
                 # on a later call for the same reason, and because a tunnel
                 # started after an earlier one -- `start` was interrupted
                 # partway -- would otherwise keep its `kubectl` child.
-                tunnel.shutdown()
-                tunnel.join(_JOIN_TIMEOUT)
+                #
+                # The deadline goes into `shutdown` as well as into the join
+                # after it, because taking a tunnel down is not a wait on a
+                # thread: it signals `kubectl` and waits for it to die, which
+                # is where the other ten seconds of the worst case used to be.
+                tunnel.shutdown(timeout=remaining())
+                tunnel.join(remaining())
 
             for slot in self._slots:
                 if slot.shut_down:
