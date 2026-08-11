@@ -1203,6 +1203,8 @@ git commit -m "feat(render): binding resolution and filter pipeline"
 `packages/ors-render/tests/test_geometry.py`:
 
 ```python
+import pytest
+
 from ors_render.geometry import Geometry
 
 
@@ -1223,7 +1225,7 @@ def test_radii_are_fractions_of_the_panel_radius():
     g = Geometry()
     # 0.875 of a 240px panel radius == 105px, which is 210px in supersampled space
     assert g.radial(0.875) == 210.0
-    assert g.radial(0.092) == 22.08
+    assert g.radial(0.092) == pytest.approx(22.08)
 
 
 def test_font_sizes_scale_from_a_240_baseline():

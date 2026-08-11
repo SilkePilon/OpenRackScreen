@@ -1,0 +1,33 @@
+[project]
+name = "openrackscreen"
+version = "0.1.0"
+description = "Configurable monitoring displays for server racks"
+requires-python = ">=3.11"
+dependencies = ["ors-schema", "ors-render"]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+ors-schema = { workspace = true }
+ors-render = { workspace = true }
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+testpaths = ["packages/ors-schema/tests", "packages/ors-render/tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# ruff >=0.16 formats fenced code blocks inside Markdown by default; docs/ holds
+# planning prose with illustrative (non-authoritative) snippets, not source.
+extend-exclude = ["docs/**/*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

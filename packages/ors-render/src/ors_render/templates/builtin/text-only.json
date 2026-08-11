@@ -1,0 +1,25 @@
+{
+  "name": "text-only",
+  "category": "basic",
+  "builtin": true,
+  "params_schema": {
+    "title":    { "type": "string",  "label": "Title",         "default": "" },
+    "big":      { "type": "binding", "label": "Centre text",   "default": "" },
+    "subtitle": { "type": "binding", "label": "Subtitle",      "default": "" },
+    "color":    { "type": "color",   "label": "Centre colour", "default": "#ffffff" }
+  },
+  "scenes": [
+    {
+      "name": "default",
+      "background": "#000000",
+      "elements": [
+        { "type": "text", "cy": 0.29, "size": 15, "font": "bold",
+          "text": "{{params.title}}", "color": "#8c96a5" },
+        { "type": "text", "cy": 0.5, "size": 46, "font": "bold",
+          "text": "{{params.big}}", "color": "{{params.color}}" },
+        { "type": "text", "cy": 0.72, "size": 13, "font": "bold",
+          "text": "{{params.subtitle}}", "color": "#8c96a5" }
+      ]
+    }
+  ]
+}

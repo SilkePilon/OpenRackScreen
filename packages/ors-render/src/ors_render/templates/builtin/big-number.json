@@ -1,0 +1,27 @@
+{
+  "name": "big-number",
+  "category": "gauge",
+  "builtin": true,
+  "params_schema": {
+    "title":    { "type": "string",  "label": "Title",       "default": "PODS" },
+    "value":    { "type": "binding", "label": "Ring 0-100",  "default": "0" },
+    "big":      { "type": "binding", "label": "Centre text", "default": "0" },
+    "subtitle": { "type": "binding", "label": "Subtitle",    "default": "" },
+    "palette":  { "type": "palette", "label": "Palette",     "default": "lime" }
+  },
+  "scenes": [
+    {
+      "name": "default",
+      "background": "#000000",
+      "elements": [
+        { "type": "ring", "r": 0.875, "thickness": 0.092, "cap": "dot",
+          "value": "{{params.value}}", "palette": "{{params.palette}}", "track": "#16181e" },
+        { "type": "text", "cy": 0.275, "size": 15, "font": "bold",
+          "text": "{{params.title}}", "color": "@palette", "palette": "{{params.palette}}" },
+        { "type": "text", "cy": 0.517, "size": 58, "font": "bold", "text": "{{params.big}}" },
+        { "type": "text", "cy": 0.72, "size": 13, "font": "bold",
+          "text": "{{params.subtitle}}", "color": "#8c96a5" }
+      ]
+    }
+  ]
+}

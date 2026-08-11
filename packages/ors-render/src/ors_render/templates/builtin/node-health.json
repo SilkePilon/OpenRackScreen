@@ -1,0 +1,37 @@
+{
+  "name": "node-health",
+  "category": "status",
+  "builtin": true,
+  "params_schema": {
+    "title": { "type": "string",  "label": "Title",     "default": "NODES" },
+    "hint":  { "type": "binding", "label": "Hint line", "default": "" }
+  },
+  "scenes": [
+    {
+      "name": "nodes",
+      "background": "#000000",
+      "elements": [
+        { "type": "ring", "r": 0.875, "thickness": 0.092, "cap": "dot", "track": "#16181e",
+          "value": "{{prom.nodes_ready / prom.nodes_total * 100}}",
+          "palette": { "kind": "threshold", "thresholds": [
+            { "at": 0,   "palette": "red" },
+            { "at": 60,  "palette": "amber" },
+            { "at": 100, "palette": "green" } ] } },
+        { "type": "text", "cy": 0.275, "size": 15, "font": "bold",
+          "text": "{{params.title}}", "color": "#38bdf8" },
+        { "type": "text", "cy": 0.517, "size": 52, "font": "bold",
+          "text": "{{prom.nodes_ready}}/{{prom.nodes_total}}",
+          "when": "prom.nodes_ready != null and prom.nodes_total != null" },
+        { "type": "text", "cy": 0.708, "size": 13, "font": "bold", "color": "#8c96a5",
+          "text": "ALL OK", "when": "prom.nodes_ready == prom.nodes_total and prom.alerts == 0" },
+        { "type": "text", "cy": 0.708, "size": 13, "font": "bold", "color": "#8c96a5",
+          "text": "{{prom.alerts}} ALERTS", "when": "prom.alerts > 0" },
+        { "type": "text", "cy": 0.708, "size": 13, "font": "bold", "color": "#8c96a5",
+          "text": "{{prom.nodes_total - prom.nodes_ready}} NOT READY",
+          "when": "prom.alerts == 0 and prom.nodes_ready < prom.nodes_total" },
+        { "type": "text", "cy": 0.8, "size": 10, "font": "bold",
+          "text": "{{params.hint}}", "color": "#555f69" }
+      ]
+    }
+  ]
+}
