@@ -716,6 +716,29 @@ def test_a_tick_survives_a_status_path_it_cannot_write(tmp_path: Path) -> None:
         supervisor.stop()
 
 
+@pytest.mark.parametrize("hostile", ["/", ".", ""])
+def test_a_status_path_with_no_filename_does_not_escape_a_tick(
+    tmp_path: Path, hostile: str
+) -> None:
+    """`--status /` used to be an infinite restart loop, not a warning.
+
+    A path with no filename has no name to derive the temporary file from, and
+    that raises `ValueError` rather than `OSError` -- so it went straight past
+    the guard here, out of `run_forever` and out of `main`. Under the shipped
+    unit's `Restart=always` and `StartLimitIntervalSec=0` that is a crash every
+    five seconds, each one re-running the GC9A01 init sequence on four panels,
+    for as long as the typo survives.
+    """
+    supervisor, _, displays = make(tmp_path, screens=1, status_path=Path(hostile))
+    supervisor.start()
+    try:
+        supervisor.tick()
+    finally:
+        supervisor.stop()
+
+    assert displays["S1"].calls[-2:] == ["sleep", "close"], "the rack ran, and shut down cleanly"
+
+
 def test_every_integration_gets_a_poller_that_is_started_and_joined(tmp_path: Path) -> None:
     pollers: list[RecordingPoller] = []
 

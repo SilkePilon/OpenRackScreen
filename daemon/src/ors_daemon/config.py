@@ -10,6 +10,8 @@ Three products, all decided once at startup rather than per frame:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from collections.abc import Iterator, Mapping
@@ -93,6 +95,40 @@ def load_config(path: Path) -> DaemonConfig:
         first = exc.errors()[0]
         location = ".".join(str(part) for part in first["loc"]) or "(root)"
         raise ConfigError(f"{path}: {location}: {first['msg']}") from exc
+
+
+_FINGERPRINT_CHARS = 12
+"""Enough of the digest to identify a config, and short enough to read out loud.
+
+48 bits. What it has to survive is a person comparing two of these over SSH and
+a server deciding whether the Pi is running what it pushed -- a set of a few
+hundred configs at the very most, not an adversary hunting a collision -- and at
+that scale the odds of two differing configs sharing twelve hex characters are
+around one in 10^11.
+"""
+
+
+def config_fingerprint(config: DaemonConfig) -> str:
+    """A short, stable identity for the *contents* of a config.
+
+    `DaemonConfig.version` cannot answer "did the Pi apply the config I pushed?"
+    and never could: it is a `Literal[1]`, the version of the *schema*, so it
+    reads the same for every document that has ever validated. The status file
+    -- which M3 forwards verbatim -- therefore needs something that moves when
+    the config does, and this is it. The two are reported side by side under
+    names that cannot be confused: `config_schema_version` and this.
+
+    Taken over the validated model rather than over the file, which is what makes
+    it a fact both ends can compute. The server holds a document and the Pi holds
+    whatever it parsed; hashing the bytes would make a reformatted YAML file, a
+    changed comment or the same JSON with its keys in another order look like a
+    different rack. `mode="json"` and `sort_keys` reduce both ends to the same
+    canonical form, so what is left is exactly what the daemon will act on --
+    every screen, every query, every pin. List order is preserved because it is
+    meaningful: two screens swapping position is a different rack.
+    """
+    canonical = json.dumps(config.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:_FINGERPRINT_CHARS]
 
 
 def _templates(config: DaemonConfig) -> dict[str, Template]:

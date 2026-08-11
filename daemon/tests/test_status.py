@@ -14,6 +14,8 @@ from ors_daemon.status import UnavailableScreen, build_status, write_status
 from ors_schema.daemon import DisplayConfig, NightWindow, ScreenConfig
 
 START = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
+FINGERPRINT = "0123456789ab"
+"""Any fingerprint: this module reports one, `test_config` is where it is derived."""
 
 
 def make_worker(name: str = "CPU") -> ScreenWorker:
@@ -63,13 +65,15 @@ def test_status_reports_uptime_screens_and_integration_health() -> None:
     payload = build_status(
         started_at=START,
         now=START + timedelta(seconds=90),
-        config_version=1,
+        config_schema_version=1,
+        config_fingerprint="0123456789ab",
         screens=[rendered()],
         snapshot=store.read(),
     )
 
     assert payload["uptime_s"] == 90
-    assert payload["config_version"] == 1
+    assert payload["config_schema_version"] == 1
+    assert payload["config_fingerprint"] == "0123456789ab"
     assert payload["screens"][0] == {
         "name": "CPU",
         "scene": "default",
@@ -96,6 +100,7 @@ def test_a_screen_whose_panel_could_not_be_opened_is_reported_rather_than_omitte
         START,
         START,
         1,
+        FINGERPRINT,
         [rendered("CPU"), UnavailableScreen(name="MEM", reason="no such SPI bus")],
         SnapshotStore().read(),
     )
@@ -117,6 +122,7 @@ def test_every_screen_carries_an_error_key_whether_or_not_it_has_one() -> None:
         START,
         START,
         1,
+        FINGERPRINT,
         [rendered(), UnavailableScreen("MEM", "no such SPI bus")],
         SnapshotStore().read(),
     )
@@ -130,12 +136,14 @@ def test_a_sleeping_and_a_faulted_screen_report_their_state() -> None:
     sleeping.asleep = True
     faulted.faulted = True
 
-    payload = build_status(START, START, 1, [sleeping, faulted], SnapshotStore().read())
+    payload = build_status(
+        START, START, 1, FINGERPRINT, [sleeping, faulted], SnapshotStore().read()
+    )
     assert [screen["state"] for screen in payload["screens"]] == ["asleep", "faulted"]
 
 
 def test_a_screen_that_has_never_rendered_says_so_rather_than_guessing() -> None:
-    payload = build_status(START, START, 1, [make_worker()], SnapshotStore().read())
+    payload = build_status(START, START, 1, FINGERPRINT, [make_worker()], SnapshotStore().read())
     assert payload["screens"][0] == {
         "name": "CPU",
         "scene": None,
@@ -147,7 +155,7 @@ def test_a_screen_that_has_never_rendered_says_so_rather_than_guessing() -> None
 
 
 def test_a_daemon_with_no_screens_and_no_integrations_reports_empty_lists() -> None:
-    payload = build_status(START, START, 1, [], SnapshotStore().read())
+    payload = build_status(START, START, 1, FINGERPRINT, [], SnapshotStore().read())
     assert payload["screens"] == []
     assert payload["integrations"] == []
 
@@ -158,7 +166,7 @@ def test_a_failing_integration_reports_its_reason() -> None:
     store.put("prom", {"cpu": 1.0}, latency_ms=12.5, now=START)
     store.fail("prom", "connection refused", now=START)
 
-    payload = build_status(START, START, 1, [], store.read())
+    payload = build_status(START, START, 1, FINGERPRINT, [], store.read())
     assert payload["integrations"][0]["state"] == "unhealthy"
     assert payload["integrations"][0]["last_error"] == "connection refused"
     # The last *success* is what the field says, and a failure does not move it.
@@ -170,7 +178,7 @@ def test_an_integration_that_has_never_answered_reports_connecting() -> None:
     store.register("prom")
     store.fail("prom", "connection refused", now=START)
 
-    payload = build_status(START, START, 1, [], store.read())
+    payload = build_status(START, START, 1, FINGERPRINT, [], store.read())
     # Not unhealthy: the store keeps a cold start `connecting` however many
     # times it has failed, and the status file must not relabel that.
     assert payload["integrations"][0]["state"] == "connecting"
@@ -186,7 +194,7 @@ def test_a_stale_integration_says_so() -> None:
     store.fail("prom", "timeout", now=START)
     store.fail("prom", "timeout", now=START)
 
-    payload = build_status(START, START, 1, [], store.read())
+    payload = build_status(START, START, 1, FINGERPRINT, [], store.read())
     assert payload["integrations"][0]["stale"] is True
 
 
@@ -200,7 +208,9 @@ def test_the_payload_needs_no_serialisation_fallback() -> None:
     store.register("prom")
     store.put("prom", {"cpu": 1.0}, latency_ms=12.5, now=START)
 
-    payload = build_status(START, START, 1, [rendered(), make_worker("B")], store.read())
+    payload = build_status(
+        START, START, 1, FINGERPRINT, [rendered(), make_worker("B")], store.read()
+    )
     assert json.loads(json.dumps(payload)) == payload
 
 
@@ -260,6 +270,22 @@ def test_write_status_raises_rather_than_reporting_a_write_it_did_not_do(
 
     with pytest.raises(OSError):
         write_status(blocked / "status.json", {"uptime_s": 1})
+
+
+@pytest.mark.parametrize("hostile", ["/", ".", ""])
+def test_a_path_with_no_filename_is_refused_rather_than_written_somewhere_else(
+    hostile: str,
+) -> None:
+    """And it is refused with a `ValueError`, which is the point of this test.
+
+    The temporary file is derived from the target's *name*, and these paths do
+    not have one -- so the failure is not the `OSError` a caller would expect
+    from a path it cannot write. `Supervisor.tick` catches both, because
+    `--status /` reaching the panels as a five-second restart loop is the
+    opposite of what this module promises about an unwritable status path.
+    """
+    with pytest.raises(ValueError):
+        write_status(Path(hostile), {"uptime_s": 1})
 
 
 def test_a_reader_never_observes_a_partial_file(tmp_path: Path) -> None:

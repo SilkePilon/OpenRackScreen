@@ -36,7 +36,7 @@ from ors_schema.daemon import DaemonConfig, IntegrationConfig, ScreenConfig, Tun
 from PIL import Image
 
 from ors_daemon.clock import Clock
-from ors_daemon.config import ResolvedScreen, system_scenes
+from ors_daemon.config import ResolvedScreen, config_fingerprint, system_scenes
 from ors_daemon.displays import DisplayBackend, build_display
 from ors_daemon.integrations import UrlProvider, build_integration
 from ors_daemon.poller import Poller
@@ -227,6 +227,7 @@ class Supervisor:
                 f"a worker in night mode parks for up to {_NIGHT_PARK_CHUNK}s at a time"
             )
         self._config = config
+        self._config_fingerprint = config_fingerprint(config)
         self._screens = screens
         self._store = store
         self._clock = clock
@@ -314,17 +315,35 @@ class Supervisor:
                 build_status(
                     started_at=self._started_at,
                     now=self._clock(),
-                    config_version=self._config.version,
+                    config_schema_version=self._config.version,
+                    # Computed once, at construction: the config cannot change
+                    # under a running supervisor in M2, and hashing it on every
+                    # tick would put a serialisation of the whole document on the
+                    # once-a-second path for an answer that cannot have moved.
+                    config_fingerprint=self._config_fingerprint,
                     # Every configured screen, not only the ones that came up.
                     screens=[*self.workers, *self._unavailable],
                     snapshot=self._store.read(),
                 ),
             )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             # `write_status` raises deliberately: the module reports, the loop
             # decides. A read-only /run or a full disk must not darken the rack
             # -- a status file is a nicety, and the panels are the product.
-            log.warning("could not write the status file", extra={"error": str(exc)})
+            #
+            # `ValueError` is not the exotic half of that pair. `--status /`,
+            # `--status .` and an empty one are paths with no filename, and
+            # deriving the temporary file beside the target raises `ValueError`
+            # rather than `OSError` for every one of them -- which escaped here,
+            # escaped `run_forever` and `main`, and under `Restart=always` with
+            # `StartLimitIntervalSec=0` became an infinite five-second restart
+            # loop re-running the GC9A01 init sequence on four panels. A path
+            # this daemon cannot write to is a warning a second, whatever kind
+            # of wrong it is.
+            log.warning(
+                "could not write the status file",
+                extra={"path": str(self._status_path), "error": str(exc)},
+            )
 
     def run_forever(self, interval: float = 1.0) -> None:
         """Start, tick until stopped, and shut down whatever happens.

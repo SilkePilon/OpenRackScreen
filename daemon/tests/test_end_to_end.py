@@ -23,8 +23,10 @@ from zoneinfo import ZoneInfo
 
 import yaml
 from ors_daemon.clock import FakeClock
-from ors_daemon.config import resolve_screens
+from ors_daemon.config import config_fingerprint, resolve_screens
 from ors_daemon.displays import DisplayBackend, build_display
+from ors_daemon.integrations.prometheus import PrometheusIntegration
+from ors_daemon.poller import Poller
 from ors_daemon.snapshot import SnapshotStore
 from ors_daemon.supervisor import Supervisor
 from ors_schema.daemon import DaemonConfig, ScreenConfig
@@ -57,7 +59,72 @@ HEALTHY = {
     "nodes_total": 3,
     "alerts": 0,
 }
-"""One poll of the author's cluster, in the shape `prometheus.py` publishes."""
+"""One poll of the author's cluster, in the shape `prometheus.py` publishes.
+
+Not a claim: `test_the_namespace_prometheus_publishes_is_the_one_the_screens_bind`
+puts a real `PrometheusIntegration` and a real `Poller` in front of a store and
+asserts they produce exactly this. Without that, a change to what `reduce: top`
+publishes would leave every test in this file passing against a shape the daemon
+no longer writes.
+"""
+
+CLUSTER = {
+    # What Prometheus answers each of the shipped config's queries with, keyed by
+    # the field the query belongs to. Strings, because that is what a Prometheus
+    # sample is on the wire -- `[timestamp, "42.4"]` -- and turning them into
+    # numbers is part of what the integration is being tested for here.
+    "cpu": ("42.4", None),
+    # Two nodes, so the `top` reduction has something to choose between and the
+    # `last_octet` strip has a real `instance` label to shorten. The peak is not
+    # the first series, so a reduction that took `results[0]` would fail.
+    "cpu_hot": (None, (("192.168.1.4:9100", "40.1"), ("192.168.1.5:9100", "71.2"))),
+    "mem": ("61.2", None),
+    "mem_used_gb": ("19.4", None),
+    "mem_total_gb": ("32", None),
+    "mem_hot": (None, (("192.168.1.3:9100", "51.5"), ("192.168.1.7:9100", "78"))),
+    "pods_run": ("38", None),
+    "pods_tot": ("41", None),
+    "nodes_ready": ("3", None),
+    "nodes_total": ("3", None),
+    "alerts": ("0", None),
+}
+
+
+class FakeResponse:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.status_code = 200
+        self._payload = payload
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+
+class FakePrometheus:
+    """A Prometheus's HTTP surface, and nothing else in the chain.
+
+    The session is the only fake in this seam: the integration parses these
+    envelopes for real, the poller publishes for real, and the store hands the
+    result to four real screen workers. Queries are looked up by the *config's*
+    own query strings, so a field renamed or a query edited in `rack.yaml`
+    surfaces here as a missing key rather than as a silently different reading.
+    """
+
+    def __init__(self, config: Any) -> None:
+        self._by_query = {spec.query: (name, CLUSTER[name]) for name, spec in config.fields.items()}
+        self.urls: list[str] = []
+
+    def get(self, url: str, params: dict[str, str], timeout: float) -> FakeResponse:
+        self.urls.append(url)
+        _, (value, series) = self._by_query[params["query"]]
+        rows = (
+            [{"metric": {}, "value": [0, value]}]
+            if series is None
+            else [
+                {"metric": {"instance": instance}, "value": [0, sample]}
+                for instance, sample in series
+            ]
+        )
+        return FakeResponse({"status": "success", "data": {"resultType": "vector", "result": rows}})
 
 
 class SignallingDisplay:
@@ -102,17 +169,28 @@ class SignallingDisplay:
             return self._condition.wait_for(lambda: self.sleeps >= 1, timeout=WAIT)
 
 
-def rack(
-    tmp_path: Path, now: datetime
-) -> tuple[Supervisor, SnapshotStore, dict[str, SignallingDisplay]]:
-    """The shipped rack on virtual panels, with no tunnel and no poller."""
+def config_of(tmp_path: Path) -> DaemonConfig:
+    """`examples/rack.yaml`, with the two things a rackless machine cannot honour.
+
+    The GC9A01 panels become virtual ones and the `kubectl` tunnel is removed --
+    the second removed rather than faked, because a test does not spawn kubectl.
+    Everything else is the shipped file's own, including the integration's `url`,
+    which is what the daemon polls once the tunnel it would otherwise defer to is
+    gone.
+    """
     raw = yaml.safe_load(EXAMPLE.read_text())
     for screen in raw["screens"]:
         screen["display"] = {"backend": "virtual", "out_dir": str(tmp_path / "panels")}
     for integration in raw["integrations"]:
-        # Removed rather than faked: a test does not spawn `kubectl`.
         integration.pop("tunnel", None)
-    config = DaemonConfig.model_validate(raw)
+    return DaemonConfig.model_validate(raw)
+
+
+def rack(
+    tmp_path: Path, now: datetime
+) -> tuple[Supervisor, SnapshotStore, dict[str, SignallingDisplay]]:
+    """The shipped rack on virtual panels, with no tunnel and no poller."""
+    config = config_of(tmp_path)
 
     store = SnapshotStore()
     displays: dict[str, SignallingDisplay] = {}
@@ -216,7 +294,61 @@ def test_the_whole_rack_renders_from_the_example_config(tmp_path: Path) -> None:
         assert screen["renders"] == 2
     assert status["integrations"][0]["state"] == "healthy"
     assert status["integrations"][0]["latency_ms"] == 5.0
-    assert status["config_version"] == 1
+    assert status["config_schema_version"] == 1
+    # The schema version is a constant on every rack that has ever validated;
+    # this is the field that says *which* config the Pi is running.
+    assert status["config_fingerprint"] == config_fingerprint(config_of(tmp_path))
+
+
+def test_the_namespace_prometheus_publishes_is_the_one_the_screens_bind(tmp_path: Path) -> None:
+    """The seam the rest of this file assumes: Prometheus, poller, store, panels.
+
+    Every other end-to-end test injects `HEALTHY` into the store directly and
+    claims in a comment that it is what `prometheus.py` publishes. Nothing
+    checked that, so a change to what `reduce: top` returns -- the nested
+    `{"node": ..., "value": ...}` four `{{prom.cpu_hot.node}}` bindings read
+    through -- would have left all of them passing while the rack drew `--`.
+
+    Only the HTTP session is faked here. The integration is the real one built
+    from the shipped config's own PromQL, the poller is the real one, the store
+    is the real one, and the assertion is that what comes out the far end is
+    exactly the namespace the shipped screens bind against.
+    """
+    config = config_of(tmp_path)
+    integration_config = config.integrations[0]
+    server = FakePrometheus(integration_config)
+    supervisor, store, displays = rack(tmp_path, NOON)
+    poller = Poller(
+        integration=PrometheusIntegration(integration_config, session=server),
+        store=store,
+        interval=integration_config.poll_interval,
+        stop=threading.Event(),
+        clock=FakeClock(NOON),
+    )
+
+    supervisor.start()
+    try:
+        assert all(display.wait_for_frames(1) for display in displays.values())
+        # One cycle, on this thread: the poller's loop is what a started thread
+        # would add, and it would add a wait rather than a fact.
+        poller.poll_once()
+        assert all(display.wait_for_frames(2) for display in displays.values())
+        settle(supervisor)
+        supervisor.tick()
+    finally:
+        supervisor.stop()
+
+    assert store.read().data["prom"] == HEALTHY, "the literal the other tests inject"
+    assert server.urls == [f"{integration_config.url}/api/v1/query"] * len(
+        integration_config.fields
+    ), "with no tunnel, the configured `url` is what is polled"
+
+    status = status_of(tmp_path)
+    assert status["integrations"][0]["state"] == "healthy"
+    # And the panels drew their own scenes from it rather than falling back to
+    # `stale`, which is what a namespace of the wrong shape would produce.
+    screens = {screen["name"]: screen["scene"] for screen in status["screens"]}
+    assert screens == {"CPU": "default", "MEM": "default", "PODS": "default", "HEALTH": "nodes"}
 
 
 def test_the_rack_sleeps_inside_the_shipped_night_window(tmp_path: Path) -> None:

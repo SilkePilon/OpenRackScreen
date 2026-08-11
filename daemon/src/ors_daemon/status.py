@@ -78,7 +78,8 @@ def _screen(entry: ScreenWorker | UnavailableScreen) -> dict[str, Any]:
 def build_status(
     started_at: datetime,
     now: datetime,
-    config_version: int,
+    config_schema_version: int,
+    config_fingerprint: str,
     screens: Sequence[ScreenWorker | UnavailableScreen],
     snapshot: Snapshot,
 ) -> dict[str, Any]:
@@ -94,6 +95,16 @@ def build_status(
     `now` is passed in rather than read here so the caller's injected clock is
     the only clock in the daemon, uptime included.
 
+    The config is described by two fields that must never be read as one.
+    `config_schema_version` is `DaemonConfig.version`: which *shape* of document
+    this daemon parsed, a `Literal[1]` that changes when the schema does and
+    never otherwise. `config_fingerprint` identifies the document's *contents*,
+    so it is what answers the first question the server asks -- "is the Pi
+    running the config I pushed?" -- which the schema version cannot answer at
+    all, being the same constant on every rack that has ever validated. They are
+    named apart rather than merged because a consumer that confused them would
+    conclude that a rack it had just reconfigured was already up to date.
+
     `screens` carries every *configured* screen, in panel order -- a worker
     where there is one, an `UnavailableScreen` where the panel would not open.
     A screen missing from this list is a screen the daemon has forgotten, not a
@@ -101,7 +112,8 @@ def build_status(
     """
     return {
         "uptime_s": int((now - started_at).total_seconds()),
-        "config_version": config_version,
+        "config_schema_version": config_schema_version,
+        "config_fingerprint": config_fingerprint,
         "screens": [_screen(entry) for entry in screens],
         "integrations": [
             {

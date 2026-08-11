@@ -2,7 +2,13 @@ import logging
 
 import pytest
 import yaml
-from ors_daemon.config import ConfigError, load_config, resolve_screens, system_scenes
+from ors_daemon.config import (
+    ConfigError,
+    config_fingerprint,
+    load_config,
+    resolve_screens,
+    system_scenes,
+)
 
 BASE = {
     "version": 1,
@@ -341,3 +347,70 @@ def test_an_inline_template_shadowing_a_builtin_is_logged(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="ors_daemon.config"):
         resolve_screens(config)
     assert "ring-gauge" in caplog.text
+
+
+# --- the fingerprint: which config, not which schema -------------------------
+
+
+def test_the_fingerprint_changes_when_anything_in_the_config_does(tmp_path):
+    """The field `DaemonConfig.version` cannot be: it is a `Literal[1]`, the
+    version of the *schema*, so it reads the same on every rack that has ever
+    validated. The status file M3 reads verbatim needs something that moves when
+    the config does, or "did the Pi apply the snapshot I pushed?" has no answer.
+    """
+    original = load_config(write(tmp_path, BASE))
+    edited = {**BASE, "screens": [{**BASE["screens"][0], "rotation": 90}]}
+
+    assert config_fingerprint(original) != config_fingerprint(load_config(write(tmp_path, edited)))
+    assert original.version == load_config(write(tmp_path, edited)).version == 1
+
+
+def test_the_fingerprint_is_the_same_for_the_same_config_read_twice(tmp_path):
+    """A restart that changed nothing must not read as a reconfiguration, so
+    this cannot depend on dict iteration order, on a per-process hash seed, or
+    on anything else that is not in the document."""
+    first = load_config(write(tmp_path, BASE))
+    second = load_config(write(tmp_path, BASE))
+
+    assert config_fingerprint(first) == config_fingerprint(second)
+
+
+def test_reordering_the_keys_of_a_config_is_not_a_new_config(tmp_path):
+    """It is taken over the validated model in a canonical form, not over the
+    file: the server holds a document and the Pi holds what it parsed, and the
+    two have to agree. A comment, a reformat or a mapping written in another
+    order is the same rack."""
+    reordered = {
+        **BASE,
+        "integrations": [
+            {
+                "fields": {"cpu": {"query": "up"}},
+                "url": "http://p:9090",
+                "type": "prometheus",
+                "name": "prom",
+            }
+        ],
+    }
+
+    assert config_fingerprint(load_config(write(tmp_path, BASE))) == config_fingerprint(
+        load_config(write(tmp_path, reordered))
+    )
+
+
+def test_reordering_the_screens_of_a_config_is_a_new_config(tmp_path):
+    """A list is not a mapping: two panels swapping places is a different rack,
+    and someone who has just swapped them needs the server to notice."""
+    second = {**BASE["screens"][0], "name": "MEM", "position": 2}
+    forwards = {**BASE, "screens": [BASE["screens"][0], second]}
+    backwards = {**BASE, "screens": [second, BASE["screens"][0]]}
+
+    assert config_fingerprint(load_config(write(tmp_path, forwards))) != config_fingerprint(
+        load_config(write(tmp_path, backwards))
+    )
+
+
+def test_a_fingerprint_is_short_enough_to_read_out_loud(tmp_path):
+    fingerprint = config_fingerprint(load_config(write(tmp_path, BASE)))
+
+    assert len(fingerprint) == 12
+    assert all(character in "0123456789abcdef" for character in fingerprint)
