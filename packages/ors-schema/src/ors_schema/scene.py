@@ -20,6 +20,14 @@ class BaseElement(BaseModel):
     cx: float = 0.5
     cy: float = 0.5
     when: str | None = None
+    # NOT IMPLEMENTED as of M1: validated here and read by no renderer, so an
+    # element with `"opacity": 0.2` draws at full strength and an `"opacity": 0`
+    # one is fully visible rather than hidden. Kept in the schema because the
+    # field is part of the documented scene format and dropping it would reject
+    # scenes that already carry it -- but anything reaching for it (M2's night
+    # mode is the obvious candidate) has to implement it in the element
+    # renderers first, since nothing in the render path composites today.
+    # `when` is the only way a scene can currently hide an element.
     opacity: float = Field(default=1.0, ge=0.0, le=1.0)
 
 

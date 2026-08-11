@@ -5,6 +5,16 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 PALETTE_TOKEN = "@palette"
+"""The colour that means "whatever this element's palette resolves to".
+
+The one string the schema and the renderer must agree on character for
+character, which is why it is a name rather than a literal on each side: the
+pattern below admits it, `ors_render.elements.resolve_color` recognises it, and
+a drift between the two would not raise anywhere -- it would silently render
+white, on a panel with no other way to say so. The pattern spells the token out
+because a regex is what it is; `test_palette_token_is_a_legal_color` checks the
+two against each other, so the literal cannot drift from the constant unnoticed.
+"""
 
 Color = Annotated[str, Field(pattern=r"^(#[0-9a-fA-F]{6}|@palette|\{\{.*\}\})$")]
 """A `#rrggbb` color, the literal `@palette`, or a binding resolving to either.

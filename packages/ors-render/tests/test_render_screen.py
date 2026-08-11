@@ -5,6 +5,7 @@ import sys
 
 from ors_render import RenderContext, render_scene, render_screen, select_scene
 from ors_render.render import expand_params
+from ors_render.templates import load_builtin_templates
 from ors_schema.scene import Scene
 
 HEALTHY = RenderContext(
@@ -108,6 +109,28 @@ scene = Scene.model_validate({"elements": [{"type": "text", "size": 60, "text": 
 image = ors_render.render_screen([scene], ors_render.RenderContext())
 assert image.convert("L").getextrema()[1] > 0, "element registry was empty: nothing drew"
 """
+
+
+def test_the_documented_surface_is_reachable_from_the_package_root() -> None:
+    """All four of M2's entry points, at one import path.
+
+    `load_builtin_templates` is as much of that surface as `render_screen` is --
+    the daemon and the preview endpoint both start from a built-in -- and it was
+    the only one a consumer had to reach for down a submodule path.
+    """
+    import ors_render
+
+    for name in (
+        "Geometry",
+        "RenderContext",
+        "load_builtin_templates",
+        "render_scene",
+        "render_screen",
+        "select_scene",
+    ):
+        assert name in ors_render.__all__, name
+        assert getattr(ors_render, name) is not None, name
+    assert ors_render.load_builtin_templates() is load_builtin_templates()
 
 
 def test_importing_the_package_alone_populates_the_element_registry() -> None:

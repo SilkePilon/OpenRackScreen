@@ -11,7 +11,7 @@ import math
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from ors_schema.palette import GradientPalette
+from ors_schema.palette import PALETTE_TOKEN, GradientPalette
 
 from ors_render.bindings import resolve_text
 from ors_render.canvas import Canvas, parse_hex_color
@@ -115,7 +115,12 @@ def pixel_width(geometry: Geometry, width: float) -> int:
 def resolve_color(
     color: str | None, palette: GradientPalette, data: Mapping[str, Any] | None = None
 ) -> tuple[int, int, int] | None:
-    """Resolve a color field, which may be `#rrggbb`, `@palette`, or a binding.
+    """Resolve a color field, which may be `#rrggbb`, `PALETTE_TOKEN`, or a binding.
+
+    The token is compared through the schema's own constant rather than as a
+    literal here: this is the only site that acts on it, and a spelling that
+    drifted from the pattern which admits it would not raise -- it would fall
+    through to `parse_hex_color` and paint white.
 
     ``None`` resolves to ``None``, meaning *no colour at all*. The schema models
     a genuinely absent colour that way -- `RectElement.fill` and `.stroke`,
@@ -136,6 +141,6 @@ def resolve_color(
         return None
     if "{{" in color:
         color = resolve_text(color, data or {}) or "#ffffff"
-    if color == "@palette":
+    if color == PALETTE_TOKEN:
         return gradient_color(palette, 1.0)
     return parse_hex_color(color, (255, 255, 255))

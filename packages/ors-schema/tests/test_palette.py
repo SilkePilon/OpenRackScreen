@@ -1,5 +1,6 @@
+import ors_schema
 import pytest
-from ors_schema.palette import Color, GradientPalette, PaletteRef, ThresholdPalette
+from ors_schema.palette import PALETTE_TOKEN, Color, GradientPalette, PaletteRef, ThresholdPalette
 from pydantic import BaseModel, ValidationError
 
 
@@ -14,7 +15,11 @@ def test_named_palette_is_a_plain_string():
 
 
 def test_palette_token_is_a_legal_color():
-    assert Holder(color="@palette", palette="cyan").color == "@palette"
+    # Through the constant, not the literal: `Color`'s pattern and
+    # `ors_render.elements.resolve_color` have to agree on this exact string,
+    # and a drift between them would render white rather than fail anywhere.
+    assert "PALETTE_TOKEN" in ors_schema.__all__, "the renderer imports it from the package root"
+    assert Holder(color=PALETTE_TOKEN, palette="cyan").color == PALETTE_TOKEN
 
 
 def test_gradient_palette_parses_from_dict():
