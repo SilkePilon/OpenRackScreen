@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 from ors_daemon.clock import FakeClock
 from ors_daemon.config import ResolvedScreen, system_scenes
+from ors_daemon.screen import _NIGHT_PARK_CHUNK as NIGHT_PARK_CHUNK
 from ors_daemon.screen import ScreenWorker
 from ors_daemon.snapshot import SnapshotStore
 from ors_render import load_builtin_templates, render_scene
@@ -527,7 +528,7 @@ def test_a_worker_that_cannot_draw_waits_on_the_clock_not_on_the_data(state: str
     worker._wait()
 
 
-def test_a_sleeping_worker_parks_until_the_window_closes() -> None:
+def test_a_sleeping_worker_parks_in_chunks_a_watchdog_can_live_with() -> None:
     clock = FakeClock(NIGHT)
     worker, store, _ = make(night=NIGHT_WINDOW, clock=clock)
     worker.tick()
@@ -538,7 +539,40 @@ def test_a_sleeping_worker_parks_until_the_window_closes() -> None:
 
     worker._wait()
 
-    assert stop.waits == [UNTIL_MORNING], "one park, not one per floor for eight hours"
+    assert stop.waits == [NIGHT_PARK_CHUNK], "bounded, so the heartbeat keeps moving"
+
+
+def test_a_sleeping_worker_keeps_its_heartbeat_moving_through_the_night() -> None:
+    clock = FakeClock(NIGHT)
+    worker, store, display = make(night=NIGHT_WINDOW, clock=clock)
+    publish(store)
+    stop = RecordingStop()
+    worker._stop_event = stop  # type: ignore[assignment]
+    # Nothing in a sleeping loop may reach the store: that wait is the only one
+    # here that blocks on a real condition variable, and it would be five
+    # seconds of genuine sleep dressed up as a passing test.
+    store.wait_for_change = _forbidden  # type: ignore[method-assign]
+
+    # The real loop, driven by hand: tick, park, and move the clock on by
+    # whatever was parked for -- from lights-out until the panel wakes again.
+    stamps = []
+    laps = 0
+    while True:
+        worker.tick()
+        stamps.append(worker.heartbeat)
+        if not worker.asleep:
+            break
+        worker._wait()
+        clock.advance(stop.waits[-1])
+        laps += 1
+        assert laps < 10_000, "the night never ended"
+
+    assert max(stop.waits) <= NIGHT_PARK_CHUNK, (
+        "one long park leaves the heartbeat frozen, and the watchdog reads exactly that"
+    )
+    assert laps >= UNTIL_MORNING / NIGHT_PARK_CHUNK
+    assert stamps[-1] > stamps[0], "the heartbeat moved across the night"
+    assert display.wakes == 1, "and the night still ended on time"
 
 
 def test_a_wake_that_failed_is_retried_at_the_floor_not_at_the_next_nightfall() -> None:

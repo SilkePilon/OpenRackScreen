@@ -50,6 +50,31 @@ line that says which panel actually died. The count resets on any good frame,
 so this is three failures in a row, not three in the daemon's lifetime.
 """
 
+_NIGHT_PARK_CHUNK = 20.0
+"""The longest a sleeping worker parks in one go, in seconds.
+
+Bounded on purpose. Do not "optimise" this back to the window boundary: the
+whole night is one wait as far as this branch is concerned, and parking it in a
+single call is the obvious simplification and the wrong one.
+
+`heartbeat` is stamped at the top of `tick`, and the supervisor's watchdog
+restarts any worker whose heartbeat has not moved inside its timeout. A single
+park across an eight-hour night therefore reads as four wedged panels thirty
+seconds after lights-out -- and each restart re-opens the backend, re-sleeps the
+panel and parks again, so it repeats: ~960 spurious restarts a night, every one
+logged as a fault, describing a rack that is working perfectly.
+
+A lap here costs a clock read, an `in_window` and a stamp. No render, no SPI, no
+snapshot read. So ~1,400 of them across a night are free beside the ~5,400
+*rendering* laps that parking on the boundary at all was introduced to remove --
+this keeps that win and drops the part of it that was never the point.
+
+Twenty seconds because it has to sit comfortably under the watchdog's timeout,
+whose default is 30s. That is a real constraint between the two modules: a
+watchdog timeout at or below this value restarts every sleeping panel on
+schedule.
+"""
+
 _ERROR_MESSAGE_CHARS = 40
 """How much of a render failure reaches the glass.
 
@@ -230,12 +255,16 @@ class ScreenWorker(threading.Thread):
         boundary = seconds_until_boundary(now, self._night)
 
         if self.asleep and in_window(now, self._night):
-            # Park on the window itself. Nothing can produce a frame before it
-            # closes, and `seconds_until_boundary` exists precisely so this
-            # branch can wait once: capping it at the floor is ~5,400 wakeups
-            # across an eight-hour night to re-decide the same thing. Still the
-            # stop event, so shutdown is felt immediately rather than at dawn.
-            self._stop_event.wait(boundary)
+            # Towards the window's end, in bounded chunks. Nothing can produce a
+            # frame before it closes, so the floor has no business pacing this
+            # -- capping it there is ~5,400 wakeups across an eight-hour night
+            # to re-decide the same thing. But it must not be one long park
+            # either: the laps are what keep `heartbeat` moving, and the
+            # watchdog restarts a worker whose heartbeat has stopped. See
+            # `_NIGHT_PARK_CHUNK`. The `min` is what makes the last chunk land
+            # on the boundary itself, so the panel still wakes on time. Still
+            # the stop event, so shutdown is felt at once rather than at dawn.
+            self._stop_event.wait(min(boundary, _NIGHT_PARK_CHUNK))
             return
 
         timeout = min(self._floor, boundary)
@@ -354,10 +383,13 @@ class ScreenWorker(threading.Thread):
             self._failures += 1
             message = f"{action}: {type(exc).__name__}: {exc}"
             if message != self._logged_backend_error:
-                # Once per distinct failure, for the same reason the render path
-                # dedupes: the fault latch bounds a *consecutive* run of them,
-                # but a panel failing every other frame never reaches it and
-                # would write a line at the loop's pace for as long as it flaps.
+                # Once per distinct failure, the same bargain the render path
+                # makes: a consecutive run of the identical failure is one line,
+                # not one per lap. Cleared on the next good call below, so a
+                # panel that *flaps* -- good frame, bad frame, repeating -- does
+                # log each failure. That is the intent, not a gap in it: a fault
+                # that comes back after a recovery is a new incident, and the
+                # loop's own pacing bounds those at about a line per floor.
                 log.warning(
                     "display command failed",
                     extra={
