@@ -274,16 +274,23 @@ Per the Core spec §9, made concrete:
   "config_version": 1,
   "screens": [
     {"name": "CPU", "scene": "default", "state": "awake",
-     "last_render": "2026-08-11T21:14:02Z", "renders": 4218}
+     "last_render": "2026-08-11T21:14:02+02:00", "renders": 4218}
   ],
   "integrations": [
-    {"name": "prom", "state": "healthy", "latency_ms": 42,
-     "last_success": "2026-08-11T21:14:00Z", "last_error": null}
+    {"name": "prom", "state": "healthy", "stale": false, "latency_ms": 42.0,
+     "last_success": "2026-08-11T21:14:00+02:00", "last_error": null}
   ]
 }
 ```
 
 M3's link client reports this structure upstream verbatim.
+
+Timestamps carry the daemon's configured offset rather than a `Z` suffix — the
+clock is zoned by config, so `+02:00` is what a rack in Amsterdam actually
+emits, and a consumer matching on `Z` alone would drop every one of them.
+`stale` is present on every integration, always: a source can be `unhealthy`
+without yet being stale, and that difference decides whether a panel keeps
+showing its last good reading or falls to `NO DATA`.
 
 `renders` is a lifetime counter, not a rate. A rate needs history the daemon
 deliberately does not keep, and a lifetime average would read as a current

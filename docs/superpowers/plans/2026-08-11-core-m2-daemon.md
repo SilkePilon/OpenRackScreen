@@ -3361,18 +3361,24 @@ class Supervisor:
         now = time.monotonic()
         for index, worker in enumerate(list(self.workers)):
             if worker.heartbeat and (now - worker.heartbeat) > self._watchdog_timeout:
-                log.error("worker wedged, restarting", extra={"screen": worker.name})
+                log.error("worker wedged, restarting", extra={"screen": worker.screen_name})
                 self.workers[index] = self._restart(worker)
-        write_status(
-            self._status_path,
-            build_status(
-                started_at=self._started_at,
-                now=self._clock(),
-                config_version=self._config.version,
-                screens=self.workers,
-                snapshot=self._store.read(),
-            ),
-        )
+        try:
+            write_status(
+                self._status_path,
+                build_status(
+                    started_at=self._started_at,
+                    now=self._clock(),
+                    config_version=self._config.version,
+                    screens=self.workers,
+                    snapshot=self._store.read(),
+                ),
+            )
+        except OSError as exc:
+            # `write_status` raises deliberately: the module reports, the loop
+            # decides. A read-only /run or a full disk must not darken the rack
+            # -- a status file is a nicety, and the panels are the product.
+            log.warning("could not write the status file", extra={"error": str(exc)})
 
     def run_forever(self, interval: float = 1.0) -> None:
         self.start()
