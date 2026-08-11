@@ -22,12 +22,13 @@ daemon: see `_identify`.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import signal
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -69,6 +70,9 @@ error the moment the unit was written."""
 
 _USAGE_EXIT = 2
 """The conventional shell exit code for "you typed it wrong", and argparse's."""
+
+_STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+"""What systemd sends on `stop`, and what a person at a terminal presses."""
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -202,11 +206,15 @@ def _install_signal_handlers(stop: Callable[[], None]) -> bool:
     shutdown flag first, under a re-entrant lock.
 
     *A second signal is therefore a no-op.* It lands on the same thread, which
-    already holds that lock, and re-enters a `stop` that has already claimed the
-    shutdown -- so it returns immediately rather than sleeping and closing every
-    panel a second time, which on a GC9A01 is a command written to a device that
-    has been torn down. An impatient operator pressing Ctrl-C twice is the
-    ordinary case, not the exotic one.
+    already holds that lock, and re-enters a `stop` that has already claimed
+    each panel it has shut down -- so it does not sleep and close one a second
+    time, which on a GC9A01 is a command written to a device that has been torn
+    down. An impatient operator pressing Ctrl-C twice is the ordinary case, not
+    the exotic one.
+
+    Nothing is restored: `run` installs these for the rest of the process's
+    life, because the only thing after `run` is exit. A caller that has to give
+    the dispositions back uses `_stopping_on_signals`.
     """
     if threading.current_thread() is not threading.main_thread():
         log.warning(
@@ -219,9 +227,36 @@ def _install_signal_handlers(stop: Callable[[], None]) -> bool:
         log.info("stopping", extra={"signal": signal.Signals(signum).name})
         stop()
 
-    for number in (signal.SIGTERM, signal.SIGINT):
+    for number in _STOP_SIGNALS:
         signal.signal(number, handle)
     return True
+
+
+@contextlib.contextmanager
+def _stopping_on_signals(stop: Callable[[], None]) -> Iterator[None]:
+    """Arm the two signals for the block, then put back what was there before.
+
+    For `identify`, which is a command and not a process: `main` returns, so
+    whoever owned SIGINT before it has to own it again afterwards. Leaving the
+    daemon's handler installed points Ctrl-C at a closure that sets an `Event`
+    nobody is waiting on any more -- which under the console script is merely
+    untidy, and inside anything that calls `main` and keeps running (an
+    embedder, a test runner, the M3 server's own tooling) is a Ctrl-C that does
+    nothing at all.
+
+    A disposition that did not come from Python reads as `None`, and
+    `signal.signal` will not take it back; there is nothing to restore in that
+    case, so it is left alone rather than guessed at.
+    """
+    previous = {number: signal.getsignal(number) for number in _STOP_SIGNALS}
+    installed = _install_signal_handlers(stop)
+    try:
+        yield
+    finally:
+        if installed:
+            for number, handler in previous.items():
+                if handler is not None:
+                    signal.signal(number, handler)
 
 
 def _render(screens: list[ResolvedScreen], out: Path, data_path: Path | None) -> int:
@@ -232,6 +267,14 @@ def _render(screens: list[ResolvedScreen], out: Path, data_path: Path | None) ->
     templates bind `{{prom.cpu}}` and friends, so rendering their own scenes
     against nothing would paint an empty gauge that looks like a working one
     reading zero.
+
+    One PNG per screen, named after the screen. `ScreenConfig.name` is not
+    unique in the schema -- uniqueness is a rule about the set, which nothing
+    enforces -- so two screens sharing a name write one file between them, last
+    one winning. The virtual display backend keys its output the same way and
+    has the same property; both are documented rather than defended, because
+    inventing a suffix here would mean a preview whose filenames no longer
+    match the config a person is reading it against.
     """
     data: Any = {}
     if data_path is not None:
@@ -289,10 +332,19 @@ def _identify(
     says which screen and which SPI device that number is, which is the half of
     the mapping the glass cannot show.
 
-    A panel that will not open is reported and skipped rather than abandoning
-    the rest -- the same bargain the supervisor makes -- and is what the
-    non-zero return says: the operator is standing there, and a silent three
-    out of four is worse than useless to them.
+    A panel that will not open, *or that opens and then will not take the
+    frame*, is reported and left out of the map rather than abandoning the
+    rest -- the same bargain the supervisor makes -- and is what the non-zero
+    return says. The second case is the one worth spelling out: the whole
+    command is a single claim, "that panel is this screen", so a dark panel
+    with `3  PODS` printed beside it is not a partial success but a wrong
+    answer. `ScreenWorker.identify` absorbs a failed write by design (a render
+    loop must survive one), so the outcome is read back off the worker rather
+    than caught.
+
+    Panels are keyed by name in the printed map, and `ScreenConfig.name` is not
+    unique in the schema -- two screens may share one. They still get their own
+    line here, distinguished by their `position`.
     """
     store = SnapshotStore()
     system = system_scenes()
@@ -324,20 +376,30 @@ def _identify(
             clock=clock,
         )
         worker.identify(str(screen.config.position))
+        # Opened is opened, drawn or not: it goes on the list either way, or its
+        # serial device outlives the command that opened it.
         panels.append((name, backend))
-        print(f"{screen.config.position}  {name}  {_display_label(screen.config.display)}")
+        if worker.renders:
+            print(f"{screen.config.position}  {name}  {_display_label(screen.config.display)}")
+        else:
+            # `renders` counts frames that reached the glass, so nought after
+            # one identify is a write the backend refused -- a ribbon seated
+            # well enough to enumerate the device and not well enough to clock a
+            # frame out of it. The backend logged why.
+            print(f"{name}: the panel opened but would not take a frame", file=sys.stderr)
+            failed.append(name)
 
-    # Only when the wait can actually block. `--hold 0` is a script asking for
-    # a flash of the digits, and it has no business changing the disposition of
-    # two signals on its way past -- which would outlive this command inside
-    # anything that called `main` rather than the process.
+    # Armed only when the wait can actually block: `--hold 0` is a script asking
+    # for a flash of the digits, and it has no business touching the process's
+    # signals on its way past. Restored on the way out either way -- see
+    # `_stopping_on_signals`.
     if panels and (hold is None or hold > 0):
-        _install_signal_handlers(stop.set)
-        if hold is None:
-            print("holding; press Ctrl-C to blank the panels", flush=True)
-        # `wait(None)` blocks until a signal sets the event; `wait(30)` gives up
-        # on its own. One call covers both.
-        stop.wait(hold)
+        with _stopping_on_signals(stop.set):
+            if hold is None:
+                print("holding; press Ctrl-C to blank the panels", flush=True)
+            # `wait(None)` blocks until a signal sets the event; `wait(30)`
+            # gives up on its own. One call covers both.
+            stop.wait(hold)
 
     for name, backend in panels:
         _blank(name, backend)

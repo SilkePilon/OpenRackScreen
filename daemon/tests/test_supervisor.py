@@ -414,6 +414,89 @@ def test_stop_is_idempotent(tmp_path: Path) -> None:
         assert display.closed == 1
 
 
+def build_interrupted_by_stop(
+    tmp_path: Path, on_screen: str, screens: int = 4
+) -> tuple[Supervisor, dict[str, RecordingDisplay]]:
+    """A supervisor whose `stop` lands while `start` is opening `on_screen`.
+
+    Called from inside the display factory, so it runs on the very thread that
+    is inside `start()` -- which is what a signal handler does, and what makes
+    a re-entrant lock no protection at all.
+    """
+    config = DaemonConfig.model_validate(config_dict(tmp_path, screens=screens))
+    displays: dict[str, RecordingDisplay] = {}
+    holder: list[Supervisor] = []
+
+    def display_factory(screen_config: ScreenConfig, name: str) -> RecordingDisplay:
+        displays[name] = RecordingDisplay()
+        if name == on_screen:
+            holder[0].stop()
+        return displays[name]
+
+    holder.append(
+        Supervisor(
+            config=config,
+            screens=resolve_screens(config),
+            store=SnapshotStore(),
+            clock=FakeClock(NOW),
+            status_path=tmp_path / "status.json",
+            display_factory=display_factory,
+            poller_factory=lambda integration_config, url_provider: None,
+        )
+    )
+    return holder[0], displays
+
+
+def test_a_stop_landing_mid_start_still_sleeps_every_panel_that_was_opened(
+    tmp_path: Path,
+) -> None:
+    """The one thing shutdown exists to do, in the one window it used to miss.
+
+    `stop` walks the slots recorded so far, and `start` then carries on opening
+    backends behind it: every panel opened after that point had no slot, so it
+    was never slept and never closed -- lit glass and an open serial device,
+    for as long as the process lived. The slot is therefore recorded *before*
+    the stopped flag is read, and `stop` shuts down every slot it has not
+    already claimed rather than returning early.
+    """
+    supervisor, displays = build_interrupted_by_stop(tmp_path, on_screen="S2")
+
+    supervisor.start()
+
+    assert displays, "the test proves nothing if no panel was ever opened"
+    for name, display in displays.items():
+        assert (display.sleeps, display.closed) == (1, 1), name
+        assert display.calls[-2:] == ["sleep", "close"], name
+
+
+def test_a_stop_landing_mid_start_stops_opening_the_rest_of_the_rack(tmp_path: Path) -> None:
+    """Opening a panel takes a hardware reset and a fifty-command init sequence.
+
+    Doing that three more times, to close all three immediately, is a slower
+    shutdown for nothing -- and three more chances for an SPI error on the way
+    out of a daemon that is already leaving.
+    """
+    supervisor, displays = build_interrupted_by_stop(tmp_path, on_screen="S2")
+
+    supervisor.start()
+
+    assert sorted(displays) == ["S1", "S2"]
+
+
+def test_a_stop_landing_mid_start_is_not_confused_by_a_second_one(tmp_path: Path) -> None:
+    """An impatient operator, or systemd's SIGTERM followed by its SIGKILL
+    timer being beaten by a second `systemctl stop`. Each panel is slept once,
+    whichever call reaches it."""
+    supervisor, displays = build_interrupted_by_stop(tmp_path, on_screen="S2")
+
+    supervisor.start()
+    supervisor.stop()
+    supervisor.stop()
+
+    for name, display in displays.items():
+        assert (display.sleeps, display.closed) == (1, 1), name
+
+
 def test_stop_without_a_start_does_nothing_and_says_nothing(tmp_path: Path) -> None:
     supervisor, _, displays = make(tmp_path)
     supervisor.stop()

@@ -24,6 +24,7 @@ import yaml
 from ors_daemon.__main__ import DEFAULT_STATUS_PATH, _install_signal_handlers, main
 from ors_daemon.clock import FakeClock
 from ors_daemon.config import load_config, resolve_screens
+from ors_daemon.displays import DisplayError
 from ors_daemon.snapshot import SnapshotStore
 from ors_daemon.supervisor import Supervisor
 from ors_schema.daemon import ScreenConfig
@@ -142,13 +143,59 @@ def capture_signals(monkeypatch: Any) -> dict[int, Callable[[int, FrameType | No
     return INSTALLED
 
 
-def virtual_supervisor(tmp_path: Path) -> tuple[Supervisor, list[CountingDisplay]]:
-    """The real supervisor over the shipped config, on panels that are counters."""
+class DeadDisplay(CountingDisplay):
+    """A panel that opens and then refuses every frame.
+
+    A ribbon seated well enough to enumerate the device and not well enough to
+    clock a frame out of it, which is a real state of a rack and the one the
+    `identify` map must not report as a lit panel.
+    """
+
+    def show(self, image: Image.Image) -> None:
+        raise DisplayError("no ack from the panel")
+
+
+def explode(*args: Any, **kwargs: Any) -> None:
+    raise AssertionError("this command must not build a display backend")
+
+
+def capture_firing_signals(monkeypatch: Any) -> list[tuple[int, Any]]:
+    """Record every disposition change, and fire the *first* one per signal.
+
+    Firing the arming is a signal landing during a hold, which is what ends it
+    -- so a passing test spends none of its `--hold`. Only the arming: firing a
+    *restore* would call whatever was there before, which is pytest's own SIGINT
+    handler or `SIG_DFL`, and the latter is not callable at all.
+    """
+    calls: list[tuple[int, Any]] = []
+    fired: set[int] = set()
+
+    def fake_signal(number: int, handler: Any) -> None:
+        calls.append((number, handler))
+        if number not in fired:
+            fired.add(number)
+            handler(number, None)
+
+    monkeypatch.setattr(signal, "signal", fake_signal)
+    return calls
+
+
+def virtual_supervisor(
+    tmp_path: Path, on_build: Callable[[str], None] | None = None
+) -> tuple[Supervisor, list[CountingDisplay]]:
+    """The real supervisor over the shipped config, on panels that are counters.
+
+    `on_build` runs while a panel is being opened, which is how a test lands a
+    signal in the middle of `start()` -- on the very thread doing the opening,
+    exactly as a real one does.
+    """
     config = load_config(write_virtual_config(tmp_path))
     displays: list[CountingDisplay] = []
 
     def display_factory(screen_config: ScreenConfig, name: str) -> CountingDisplay:
         displays.append(CountingDisplay())
+        if on_build is not None:
+            on_build(name)
         return displays[-1]
 
     supervisor = Supervisor(
@@ -174,10 +221,6 @@ def test_the_shipped_example_config_validates() -> None:
 
 def test_validating_never_opens_a_panel(monkeypatch: Any) -> None:
     """The pins in the shipped config are a document, not a device."""
-
-    def explode(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("validate must not build a display backend")
-
     monkeypatch.setattr("ors_daemon.__main__.build_display", explode)
 
     assert main(["validate", "--config", str(EXAMPLE)]) == 0
@@ -254,6 +297,19 @@ def test_render_needs_no_backend_even_for_the_gc9a01_rack(tmp_path: Path) -> Non
     assert main(["render", "--config", str(EXAMPLE), "--out", str(out)]) == 0
     assert len(list(out.glob("*.png"))) == 4
     assert Image.open(out / "CPU.png").size == (240, 240)
+
+
+def test_render_never_opens_a_panel(tmp_path: Path, monkeypatch: Any) -> None:
+    """Pinned, not inferred from luma being absent.
+
+    The test above passes on CI for the wrong reason too -- there is no luma to
+    open a panel with. On the Pi, where the hardware extra is installed, a
+    regression that reached for a backend would light four panels and still be
+    green without this.
+    """
+    monkeypatch.setattr("ors_daemon.__main__.build_display", explode)
+
+    assert main(["render", "--config", str(EXAMPLE), "--out", str(tmp_path / "out")]) == 0
 
 
 def test_render_accepts_a_data_file_so_a_screen_can_be_checked_offline(tmp_path: Path) -> None:
@@ -372,18 +428,31 @@ def test_identify_holds_the_ordinals_until_a_signal_arrives(
     `--hold` and then fail on the handlers, rather than hanging the suite --
     which is why the hold here is a number and not the real default of `None`.
     """
-    INSTALLED.clear()
-
-    def fire_at_once(number: int, handler: Callable[[int, FrameType | None], None]) -> None:
-        INSTALLED[number] = handler
-        handler(number, None)
-
-    monkeypatch.setattr(signal, "signal", fire_at_once)
+    calls = capture_firing_signals(monkeypatch)
     path = write_virtual_config(tmp_path)
 
     assert main(["identify", "--config", str(path), "--hold", str(WAIT)]) == 0
-    assert set(INSTALLED) == {signal.SIGTERM, signal.SIGINT}
+    assert {number for number, _ in calls[:2]} == {signal.SIGTERM, signal.SIGINT}
     assert len(list((tmp_path / "panels").glob("*.png"))) == 4
+
+
+def test_identify_puts_the_signal_handlers_back(tmp_path: Path, monkeypatch: Any) -> None:
+    """`identify` is a command, not a process.
+
+    `main` returns, so whatever owned SIGINT before it -- a shell wrapper, an
+    embedder, a test runner -- has to own it afterwards. A hold that *elapses*
+    rather than being cut short by a signal would otherwise leave both
+    dispositions pointing at a closure setting an `Event` nobody is waiting on:
+    Ctrl-C would then do nothing at all. `run` is the opposite case and keeps
+    its handlers, because the only thing after `run` is exit.
+    """
+    before = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
+    calls = capture_firing_signals(monkeypatch)
+    path = write_virtual_config(tmp_path)
+
+    assert main(["identify", "--config", str(path), "--hold", str(WAIT)]) == 0
+    assert len(calls) == 4, calls
+    assert dict(calls[-2:]) == before
 
 
 def test_identify_leaves_the_processs_signals_alone_when_it_does_not_wait(
@@ -413,6 +482,34 @@ def test_identify_reports_a_panel_it_cannot_open(tmp_path: Path, capsys: Any) ->
     assert main(["identify", "--config", str(path), "--hold", "0"]) == 1
     assert "CPU" in capsys.readouterr().err
     assert len(list((tmp_path / "panels").glob("*.png"))) == 3
+
+
+def test_identify_reports_a_panel_that_opens_but_will_not_take_a_frame(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    """A dark panel with a line in the map beside it is worse than no line.
+
+    The whole command is one claim -- "that panel is this screen" -- so a panel
+    that took no frame must not be in the map, must be on stderr, and must not
+    let the command exit 0.
+    """
+    displays: dict[str, CountingDisplay] = {}
+
+    def build(config: Any, name: str) -> CountingDisplay:
+        displays[name] = DeadDisplay() if name == "PODS" else CountingDisplay()
+        return displays[name]
+
+    monkeypatch.setattr("ors_daemon.__main__.build_display", build)
+    path = write_virtual_config(tmp_path)
+
+    assert main(["identify", "--config", str(path), "--hold", "0"]) == 1
+    captured = capsys.readouterr()
+    assert "PODS" in captured.err
+    assert "3  PODS" not in captured.out
+    assert "1  CPU" in captured.out
+    # Opened is opened: a panel that would not draw is still closed on the way
+    # out, or its serial device outlives the command that opened it.
+    assert [(display.sleeps, display.closed) for display in displays.values()] == [(1, 1)] * 4
 
 
 def test_run_installs_a_handler_for_both_signals_before_it_loops(
@@ -474,6 +571,32 @@ def test_a_second_signal_during_shutdown_does_not_sleep_a_panel_twice(
     handlers[signal.SIGTERM](signal.SIGTERM, None)
 
     assert [(display.sleeps, display.closed) for display in displays] == [(1, 1)] * 4
+
+
+def test_a_signal_landing_while_the_rack_is_coming_up_leaves_no_panel_lit(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The window the README's own bring-up step walks the operator into.
+
+    `ors-daemon run`, then Ctrl-C while the four GC9A01s are still opening --
+    each one a hardware reset and a fifty-command init. The handler runs on the
+    thread that is inside `start()`, so `stop` walks a slot list the panels
+    still being opened are not in yet. Every panel that got as far as being
+    opened has to be slept and closed regardless of when the signal landed.
+    """
+    handlers = capture_signals(monkeypatch)
+
+    def signal_on(name: str) -> None:
+        if name == "MEM":
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+    supervisor, displays = virtual_supervisor(tmp_path, on_build=signal_on)
+    _install_signal_handlers(supervisor.stop)
+
+    supervisor.start()
+
+    assert displays, "the test proves nothing if no panel was ever opened"
+    assert [(display.sleeps, display.closed) for display in displays] == [(1, 1)] * len(displays)
 
 
 def test_handlers_are_not_installed_off_the_main_thread() -> None:

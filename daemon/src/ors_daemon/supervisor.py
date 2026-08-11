@@ -165,6 +165,11 @@ class _Slot:
     panel: _Panel
     worker: ScreenWorker
     restarts: int = 0
+    shut_down: bool = False
+    """Claimed by whichever `stop` reaches this slot first, before it does the
+    work. It is what makes shutdown repeatable without being repeated: `stop`
+    runs more than once by design, and a panel may only be slept and closed
+    once."""
 
 
 class Supervisor:
@@ -223,14 +228,29 @@ class Supervisor:
         return [slot.worker for slot in self._slots]
 
     def start(self) -> None:
-        """Bring the rack up: tunnels and pollers first, then panels."""
+        """Bring the rack up: tunnels and pollers first, then panels.
+
+        Interruptible, because on the rack it is interrupted: the CLI arms
+        SIGTERM before this runs, the README's own bring-up step is "start it,
+        then Ctrl-C", and systemd will `stop` a unit it is still starting.
+        Every lap checks whether that has happened -- opening a GC9A01 is a
+        hardware reset and a fifty-command init sequence, and doing three more
+        of those to close all three immediately is a slower shutdown for
+        nothing. What makes it *correct* rather than merely quick is in
+        `_start_screen` and `stop`: this check is an optimisation and is not
+        load-bearing, because a signal can always land the instant after it.
+        """
         for integration_config in self._config.integrations:
+            if self._stopped:
+                return
             # Registered before the poller runs, so a screen depending on an
             # integration that has not answered yet shows `connecting` rather
             # than failing to find it at all.
             self._store.register(integration_config.name)
             self._start_integration(integration_config)
         for screen in self._screens:
+            if self._stopped:
+                return
             self._start_screen(screen)
 
     def tick(self) -> None:
@@ -281,7 +301,7 @@ class Supervisor:
             self.stop()
 
     def stop(self) -> None:
-        """Stop every thread, then put every panel to sleep. Idempotent.
+        """Stop every thread, then put every panel to sleep. Repeatable, never repeated.
 
         The order is the whole method. The stop event goes first so nothing
         starts another lap; the store is released because a screen worker parks
@@ -291,18 +311,27 @@ class Supervisor:
         Only once every thread has been joined are the leases revoked and the
         panels slept and closed, so no backend is ever touched by two threads.
 
-        Idempotent because it has two callers in production and they overlap:
-        M2's CLI installs it as the SIGTERM handler *and* calls it from
-        `run_forever`'s `finally`, so the signal that ends the loop also runs
-        this to completion before the loop's own call arrives.
+        It runs more than once by design: the CLI installs it as the SIGTERM
+        handler *and* `run_forever` calls it from its `finally`, and an
+        impatient operator sends the signal twice. So every step is written to
+        be safe to repeat -- setting an event, closing a closed store, joining a
+        finished thread and telling a stopped tunnel to stop all cost nothing --
+        and the one step that is *not* repeatable, sleeping and closing a panel,
+        is claimed per slot before it is done.
+
+        That is a stronger promise than "returns early the second time", and the
+        difference is a real failure. This can be called *while `start` is still
+        opening panels*: the handler runs on the thread inside `start`, so a
+        re-entrant lock protects nothing, and an early return would leave every
+        panel opened after the signal lit, with its serial device open, for as
+        long as the process lived. Draining whatever is in `_slots` on every
+        call is what closes that window -- together with `_start_screen`
+        recording a slot *before* it reads `_stopped`, so no panel can exist
+        outside this list at a moment when a stop could be running.
         """
         with self._shutdown_lock:
-            if self._stopped:
-                return
-            # Claimed first, under the lock. The lock is re-entrant and a signal
-            # lands on the thread that already holds it, so anything between the
-            # claim and the lock would let a SIGTERM arriving mid-shutdown run
-            # the whole thing a second time -- two sleeps and two closes a panel.
+            # Claimed first, under the lock, because `tick` and `_start_screen`
+            # both read it to decide whether the rack is still coming up.
             self._stopped = True
             self._stop_event.set()
             # Releases every `wait_for_change`, which is where a screen worker
@@ -311,6 +340,11 @@ class Supervisor:
             self._store.close()
 
             for slot in self._slots:
+                if slot.shut_down:
+                    # Joined and slept by an earlier call; its worker is gone
+                    # and its panel is off. Re-joining would be free, but
+                    # re-warning about a wedged one would not be.
+                    continue
                 slot.worker.join(_JOIN_TIMEOUT)
                 if slot.worker.is_alive():
                     log.warning(
@@ -322,11 +356,22 @@ class Supervisor:
             for tunnel in self.tunnels:
                 # Sets the stop event again on its way past, which is harmless
                 # and not worth working around: it is what makes `shutdown`
-                # usable on a tunnel whose own loop is still running.
+                # usable on a tunnel whose own loop is still running. Repeated
+                # on a later call for the same reason, and because a tunnel
+                # started after an earlier one -- `start` was interrupted
+                # partway -- would otherwise keep its `kubectl` child.
                 tunnel.shutdown()
                 tunnel.join(_JOIN_TIMEOUT)
 
             for slot in self._slots:
+                if slot.shut_down:
+                    continue
+                # Claimed before the work and under the lock, so a signal
+                # landing inside `_shut_down_panel` -- on this very thread --
+                # re-enters here and skips what is already in hand instead of
+                # sleeping and closing it a second time. On a GC9A01 a second
+                # close writes to a device that has been torn down.
+                slot.shut_down = True
                 # Abandoned workers are not joined -- a wedged one never would
                 # be -- and they do not need to be: their lease is revoked, so
                 # the only thread that can still reach this panel is this one.
@@ -435,6 +480,18 @@ class Supervisor:
         # Started before the slot records it, for the reason `_replace` gives.
         worker.start()
         self._slots.append(_Slot(screen=screen, panel=panel, worker=worker))
+        # Recorded first, *then* the flag is read -- never the other way round.
+        # `_stopped` only ever goes from false to true, so a stop that has begun
+        # at any point up to this line is still visible here, while a stop that
+        # begins after it finds the slot already in the list. Between the two
+        # there is no instant at which this panel is open and unreachable by a
+        # shutdown, which is the entire property: the check-then-act ordering,
+        # not the lock, is what makes it race-free, because the stop that
+        # matters most is a signal handler running on this very thread and no
+        # lock excludes that.
+        if self._stopped:
+            log.info("stopped while opening a panel; shutting it down", extra={"screen": name})
+            self.stop()
 
     def _make_worker(self, screen: ResolvedScreen, panel: _Panel) -> ScreenWorker:
         return ScreenWorker(

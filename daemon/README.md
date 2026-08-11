@@ -90,10 +90,21 @@ ors-daemon identify --config /etc/openrackscreen/rack.yaml --hold 30
 # Drive the rack. SIGTERM and SIGINT blank, sleep and close every panel first.
 ors-daemon run --config /etc/openrackscreen/rack.yaml \
     --status /run/openrackscreen/status.json
+
+# --log-level belongs to the program, not to the subcommand, so it goes BEFORE
+# it. DEBUG | INFO (default) | WARNING | ERROR | CRITICAL, one JSON object per
+# line on stderr. This is the usual thing to get wrong:
+ors-daemon --log-level DEBUG run --config /etc/openrackscreen/rack.yaml
 ```
 
 `identify` starts no poller and no tunnel: it opens the panels, draws, waits,
-and blanks. It is safe to run against a cluster that is down.
+and blanks. It is safe to run against a cluster that is down. It exits non-zero
+if any panel could not be opened, or opened and would not take the frame — a
+panel missing from the printed map is a panel you cannot trust the map about.
+
+`render` and `identify` name their output after each screen's `name`, which the
+schema does not force to be unique: two screens called `CPU` write one
+`CPU.png` between them. Give them distinct names, or read the ordinals.
 
 ## Run it under systemd
 

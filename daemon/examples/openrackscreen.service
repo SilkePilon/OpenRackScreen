@@ -37,6 +37,10 @@ Group=openrackscreen
 # comes up `unavailable` and the rack stays dark.
 SupplementaryGroups=spi gpio
 
+# `--log-level` is the program's, not the subcommand's, so it goes before `run`:
+# add `--log-level DEBUG` right after the executable when a panel is misbehaving
+# and the INFO lines are not saying enough. INFO is the default and is what a
+# healthy rack should be left on -- DEBUG on four screens fills a journal.
 ExecStart=/opt/openrackscreen/.venv/bin/ors-daemon run \
           --config /etc/openrackscreen/rack.yaml \
           --status /run/openrackscreen/status.json
