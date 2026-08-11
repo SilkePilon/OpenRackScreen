@@ -238,9 +238,60 @@ def test_a_data_driven_template_draws_no_text_at_all_without_data(name):
 
 def test_a_template_left_on_its_default_params_still_renders():
     for template in load_builtin_templates().values():
-        defaults = {name: spec.default for name, spec in template.params_schema.items()}
-        image = render_screen(template.scenes, RenderContext(data={"params": defaults}))
+        image = render_screen(
+            template.scenes, RenderContext(data={"params": template.bind_params()})
+        )
         assert image.size == (240, 240)
+
+
+def test_bind_params_is_what_a_caller_hands_to_render_screen():
+    """The bridge between a template's declared defaults and `ctx.data["params"]`.
+
+    Nothing joined the two before, so the daemon, the server's preview endpoint
+    and these tests were each about to write their own merge and diverge on the
+    edges. Rendering a real built-in through it has to be indistinguishable from
+    rendering the same values written out by hand.
+    """
+    template = load_builtin_templates()["ring-gauge"]
+    bound = template.bind_params({"title": "MEM", "palette": "green"})
+    assert bound == {
+        "title": "MEM",
+        "value": "0",
+        "big": "0%",
+        "subtitle": "",
+        "hint": "",
+        "palette": "green",
+    }
+    literal = render_screen(template.scenes, RenderContext(data={"params": bound}))
+    assert (
+        literal.tobytes()
+        == render_screen(
+            template.scenes,
+            RenderContext(
+                data={
+                    "params": {
+                        "title": "MEM",
+                        "value": "0",
+                        "big": "0%",
+                        "subtitle": "",
+                        "hint": "",
+                        "palette": "green",
+                    }
+                }
+            ),
+        ).tobytes()
+    )
+    # And the screen the goldens draw: an override may be a binding, which
+    # `expand_params` resolves exactly as it does one written inline.
+    ctx = RenderContext(
+        data={
+            "prom": PROM,
+            "params": template.bind_params(
+                {"title": "CPU", "value": "{{prom.cpu}}", "big": "{{prom.cpu | round:0}}%"}
+            ),
+        }
+    )
+    assert render_screen(template.scenes, ctx).convert("L").getextrema()[1] > 0
 
 
 @pytest.mark.parametrize("scene_name", ["stale", "connecting", "error", "identify"])

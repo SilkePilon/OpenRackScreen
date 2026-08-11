@@ -83,6 +83,68 @@ def test_scene_round_trips_through_json_with_repeat_alias():
     assert Scene.model_validate(dumped) == scene
 
 
+def _params_template() -> Template:
+    return Template.model_validate(
+        {
+            "name": "t",
+            "params_schema": {
+                "title": {"type": "string", "default": "CPU"},
+                "palette": {"type": "palette", "default": "cyan"},
+                # A declared parameter with no default at all: `ParamSpec.default`
+                # is `Any`, so `None` is what "nothing supplied" looks like.
+                "hint": {"type": "string"},
+            },
+            "scenes": [],
+        }
+    )
+
+
+def test_bind_params_returns_the_declared_defaults():
+    assert _params_template().bind_params() == {
+        "title": "CPU",
+        "palette": "cyan",
+        "hint": None,
+    }
+
+
+def test_bind_params_lets_an_override_win():
+    bound = _params_template().bind_params({"title": "MEM", "hint": "peak .5"})
+    assert bound["title"] == "MEM"
+    assert bound["hint"] == "peak .5"
+    assert bound["palette"] == "cyan", "an unmentioned param keeps its default"
+
+
+def test_bind_params_keeps_an_override_the_template_never_declared():
+    # Deliberate, and documented on the method: `params_schema` is what the
+    # editor offers, not a filter on what a scene may read. A user-edited
+    # template that draws `{{params.extra}}` without declaring it still renders,
+    # and dropping the value would blank a field that works today.
+    assert _params_template().bind_params({"extra": "x"})["extra"] == "x"
+
+
+def test_bind_params_does_not_second_guess_an_overrides_type():
+    # `ParamSpec.type` is editor metadata. Every field the renderer reads
+    # degrades on its own -- an unusable number falls back, an unusable colour
+    # renders white -- so coercing or dropping here would only move the decision
+    # somewhere with less context.
+    assert _params_template().bind_params({"title": 42, "palette": None}) == {
+        "title": 42,
+        "palette": None,
+        "hint": None,
+    }
+
+
+def test_bind_params_hands_back_a_fresh_dict_every_time():
+    # `load_builtin_templates` caches, so every caller shares one `Template`.
+    # A result that aliased anything on it would let one screen's params leak
+    # into the next frame's.
+    template = _params_template()
+    first = template.bind_params({"title": "MEM"})
+    first["title"] = "MUTATED"
+    assert template.bind_params()["title"] == "CPU"
+    assert template.params_schema["title"].default == "CPU"
+
+
 def test_template_declares_params_and_scenes():
     tpl = Template.model_validate(
         {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -154,3 +155,48 @@ class Template(BaseModel):
     builtin: bool = False
     params_schema: dict[str, ParamSpec] = Field(default_factory=dict)
     scenes: list[Scene] = Field(default_factory=list)
+
+    def bind_params(self, overrides: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """This template's declared defaults, overlaid with a screen's own values.
+
+        The one bridge between `params_schema`, which is where a default is
+        written, and ``ctx.data["params"]``, which is what a renderer reads:
+
+            render_screen(template.scenes, RenderContext(data={
+                "prom": readings, "params": template.bind_params(screen.params)
+            }))
+
+        It lives on the model rather than in the renderer because all three
+        consumers need it -- the daemon rendering to a panel, the server
+        rendering a preview, the tests rendering a golden -- and a merge written
+        three times is three chances to disagree about an edge. Three edges, each
+        decided here once:
+
+        *An override naming a parameter the template does not declare is kept.*
+        `params_schema` is what an editor offers, not a filter on what a scene
+        may read: a user-edited template can draw ``{{params.extra}}`` without
+        having declared it, and dropping the value would blank a field that
+        renders today. A stray key costs nothing -- no scene reads it.
+
+        *A parameter declared with no default appears anyway, as ``None``.*
+        `ParamSpec.default` is `Any`, so ``None`` is both "no default written"
+        and a default someone could write, and there is no third state to
+        distinguish them by. The renderer treats an absent key and a ``None`` one
+        identically -- both resolve to nothing and both take a ``| default:``
+        filter -- so including it costs nothing and makes the result total: every
+        declared name is present.
+
+        *An override of the wrong type passes through unchanged.* `ParamSpec.type`
+        is metadata for the editor's form controls, and the renderer already
+        degrades per field -- an unusable number falls back to the element's own,
+        an unusable colour renders white. Coercing or refusing here would decide
+        that with strictly less context than the field has.
+
+        The result is a fresh `dict` that shares nothing with the template, which
+        matters because `ors_render.templates.load_builtin_templates` caches: one
+        `Template` is handed to every caller, and a result aliasing part of it
+        would let one screen's parameters leak into the next frame's.
+        """
+        bound = {name: spec.default for name, spec in self.params_schema.items()}
+        bound.update(overrides or {})
+        return bound
