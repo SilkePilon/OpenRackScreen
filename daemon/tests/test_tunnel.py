@@ -509,3 +509,23 @@ def test_shutdown_is_safe_before_a_start_and_twice_over():
 
     assert harness.processes == []
     assert tunnel.ready.is_set() is False
+
+
+def test_a_tunnel_can_be_joined():
+    # See the matching poller test: storing the stop event as `self._stop` shadows
+    # `threading.Thread._stop`, which `join` calls, and every join raises.
+    harness = Harness([True])
+    stop = threading.Event()
+    stop.set()
+    tunnel = Tunnel(
+        config=CONFIG,
+        stop=stop,
+        probe=harness.probe,
+        launcher=harness.launcher,
+        discoverer=harness.discoverer,
+        sleeper=lambda seconds: None,
+    )
+    tunnel.start()
+    tunnel.join(timeout=5.0)
+
+    assert not tunnel.is_alive()

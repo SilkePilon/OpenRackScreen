@@ -417,3 +417,23 @@ def test_a_sleeper_that_raises_does_not_take_the_thread_down():
     poller.run()
 
     assert len(calls) == 3
+
+
+def test_a_poller_can_be_joined():
+    # `threading.Thread.join` calls `self._stop()`, so a subclass that stores its
+    # stop *event* as `self._stop` shadows a method the base class needs and every
+    # join raises `TypeError: 'Event' object is not callable`. The failure is
+    # invisible until something joins, which is what the supervisor does on SIGTERM.
+    stop = threading.Event()
+    stop.set()
+    poller = Poller(
+        integration=FakeIntegration(),
+        store=SnapshotStore(),
+        interval=0.0,
+        stop=stop,
+        clock=lambda: NOW,
+    )
+    poller.start()
+    poller.join(timeout=5.0)
+
+    assert not poller.is_alive()

@@ -34,7 +34,7 @@ class Poller(threading.Thread):
         self._integration = integration
         self._store = store
         self._interval = interval
-        self._stop = stop
+        self._stop_event = stop
         self._clock = clock
         self._backoff_cap = backoff_cap
         # Waiting on the stop event rather than sleeping is what makes SIGTERM
@@ -83,7 +83,7 @@ class Poller(threading.Thread):
         even that. So the loop body, the wait and the close are each guarded.
         """
         try:
-            while not self._stop.is_set():
+            while not self._stop_event.is_set():
                 try:
                     self.poll_once()
                 except Exception as exc:
@@ -111,7 +111,7 @@ class Poller(threading.Thread):
                     # the default `stop.wait` cannot raise. Losing the pace is
                     # survivable; losing the thread is not.
                     log.exception("sleeper failed", extra={"integration": self._integration.name})
-                    self._stop.wait(self.next_delay)
+                    self._stop_event.wait(self.next_delay)
         finally:
             try:
                 self._integration.close()

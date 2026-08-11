@@ -164,7 +164,7 @@ class Tunnel(threading.Thread):
     ) -> None:
         super().__init__(name=f"tunnel-{config.namespace}", daemon=True)
         self._config = config
-        self._stop = stop
+        self._stop_event = stop
         self._probe = probe or default_probe
         self._launch = launcher or default_launcher
         self._discover = discoverer or default_discoverer
@@ -230,7 +230,7 @@ class Tunnel(threading.Thread):
         launcher that returned an object whose `poll` raises, say.
         """
         try:
-            while not self._stop.is_set():
+            while not self._stop_event.is_set():
                 try:
                     self.tick()
                 except Exception:
@@ -249,7 +249,7 @@ class Tunnel(threading.Thread):
                     # default `stop.wait` cannot raise. Losing the pace is
                     # survivable; losing the thread is not.
                     log.exception("sleeper failed", extra={"namespace": self._config.namespace})
-                    self._stop.wait(self._interval)
+                    self._stop_event.wait(self._interval)
         finally:
             self.shutdown()
 
@@ -264,7 +264,7 @@ class Tunnel(threading.Thread):
         port. Setting it also ends the default sleeper's `stop.wait` at once, so
         the join is quick rather than up to an interval long.
         """
-        self._stop.set()
+        self._stop_event.set()
         self.ready.clear()
         self._kill()
 
