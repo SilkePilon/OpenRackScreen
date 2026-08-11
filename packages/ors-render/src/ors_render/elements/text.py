@@ -39,6 +39,7 @@ after the coordinate has reached its C rasteriser, which indexes with a signed
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 from ors_schema.palette import GradientPalette
 from ors_schema.scene import TextElement
@@ -49,6 +50,49 @@ from ors_render.canvas import Canvas
 from ors_render.context import RenderContext
 from ors_render.elements import register, resolve_color
 from ors_render.fonts import load_font
+
+_MAX_GLYPHS = 256
+"""Longest resolved string this element will measure or draw, in characters.
+
+`text` is a *binding*, so its length belongs to whatever the feed sent -- a
+torrent name, a Kubernetes error message, a Prometheus label -- and not to the
+scene. Before this cap there was no safe configuration:
+
+* **With** `max_width`, `_truncate` walked one character at a time and
+  re-measured the whole string, which is quadratic: measured, 0.28 s at 1 000
+  characters, 1.02 s at 2 000, 3.88 s at 4 000, 15.18 s at 8 000, and at 200 000
+  it had not finished after four minutes.
+* **Without** `max_width`, the string reached `textbbox` whole and Pillow's own
+  decompression-bomb guard fired: 200 000 characters warned at 114 MP and
+  400 000 raised `Image.DecompressionBombError`.
+
+Both halves were live on shipped templates -- `torrent.json` sets `max_width` on
+a torrent name and on `min_eta`, `system.json` on a daemon-supplied error string
+-- so this is the same argument the module docstring above makes for `size`,
+carried to the other unbounded dimension of the same element. The truncation is
+now a bisect as well, but a bound that depends on an algorithm staying fast is
+not a bound; this one holds whatever either path costs per measurement.
+
+256 because two things have to be true of it:
+
+*Nothing readable is anywhere near it.* A 240 px panel shows roughly 120 glyphs
+at the smallest legible size, so the cap is about twice what the hardware can
+display in one line, and an order of magnitude past the 12 characters `trunc`
+defaults to or the longest label any built-in draws.
+
+*Even at `_MAX_SIZE` it stays under Pillow's bomb threshold.* The widest glyph in
+the bundled face advances 529 px at that size on the supersampled canvas, so 256
+of them measure 47 MP against `Image.MAX_IMAGE_PIXELS`' 89.5 MP -- meaning a
+`DecompressionBombWarning` can never be emitted from here, exactly as
+`ors_render.elements.media`'s `_MAX_SOURCE_PIXELS` guarantees for an asset.
+Measured at 512 glyphs it is 94.9 MP and does warn, which is why the cap is not
+that. Worst measured cost at the ceiling is 0.20 s, for the absurd combination of
+256 glyphs at one panel height; a realistic 13 px label is 0.013 s.
+
+Cutting rather than skipping, for the reason `_MAX_SIZE` clamps: the string is
+what is over-long, not the element, and the first 256 characters of an error
+message are the part a panel could have shown anyway.
+"""
 
 _MAX_SIZE = 240.0
 """Largest `size` honoured, in the schema's own px-at-a-240px-baseline units.
@@ -66,6 +110,10 @@ def render_text(
     text = resolve_text(element.text, ctx.data)
     if not text:
         return
+    # Ahead of *both* measuring paths -- the truncation loop below and the bare
+    # `textbbox` when there is no `max_width` -- because each was unbounded in
+    # the length of this string on its own. See `_MAX_GLYPHS`.
+    text = text[:_MAX_GLYPHS]
 
     geometry = canvas.geometry
     cx, cy = geometry.x(element.cx), geometry.y(element.cy)
@@ -118,18 +166,65 @@ def _truncate(
     limit: float,
     ellipsis: bool,
 ) -> str:
-    """Drop characters from the end until `text` measures no wider than `limit`.
+    """The longest prefix of `text` that measures no wider than `limit`.
 
     Text that already fits is returned untouched. When `ellipsis` is set the
     last surviving character is traded for a ``.`` as soon as that fits, which
     is why the trailing dot never pushes the result back over the limit. A
     limit too narrow for even one glyph empties the string; drawing "" is a
     no-op, so the element simply disappears rather than overflowing.
+
+    Found by **bisection**, not by walking a character at a time. The walk
+    re-measured the whole string on every step, which is quadratic in a length
+    the scene does not control -- measured at 3.88 s for 4 000 characters and
+    15.18 s for 8 000, on a panel that redraws several times a second.
+    `_MAX_GLYPHS` now caps the input as well; the two bounds are independent on
+    purpose, since the cap alone still left the cost growing as its square and
+    the bisect alone still measured strings big enough to trip Pillow's
+    decompression-bomb guard.
+
+    Bisection is sound here because a prefix cannot measure *narrower* than a
+    shorter one: glyph advances are non-negative, so width grows monotonically
+    with the prefix length, and the same holds for the dotted candidates, which
+    differ from each other in exactly the same way. The dotted and plain
+    searches are kept separate, and the dotted result wins a tie, because that
+    is the order the walk tried them in -- and the two are genuinely different
+    questions: ``.`` is *wider* than an ``i`` in this face, so a dotted
+    candidate can fail where the plain prefix of the same length fits.
     """
-    while text and draw.textlength(text, font=font) > limit:
-        text = text[:-1]
-        if ellipsis and text:
-            candidate = text[:-1] + "."
-            if draw.textlength(candidate, font=font) <= limit:
-                return candidate
-    return text
+    if math.isnan(limit) or draw.textlength(text, font=font) <= limit:
+        # `max_width` is an unbounded float in the schema and `json.loads` parses
+        # `NaN`, so a limit that is not a number is reachable input. It means
+        # "no limit" here, which is what the walk did with it: every ``>``
+        # comparison against a NaN is false, so it never dropped a character.
+        return text
+
+    def fits(candidate: str) -> bool:
+        return draw.textlength(candidate, font=font) <= limit
+
+    # The full string is known not to fit, so both searches stop one short of it.
+    plain = _longest_fitting(lambda n: text[:n], fits, len(text) - 1)
+    if ellipsis:
+        dotted = _longest_fitting(lambda n: text[: n - 1] + ".", fits, len(text) - 1, low=1)
+        if dotted is not None and dotted >= (plain or 0):
+            return text[: dotted - 1] + "."
+    return text[: plain or 0]
+
+
+def _longest_fitting(
+    build: Callable[[int], str], fits: Callable[[str], bool], high: int, low: int = 0
+) -> int | None:
+    """The largest length in ``low..high`` whose candidate fits, or ``None``.
+
+    ``None`` rather than ``low - 1`` because "nothing fits at all" is a real
+    answer: a negative `max_width` scales to a negative limit, which not even
+    the empty string measures under.
+    """
+    best: int | None = None
+    while low <= high:
+        middle = (low + high) // 2
+        if fits(build(middle)):
+            best, low = middle, middle + 1
+        else:
+            high = middle - 1
+    return best

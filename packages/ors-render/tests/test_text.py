@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import time
+import warnings
+
+import pytest
 from ors_render.context import RenderContext
+from ors_render.elements.text import _MAX_GLYPHS, _truncate
+from ors_render.fonts import load_font
 from ors_render.render import render_scene
 from ors_schema.scene import Scene
+from PIL import Image, ImageDraw
 
 
 def _ctx() -> RenderContext:
@@ -236,6 +243,107 @@ def test_left_and_right_aligned_text_land_on_opposite_sides():
     assert left.getpixel((105, 120)) == (0, 0, 0)
     assert right.getpixel((110, 120)) != (0, 0, 0)
     assert right.getpixel((135, 120)) == (0, 0, 0)
+
+
+def _long_text_scene(length: int, **overrides) -> Scene:
+    # A torrent name, a Kubernetes error message: `text` is a binding whose
+    # value is upstream data, so its length is not the scene's to promise.
+    element = {"type": "text", "size": 20, "text": "W" * length, **overrides}
+    return Scene.model_validate({"elements": [element]})
+
+
+@pytest.mark.parametrize("length", [1_000, 8_000, 200_000, 400_000])
+@pytest.mark.parametrize("max_width", [None, 0.8])
+def test_a_string_no_scene_bounded_renders_promptly_and_quietly(length, max_width):
+    """Neither text path may be paid for by the panel's refresh rate.
+
+    Measured before the cap, both halves were live on shipped templates and
+    neither was safe:
+
+    * **with** `max_width`, `_truncate` dropped one character per iteration and
+      re-measured the whole string -- 0.28 s at 1 000 characters, 1.02 s at
+      2 000, 3.88 s at 4 000 and 15.18 s at 8 000, on a machine far faster than
+      the Pi. `torrent.json` sets `max_width` on a torrent name.
+    * **without** it, the string reached `textbbox` intact and Pillow's own
+      decompression-bomb guard fired: 200 000 characters warned at 114 MP and
+      400 000 raised `Image.DecompressionBombError`.
+
+    The warning matters as much as the exception: a `DecompressionBombWarning`
+    escaping this renderer is the same defect `ors_render.elements.media`'s
+    `_MAX_SOURCE_PIXELS` exists to make impossible for an asset.
+    """
+    overrides = {} if max_width is None else {"max_width": max_width}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        start = time.perf_counter()
+        image = render_scene(_long_text_scene(length, **overrides), _ctx())
+        elapsed = time.perf_counter() - start
+    assert image.size == (240, 240)
+    # Loose on purpose: a correct render of these is a few tens of milliseconds,
+    # so anything near the limit is the unbounded path coming back.
+    assert elapsed < 0.5, f"{length} characters took {elapsed:.2f}s"
+
+
+@pytest.mark.parametrize("max_width", [None, 0.55])
+def test_text_is_cut_to_the_glyph_ceiling_before_anything_measures_it(max_width):
+    # The cap lands on the *resolved* string, ahead of both the truncation loop
+    # and the bare `textbbox`, so an over-long string renders exactly as its
+    # first `_MAX_GLYPHS` characters do -- including the centring, which is
+    # computed from the measured width.
+    overrides = {} if max_width is None else {"max_width": max_width}
+    long = render_scene(_long_text_scene(4_000, **overrides), _ctx())
+    capped = render_scene(_long_text_scene(_MAX_GLYPHS, **overrides), _ctx())
+    assert long.tobytes() == capped.tobytes()
+
+
+def test_the_glyph_ceiling_leaves_every_string_a_panel_can_show_alone():
+    # 240 px shows about 120 glyphs at the smallest legible size, so nothing a
+    # person can read is anywhere near the cap; `trunc`'s own default limit is
+    # 12 characters and the longest string any built-in draws is far shorter.
+    assert _MAX_GLYPHS >= 256
+    for length in (1, 12, 120, _MAX_GLYPHS):
+        scene = _long_text_scene(length)
+        assert render_scene(scene, _ctx()).tobytes() == render_scene(scene, _ctx()).tobytes()
+
+
+def _truncate_linearly(draw, text, font, limit, ellipsis):
+    """The original character-at-a-time walk, kept as the bisect's oracle."""
+    while text and draw.textlength(text, font=font) > limit:
+        text = text[:-1]
+        if ellipsis and text:
+            candidate = text[:-1] + "."
+            if draw.textlength(candidate, font=font) <= limit:
+                return candidate
+    return text
+
+
+@pytest.mark.parametrize("ellipsis", [True, False])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "an extremely long torrent name",
+        "alpha-release-2160p",
+        "iiiiiiiiiiiiiiiiiiiiiiii",
+        "WWWWWWWWWWWWWWWW",
+        "W.W.W.W.W.W.W.W.W.W.W.W",
+        "12h 34m",
+        "x",
+        "",
+    ],
+)
+@pytest.mark.parametrize("limit", [0.0, 1.0, 4.0, 17.0, 60.0, 240.0, 4000.0])
+def test_the_bisecting_truncation_returns_what_the_linear_walk_returned(text, limit, ellipsis):
+    # The bisect is an optimisation, not a change of behaviour: it must pick the
+    # same string the walk did for every input, or `text_truncated` and the
+    # torrent golden move. `.` is deliberately among the fixtures -- it is
+    # *wider* than an `i` in this face, so "the dotted candidate always fits
+    # when the plain one does" is not an assumption the search may make.
+    image = Image.new("RGB", (16, 16))
+    draw = ImageDraw.Draw(image)
+    font = load_font("bold", 20)
+    assert _truncate(draw, text, font, limit, ellipsis) == _truncate_linearly(
+        draw, text, font, limit, ellipsis
+    )
 
 
 def test_bound_color_is_resolved():
