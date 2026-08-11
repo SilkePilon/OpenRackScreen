@@ -21,17 +21,99 @@ _STOP_TIMEOUT = 5.0
 
 
 def default_launcher(argv: list[str]) -> Any:
-    return subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # stdout is dropped -- port-forward narrates every connection it proxies --
+    # but stderr is *inherited*, so the journal gets kubectl's own diagnosis of a
+    # launch that fails: bad kubeconfig, RBAC denial, "unable to listen on port",
+    # no such service. Discarding it made every launch failure look identical
+    # from out here. Inheriting is also free of the `wait()` deadlock that a
+    # `PIPE` would risk: nothing here ever has to drain it.
+    return subprocess.Popen(argv, stdout=subprocess.DEVNULL)
+
+
+# Other components of the same charts. A name matching one of these is not the
+# Prometheus server no matter what else it contains -- `prometheus-alertmanager`
+# answers 200 on `/` and 404s every `/api/v1/query`, which is worse than
+# forwarding nothing because the tunnel then reports healthy forever.
+_NOT_THE_SERVER = (
+    "alertmanager",
+    "pushgateway",
+    "operator",
+    "exporter",  # node-exporter, blackbox-exporter, snmp-exporter
+    "kube-state-metrics",
+    "thanos",
+    "grafana",
+)
+# What the two mainstream charts call the server: `-server` on
+# prometheus-community/prometheus, `-prometheus` on kube-prometheus-stack
+# (`<release>-<chart>-prometheus`).
+_SERVER_SUFFIXES = ("-server", "-prometheus")
+
+
+def _rank(name: str) -> int | None:
+    """How much a service name looks like a Prometheus server. Lower is better.
+
+    Order matters: a known-good *suffix* outranks the exclusions, because a chart
+    installed under a release name like `prometheus-operator` produces
+    `prometheus-operator-kube-p-prometheus` -- a real server whose name carries
+    another component's word. The exclusions only decide between the leftovers,
+    which is where "contains prom" used to pick the alertmanager.
+    """
+    name = name.lower()
+    if "prom" not in name:
+        # `-server` is a chart's word for its own main service, not Prometheus's:
+        # without this, a namespace holding Loki and Mimir hands back `loki-server`.
+        return None
+    if name == "prometheus":
+        return 0
+    if name.endswith(_SERVER_SUFFIXES):
+        return 1
+    if any(token in name for token in _NOT_THE_SERVER):
+        return None
+    if name.endswith("-operated"):
+        # The operator's headless service for the StatefulSet. It forwards fine,
+        # but it is not what the chart documents, so it loses to a named service
+        # and is taken only when the namespace offers nothing else.
+        return 3
+    return 2
+
+
+def select_service(output: str) -> str | None:
+    """Pick the Prometheus server out of `kubectl get svc -o name` output.
+
+    Returns `None` when nothing in the namespace looks like one, which the caller
+    treats as "not yet": no launch this cycle, nothing cached, and the next cycle
+    asks again -- so a chart installed after the daemon started is picked up
+    without a restart.
+
+    Both the choice and the rejects are logged, because this is a guess about
+    someone else's cluster and a wrong one has to be answerable from the journal.
+    """
+    names = [line.split("/")[-1].strip() for line in output.splitlines() if line.strip()]
+    ranked = sorted(
+        (rank, name) for rank, name in ((_rank(name), name) for name in names) if rank is not None
+    )
+    if not ranked:
+        log.info(
+            "no service here looks like a Prometheus server",
+            extra={"candidates": ", ".join(names)},
+        )
+        return None
+    chosen = ranked[0][1]
+    log.info(
+        "picked a service to forward",
+        extra={"chosen": chosen, "rejected": ", ".join(n for n in names if n != chosen)},
+    )
+    return chosen
 
 
 def default_discoverer(config: TunnelConfig) -> str | None:
-    """Find a service whose name looks like the integration it fronts."""
+    """Find the service in `namespace` that fronts the integration."""
     try:
         output = subprocess.check_output(
             [
                 "kubectl",
                 "--kubeconfig",
-                config.kubeconfig,
+                config.kubeconfig_path,
                 "get",
                 "svc",
                 "-n",
@@ -39,7 +121,10 @@ def default_discoverer(config: TunnelConfig) -> str | None:
                 "-o",
                 "name",
             ],
-            stderr=subprocess.DEVNULL,
+            # Inherited, like the launcher's: `CalledProcessError` says only that
+            # kubectl exited 1, while its stderr says "You must be logged in to
+            # the server" or "namespace not found". Only stdout is piped here, so
+            # there is nothing for a `wait` to deadlock against.
             timeout=10,
         ).decode()
     except Exception as exc:
@@ -48,11 +133,7 @@ def default_discoverer(config: TunnelConfig) -> str | None:
             extra={"namespace": config.namespace, "error": str(exc)},
         )
         return None
-    for line in output.splitlines():
-        name = line.split("/")[-1].strip()
-        if "prom" in name.lower():
-            return name
-    return None
+    return select_service(output)
 
 
 def default_probe(url: str) -> bool:
@@ -103,8 +184,19 @@ class Tunnel(threading.Thread):
         one means something different -- no process, no service, no working
         tunnel -- and only here is there enough context to say which.
         """
-        if self._process is None or self._process.poll() is not None:
+        process = self._process
+        returncode = None if process is None else process.poll()
+        if process is None or returncode is not None:
             self.ready.clear()
+            if process is not None:
+                # The one number that says *why* a launch failed -- 1 for a
+                # kubeconfig kubectl cannot read, for an RBAC denial, for a local
+                # port already bound. Without it every failure mode is the same
+                # info line every interval, forever.
+                log.warning(
+                    "kubectl exited, relaunching",
+                    extra={"namespace": self._config.namespace, "returncode": returncode},
+                )
             self._kill()
             self._start()
             return
@@ -123,6 +215,9 @@ class Tunnel(threading.Thread):
             )
             self._kill()
             self._failures = 0
+            # Relaunched here rather than left to the next cycle, so recovering
+            # from a wedged tunnel costs what recovering from a dead one does.
+            self._start()
 
     def run(self) -> None:
         """Supervise until stopped. Nothing gets out of here.
@@ -139,6 +234,11 @@ class Tunnel(threading.Thread):
                 try:
                     self.tick()
                 except Exception:
+                    # `ready` is what releases the integrations behind this tunnel
+                    # to poll, and a cycle that blew up is no evidence the tunnel
+                    # works. Keeping the previous value would let a pathological
+                    # launcher leave it set with nothing behind it.
+                    self.ready.clear()
                     log.exception(
                         "tunnel cycle failed", extra={"namespace": self._config.namespace}
                     )
@@ -154,6 +254,17 @@ class Tunnel(threading.Thread):
             self.shutdown()
 
     def shutdown(self) -> None:
+        """Stop supervising and take the tunnel down. Idempotent, and safe before `start`.
+
+        The stop event goes first, and it is the whole point: without it a
+        `shutdown` on a live `run` only kills the child, and the next cycle
+        forwards again. A supervisor that shut this down and joined would get a
+        thread still re-forwarding -- and at interpreter exit that daemon thread
+        dies where it stands, orphaning a `kubectl` that still holds the local
+        port. Setting it also ends the default sleeper's `stop.wait` at once, so
+        the join is quick rather than up to an interval long.
+        """
+        self._stop.set()
         self.ready.clear()
         self._kill()
 
@@ -179,7 +290,7 @@ class Tunnel(threading.Thread):
         argv = [
             "kubectl",
             "--kubeconfig",
-            self._config.kubeconfig,
+            self._config.kubeconfig_path,
             "port-forward",
             "-n",
             self._config.namespace,

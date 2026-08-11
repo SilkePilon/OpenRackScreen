@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os.path
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -46,10 +47,31 @@ class TunnelConfig(BaseModel):
     namespace: str
     # "auto" means the daemon discovers the service in `namespace` rather than
     # the config naming it, so a chart that renames its service on upgrade does
-    # not need a config edit.
-    service: str = "auto"
+    # not need a config edit. Empty is neither: it discovers nothing and names
+    # nothing, and only surfaces as a permanent "no service to forward".
+    service: str = Field(default="auto", min_length=1)
     remote_port: int = Field(ge=1, le=65535)
     local_port: int = Field(ge=1, le=65535)
+
+    @property
+    def kubeconfig_path(self) -> str:
+        """`kubeconfig` with `~` resolved -- what to hand an actual `kubectl`.
+
+        Every example config in the spec and the plan writes `~/k8s-monitor.yaml`,
+        and nothing expands it: `subprocess` does no shell expansion, and client-go
+        does not expand `~` for an explicit `--kubeconfig`. kubectl therefore fails
+        to stat the literal path and dies at every launch, forever.
+
+        Derived rather than expanded in a validator, and derived *here* rather than
+        at the daemon's call sites, for the same reason: expansion is a fact about
+        the machine that runs kubectl, while the model is a document M3's server
+        produces and pushes down. A validator would bake the server's home into a
+        document destined for the Pi -- silently, since expanding an absolute path
+        is a no-op and a round-trip test cannot see it. A property resolves on the
+        machine that reads it, leaves `model_dump` verbatim, and is still one
+        definition every consumer shares.
+        """
+        return os.path.expanduser(self.kubeconfig)
 
 
 class FieldSpec(BaseModel):

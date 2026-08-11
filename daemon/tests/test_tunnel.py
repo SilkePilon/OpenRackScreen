@@ -1,7 +1,9 @@
+import logging
 import subprocess
 import threading
 
-from ors_daemon.tunnel import Tunnel
+import pytest
+from ors_daemon.tunnel import Tunnel, select_service
 from ors_schema.daemon import TunnelConfig
 
 CONFIG = TunnelConfig(
@@ -302,3 +304,208 @@ def test_run_survives_a_sleeper_that_raises():
     tunnel.run()
 
     assert harness.processes[0].terminated is True
+
+
+def test_run_clears_ready_when_a_cycle_raises():
+    # A cycle that blew up is no evidence the tunnel works, and `ready` is what
+    # releases an integration to poll: leaving it set behind a pathological
+    # launcher is the silent wedge this module exists to prevent. Observed
+    # *during* the run, because the teardown in `run`'s `finally` clears it too.
+    class PollExploder(FakeProcess):
+        polls = 0
+
+        def poll(self):
+            self.polls += 1
+            if self.polls >= 2:
+                raise OSError("no such process")
+            return self._returncode
+
+    harness = Harness([True] * 4)
+    stop = threading.Event()
+    seen = []
+
+    def sleeper(seconds):
+        seen.append(tunnel.ready.is_set())
+        if len(seen) >= 3:
+            stop.set()
+
+    tunnel = make(harness, stop=stop, sleeper=sleeper, launcher=launching(harness, PollExploder))
+    tunnel.run()
+
+    assert seen == [False, True, False], "a raising cycle must not leave `ready` set"
+
+
+# --- reaching the right cluster ----------------------------------------------
+
+# Real `kubectl get svc -o name` output. The release name is the first segment
+# and the chart names the rest, which is why "contains prom" is not a rule: on
+# both of the mainstream charts the *alertmanager* sorts first among the names
+# containing "prom".
+
+KUBE_PROMETHEUS_STACK = """\
+service/alertmanager-operated
+service/kps-grafana
+service/kps-kube-prometheus-stack-alertmanager
+service/kps-kube-prometheus-stack-operator
+service/kps-kube-prometheus-stack-prometheus
+service/kps-kube-state-metrics
+service/kps-prometheus-node-exporter
+service/prometheus-operated
+"""
+
+# The same chart under `helm install prometheus ...`, where the release name is
+# itself "prometheus" -- the form every kube-prometheus-stack README shows.
+KUBE_PROMETHEUS_STACK_DEFAULT_RELEASE = """\
+service/alertmanager-operated
+service/prometheus-grafana
+service/prometheus-kube-prometheus-alertmanager
+service/prometheus-kube-prometheus-operator
+service/prometheus-kube-prometheus-prometheus
+service/prometheus-kube-state-metrics
+service/prometheus-operated
+service/prometheus-prometheus-node-exporter
+"""
+
+PROMETHEUS_CHART = """\
+service/prometheus-alertmanager
+service/prometheus-alertmanager-headless
+service/prometheus-kube-state-metrics
+service/prometheus-prometheus-node-exporter
+service/prometheus-prometheus-pushgateway
+service/prometheus-server
+"""
+
+
+@pytest.mark.parametrize(
+    ("listing", "expected"),
+    [
+        (KUBE_PROMETHEUS_STACK, "kps-kube-prometheus-stack-prometheus"),
+        (KUBE_PROMETHEUS_STACK_DEFAULT_RELEASE, "prometheus-kube-prometheus-prometheus"),
+        (PROMETHEUS_CHART, "prometheus-server"),
+        ("service/prometheus\n", "prometheus"),
+        # A hand-rolled Deployment plus Service, the third common shape.
+        ("service/grafana\nservice/prometheus-server\n", "prometheus-server"),
+    ],
+)
+def test_the_prometheus_server_is_picked_out_of_a_real_listing(listing, expected):
+    assert select_service(listing) == expected
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [
+        "",
+        "service/grafana\nservice/loki\n",
+        # Alertmanager alone is not a Prometheus, and forwarding it is worse than
+        # forwarding nothing: its `/` answers 200 and every query 404s.
+        "service/prometheus-alertmanager\nservice/prometheus-alertmanager-headless\n",
+        # `-server` is a chart's word for its main service, not Prometheus's own:
+        # a namespace of Loki and Mimir has nothing to forward here.
+        "service/loki-server\nservice/mimir-server\nservice/grafana\n",
+    ],
+)
+def test_a_listing_with_no_prometheus_server_picks_nothing(listing):
+    assert select_service(listing) is None
+
+
+def test_the_headless_operated_service_is_only_a_last_resort():
+    # `prometheus-operated` is the operator's headless service for the StatefulSet.
+    # It works, but the named one is what the chart documents, so it is taken only
+    # when the listing offers nothing else.
+    assert select_service("service/prometheus-operated\n") == "prometheus-operated"
+
+
+def test_the_chosen_and_rejected_candidates_are_logged(caplog):
+    with caplog.at_level(logging.INFO, logger="ors_daemon.tunnel"):
+        select_service(PROMETHEUS_CHART)
+
+    record = next(r for r in caplog.records if getattr(r, "chosen", None))
+    assert record.chosen == "prometheus-server"
+    assert "prometheus-alertmanager" in record.rejected
+
+
+def test_discovery_is_retried_after_a_namespace_offers_nothing():
+    # Only a *successful* pick is cached, so a chart installed after the daemon
+    # started is picked up on the next cycle rather than needing a restart.
+    harness = Harness([True, True])
+    harness.service = None
+    tunnel = make(harness)
+    tunnel.tick()
+    tunnel.tick()
+
+    assert harness.discoveries == 2
+    assert harness.argvs == []
+
+
+def test_the_kubeconfig_reaches_kubectl_with_its_home_expanded(monkeypatch):
+    monkeypatch.setenv("HOME", "/home/rack")
+    harness = Harness([True])
+    tunnel = make(harness, config=CONFIG.model_copy(update={"kubeconfig": "~/k8s-monitor.yaml"}))
+    tunnel.tick()
+
+    argv = harness.argvs[0]
+    assert "/home/rack/k8s-monitor.yaml" in argv
+    assert "~/k8s-monitor.yaml" not in argv
+
+
+def test_a_dead_process_logs_the_exit_code_it_died_with(caplog):
+    # Without this, a kubectl that dies at launch -- bad kubeconfig, RBAC denial,
+    # local port already bound -- looks exactly like every other failure: `ready`
+    # never sets and one info line a cycle says nothing about why.
+    harness = Harness([True, True])
+    tunnel = make(harness)
+    tunnel.tick()
+    harness.processes[0].die()
+
+    with caplog.at_level(logging.WARNING, logger="ors_daemon.tunnel"):
+        tunnel.tick()
+
+    dead = [r for r in caplog.records if getattr(r, "returncode", None) is not None]
+    assert [r.returncode for r in dead] == [1]
+    assert dead[0].levelno == logging.WARNING
+
+
+def test_a_probe_failure_relaunches_in_the_same_cycle_a_death_would():
+    # The dead-process branch tears down and relaunches in one tick; this one used
+    # to tear down and wait a whole interval, so recovering from a wedged tunnel
+    # cost strictly more than recovering from a dead one.
+    harness = Harness([True, False, False])
+    tunnel = make(harness)
+    for _ in range(4):  # launch, probe ok, probe fails, probe fails -> relaunch
+        tunnel.tick()
+
+    assert harness.processes[0].terminated is True
+    assert len(harness.processes) == 2
+
+
+def test_a_shutdown_during_a_run_does_not_relaunch():
+    # A supervisor that calls `shutdown()` and joins must get a stopped thread,
+    # not one that forwards again on the next tick and orphans a kubectl still
+    # holding the local port when the interpreter exits.
+    harness = Harness([True] * 6)
+    stop = threading.Event()
+    sleeps = []
+
+    def sleeper(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 1:
+            tunnel.shutdown()
+        if len(sleeps) >= 4:
+            stop.set()  # a fuse, so a `shutdown` that does not stop cannot hang this test
+
+    tunnel = make(harness, stop=stop, sleeper=sleeper)
+    tunnel.run()
+
+    assert len(harness.processes) == 1
+    assert harness.processes[0].terminated is True
+    assert stop.is_set() is True
+
+
+def test_shutdown_is_safe_before_a_start_and_twice_over():
+    harness = Harness([True])
+    tunnel = make(harness)
+    tunnel.shutdown()
+    tunnel.shutdown()
+
+    assert harness.processes == []
+    assert tunnel.ready.is_set() is False

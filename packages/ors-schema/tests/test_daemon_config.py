@@ -225,6 +225,50 @@ def test_an_integration_that_queries_nothing_is_rejected():
         )
 
 
+TUNNEL = {
+    "kubeconfig": "~/k8s-monitor.yaml",
+    "namespace": "monitoring",
+    "remote_port": 9090,
+    "local_port": 19090,
+}
+
+
+def test_kubeconfig_path_expands_a_home_relative_kubeconfig(monkeypatch):
+    # `subprocess` does no shell expansion and client-go does not expand `~` for
+    # an explicit `--kubeconfig`, so a literal `~/...` reaches kubectl, fails to
+    # stat, and kills every launch forever. The spec's own example config, the
+    # plan's `rack.yaml` and the test above all write it that way.
+    monkeypatch.setenv("HOME", "/home/rack")
+    tunnel = TunnelConfig.model_validate(TUNNEL)
+    assert tunnel.kubeconfig_path == "/home/rack/k8s-monitor.yaml"
+
+
+def test_kubeconfig_path_leaves_an_absolute_path_alone():
+    absolute = TunnelConfig.model_validate({**TUNNEL, "kubeconfig": "/etc/rancher/k3s.yaml"})
+    assert absolute.kubeconfig_path == "/etc/rancher/k3s.yaml"
+
+
+def test_the_document_keeps_the_kubeconfig_as_it_was_written(monkeypatch):
+    # Expansion is a fact about the machine that runs kubectl, not about the
+    # document: M3's server produces the same structure it pushes down, and a
+    # `~` baked into *its* home directory names a path that exists on neither
+    # machine. So the field round-trips verbatim and only the derived path
+    # resolves.
+    monkeypatch.setenv("HOME", "/home/server")
+    tunnel = TunnelConfig.model_validate(TUNNEL)
+    assert tunnel.kubeconfig == "~/k8s-monitor.yaml"
+    assert tunnel.model_dump()["kubeconfig"] == "~/k8s-monitor.yaml"
+    assert TunnelConfig.model_validate(tunnel.model_dump()) == tunnel
+
+
+def test_tunnel_rejects_an_empty_service_name():
+    # `""` is neither `auto` nor a service: it discovers nothing and forwards
+    # nothing, and the daemon can only report "no service to forward" forever
+    # with no way to tell that from a namespace that really has none.
+    with pytest.raises(ValidationError):
+        TunnelConfig.model_validate({**TUNNEL, "service": ""})
+
+
 @pytest.mark.parametrize("key", ["remote_port", "local_port"])
 @pytest.mark.parametrize("bad", [0, -1, 65536, 70000])
 def test_tunnel_rejects_a_port_outside_the_tcp_range(key, bad):
