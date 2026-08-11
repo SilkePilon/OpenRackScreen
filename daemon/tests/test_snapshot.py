@@ -4,6 +4,8 @@ from datetime import UTC, datetime
 from ors_daemon.snapshot import Health, SnapshotStore
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
+WAIT = 5.0
+"""Generous on purpose: a passing test never spends it, only a broken one does."""
 
 
 def test_a_registered_integration_starts_connecting_with_no_data():
@@ -80,6 +82,12 @@ def test_recovery_clears_staleness_and_the_failure_count():
 
 
 def test_wait_for_change_returns_immediately_when_already_behind():
+    """The lost-wakeup shape: the version moved between a worker's read and its wait.
+
+    The publish happens before anyone waits, so the notification it sent reached
+    nobody. A store that answered only from notifications would freeze this
+    panel until the next poll; the answer has to come from the version.
+    """
     store = SnapshotStore()
     store.register("prom")
     store.put("prom", {"cpu": 1.0}, latency_ms=1.0, now=NOW)
@@ -107,3 +115,170 @@ def test_wait_for_change_wakes_on_a_publish_from_another_thread():
 def test_wait_for_change_times_out_when_nothing_happens():
     store = SnapshotStore()
     assert store.wait_for_change(version=0, timeout=0.01) is False
+
+
+def test_a_failure_does_not_satisfy_a_worker_waiting_for_new_data():
+    store = SnapshotStore()
+    store.register("prom")
+    store.put("prom", {"cpu": 1.0}, latency_ms=1.0, now=NOW)
+    store.fail("prom", "timeout", now=NOW)
+
+    assert store.wait_for_change(version=1, timeout=0.0) is False
+
+
+def test_put_copies_the_fields_so_a_poller_may_reuse_its_dict():
+    store = SnapshotStore()
+    store.register("prom")
+    fields = {"cpu_hot": {"node": ".5", "value": 71.2}}
+    store.put("prom", fields, latency_ms=1.0, now=NOW)
+
+    fields["cpu_hot"]["value"] = 0.0
+    assert store.read().data["prom"]["cpu_hot"]["value"] == 71.2
+
+
+def test_read_copies_nested_structures_all_the_way_down():
+    """`reduce: top` publishes `{"cpu_hot": {"node": ".5", "value": 71.2}}`.
+
+    One level of copying would hand every screen the same inner dict, and the
+    first one to write through it would rewrite what the other three render.
+    """
+    store = SnapshotStore()
+    store.register("prom")
+    store.put("prom", {"cpu_hot": {"node": ".5", "value": 71.2}}, latency_ms=1.0, now=NOW)
+
+    snap = store.read()
+    snap.data["prom"]["cpu_hot"]["node"] = "corrupted"
+    assert store.read().data["prom"]["cpu_hot"] == {"node": ".5", "value": 71.2}
+
+
+def test_registering_an_integration_twice_keeps_the_health_it_has():
+    store = SnapshotStore()
+    store.register("prom")
+    store.put("prom", {"cpu": 1.0}, latency_ms=1.0, now=NOW)
+    store.register("prom")
+
+    assert store.read().health["prom"].state is Health.HEALTHY
+
+
+def test_a_reader_never_sees_the_data_and_the_version_disagree():
+    store = SnapshotStore()
+    store.register("prom")
+    done = threading.Event()
+    torn: list[tuple[int, int]] = []
+
+    def writer() -> None:
+        for value in range(200):
+            store.put("prom", {"n": value}, latency_ms=1.0, now=NOW)
+        done.set()
+
+    def reader() -> None:
+        while not done.is_set():
+            snap = store.read()
+            # The n-th publish carries n-1, so any other pairing is a snapshot
+            # assembled from two different versions of the store.
+            if snap.version and snap.data["prom"]["n"] != snap.version - 1:
+                torn.append((snap.version, snap.data["prom"]["n"]))
+
+    threads = [threading.Thread(target=target, daemon=True) for target in (reader, writer)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=WAIT)
+
+    assert torn == []
+
+
+class _ObservableCondition(threading.Condition):
+    """A condition that reports, from inside the lock, each time a thread parks.
+
+    The handshake is exact rather than approximate, which is why nothing here
+    sleeps to wait for a thread to get going: `wait()` gives the store lock up
+    only once its caller is genuinely parked, so a test that has seen the
+    semaphore and then reaches for that lock -- through `put`, or `with
+    condition` -- cannot possibly get there first.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parked = threading.Semaphore(0)
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.parked.release()
+        return super().wait(timeout)
+
+
+def _watched_store() -> tuple[SnapshotStore, _ObservableCondition]:
+    store = SnapshotStore()
+    store._condition = condition = _ObservableCondition()
+    return store, condition
+
+
+def _await_parks(condition: _ObservableCondition, count: int) -> None:
+    for _ in range(count):
+        assert condition.parked.acquire(timeout=WAIT), "a worker never parked in wait()"
+
+
+def test_a_publish_wakes_a_worker_already_blocked_in_wait():
+    store, condition = _watched_store()
+    woke = threading.Event()
+
+    def waiter() -> None:
+        if store.wait_for_change(version=0, timeout=WAIT):
+            woke.set()
+
+    thread = threading.Thread(target=waiter, daemon=True)
+    thread.start()
+    _await_parks(condition, 1)  # so this exercises the notification, not the version check
+
+    store.put("prom", {"cpu": 1.0}, latency_ms=1.0, now=NOW)
+    thread.join(timeout=WAIT)
+
+    assert woke.is_set()
+
+
+def test_one_publish_wakes_every_waiting_worker():
+    store, condition = _watched_store()
+    woke = [threading.Event() for _ in range(4)]  # one per panel
+
+    def waiter(flag: threading.Event) -> None:
+        if store.wait_for_change(version=0, timeout=WAIT):
+            flag.set()
+
+    threads = [threading.Thread(target=waiter, args=(flag,), daemon=True) for flag in woke]
+    for thread in threads:
+        thread.start()
+    _await_parks(condition, len(threads))
+
+    store.put("prom", {"cpu": 1.0}, latency_ms=1.0, now=NOW)
+    for thread in threads:
+        thread.join(timeout=WAIT)
+
+    assert [flag.is_set() for flag in woke] == [True] * len(woke)
+
+
+def test_a_wake_with_no_version_change_behind_it_does_not_end_the_wait():
+    """A bare wake is not news, and a worker that treats it as news renders again.
+
+    The docs are explicit that `wait()` "can return after an arbitrary long
+    time, and the condition which prompted the notify() call may no longer hold
+    true", so returning from one `wait()` proves nothing about the version. The
+    wake is explicit here; on the Pi it can equally be the OS's own spurious one.
+    """
+    store, condition = _watched_store()
+    outcome: list[bool] = []
+
+    def waiter() -> None:
+        outcome.append(store.wait_for_change(version=0, timeout=WAIT))
+
+    thread = threading.Thread(target=waiter, daemon=True)
+    thread.start()
+    _await_parks(condition, 1)
+
+    with condition:
+        condition.notify_all()
+    _await_parks(condition, 1)  # it must go back to waiting, not report a change
+
+    store.put("prom", {"cpu": 1.0}, latency_ms=1.0, now=NOW)
+    thread.join(timeout=WAIT)
+
+    assert outcome == [True]
