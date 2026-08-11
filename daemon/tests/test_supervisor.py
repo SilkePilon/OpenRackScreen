@@ -9,14 +9,19 @@ from typing import Any
 import pytest
 from ors_daemon.clock import FakeClock
 from ors_daemon.config import resolve_screens
+from ors_daemon.displays import DisplayError
 from ors_daemon.screen import _NIGHT_PARK_CHUNK as NIGHT_PARK_CHUNK
 from ors_daemon.snapshot import SnapshotStore
 from ors_daemon.supervisor import _MAX_RESTARTS as MAX_RESTARTS
 from ors_daemon.supervisor import Supervisor, _Panel
-from ors_schema.daemon import DaemonConfig, ScreenConfig
+from ors_schema.daemon import DaemonConfig, NightWindow, ScreenConfig
 from PIL import Image
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
+NIGHT = datetime(2026, 8, 11, 23, 30, tzinfo=UTC)
+NIGHT_WINDOW = NightWindow(start="23:00", end="07:00")
+UNTIL_MORNING = 7.5 * 3600
+"""Seconds from `NIGHT` to the end of `NIGHT_WINDOW`."""
 WAIT = 5.0
 """Generous on purpose: a passing test never spends it, only a broken one does."""
 
@@ -587,3 +592,101 @@ def test_run_forever_starts_ticks_and_stops(tmp_path: Path) -> None:
     for display in displays.values():
         assert display.sleeps == 1
         assert display.closed == 1
+
+
+def test_a_dead_panel_is_reported_rather_than_omitted(tmp_path: Path) -> None:
+    """Four screens with two dead panels must not read as a healthy two-screen rack.
+
+    The startup ERROR line is written once and never repeated, and on a headless
+    rack this file is the diagnostic -- and the one M3 forwards verbatim.
+    """
+    config = DaemonConfig.model_validate(config_dict(tmp_path, screens=4))
+    store = SnapshotStore()
+
+    def display_factory(screen_config: ScreenConfig, name: str) -> RecordingDisplay:
+        if name in {"S1", "S3"}:
+            raise DisplayError(f"cannot open SPI for {name}")
+        return RecordingDisplay()
+
+    supervisor = Supervisor(
+        config=config,
+        screens=resolve_screens(config),
+        store=store,
+        clock=FakeClock(NOW),
+        status_path=tmp_path / "status.json",
+        display_factory=display_factory,
+        poller_factory=lambda integration_config, url_provider: None,
+    )
+    supervisor.start()
+    try:
+        supervisor.tick()
+    finally:
+        supervisor.stop()
+
+    reported = json.loads((tmp_path / "status.json").read_text())["screens"]
+    by_name = {screen["name"]: screen for screen in reported}
+
+    assert set(by_name) == {"S1", "S2", "S3", "S4"}, "every configured screen is reported"
+    assert by_name["S1"]["state"] == "unavailable"
+    assert "cannot open SPI" in by_name["S1"]["error"]
+    assert by_name["S2"]["state"] == "awake"
+    assert by_name["S2"]["error"] is None
+
+
+def test_a_start_that_fails_partway_still_shuts_down_what_it_opened(tmp_path: Path) -> None:
+    """A panel left lit, or a kubectl child orphaned, is the cost of getting this wrong.
+
+    The failure is in building a poller, which nothing guards, and it lands
+    after the tunnel has already been started -- so a `start` outside the
+    `try` leaves a `kubectl port-forward` child holding its local port until
+    the process exits.
+    """
+    raw = config_dict(tmp_path, screens=1)
+    raw["integrations"][0]["tunnel"] = {
+        "kubeconfig": "/tmp/kubeconfig",
+        "namespace": "monitoring",
+        "remote_port": 9090,
+        "local_port": 19090,
+    }
+    config = DaemonConfig.model_validate(raw)
+    tunnels: list[FakeTunnel] = []
+
+    def poller_factory(integration_config: Any, url_provider: Any) -> Any:
+        raise RuntimeError("can't start new thread")
+
+    def tunnel_factory(tunnel_config: Any, stop: threading.Event) -> FakeTunnel:
+        tunnels.append(FakeTunnel(tunnel_config))
+        return tunnels[-1]
+
+    supervisor = Supervisor(
+        config=config,
+        screens=resolve_screens(config),
+        store=SnapshotStore(),
+        clock=FakeClock(NOW),
+        status_path=tmp_path / "status.json",
+        display_factory=lambda screen_config, name: RecordingDisplay(),
+        poller_factory=poller_factory,
+        tunnel_factory=tunnel_factory,
+    )
+
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        supervisor.run_forever(interval=0.0)
+
+    assert [tunnel.shutdowns for tunnel in tunnels] == [1], (
+        "a started tunnel must not outlive a failed start, or kubectl is orphaned"
+    )
+    assert supervisor.workers == [], "the failure landed before any screen started"
+
+
+def test_a_tick_after_stop_does_nothing(tmp_path: Path) -> None:
+    """SIGTERM can land mid-tick; the resumed tick must not touch a closed rack."""
+    supervisor, _, displays = make(tmp_path, screens=1)
+    supervisor.start()
+    supervisor.stop()
+    status = tmp_path / "status.json"
+    status.unlink(missing_ok=True)
+
+    supervisor.tick()
+
+    assert not status.exists(), "a stopped supervisor writes no status"
+    assert displays["S1"].sleeps == 1, "and does not re-sleep the panel"

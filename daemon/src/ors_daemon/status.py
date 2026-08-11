@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,11 +24,62 @@ from ors_daemon.screen import ScreenWorker
 from ors_daemon.snapshot import Snapshot
 
 
+@dataclass(frozen=True)
+class UnavailableScreen:
+    """A configured screen with no worker behind it, and why.
+
+    A panel whose backend would not open has no `ScreenWorker` to read state
+    off, and the shape of that hole matters: reporting only the screens that
+    started makes a four-panel rack with two dead panels write a file
+    byte-identical to a healthy two-panel rack. The one ERROR line at startup
+    is not a substitute -- it is never repeated, and this file is what a
+    headless rack is read through, verbatim, by M3.
+
+    It lives here rather than in the supervisor because this module owns the
+    wire shape: every key the status file can carry is defined in one place,
+    and the supervisor supplies facts rather than JSON. The supervisor is what
+    *knows* -- it caught the exception -- so it constructs these and passes
+    them in panel order alongside the workers.
+    """
+
+    name: str
+    reason: str
+
+
+def _screen(entry: ScreenWorker | UnavailableScreen) -> dict[str, Any]:
+    """One screen's line of the report, whether or not it has a worker."""
+    if isinstance(entry, UnavailableScreen):
+        return {
+            "name": entry.name,
+            "scene": None,
+            "state": "unavailable",
+            "last_render": None,
+            "renders": 0,
+            "error": entry.reason,
+        }
+    return {
+        "name": entry.screen_name,
+        "scene": entry.current_scene,
+        # Faulted first: a panel that fell over inside the night window
+        # is asleep *and* faulted, and the fault is the news.
+        "state": "faulted" if entry.faulted else ("asleep" if entry.asleep else "awake"),
+        "last_render": entry.last_render.isoformat() if entry.last_render else None,
+        "renders": entry.renders,
+        # Present always, and null for a screen that has a worker at all --
+        # the same bargain `stale` makes on an integration. A *faulted* panel
+        # is the one gap: its reason is in the log rather than on the worker,
+        # so it reports `faulted` with no `error`. Closing that means giving
+        # `ScreenWorker` a public fault reason, which is a change to the render
+        # loop and not to this file.
+        "error": None,
+    }
+
+
 def build_status(
     started_at: datetime,
     now: datetime,
     config_version: int,
-    screens: Sequence[ScreenWorker],
+    screens: Sequence[ScreenWorker | UnavailableScreen],
     snapshot: Snapshot,
 ) -> dict[str, Any]:
     """Assemble what a person over SSH -- and later the server -- needs to see.
@@ -41,22 +93,16 @@ def build_status(
 
     `now` is passed in rather than read here so the caller's injected clock is
     the only clock in the daemon, uptime included.
+
+    `screens` carries every *configured* screen, in panel order -- a worker
+    where there is one, an `UnavailableScreen` where the panel would not open.
+    A screen missing from this list is a screen the daemon has forgotten, not a
+    screen that is broken, and the file must be able to tell those apart.
     """
     return {
         "uptime_s": int((now - started_at).total_seconds()),
         "config_version": config_version,
-        "screens": [
-            {
-                "name": worker.screen_name,
-                "scene": worker.current_scene,
-                # Faulted first: a panel that fell over inside the night window
-                # is asleep *and* faulted, and the fault is the news.
-                "state": "faulted" if worker.faulted else ("asleep" if worker.asleep else "awake"),
-                "last_render": worker.last_render.isoformat() if worker.last_render else None,
-                "renders": worker.renders,
-            }
-            for worker in screens
-        ],
+        "screens": [_screen(entry) for entry in screens],
         "integrations": [
             {
                 "name": name,

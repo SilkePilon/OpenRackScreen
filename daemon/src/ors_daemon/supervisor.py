@@ -41,7 +41,7 @@ from ors_daemon.integrations import UrlProvider, build_integration
 from ors_daemon.poller import Poller
 from ors_daemon.screen import _NIGHT_PARK_CHUNK, ScreenWorker
 from ors_daemon.snapshot import SnapshotStore
-from ors_daemon.status import build_status, write_status
+from ors_daemon.status import UnavailableScreen, build_status, write_status
 from ors_daemon.tunnel import Tunnel
 
 log = logging.getLogger(__name__)
@@ -203,6 +203,7 @@ class Supervisor:
         # They would each have to rename it back, so it is named right here.
         self._stop_event = threading.Event()
         self._slots: list[_Slot] = []
+        self._unavailable: list[UnavailableScreen] = []
         self._shutdown_lock = threading.RLock()
         self._stopped = False
         self._started_at = clock()
@@ -234,6 +235,13 @@ class Supervisor:
 
     def tick(self) -> None:
         """One watchdog pass and one status write."""
+        if self._stopped:
+            # A tick interrupted by a SIGTERM-installed `stop()` would otherwise
+            # resume here and restart a wedged worker onto a closed backend. The
+            # replacement happens not to draw -- `ScreenWorker.run` re-checks its
+            # stop event before its first tick -- but that is another module's
+            # invariant to keep, and this line makes the guarantee local.
+            return
         now = time.monotonic()
         for slot in self._slots:
             self._check(slot, now)
@@ -244,7 +252,8 @@ class Supervisor:
                     started_at=self._started_at,
                     now=self._clock(),
                     config_version=self._config.version,
-                    screens=self.workers,
+                    # Every configured screen, not only the ones that came up.
+                    screens=[*self.workers, *self._unavailable],
                     snapshot=self._store.read(),
                 ),
             )
@@ -255,9 +264,16 @@ class Supervisor:
             log.warning("could not write the status file", extra={"error": str(exc)})
 
     def run_forever(self, interval: float = 1.0) -> None:
-        """Start, tick until stopped, and shut down whatever happens."""
-        self.start()
+        """Start, tick until stopped, and shut down whatever happens.
+
+        `start` is inside the `try` because a startup that fails partway has
+        already opened backends and started threads: a panel left lit, and a
+        `kubectl port-forward` child orphaned holding its local port until the
+        process exits. Thread exhaustion on a Pi and a template-packaging
+        failure both land there -- after the first backend is open.
+        """
         try:
+            self.start()
             while not self._stop_event.is_set():
                 self.tick()
                 self._stop_event.wait(interval)
@@ -280,15 +296,19 @@ class Supervisor:
         `run_forever`'s `finally`, so the signal that ends the loop also runs
         this to completion before the loop's own call arrives.
         """
-        self._stop_event.set()
-        # Releases every `wait_for_change`, which is where a screen worker
-        # spends nearly all of its time. `ScreenWorker.run` says this is the
-        # supervisor's to arrange, since the supervisor is what owns both.
-        self._store.close()
         with self._shutdown_lock:
             if self._stopped:
                 return
+            # Claimed first, under the lock. The lock is re-entrant and a signal
+            # lands on the thread that already holds it, so anything between the
+            # claim and the lock would let a SIGTERM arriving mid-shutdown run
+            # the whole thing a second time -- two sleeps and two closes a panel.
             self._stopped = True
+            self._stop_event.set()
+            # Releases every `wait_for_change`, which is where a screen worker
+            # spends nearly all of its time. `ScreenWorker.run` says this is the
+            # supervisor's to arrange, since the supervisor is what owns both.
+            self._store.close()
 
             for slot in self._slots:
                 slot.worker.join(_JOIN_TIMEOUT)
@@ -403,7 +423,12 @@ class Supervisor:
         except Exception as exc:
             # One missing panel is three working ones plus a log line, not a
             # dark rack: the backends are independent, and so are the screens.
+            # But it is recorded as well as logged. The startup line is written
+            # once and never repeated, and on a headless rack the status file is
+            # the diagnostic -- without this, four screens with two dead panels
+            # report exactly what a healthy two-screen rack reports.
             log.error("screen unavailable", extra={"screen": name, "error": str(exc)})
+            self._unavailable.append(UnavailableScreen(name=name, reason=str(exc)))
             return
         panel = _Panel(backend)
         worker = self._make_worker(screen, panel)

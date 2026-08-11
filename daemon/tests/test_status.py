@@ -10,7 +10,7 @@ from ors_daemon.clock import FakeClock
 from ors_daemon.config import ResolvedScreen
 from ors_daemon.screen import ScreenWorker
 from ors_daemon.snapshot import SnapshotStore
-from ors_daemon.status import build_status, write_status
+from ors_daemon.status import UnavailableScreen, build_status, write_status
 from ors_schema.daemon import DisplayConfig, NightWindow, ScreenConfig
 
 START = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
@@ -76,6 +76,7 @@ def test_status_reports_uptime_screens_and_integration_health() -> None:
         "state": "awake",
         "last_render": START.isoformat(),
         "renders": 12,
+        "error": None,
     }
     assert payload["integrations"][0] == {
         "name": "prom",
@@ -85,6 +86,43 @@ def test_status_reports_uptime_screens_and_integration_health() -> None:
         "last_success": START.isoformat(),
         "last_error": None,
     }
+
+
+def test_a_screen_whose_panel_could_not_be_opened_is_reported_rather_than_omitted() -> None:
+    """Otherwise a four-screen rack with two dead panels writes a file that is
+    byte-identical to a healthy two-screen rack, and the only signal anywhere is
+    one ERROR line at startup that is never repeated."""
+    payload = build_status(
+        START,
+        START,
+        1,
+        [rendered("CPU"), UnavailableScreen(name="MEM", reason="no such SPI bus")],
+        SnapshotStore().read(),
+    )
+
+    assert payload["screens"][1] == {
+        "name": "MEM",
+        "scene": None,
+        "state": "unavailable",
+        "last_render": None,
+        "renders": 0,
+        "error": "no such SPI bus",
+    }
+
+
+def test_every_screen_carries_an_error_key_whether_or_not_it_has_one() -> None:
+    """Present always, like an integration's `stale`: a key that appears only
+    sometimes is a key every consumer has to guess at."""
+    payload = build_status(
+        START,
+        START,
+        1,
+        [rendered(), UnavailableScreen("MEM", "no such SPI bus")],
+        SnapshotStore().read(),
+    )
+
+    assert payload["screens"][0]["error"] is None
+    assert payload["screens"][1]["error"] == "no such SPI bus"
 
 
 def test_a_sleeping_and_a_faulted_screen_report_their_state() -> None:
@@ -104,6 +142,7 @@ def test_a_screen_that_has_never_rendered_says_so_rather_than_guessing() -> None
         "state": "awake",
         "last_render": None,
         "renders": 0,
+        "error": None,
     }
 
 
