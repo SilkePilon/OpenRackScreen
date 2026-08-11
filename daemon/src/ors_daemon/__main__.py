@@ -327,13 +327,16 @@ def _identify(
         panels.append((name, backend))
         print(f"{screen.config.position}  {name}  {_display_label(screen.config.display)}")
 
-    if panels:
+    # Only when the wait can actually block. `--hold 0` is a script asking for
+    # a flash of the digits, and it has no business changing the disposition of
+    # two signals on its way past -- which would outlive this command inside
+    # anything that called `main` rather than the process.
+    if panels and (hold is None or hold > 0):
         _install_signal_handlers(stop.set)
         if hold is None:
             print("holding; press Ctrl-C to blank the panels", flush=True)
-        # `wait(None)` blocks until a signal sets the event, `wait(0)` returns
-        # at once: one call covers both, and neither spends time nobody asked
-        # for.
+        # `wait(None)` blocks until a signal sets the event; `wait(30)` gives up
+        # on its own. One call covers both.
         stop.wait(hold)
 
     for name, backend in panels:

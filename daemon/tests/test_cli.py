@@ -362,6 +362,41 @@ def test_identify_blanks_the_panels_it_lit(tmp_path: Path, monkeypatch: Any) -> 
     assert [(display.sleeps, display.closed) for display in displays] == [(1, 1)] * 4
 
 
+def test_identify_holds_the_ordinals_until_a_signal_arrives(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The operator's own path: the digits stay up, and Ctrl-C is what ends them.
+
+    The fake fires each handler the instant it is armed, which is a signal
+    landing during the hold. A version that armed nothing would spend the whole
+    `--hold` and then fail on the handlers, rather than hanging the suite --
+    which is why the hold here is a number and not the real default of `None`.
+    """
+    INSTALLED.clear()
+
+    def fire_at_once(number: int, handler: Callable[[int, FrameType | None], None]) -> None:
+        INSTALLED[number] = handler
+        handler(number, None)
+
+    monkeypatch.setattr(signal, "signal", fire_at_once)
+    path = write_virtual_config(tmp_path)
+
+    assert main(["identify", "--config", str(path), "--hold", str(WAIT)]) == 0
+    assert set(INSTALLED) == {signal.SIGTERM, signal.SIGINT}
+    assert len(list((tmp_path / "panels").glob("*.png"))) == 4
+
+
+def test_identify_leaves_the_processs_signals_alone_when_it_does_not_wait(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """`--hold 0` paints and returns; nothing about that needs a SIGINT handler."""
+    handlers = capture_signals(monkeypatch)
+    path = write_virtual_config(tmp_path)
+
+    assert main(["identify", "--config", str(path), "--hold", "0"]) == 0
+    assert handlers == {}
+
+
 def test_identify_reports_a_panel_it_cannot_open(tmp_path: Path, capsys: Any) -> None:
     """One unopenable panel is three lit ones plus a message, not a crash."""
     blocked = tmp_path / "blocked"
