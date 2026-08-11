@@ -240,7 +240,11 @@ On a static cluster that is roughly 0.8 renders per second across four panels, a
 
 1. **Health.** If any namespace the screen depends on is `connecting`, the `connecting` system scene renders. If stale, the `stale` scene. These are selected **by name** from the `system` template, because system scenes carry no `when` — a fact M1's review established and this design depends on.
 
-   A screen's dependencies are derived once at config load, not per frame: scan the screen's bound params and its template's scenes for `{{namespace.` prefixes, and intersect with the configured integration names. A screen whose params reference no integration — a static label, say — depends on nothing and never falls to a system scene.
+   A screen's dependencies are derived once at config load, not per frame: walk the screen's bound params and its template's scenes, collect every `namespace.` reference, and intersect with the configured integration names. A screen whose params reference no integration — a static label, say — depends on nothing and never falls to a system scene.
+
+   Two string kinds have to be read differently, and both count. A **binding** is braced, and the namespace need not be its first token — `{{100 - prom.cpu}}` and `{{prom.a + qbit.b}}` depend on what they name, so the whole `{{...}}` body is scanned, not just its opening. A **`when` condition** carries no braces at all: `prom.nodes_ready == prom.nodes_total and prom.alerts == 0` is a bare expression. Missing that second kind is not hypothetical — the built-in `torrent` template mentions `prom` only in its scene-level `when`, so a scan that skipped conditions would show that screen `stale` on a cold start where `connecting` belongs. Both scene-level and element-level `when` are scanned, at any nesting depth.
+
+   The derivation errs toward declaring a dependency rather than missing one: an over-broad match costs a screen the `connecting` scene it would have shown anyway, while a missed one puts a panel's template in front of data that has never arrived.
 2. **Condition.** Otherwise `select_scene` runs over the screen's template scenes as normal, and the first matching `when` wins.
 
 ### 7.3 Night mode
