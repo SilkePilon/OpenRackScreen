@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,13 +25,26 @@ from pydantic import ValidationError
 
 log = logging.getLogger(__name__)
 
-_NAMESPACE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*[.\[]")
-"""The leading name of a binding: `{{prom.cpu}}`, `{{ prom.active[0].name }}`.
+_BINDING = re.compile(r"\{\{(.*?)\}\}", re.DOTALL)
+"""One binding's body. Lazy, so it stops at the first `}}` -- the same pattern,
+and the same reasoning, as `ors_render.bindings`."""
 
-Anchored on `{{` so an expression's *later* operands are not scanned, and closed
-on `.` or `[` so it names a namespace rather than a bare `{{value}}`. The name is
-matched whole, so `{{prometheus.x}}` yields `prometheus` -- never the configured
-`prom` it happens to start with.
+_REFERENCE = re.compile(r"(?<![\w.])([A-Za-z_][A-Za-z0-9_]*)\s*[.\[]")
+"""The head of a namespace reference: the `prom` of `prom.cpu` or `prom.hot[0]`.
+
+Applied to a whole *expression*, not to a binding's first token, so every operand
+counts: `100 - prom.cpu`, `len(prom.hosts)` and `prom.a + qbit.b` all yield their
+namespaces. Two guards keep that from over-reaching.
+
+`(?<![\\w.])` refuses a name that follows a dot, so only the head of a chain is a
+namespace: `prom.active[0].name` yields `prom` and not `active`, which matters
+because a field of one integration may well share a name with another.
+
+The name is matched whole -- word boundary on the left, greedy identifier on the
+right -- and then compared for equality against the configured names, so neither
+half of a substring pair can be mistaken for the other: `prometheus_extra.x`
+yields `prometheus_extra`, never `prom`, and a configured `prometheus_extra` is
+not matched by a reference to `prom.x`.
 """
 
 
@@ -111,27 +125,66 @@ def system_scenes() -> dict[str, Scene]:
     return {scene.name: scene for scene in load_builtin_templates()["system"].scenes}
 
 
+def _names_in_text(text: str) -> Iterator[str]:
+    """Namespaces referenced by the bindings inside a piece of scene text.
+
+    Only inside the braces: `peak: {{prom.hot.node}}` is a label plus a binding,
+    and the label is prose that must not be read as an expression.
+    """
+    for body in _BINDING.findall(text):
+        yield from _REFERENCE.findall(body)
+
+
+def _names_in_dump(node: Any, key: str | None = None) -> Iterator[str]:
+    """Every namespace a dumped scene refers to, at any depth.
+
+    A generic walk rather than a typed one because a binding can sit in any
+    string field of any element -- an element's `text`, a ring's `value`, a
+    group's `repeat.over` -- and a walk that knows the element classes has to be
+    revisited every time one gains a field.
+
+    The two string kinds are told apart by the field they arrived in, which is
+    the only thing that distinguishes them: a `when` is a bare expression
+    (`prom.alerts == 0`), while every other field carries `{{...}}` bindings
+    inside surrounding text. Scanning a `when` as if it were binding text finds
+    nothing at all -- the gap that left a `torrent` screen not depending on the
+    Prometheus its own health gate reads.
+    """
+    if isinstance(node, Mapping):
+        for name, value in node.items():
+            yield from _names_in_dump(value, str(name))
+    elif isinstance(node, list):
+        for item in node:
+            yield from _names_in_dump(item, key)
+    elif isinstance(node, str):
+        yield from _REFERENCE.findall(node) if key == "when" else _names_in_text(node)
+
+
 def _dependencies(scenes: list[Scene], params: dict[str, Any], known: set[str]) -> frozenset[str]:
     """Which of `known` this screen needs before it can show anything real.
 
     Both halves matter. A screen's params name the integrations *it* chose
     (`{{prom.cpu}}` in a `ring-gauge`), while a template's scenes can name one
-    the params never mention (`node-health` binds `{{prom.nodes_ready}}` itself).
-    Scanning only params would leave such a screen depending on nothing and
-    rendering a blank ring where it should show `connecting`.
+    the params never mention (`node-health` binds `{{prom.nodes_ready}}` itself,
+    `torrent` reads `prom.alerts` in its scene's `when`). Scanning only params
+    would leave such a screen depending on nothing and rendering a blank ring
+    where it should show `connecting`.
 
-    Scenes are scanned as JSON because a binding can sit in any string field at
-    any depth -- an element's `text`, a ring's `value`, a group's `repeat.over`.
-    The alternative is a walk that must be revisited every time an element gains
-    a field. What the dump adds beyond those strings is field *names* and the
-    element `type` values, and none of those can contain `{{`, so the extra text
-    cannot match. What it does not add is any reading of intent: a `when`
-    expression carries no braces, so a namespace named only in a condition is
-    not found here.
+    Params are scanned as binding text, never as expressions, whatever they are
+    named: a param is a value the template interpolates, and a screen that
+    happened to declare one called `when` would otherwise have its *value* read
+    as a condition.
+
+    The intersection with `known` is what does the filtering, so an over-broad
+    candidate -- a repeat alias, a name inside a string literal in an expression
+    -- costs nothing unless it collides with a configured integration name.
     """
-    text = " ".join([str(value) for value in params.values()])
-    text += " " + " ".join(scene.model_dump_json() for scene in scenes)
-    return frozenset(name for name in _NAMESPACE.findall(text) if name in known)
+    names: set[str] = set()
+    for value in params.values():
+        names.update(_names_in_text(str(value)))
+    for scene in scenes:
+        names.update(_names_in_dump(scene.model_dump()))
+    return frozenset(names & known)
 
 
 def resolve_screens(config: DaemonConfig) -> list[ResolvedScreen]:

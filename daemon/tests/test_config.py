@@ -149,11 +149,6 @@ def test_whitespace_and_indexing_inside_a_binding_still_name_the_namespace(tmp_p
     assert screen.depends_on == frozenset({"prom"})
 
 
-def test_a_namespace_merely_starting_with_a_configured_name_is_not_a_dependency(tmp_path):
-    screen = one_screen(tmp_path, params={"big": "{{prometheus.cpu}}"})
-    assert screen.depends_on == frozenset()
-
-
 def test_a_template_scene_contributes_a_dependency_the_params_never_mention(tmp_path):
     # `node-health`'s scenes bind `{{prom.nodes_ready}}` themselves; the screen's
     # own params name nothing at all.
@@ -189,11 +184,11 @@ def test_a_binding_nested_in_a_group_is_found(tmp_path):
     assert screen.depends_on == frozenset({"prom"})
 
 
-def test_a_namespace_named_only_in_a_when_expression_is_not_a_dependency(tmp_path):
-    # A known gap, pinned so it cannot change unnoticed: the scan looks for
-    # `{{namespace.` prefixes, and `when` expressions carry no braces. `torrent`'s
-    # scene selection reads `prom.alerts` and `prom.nodes_ready` in its `when` and
-    # nowhere else, so `prom` does not become a dependency of a torrent screen.
+def test_a_scene_when_expression_names_a_dependency(tmp_path):
+    # `torrent`'s health gate is a bare expression -- `len(qbit.active) > 0 and
+    # prom.alerts == 0 and ...` -- and `prom` appears nowhere else in that
+    # template. A screen that cannot even decide whether to draw without
+    # Prometheus depends on Prometheus.
     config = {
         **BASE,
         "integrations": [
@@ -208,7 +203,116 @@ def test_a_namespace_named_only_in_a_when_expression_is_not_a_dependency(tmp_pat
         "screens": [{**BASE["screens"][0], "template": "torrent", "params": {}}],
     }
     screen = resolve_screens(load_config(write(tmp_path, config)))[0]
-    assert "prom" not in screen.depends_on
+    assert screen.depends_on == frozenset({"prom", "qbit"})
+
+
+def test_an_element_when_expression_names_a_dependency(tmp_path):
+    # The element's only reference to `prom` is its condition; its text is a
+    # literal.
+    inline = {
+        **BASE,
+        "screens": [{**BASE["screens"][0], "template": "gated", "params": {}}],
+        "templates": {
+            "gated": {
+                "name": "gated",
+                "scenes": [
+                    {
+                        "name": "default",
+                        "elements": [
+                            {"type": "text", "text": "UP", "when": "prom.cpu > 0"},
+                        ],
+                    }
+                ],
+            }
+        },
+    }
+    screen = resolve_screens(load_config(write(tmp_path, inline)))[0]
+    assert screen.depends_on == frozenset({"prom"})
+
+
+def test_the_example_racks_arithmetic_binding_names_its_namespace(tmp_path):
+    # The PODS screen of `examples/rack.yaml`, pinned because it is the config
+    # the author's rack runs.
+    screen = one_screen(tmp_path, params={"value": "{{prom.pods_run / prom.pods_tot * 100}}"})
+    assert screen.depends_on == frozenset({"prom"})
+
+
+def test_an_operand_after_a_literal_or_a_call_is_a_dependency(tmp_path):
+    # An inverted gauge and a count: in neither is the namespace the first token
+    # of the expression.
+    screen = one_screen(
+        tmp_path, params={"value": "{{100 - prom.cpu}}", "big": "{{len(prom.hosts)}}"}
+    )
+    assert screen.depends_on == frozenset({"prom"})
+
+
+def test_every_namespace_in_one_expression_is_a_dependency(tmp_path):
+    config = {
+        **BASE,
+        "integrations": [
+            *BASE["integrations"],
+            {
+                "name": "qbit",
+                "type": "prometheus",
+                "url": "http://q:9090",
+                "fields": {"speed": {"query": "up"}},
+            },
+        ],
+        "screens": [{**BASE["screens"][0], "params": {"big": "{{prom.cpu + qbit.speed}}"}}],
+    }
+    screen = resolve_screens(load_config(write(tmp_path, config)))[0]
+    assert screen.depends_on == frozenset({"prom", "qbit"})
+
+
+def test_a_configured_name_that_is_a_prefix_of_the_reference_is_not_a_dependency(tmp_path):
+    screen = one_screen(tmp_path, params={"big": "{{prometheus_extra.cpu}}"})
+    assert screen.depends_on == frozenset()
+
+
+def test_a_configured_name_that_extends_the_reference_is_not_a_dependency(tmp_path):
+    config = {
+        **BASE,
+        "integrations": [
+            {
+                "name": "prometheus_extra",
+                "type": "prometheus",
+                "url": "http://p:9090",
+                "fields": {"cpu": {"query": "up"}},
+            }
+        ],
+        "screens": [{**BASE["screens"][0], "params": {"big": "{{prom.cpu}}"}}],
+    }
+    screen = resolve_screens(load_config(write(tmp_path, config)))[0]
+    assert screen.depends_on == frozenset()
+
+
+def test_an_attribute_is_not_read_as_a_namespace(tmp_path):
+    # `active` is a field *of* `prom` here and also, awkwardly, the name of
+    # another integration. Only the head of the chain is a namespace.
+    config = {
+        **BASE,
+        "integrations": [
+            *BASE["integrations"],
+            {
+                "name": "active",
+                "type": "prometheus",
+                "url": "http://a:9090",
+                "fields": {"x": {"query": "up"}},
+            },
+        ],
+        "screens": [{**BASE["screens"][0], "params": {"big": "{{prom.active[0].name}}"}}],
+    }
+    screen = resolve_screens(load_config(write(tmp_path, config)))[0]
+    assert screen.depends_on == frozenset({"prom"})
+
+
+def test_params_is_never_a_dependency(tmp_path):
+    # Every built-in binds `{{params.*}}`, and `ring-gauge` also reads
+    # `params.title` and `params.palette`. `params` is the renderer's own
+    # namespace, not an integration.
+    screen = one_screen(tmp_path)
+    assert "params" not in screen.depends_on
+    assert screen.depends_on == frozenset({"prom"})
 
 
 def test_screens_sharing_a_position_keep_the_order_they_were_written_in(tmp_path):
