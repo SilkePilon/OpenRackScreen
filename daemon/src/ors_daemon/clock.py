@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ors_schema.daemon import NightWindow
@@ -62,6 +62,19 @@ def seconds_until_boundary(now: datetime, window: NightWindow) -> float:
         return float("inf")
     target = end if in_window(now, window) else start
     candidate = now.replace(hour=target.hour, minute=target.minute, second=0, microsecond=0)
-    if candidate <= now:
+    # Two comparisons on two different clocks, deliberately. *Which* occurrence of
+    # the boundary is next is a wall-clock question -- the rack owner set 07:00 and
+    # means the 07:00 the clock on the wall shows. *How long until it* is a question
+    # about elapsed time, because the caller spends the answer on a sleep.
+    #
+    # They differ by an hour on the two nights Europe/Amsterdam shifts, and
+    # subtracting the aware datetimes directly answers the first question twice:
+    # `candidate` carries `now`'s own tzinfo object, and datetime documents that
+    # subtraction between two aware datetimes with the same tzinfo "ignores" it and
+    # returns the wall-clock difference. That reads as 8h across the spring-forward
+    # night when only 7h elapse, and a worker sleeping 8h wakes at 08:00 with the
+    # window already closed behind it -- an hour of dark panels nothing corrects.
+    # Converting to UTC forces the elapsed-time answer.
+    if candidate.replace(tzinfo=None) <= now.replace(tzinfo=None):
         candidate = candidate + timedelta(days=1)
-    return (candidate - now).total_seconds()
+    return (candidate.astimezone(UTC) - now.astimezone(UTC)).total_seconds()
