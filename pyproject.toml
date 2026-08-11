@@ -22,13 +22,15 @@ dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [tool.pytest.ini_options]
 testpaths = ["packages/ors-schema/tests", "packages/ors-render/tests", "daemon/tests"]
-# `packages/ors-render/tests/` and `daemon/tests/` both carry an `__init__.py`,
-# so under pytest's default `prepend` mode both resolve to a top-level package
-# literally named `tests`: whichever is imported first wins and the second's
-# modules raise `ModuleNotFoundError: No module named 'tests.test_logging'`.
-# `importlib` derives each module name from its full path instead, so the two
-# coexist and test-file basenames need not be unique across the workspace.
-# There is no ini key for it -- `--import-mode` is command-line only.
+# Three test directories, none of them a package, all of them holding files
+# pytest has to import. Under the default `prepend` mode a module's name is its
+# basename, so the first `test_config.py` imported takes that name and any
+# second one is either skipped or shadowed -- across three trees that is a
+# collision waiting for whoever adds the next obvious filename. `importlib`
+# derives each module name from its full path instead, so basenames need not be
+# unique across the workspace and no test directory needs an `__init__.py` to
+# make itself distinct. There is no ini key for it -- `--import-mode` is
+# command-line only.
 addopts = "-q --import-mode=importlib"
 
 [tool.ruff]

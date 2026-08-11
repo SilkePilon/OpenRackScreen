@@ -19,8 +19,12 @@ integrations:
   - name: prom
     type: prometheus
     poll_interval: 5
-    # The local end of the tunnel below. Nothing on the Pi listens on 19090
-    # until the tunnel is up, which is what the poller's backoff is for.
+    # Where to poll when there is no `tunnel:` below -- and only then. A
+    # tunnelled integration builds its base URL from the tunnel's own
+    # `local_port`, so with the block below in place this line is inert: it is
+    # kept, matching that port, so that deleting the tunnel (to run against a
+    # Prometheus that is directly routable) leaves a config that still works.
+    # The schema requires it either way.
     url: http://localhost:19090
     timeout: 4
     tunnel:

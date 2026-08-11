@@ -47,8 +47,10 @@ class TunnelConfig(BaseModel):
     namespace: str
     # "auto" means the daemon discovers the service in `namespace` rather than
     # the config naming it, so a chart that renames its service on upgrade does
-    # not need a config edit. Empty is neither: it discovers nothing and names
-    # nothing, and only surfaces as a permanent "no service to forward".
+    # not need a config edit. Empty is neither -- it would discover nothing and
+    # name nothing -- so `min_length` refuses it here, where the answer is a
+    # validation error naming the field, rather than on the Pi as a tunnel that
+    # forwards nothing and says "no service to forward" once an interval forever.
     service: str = Field(default="auto", min_length=1)
     remote_port: int = Field(ge=1, le=65535)
     local_port: int = Field(ge=1, le=65535)
@@ -105,6 +107,12 @@ class PrometheusConfig(BaseModel):
     type: Literal["prometheus"] = "prometheus"
     name: str
     poll_interval: float = Field(default=5.0, gt=0)
+    # Read only when `tunnel` is absent: a tunnelled integration takes its base
+    # URL from the tunnel, at poll time, because the tunnel is allowed to move
+    # underneath it. Still required, so that removing a `tunnel:` block leaves a
+    # document that describes where to poll rather than one that does not
+    # validate -- but a config carrying both is describing one thing twice, and
+    # the tunnel is the half that wins.
     url: str
     timeout: float = Field(default=4.0, gt=0)
     tunnel: TunnelConfig | None = None

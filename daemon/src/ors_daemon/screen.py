@@ -108,11 +108,13 @@ class ScreenWorker(threading.Thread):
         self._stop_event = stop
         self._clock = clock
         self._floor = floor
-        # Serialises everything that touches the backend. `identify` is called
-        # from the CLI's thread by way of the supervisor, and may land while this
-        # loop is mid-tick: `show` is several sequential SPI commands (address
-        # window, then the frame), so two interleaved writes do not merely race
-        # for the last frame -- they corrupt both. Held across the render too, so
+        # Serialises everything that touches the backend, for any caller that
+        # arrives while this loop is mid-tick: `show` is several sequential SPI
+        # commands (address window, then the frame), so two interleaved writes do
+        # not merely race for the last frame -- they corrupt both. Nothing races
+        # it today -- `identify`'s only caller is `__main__._identify`, on a
+        # worker it never starts -- and the lock is kept anyway, because it is
+        # also what makes a tick atomic against itself. Held across the render, so
         # the counters and `current_scene` a status report reads always describe
         # the frame that is actually on the glass. Not an `RLock`: nothing here
         # re-enters, and a plain lock keeps that provable.
@@ -198,6 +200,12 @@ class ScreenWorker(threading.Thread):
 
     def identify(self, ordinal: str) -> None:
         """Paint the panel's ordinal, now, from whatever thread asked for it.
+
+        `__main__._identify` is the only caller, and it calls this on a worker it
+        never starts -- there is no identify path through the supervisor, and a
+        running rack redraws over the digit within a tick. The lock is still
+        taken, because "from whatever thread" is the contract this offers and a
+        method that is only safe from one thread should say so instead.
 
         Deliberately not sticky: the next tick draws the screen's real scene
         again, because `_selected_scene` now reads `identify` and the change
