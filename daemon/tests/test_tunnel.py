@@ -1,3 +1,4 @@
+import subprocess
 import threading
 
 from ors_daemon.tunnel import Tunnel
@@ -54,15 +55,16 @@ class Harness:
         return self.probe_results.pop(0) if self.probe_results else True
 
 
-def make(harness):
-    return Tunnel(
-        config=CONFIG,
-        stop=threading.Event(),
-        probe=harness.probe,
-        launcher=harness.launcher,
-        discoverer=harness.discoverer,
-        sleeper=lambda seconds: None,
-    )
+def make(harness, **overrides):
+    kwargs = {
+        "config": CONFIG,
+        "stop": threading.Event(),
+        "probe": harness.probe,
+        "launcher": harness.launcher,
+        "discoverer": harness.discoverer,
+        "sleeper": lambda seconds: None,
+    }
+    return Tunnel(**(kwargs | overrides))
 
 
 def test_base_url_points_at_the_local_port():
@@ -156,5 +158,143 @@ def test_stopping_terminates_the_subprocess():
     tunnel = make(harness)
     tunnel.tick()
     tunnel.shutdown()
+
+    assert harness.processes[0].terminated is True
+
+
+# --- teardown really frees the local port ------------------------------------
+
+
+class StubbornProcess(FakeProcess):
+    """A kubectl that ignores SIGTERM, like one wedged in the API-server dial.
+
+    `wait` raises until something actually kills it, which is what
+    `subprocess.Popen.wait(timeout=...)` does: it raises `TimeoutExpired`.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.waits = 0
+
+    def terminate(self):
+        self.terminated = True  # ... and nothing else happens
+
+    def wait(self, timeout=None):
+        self.waits += 1
+        if self._returncode is None:
+            raise subprocess.TimeoutExpired("kubectl", timeout)
+        return self._returncode
+
+
+class ExplodingProcess(FakeProcess):
+    """Every way of stopping it fails. The tunnel must not end up holding it."""
+
+    def terminate(self):
+        raise OSError("no such process")
+
+    def kill(self):
+        raise OSError("no such process")
+
+    def wait(self, timeout=None):
+        raise OSError("no such process")
+
+
+def test_a_process_that_ignores_sigterm_is_killed_and_reaped():
+    harness = Harness([True])
+    harness.launcher = lambda argv: _remember(harness, argv, StubbornProcess())
+    tunnel = make(harness)
+    tunnel.tick()
+    tunnel.shutdown()
+
+    process = harness.processes[0]
+    assert process.killed is True
+    # Twice: once for the SIGTERM that timed out, once to reap the kill. The
+    # second is what frees the local port before the next launch tries to bind
+    # it -- SIGKILL only queues the death, it does not wait for it.
+    assert process.waits == 2
+
+
+def test_a_process_that_cannot_be_stopped_at_all_is_still_let_go_of():
+    harness = Harness([True, True])
+    harness.launcher = lambda argv: _remember(harness, argv, ExplodingProcess())
+    tunnel = make(harness)
+    tunnel.tick()
+    harness.processes[0].die()
+    tunnel.tick()
+
+    assert len(harness.processes) == 2, "a process it cannot kill must not block a relaunch"
+
+
+def _remember(harness, argv, process):
+    harness.argvs.append(argv)
+    harness.processes.append(process)
+    return process
+
+
+# --- nothing gets out of a supervision cycle ---------------------------------
+
+
+def boom(*_args):
+    raise RuntimeError("boom")
+
+
+def test_a_launcher_that_raises_is_survived_and_retried():
+    harness = Harness([True, True])
+    launches = []
+
+    def launcher(argv):
+        launches.append(argv)
+        if len(launches) == 1:
+            raise OSError("kubectl: not found")
+        return harness.launcher(argv)
+
+    tunnel = make(harness, launcher=launcher)
+    tunnel.tick()
+    assert tunnel.ready.is_set() is False
+
+    tunnel.tick()
+    tunnel.tick()
+    assert tunnel.ready.is_set() is True
+
+
+def test_a_probe_that_raises_counts_as_a_failed_probe():
+    harness = Harness([])
+    tunnel = make(harness, probe=boom)
+    for _ in range(3):
+        tunnel.tick()
+
+    assert tunnel.ready.is_set() is False
+    assert harness.processes[0].terminated is True
+
+
+def test_a_discoverer_that_raises_does_not_launch_or_crash():
+    harness = Harness([True])
+    tunnel = make(harness, discoverer=boom)
+    tunnel.tick()
+
+    assert harness.argvs == []
+    assert tunnel.ready.is_set() is False
+
+
+def test_run_leaves_no_tunnel_behind_when_it_is_stopped():
+    harness = Harness([True, True])
+    stop = threading.Event()
+    tunnel = make(harness, stop=stop, sleeper=lambda seconds: stop.set())
+    tunnel.run()
+
+    assert harness.processes[0].terminated is True
+    assert tunnel.ready.is_set() is False
+
+
+def test_run_survives_a_sleeper_that_raises():
+    harness = Harness([True, True])
+    stop = threading.Event()
+
+    def sleeper(seconds):
+        stop.set()  # so the fallback wait returns at once and this test never sleeps
+        raise RuntimeError("sleeper failed")
+
+    tunnel = make(harness, stop=stop, sleeper=sleeper)
+    tunnel.run()
 
     assert harness.processes[0].terminated is True
