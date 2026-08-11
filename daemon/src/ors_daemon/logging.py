@@ -25,15 +25,17 @@ class JsonFormatter(logging.Formatter):
     """One JSON object per line, so journald and the log shipper agree."""
 
     def format(self, record: logging.LogRecord) -> str:
-        payload = {
-            "time": datetime.fromtimestamp(record.created, UTC).isoformat(),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
+        # Extras go in first so the base fields below always win. `extra=` keys
+        # are not LogRecord attributes, so `makeRecord` does not reject a caller
+        # passing `level` or `time` -- and a config object logged with a `level`
+        # field would otherwise rewrite the record's own severity in the output.
+        payload: dict[str, object] = {
+            key: value for key, value in record.__dict__.items() if key not in _RESERVED
         }
-        for key, value in record.__dict__.items():
-            if key not in _RESERVED:
-                payload[key] = value
+        payload["time"] = datetime.fromtimestamp(record.created, UTC).isoformat()
+        payload["level"] = record.levelname
+        payload["logger"] = record.name
+        payload["message"] = record.getMessage()
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload, default=str)
