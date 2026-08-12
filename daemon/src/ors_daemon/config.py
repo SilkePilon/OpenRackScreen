@@ -134,19 +134,48 @@ def config_fingerprint(config: DaemonConfig) -> str:
 def _templates(config: DaemonConfig) -> dict[str, Template]:
     """The built-ins, overlaid with the config's own templates.
 
-    The config wins, which is what lets a rack owner amend a built-in without
-    forking it -- and is also silent, so a user-defined `ring-gauge` changes
-    *every* screen naming `ring-gauge`, not just theirs. That is worth a line in
-    the log: it is invisible in the YAML, and the symptom (a screen drawing
-    someone else's layout) points nowhere near the cause.
+    The config wins either way, which is what lets a rack owner amend a built-in
+    without forking it, and is what keeps a pushed snapshot honest: the server's
+    copy of a template is the one the browser drew its preview from, so agreeing
+    with it is the point.
+
+    What is worth logging is which of the two just happened, and they are told
+    apart by `Template.builtin`:
+
+    *A template the config declares as its own* (`builtin=False`) shadowing a
+    built-in is a user override, and a silent one -- a hand-written `ring-gauge`
+    changes *every* screen naming `ring-gauge`, not just theirs, which is
+    invisible in the YAML and whose symptom (a screen drawing someone else's
+    layout) points nowhere near the cause. That is a warning.
+
+    *A built-in arriving from the server* (`builtin=True`) is the normal case:
+    every snapshot carries all of them, so warning would be seven lines on every
+    config load and no signal at all. Only a *difference* from this build's own
+    copy says anything -- the two ends are on different wheels -- and that is one
+    INFO line, when it happens.
     """
     builtin = load_builtin_templates()
-    shadowed = sorted(set(builtin) & set(config.templates))
-    if shadowed:
+    overridden = sorted(
+        name
+        for name, template in config.templates.items()
+        if name in builtin and not template.builtin
+    )
+    if overridden:
         log.warning(
             "config templates shadow built-ins: %s",
-            ", ".join(shadowed),
-            extra={"templates": shadowed},
+            ", ".join(overridden),
+            extra={"templates": overridden},
+        )
+    differing = sorted(
+        name
+        for name, template in config.templates.items()
+        if name in builtin and template.builtin and template != builtin[name]
+    )
+    if differing:
+        log.info(
+            "the server's copy of these built-ins differs from this build's: %s",
+            ", ".join(differing),
+            extra={"templates": differing},
         )
     return {**builtin, **config.templates}
 
