@@ -737,7 +737,7 @@ requires-dist = [
 dev = [
     { name = "httpx2", specifier = ">=2.10" },
     { name = "pytest", specifier = ">=8.0" },
-    { name = "pytest-asyncio", specifier = ">=0.24" },
+    { name = "pytest-asyncio", specifier = ">=1.0,<2" },
     { name = "ruff", specifier = ">=0.6" },
 ]
 

@@ -24,7 +24,12 @@ ors-server = { workspace = true }
 # around the app and raises at import without one. It is `httpx2`, not `httpx`:
 # starlette 1.6 imports `httpx2` first and only falls back to `httpx` with a
 # `StarletteDeprecationWarning`. FastAPI's testing tutorial still says `httpx`.
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.6", "httpx2>=2.10"]
+# `pytest-asyncio` is floored at 1.0 rather than 0.24 because the 0.x -> 1.0
+# boundary removed the `event_loop` fixture and settled the `asyncio_mode`
+# defaults this suite relies on. A range spanning it means `uv lock --upgrade`
+# can cross the removal without anything saying so; the lock file happens to
+# pin 1.4.0 today, which is what has been keeping CI honest by accident.
+dev = ["pytest>=8.0", "pytest-asyncio>=1.0,<2", "ruff>=0.6", "httpx2>=2.10"]
 
 [tool.pytest.ini_options]
 testpaths = [

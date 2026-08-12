@@ -11,6 +11,32 @@ log = logging.getLogger(__name__)
 
 Sender = Callable[[str | bytes], Awaitable[None]]
 
+SEND_TIMEOUT = 5.0
+"""How long one send to a daemon may take before the socket is given up on.
+
+An unbounded send is the failure this bounds: a Pi that is TCP-alive but no
+longer reading its socket fills the kernel buffers and never drains them, and
+`await connection.send(...)` then never returns. Every later send to that
+daemon serialises behind it, and `PATCH /api/screens/{id}` awaits a push inside
+its request handler -- so the row is committed, the version is bumped, and the
+browser spins until it gives up, against a rack that is never told.
+
+Five seconds because the two errors cost very different amounts. Overshooting
+holds a request handler open; undershooting drops a daemon that was healthy and
+merely slow, and the daemon's link client reconnects within its first backoff
+and re-acks, which costs one round trip and -- once task 8 compares versions
+before pushing -- no repaint at all. So this is set well inside a human's
+patience rather than at the edge of what a busy Pi might need: the link client
+reads in a thread of its own and does nothing between reads, so a socket that
+has not drained a few KB in five seconds is wedged, not busy.
+
+It also has to stay at or below whatever heartbeat interval the daemon's link
+client ends up sending at, or the server would notice a silent daemon before
+this ever fires and the bound would be decoration. The client does not exist
+yet -- there is no heartbeat cadence in `daemon/src/ors_daemon/` to measure
+against today -- so that constraint belongs to whoever writes it.
+"""
+
 
 @dataclass
 class Connection:
@@ -45,12 +71,24 @@ class Hub:
     liveness, and every decision about *what* to send is made by a caller that
     can read rows. That is what keeps the API testable without a socket and the
     socket testable without a database.
+
+    **Event-loop-affine.** Every method has to be called from the thread running
+    the event loop. Nothing here takes a lock, and the properties the identity
+    guards and the frame eviction rest on are all of the form "there is no await
+    between these two lines", which is a statement about this loop and says
+    nothing whatever about another thread. FastAPI runs any `def` route in a
+    threadpool, so a route that touches the hub must be `async def` -- including
+    the read-only-looking ones, since `online_ids` builds a set from a dict a
+    reconnect can be resizing, and that raises just as readily as anything else
+    here. The one exception is `relay_frame`, which copies before it iterates,
+    because it is the only loop whose failure is not confined to one request.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, send_timeout: float = SEND_TIMEOUT) -> None:
         self._connections: dict[int, Connection] = {}
         self._acked: dict[int, int] = {}
         self._watchers: dict[int, set[asyncio.Queue[Frame]]] = {}
+        self._send_timeout = send_timeout
 
     def register(self, daemon_id: int, send: Sender) -> Connection:
         # A reconnect arrives before the old socket's close is always observed,
@@ -93,11 +131,27 @@ class Hub:
     def online_ids(self) -> set[int]:
         return set(self._connections)
 
-    def record_ack(self, daemon_id: int, version: int) -> None:
-        self._acked[daemon_id] = version
+    def record_ack(self, connection: Connection, version: int) -> None:
+        """Record what this connection's daemon has confirmed applying.
+
+        The `Connection` rather than a bare id, for the reason `drop` matches on
+        identity: a superseded handler is still a reader, and the ack it is
+        holding was read from a socket the daemon has already left. Recorded
+        under the id, that ack describes the previous boot -- so a caller
+        comparing versions before pushing sees a match, pushes nothing, and
+        leaves a freshly rebooted Pi blank against a server that believes it is
+        up to date. Which is the failure `register` clears the ack to prevent,
+        and a late ack would put straight back.
+        """
+        if self._connections.get(connection.daemon_id) is not connection:
+            return
+        self._acked[connection.daemon_id] = version
 
     def acked_version(self, daemon_id: int) -> int | None:
         """The version this daemon has confirmed applying, or None if unknown.
+
+        By id, not by connection: the caller asking is the one deciding whether
+        to push to a daemon, and it has a row, not a socket.
 
         None is "ask again", not "old": it is what an unconnected daemon, a
         daemon that has not answered its first push, and a daemon that has just
@@ -146,7 +200,15 @@ class Hub:
         otherwise change every call site. Awaiting nothing is also what makes
         the body below safe, and the two facts are the same fact.
         """
-        for queue in self._watchers.get(frame.screen_id, ()):
+        # A copy, because the set really can change under this loop: `Hub` is
+        # event-loop-affine and a `def` FastAPI route runs in a threadpool, so
+        # one browser subscribing from the wrong kind of route raises
+        # `RuntimeError: Set changed size during iteration` here. That is
+        # neither a `WebSocketDisconnect` nor a `ValidationError`, so it escapes
+        # the daemon socket handler and takes the whole rack offline -- a cost
+        # nothing like the copy, which is at most four queues at 2 fps. A
+        # watcher that arrives mid-frame catches the next one.
+        for queue in list(self._watchers.get(frame.screen_id, ())):
             try:
                 queue.put_nowait(frame)
             except asyncio.QueueFull:
@@ -157,9 +219,9 @@ class Hub:
                 # recovered its backlog, frame by stale frame, while every fresh
                 # one was thrown away.
                 #
-                # There is no await between the two calls, so nothing can touch
-                # the queue in between: the space made is the space used, and
-                # the set being iterated cannot change under the loop either.
+                # There is no await between the two calls, so nothing else on
+                # this loop -- a watcher parked in `queue.get()`, above all --
+                # runs in between: the space made is the space used.
                 queue.get_nowait()
                 queue.put_nowait(frame)
                 log.debug("dropped a frame for a slow watcher", extra={"screen": frame.screen_id})
@@ -171,7 +233,19 @@ class Hub:
             # saved, and the snapshot is pushed again when it reconnects.
             return
         try:
-            await connection.send(payload)
+            await asyncio.wait_for(connection.send(payload), self._send_timeout)
+        except TimeoutError:
+            # Indistinguishable from a dead socket as far as the hub is
+            # concerned, and treated as one: a daemon that cannot take a few KB
+            # inside `SEND_TIMEOUT` is not going to take the next message
+            # either. `wait_for` has already cancelled the send, which leaves
+            # the socket mid-frame -- which is why this drops rather than
+            # retries, and why the handler watching `closed` is what closes it.
+            log.warning(
+                "daemon send timed out; dropping",
+                extra={"daemon": daemon_id, "timeout_s": self._send_timeout},
+            )
+            self.drop(connection)
         except Exception as exc:
             log.info("daemon send failed; dropping", extra={"daemon": daemon_id, "error": str(exc)})
             self.drop(connection)

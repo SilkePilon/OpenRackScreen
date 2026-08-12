@@ -1497,7 +1497,7 @@ git commit -m "feat(server): assemble a daemon snapshot from the database"
 - Produces:
   - `Hub()` with `register(daemon_id, sender) -> Connection`, `drop(connection)`, `is_online(daemon_id) -> bool`, `online_ids() -> set[int]`
   - `await push_config(daemon_id, ConfigPush) -> None`, `await send_command(daemon_id, Command) -> None`, `await request_frames(daemon_id, FramesRequest) -> None`
-  - `record_ack(daemon_id, version)`, `acked_version(daemon_id) -> int | None`
+  - `record_ack(connection, version)`, `acked_version(daemon_id) -> int | None` — the ack is recorded against the `Connection` that carried it and ignored if that connection has been superseded or dropped; it is read back by daemon id, because the caller deciding whether to push has a row rather than a socket
   - `subscribe_frames(screen_id, queue)`, `unsubscribe_frames(screen_id, queue)`, `await relay_frame(Frame)`
   - `Sender = Callable[[str | bytes], Awaitable[None]]`
 
@@ -1976,7 +1976,7 @@ async def daemon_socket(socket: WebSocket) -> None:
         await socket.send_text(ConfigPush(version=version, snapshot=snapshot).model_dump_json())
 
         while True:
-            await _handle(state, daemon_id, parse_daemon_message(await socket.receive_text()))
+            await _handle(state, connection, parse_daemon_message(await socket.receive_text()))
     except WebSocketDisconnect:
         pass
     except ValidationError as exc:
@@ -2006,9 +2006,13 @@ def _record_hello(database, daemon_id: int, hello: Hello) -> None:
         )
 
 
-async def _handle(state, daemon_id: int, message) -> None:
+async def _handle(state, connection: Connection, message) -> None:
+    # The `Connection`, not the id: this handler can still be reading a socket
+    # the hub has already replaced, and `record_ack` is what refuses the stale
+    # ack that would otherwise describe the daemon's previous boot.
+    daemon_id = connection.daemon_id
     if isinstance(message, Ack):
-        state.hub.record_ack(daemon_id, message.config_version)
+        state.hub.record_ack(connection, message.config_version)
     elif isinstance(message, Nack):
         log.error(
             "daemon refused a snapshot",

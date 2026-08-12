@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 
 from ors_schema.daemon import DaemonConfig
@@ -16,6 +18,63 @@ class FakeSocket:
         if self.fails:
             raise ConnectionResetError("gone")
         self.sent.append(payload)
+
+
+class GatedSocket:
+    """A socket whose `send` really suspends, and finishes when the test says so.
+
+    `FakeSocket.send` reaches no await, so nothing else on the loop can run
+    while the hub is inside it -- which is exactly the window the identity
+    guards in `drop` and `record_ack` exist for, and a suite built only on
+    `FakeSocket` never opens it. This one holds the send open until `release`
+    is set, so a test can land a reconnect or a drop in the middle of one.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[str | bytes] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.fails = False
+
+    async def send(self, payload: str | bytes) -> None:
+        self.started.set()
+        await self.release.wait()
+        if self.fails:
+            raise ConnectionResetError("gone")
+        self.sent.append(payload)
+
+
+class Ticker:
+    """Counts the loop's trips back to it, so a test can prove it really yielded.
+
+    A concurrency test that never suspends is a sequential test with `async` in
+    front of it, and it passes against an implementation with the concurrency
+    removed. Entering resets the count, so `ticks` reads as "since here".
+    """
+
+    def __init__(self) -> None:
+        self.ticks = 0
+        self._task: asyncio.Task[None] | None = None
+
+    async def __aenter__(self) -> Ticker:
+        self._task = asyncio.create_task(self._run())
+        # Let it reach its first await, then discount that first scheduling.
+        await asyncio.sleep(0)
+        self.ticks = 0
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        assert self._task is not None
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+
+    async def _run(self) -> None:
+        while True:
+            await asyncio.sleep(0)
+            self.ticks += 1
 
 
 def frame(screen_id: int, seq: int) -> Frame:
@@ -136,11 +195,11 @@ async def test_a_send_that_fails_leaves_every_other_daemon_alone():
 
 async def test_acks_are_recorded_per_daemon():
     hub = Hub()
-    hub.register(1, FakeSocket().send)
+    one = hub.register(1, FakeSocket().send)
     hub.register(2, FakeSocket().send)
     assert hub.acked_version(1) is None
 
-    hub.record_ack(1, 7)
+    hub.record_ack(one, 7)
 
     assert hub.acked_version(1) == 7
     assert hub.acked_version(2) is None, "one daemon's ack says nothing about another's"
@@ -152,20 +211,20 @@ async def test_a_reconnecting_daemon_has_acked_nothing_until_it_says_so():
     # and pushes nothing. A new connection means unknown state.
     hub = Hub()
     connection = hub.register(1, FakeSocket().send)
-    hub.record_ack(1, 7)
+    hub.record_ack(connection, 7)
     hub.drop(connection)
 
-    hub.register(1, FakeSocket().send)
+    reconnected = hub.register(1, FakeSocket().send)
 
     assert hub.acked_version(1) is None
-    hub.record_ack(1, 8)
+    hub.record_ack(reconnected, 8)
     assert hub.acked_version(1) == 8
 
 
 async def test_a_reconnect_that_overtakes_the_old_drop_still_forgets_the_ack():
     hub = Hub()
-    hub.register(1, FakeSocket().send)
-    hub.record_ack(1, 7)
+    connection = hub.register(1, FakeSocket().send)
+    hub.record_ack(connection, 7)
 
     hub.register(1, FakeSocket().send)
 
@@ -175,11 +234,46 @@ async def test_a_reconnect_that_overtakes_the_old_drop_still_forgets_the_ack():
 async def test_a_daemon_that_goes_offline_is_not_still_running_its_last_ack():
     hub = Hub()
     connection = hub.register(1, FakeSocket().send)
-    hub.record_ack(1, 7)
+    hub.record_ack(connection, 7)
 
     hub.drop(connection)
 
     assert hub.acked_version(1) is None
+
+
+async def test_an_ack_from_a_replaced_connection_is_not_the_new_ones():
+    # The stale handler is still a reader, and the message it is holding was
+    # read before the daemon went away. Recording it under the id would tell a
+    # caller comparing versions that the Pi which just rebooted is running
+    # version 7, so nothing is pushed and the rack stays blank.
+    hub = Hub()
+    superseded = hub.register(1, FakeSocket().send)
+    hub.register(1, FakeSocket().send)
+
+    hub.record_ack(superseded, 7)
+
+    assert hub.acked_version(1) is None
+
+
+async def test_an_ack_from_a_dropped_connection_does_not_bring_it_back():
+    hub = Hub()
+    connection = hub.register(1, FakeSocket().send)
+    hub.drop(connection)
+
+    hub.record_ack(connection, 7)
+
+    assert hub.acked_version(1) is None, "`_acked` must not outlive the connection"
+    assert hub.is_online(1) is False
+
+
+async def test_an_ack_from_the_live_connection_of_another_daemon_is_not_confused():
+    hub = Hub()
+    one = hub.register(1, FakeSocket().send)
+    hub.register(2, FakeSocket().send)
+
+    hub.record_ack(one, 7)
+
+    assert hub.acked_version(2) is None
 
 
 async def test_a_frame_reaches_every_subscriber_of_that_screen_and_no_other():
@@ -269,6 +363,162 @@ async def test_a_frame_for_an_unwatched_screen_goes_nowhere():
     await hub.relay_frame(frame(2, seq=1))
 
     assert queue.empty()
+
+
+async def test_a_watcher_arriving_mid_fan_out_does_not_kill_the_daemons_socket():
+    # `_watchers` really can grow under this loop: FastAPI runs any `def` route
+    # in a threadpool, and a browser subscribing from one lands between two
+    # iterations. Iterating the live set raises `RuntimeError: Set changed size
+    # during iteration`, which is neither a disconnect nor a validation error,
+    # so the socket handler does not catch it -- one subscribe would take the
+    # whole rack offline. The subscribing queue stands in for the interleaving.
+    hub = Hub()
+    late: asyncio.Queue[Frame] = asyncio.Queue()
+
+    class SubscribingQueue(asyncio.Queue):  # type: ignore[type-arg]
+        def put_nowait(self, item: Frame) -> None:
+            hub.subscribe_frames(1, late)
+            super().put_nowait(item)
+
+    watching: asyncio.Queue[Frame] = SubscribingQueue()
+    hub.subscribe_frames(1, watching)
+
+    await hub.relay_frame(frame(1, seq=1))
+
+    assert watching.qsize() == 1
+    assert late.empty(), "a watcher that arrives mid-frame catches the next one, not this one"
+
+
+async def test_eviction_stays_atomic_against_a_watcher_reading_the_queue():
+    # The claim the eviction rests on: nothing can take the space between the
+    # `get_nowait` and the `put_nowait`. A consumer parked in `queue.get()` is
+    # the thing that would, so the burst below must reach it as one frame.
+    hub = Hub()
+    queue: asyncio.Queue[Frame] = asyncio.Queue(maxsize=1)
+    hub.subscribe_frames(1, queue)
+    received: list[int] = []
+
+    async def watch() -> None:
+        while True:
+            received.append((await queue.get()).seq)
+
+    consumer = asyncio.create_task(watch())
+    try:
+        async with Ticker() as ticker:
+            await asyncio.sleep(0)  # the consumer is now parked inside `get`
+            parked = ticker.ticks
+
+            for seq in (1, 2, 3):
+                await hub.relay_frame(frame(1, seq=seq))
+
+            assert ticker.ticks == parked, "relay_frame must not yield mid-eviction"
+            assert received == [], "nothing could have been consumed while it did not yield"
+
+            for _ in range(10):
+                await asyncio.sleep(0)
+                if received:
+                    break
+            assert ticker.ticks > parked, "the consumer really did suspend and resume"
+    finally:
+        consumer.cancel()
+
+    assert received == [3], "the watcher sees the newest frame, and the stale ones are gone"
+
+
+async def test_a_reconnect_landing_while_a_send_is_suspended_keeps_the_new_socket():
+    # The window a `FakeSocket` cannot open: the hub is inside `connection.send`
+    # when the daemon reconnects, and the send it is inside fails afterwards.
+    # That failure belongs to a connection the hub has already replaced.
+    hub, first, second = Hub(), GatedSocket(), FakeSocket()
+    hub.register(1, first.send)
+
+    async with Ticker() as ticker:
+        pending = asyncio.create_task(hub.send_command(1, Command(command="reload")))
+        await asyncio.wait_for(first.started.wait(), 1)
+
+        hub.register(1, second.send)
+        first.fails = True
+        first.release.set()
+        await asyncio.wait_for(pending, 1)
+
+        assert ticker.ticks > 0, "the send must really have suspended"
+
+    assert hub.is_online(1) is True
+    await hub.send_command(1, Command(command="reload"))
+    assert second.sent, "the reconnected daemon must keep receiving"
+
+
+async def test_a_drop_landing_while_a_send_is_suspended_offlines_it_once():
+    hub, socket = Hub(), GatedSocket()
+    connection = hub.register(1, socket.send)
+
+    async with Ticker() as ticker:
+        pending = asyncio.create_task(hub.send_command(1, Command(command="reload")))
+        await asyncio.wait_for(socket.started.wait(), 1)
+
+        hub.drop(connection)
+        socket.fails = True
+        socket.release.set()
+        await asyncio.wait_for(pending, 1)
+
+        assert ticker.ticks > 0, "the send must really have suspended"
+
+    assert hub.is_online(1) is False
+    replacement = FakeSocket()
+    hub.register(1, replacement.send)
+    await hub.send_command(1, Command(command="reload"))
+    assert replacement.sent, "a drop that already happened must not follow the daemon back"
+
+
+async def test_a_send_failing_after_a_drop_and_a_reconnect_spares_the_new_socket():
+    # Drop, reconnect, then the in-flight send fails: three events in the order
+    # a wifi blip really delivers them, with the failure arriving last.
+    hub, first, second = Hub(), GatedSocket(), FakeSocket()
+    connection = hub.register(1, first.send)
+
+    async with Ticker() as ticker:
+        pending = asyncio.create_task(hub.send_command(1, Command(command="reload")))
+        await asyncio.wait_for(first.started.wait(), 1)
+
+        hub.drop(connection)
+        hub.register(1, second.send)
+        first.fails = True
+        first.release.set()
+        await asyncio.wait_for(pending, 1)
+
+        assert ticker.ticks > 0, "the send must really have suspended"
+
+    assert hub.is_online(1) is True
+    await hub.send_command(1, Command(command="reload"))
+    assert second.sent
+
+
+async def test_a_send_that_never_returns_takes_the_daemon_offline():
+    # A Pi that is TCP-alive but not reading blocks the send forever, and every
+    # later send to it queues behind that one -- including the push a PATCH is
+    # awaiting inside its request handler, with the row already committed.
+    hub, socket = Hub(send_timeout=0.01), GatedSocket()
+    connection = hub.register(1, socket.send)
+
+    await asyncio.wait_for(hub.send_command(1, Command(command="reload")), 1)
+
+    assert hub.is_online(1) is False
+    assert connection.closed.is_set() is True, "the handler is what closes the wedged socket"
+    # And the next caller is not made to wait for the same dead socket again.
+    await asyncio.wait_for(hub.push_config(1, ConfigPush(version=3, snapshot=DaemonConfig())), 1)
+    assert socket.sent == []
+
+
+async def test_a_wedged_daemon_does_not_take_a_healthy_one_with_it():
+    hub, healthy = Hub(send_timeout=0.01), FakeSocket()
+    hub.register(1, GatedSocket().send)
+    hub.register(2, healthy.send)
+
+    await asyncio.wait_for(hub.send_command(1, Command(command="reload")), 1)
+
+    assert hub.online_ids() == {2}
+    await hub.send_command(2, Command(command="reload"))
+    assert healthy.sent
 
 
 async def test_a_connection_carries_the_daemon_it_belongs_to():
