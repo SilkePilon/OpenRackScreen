@@ -39,12 +39,21 @@ class _Message(BaseModel):
 class Hello(_Message):
     type: Literal["hello"] = "hello"
     token: str = Field(repr=False)
-    """The pairing token. Kept out of `repr` because it is the credential.
+    """The credential: the one-time pairing token, or the key `Paired` handed back.
 
-    A model's `repr` is what reaches a log the moment anyone writes
-    `log.info("hello", extra={"message": hello})` or drops one into an
-    exception -- and this one pairs a rack. It still serialises normally,
-    because it has to travel; it just does not travel into a log by accident.
+    One field for both, which is what the design calls `token_or_key`. They are
+    never ambiguous -- a token is spent the moment it is claimed, so at most one
+    of the two can match any row -- and a daemon that had to choose *which*
+    field to send would have to know which state the server thinks it is in.
+    With one field it sends whichever credential it holds and the server decides
+    what that is, which is the only order that survives a pairing whose reply
+    was lost.
+
+    Kept out of `repr` because it is the credential. A model's `repr` is what
+    reaches a log the moment anyone writes `log.info("hello", extra={"message":
+    hello})` or drops one into an exception -- and this one pairs a rack. It
+    still serialises normally, because it has to travel; it just does not travel
+    into a log by accident.
     """
     hostname: str
     daemon_version: str
@@ -156,6 +165,33 @@ class ConfigPush(_Message):
     snapshot: DaemonConfig
 
 
+class Paired(_Message):
+    """The pairing token is spent; this is what to present from now on.
+
+    Sent once, immediately after a token is claimed, and never again. The
+    daemon writes `key` into its local state and sends it as `Hello.token` on
+    every later connect -- which is what stops a reconnect from being
+    authenticated by something as forgeable as a hostname. The server keeps only
+    a hash of it.
+
+    A message of its own rather than a field on `ConfigPush`, for two reasons.
+    A pushed config is a document the daemon caches to disk to boot from when
+    the server is down, so a credential riding inside it would be written into
+    that cache on every push, by whatever writes the cache, forever. And a
+    config push is refusable -- a daemon that nacks a snapshot it cannot apply
+    must still keep the key it was just given, or a rack with one bad screen
+    could never reconnect.
+
+    `daemon_id` is not a secret and is carried because the daemon logs it and
+    the interface addresses the rack by it; `key` is, and so is out of `repr`
+    for the reason `Hello.token` is.
+    """
+
+    type: Literal["paired"] = "paired"
+    daemon_id: int
+    key: str = Field(repr=False)
+
+
 class Command(_Message):
     type: Literal["command"] = "command"
     command: Literal["identify", "sleep", "wake", "reload"]
@@ -173,7 +209,9 @@ DaemonMessage = Annotated[
     Hello | Heartbeat | Ack | Nack | SourceStatus | Frame | LogLine,
     Field(discriminator="type"),
 ]
-ServerMessage = Annotated[ConfigPush | Command | FramesRequest, Field(discriminator="type")]
+ServerMessage = Annotated[
+    ConfigPush | Command | FramesRequest | Paired, Field(discriminator="type")
+]
 
 _daemon_adapter: TypeAdapter[DaemonMessage] = TypeAdapter(DaemonMessage)
 _server_adapter: TypeAdapter[ServerMessage] = TypeAdapter(ServerMessage)

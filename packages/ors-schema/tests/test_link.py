@@ -14,6 +14,7 @@ from ors_schema.link import (
     Hello,
     LogLine,
     Nack,
+    Paired,
     SourceStatus,
     parse_daemon_message,
     parse_server_message,
@@ -186,6 +187,7 @@ def test_every_daemon_message_parses_back_to_its_own_class(message):
         ConfigPush(version=7, snapshot=DaemonConfig.model_validate(CONFIG)),
         Command(command="sleep", screen_id=2),
         FramesRequest(enabled=True, screen_ids=[1], fps=1.0),
+        Paired(daemon_id=3, key="a-key"),
     ],
     ids=lambda m: m.type,
 )
@@ -286,6 +288,7 @@ def test_the_link_models_are_reachable_from_the_package_root():
         "Hello",
         "LogLine",
         "Nack",
+        "Paired",
         "ServerMessage",
         "SourceStatus",
         "parse_daemon_message",
@@ -296,6 +299,27 @@ def test_the_link_models_are_reachable_from_the_package_root():
     assert all(hasattr(ors_schema, name) for name in exported)
 
 
+def test_pairing_hands_back_a_key_the_daemon_reconnects_with():
+    """The token is single-use, so something else has to identify the daemon next time.
+
+    Its own message rather than a field on `ConfigPush`, because a pushed
+    config is a document the daemon caches to disk to boot from when the server
+    is down -- a credential riding along inside it would be written into that
+    cache every push.
+    """
+    paired = parse_server_message(Paired(daemon_id=3, key="a-key").model_dump_json())
+
+    assert isinstance(paired, Paired)
+    assert paired.daemon_id == 3
+    assert paired.key == "a-key"
+
+
+def test_a_daemon_cannot_hand_itself_a_key():
+    """`Paired` travels one way. In the other direction it is not a message at all."""
+    with pytest.raises(ValidationError):
+        parse_daemon_message(Paired(daemon_id=3, key="a-key").model_dump_json())
+
+
 def test_the_pairing_token_stays_out_of_a_repr():
     """A repr is what reaches a log or an exception without anyone deciding to."""
     hello = Hello(token="s3cret-pairing-token", hostname="pi-rack", daemon_version="0.1.0")
@@ -304,3 +328,17 @@ def test_the_pairing_token_stays_out_of_a_repr():
     assert "pi-rack" in repr(hello), "the rest of the message is still useful in a log"
     assert hello.model_dump()["token"] == "s3cret-pairing-token", "it still travels"
     assert "s3cret-pairing-token" in hello.model_dump_json()
+
+
+def test_the_daemon_key_stays_out_of_a_repr_too():
+    """The same rule as `Hello.token`, for the credential that outlives it.
+
+    This one is worse if it leaks: a pairing token is spent once, and this is
+    what the daemon presents on every connect for the life of the pairing.
+    """
+    paired = Paired(daemon_id=3, key="s3cret-daemon-key")
+
+    assert "s3cret-daemon-key" not in repr(paired)
+    assert "3" in repr(paired), "the rest of the message is still useful in a log"
+    assert paired.model_dump()["key"] == "s3cret-daemon-key", "it still travels"
+    assert "s3cret-daemon-key" in paired.model_dump_json()
