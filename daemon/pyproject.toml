@@ -19,7 +19,13 @@ ors-daemon = "ors_daemon.__main__:main"
 # on x86 CI. Kept an *extra* rather than a plain dependency so `uv sync
 # --all-packages` (what CI runs) leaves both unresolved-into-the-environment --
 # extras are only installed under `--extra hardware` / `--all-extras`.
-hardware = ["luma.lcd>=2.11", "numpy>=1.26"]
+#
+# `RPi.GPIO` and `spidev` are here because `luma.core` imports its GPIO backend
+# lazily, inside the `spi()` constructor: without them the extra installs
+# cleanly, `import luma.lcd` succeeds, and every panel then fails at open with
+# `No module named 'RPi'`. Found on the rack, not in CI -- an x86 machine cannot
+# tell the difference. Verified on a Pi 3B+ running Debian 13 (trixie).
+hardware = ["luma.lcd>=2.11", "numpy>=1.26", "RPi.GPIO>=0.7.1", "spidev>=3.6"]
 
 [build-system]
 requires = ["hatchling"]
