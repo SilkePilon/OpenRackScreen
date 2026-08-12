@@ -1,0 +1,126 @@
+# The author's rack, and the config the daemon on it actually runs.
+#
+# Four GC9A01 240x240 round panels on two SPI buses, fed by one Prometheus
+# reached through a `kubectl port-forward`. The wiring, the PromQL and the
+# parameters below are carried over from the `k8s_monitor.py` this daemon
+# replaces: they are known-working on that hardware against that cluster, so
+# they are not to be tidied. CI validates this file on every push
+# (`test_the_shipped_example_config_validates`), which is what keeps it honest
+# as the schema moves.
+#
+# To run it somewhere without a rack, switch each `display` to
+# `{ backend: virtual, out_dir: /tmp/panels }` -- or leave it alone and use
+# `ors-daemon render`, which needs no backend at all.
+version: 1
+timezone: Europe/Amsterdam
+night: { enabled: true, start: "23:00", end: "07:00" }
+
+integrations:
+  - name: prom
+    type: prometheus
+    poll_interval: 5
+    # Where to poll when there is no `tunnel:` below -- and only then. A
+    # tunnelled integration builds its base URL from the tunnel's own
+    # `local_port`, so with the block below in place this line is inert: it is
+    # kept, matching that port, so that deleting the tunnel (to run against a
+    # Prometheus that is directly routable) leaves a config that still works.
+    # The schema requires it either way.
+    url: http://localhost:19090
+    timeout: 4
+    tunnel:
+      kubeconfig: ~/k8s-monitor.yaml
+      namespace: monitoring
+      # `auto` discovers the Prometheus service in that namespace, so a chart
+      # upgrade that renames it does not need a config edit.
+      service: auto
+      remote_port: 9090
+      local_port: 19090
+    fields:
+      cpu:
+        query: '100-avg(rate(node_cpu_seconds_total{mode="idle"}[2m]))*100'
+      cpu_hot:
+        query: '100-avg by(instance)(rate(node_cpu_seconds_total{mode="idle"}[2m]))*100'
+        reduce: top
+        label: instance
+        strip: last_octet
+      mem:
+        query: '(1-sum(node_memory_MemAvailable_bytes)/sum(node_memory_MemTotal_bytes))*100'
+      mem_used_gb:
+        query: '(sum(node_memory_MemTotal_bytes)-sum(node_memory_MemAvailable_bytes))/1073741824'
+      mem_total_gb:
+        query: 'sum(node_memory_MemTotal_bytes)/1073741824'
+      mem_hot:
+        query: '(1-node_memory_MemAvailable_bytes/node_memory_MemTotal_bytes)*100'
+        reduce: top
+        label: instance
+        strip: last_octet
+      pods_run:
+        query: 'sum(kube_pod_status_phase{phase="Running"}) or vector(0)'
+      pods_tot:
+        query: 'count(kube_pod_info) or vector(0)'
+      nodes_ready:
+        query: 'sum(kube_node_status_condition{condition="Ready",status="true"}) or vector(0)'
+      nodes_total:
+        query: 'count(kube_node_info) or vector(0)'
+      alerts:
+        query: 'count(ALERTS{alertstate="firing"}) or vector(0)'
+
+# `position` is the panel's place in the rack, left to right, counted from 1 --
+# and the digit `ors-daemon identify` paints on the glass, which is how a
+# position is checked against the hardware rather than assumed. `rotation` and
+# `hflip` describe how each panel is bolted in; they are per-panel because the
+# panels are not all mounted the same way round.
+screens:
+  - name: CPU
+    position: 1
+    display: { backend: gc9a01, spi_bus: 0, spi_cs: 0, dc: 6, rst: 5, hz: 40000000 }
+    rotation: 270
+    hflip: false
+    template: ring-gauge
+    params:
+      title: CPU
+      value: "{{prom.cpu}}"
+      big: "{{prom.cpu | round:0}}%"
+      subtitle: cluster avg
+      hint: "peak: {{prom.cpu_hot.node}} {{prom.cpu_hot.value | round:0}}%"
+      palette: cyan
+
+  - name: MEM
+    position: 2
+    display: { backend: gc9a01, spi_bus: 0, spi_cs: 1, dc: 13, rst: 26, hz: 40000000 }
+    rotation: 270
+    hflip: true
+    template: ring-gauge
+    params:
+      title: MEM
+      value: "{{prom.mem}}"
+      big: "{{prom.mem | round:0}}%"
+      subtitle: "{{prom.mem_used_gb | round:1}} / {{prom.mem_total_gb | round:0}} G"
+      hint: "peak: {{prom.mem_hot.node}} {{prom.mem_hot.value | round:0}}%"
+      palette: green
+
+  # SPI1 is the Pi's auxiliary block: its clock derives from the core clock, so
+  # it runs at 16 MHz where SPI0 runs at 40. See daemon/README.md.
+  - name: PODS
+    position: 3
+    display: { backend: gc9a01, spi_bus: 1, spi_cs: 0, dc: 23, rst: 22, hz: 16000000 }
+    rotation: 270
+    hflip: true
+    template: big-number
+    params:
+      title: PODS
+      value: "{{prom.pods_run / prom.pods_tot * 100}}"
+      big: "{{prom.pods_run}}"
+      subtitle: "/ {{prom.pods_tot}} total"
+      palette: lime
+
+  # The torrent screen the rack will grow is M5's; `node-health` is what this
+  # panel falls back to today, and what it shows now.
+  - name: HEALTH
+    position: 4
+    display: { backend: gc9a01, spi_bus: 1, spi_cs: 1, dc: 4, rst: 27, hz: 16000000 }
+    rotation: 270
+    hflip: true
+    template: node-health
+    params:
+      title: NODES

@@ -119,7 +119,7 @@ wake() -> None                        # sleep-out, wait, display-on
 close() -> None
 ```
 
-Two implementations: `GC9A01SPI`, holding the extracted driver and its init sequence, and `VirtualDisplay`, which writes PNGs to a directory. Backend selection is a config field, so the whole daemon runs on a laptop.
+Two implementations: `GC9A01Display`, holding the extracted driver and its init sequence, and `VirtualDisplay`, which writes PNGs to a directory. Backend selection is a config field, so the whole daemon runs on a laptop.
 
 Rotation and horizontal flip are applied by the screen worker before `show`, never inside the backend — the same rule M1 established for scenes.
 
@@ -219,7 +219,9 @@ After 3 consecutive failed cycles the namespace is marked **stale**. Screens ref
 
 A tunnel is its own thread, ported from `k8s_monitor.py`'s `PortForward` with its health-probe restart intact — the behaviour that fixes "kubectl process alive, tunnel dead after a cluster reboot". It supervises the subprocess, actively probes the local URL, and tears down and relaunches when probes keep failing, freeing the local port.
 
-It exposes a `ready` event and a base URL. An integration configured with `tunnel:` takes its base URL from the tunnel and stays `connecting` until the probe passes. Nothing else about the integration differs between tunnelled and direct.
+It exposes a base URL, read at poll time so it can move underneath a running integration. An integration configured with `tunnel:` takes its base URL from there; nothing else about it differs between tunnelled and direct.
+
+This originally specified a `ready` event gating polling until the probe passed. It was built and then removed: a poll against a tunnel that is not up yet already fails, and the poller's backoff and health machinery already turn that into `connecting` plus a reason in the status file. A second gate would have been a second source of truth for one fact, and it never acquired a reader.
 
 ## 7. The screen worker
 
@@ -240,7 +242,11 @@ On a static cluster that is roughly 0.8 renders per second across four panels, a
 
 1. **Health.** If any namespace the screen depends on is `connecting`, the `connecting` system scene renders. If stale, the `stale` scene. These are selected **by name** from the `system` template, because system scenes carry no `when` — a fact M1's review established and this design depends on.
 
-   A screen's dependencies are derived once at config load, not per frame: scan the screen's bound params and its template's scenes for `{{namespace.` prefixes, and intersect with the configured integration names. A screen whose params reference no integration — a static label, say — depends on nothing and never falls to a system scene.
+   A screen's dependencies are derived once at config load, not per frame: walk the screen's bound params and its template's scenes, collect every `namespace.` reference, and intersect with the configured integration names. A screen whose params reference no integration — a static label, say — depends on nothing and never falls to a system scene.
+
+   Two string kinds have to be read differently, and both count. A **binding** is braced, and the namespace need not be its first token — `{{100 - prom.cpu}}` and `{{prom.a + qbit.b}}` depend on what they name, so the whole `{{...}}` body is scanned, not just its opening. A **`when` condition** carries no braces at all: `prom.nodes_ready == prom.nodes_total and prom.alerts == 0` is a bare expression. Missing that second kind is not hypothetical — the built-in `torrent` template mentions `prom` only in its scene-level `when`, so a scan that skipped conditions would show that screen `stale` on a cold start where `connecting` belongs. Both scene-level and element-level `when` are scanned, at any nesting depth.
+
+   The derivation errs toward declaring a dependency rather than missing one: an over-broad match costs a screen the `connecting` scene it would have shown anyway, while a missed one puts a panel's template in front of data that has never arrived.
 2. **Condition.** Otherwise `select_scene` runs over the screen's template scenes as normal, and the first matching `when` wins.
 
 ### 7.3 Night mode
@@ -256,7 +262,7 @@ Per the Core spec §9, made concrete:
 - **Config** — validated in full before anything starts; a config that fails validation is rejected with a message naming the field, and on reload the previous config keeps running.
 - **Poller** — failure is scoped to one integration. Backoff, a health flag with a reason, and staleness after 3 misses.
 - **Render** — an exception paints the `error` scene on that panel with a short message; the worker survives; the error is logged once per distinct message, not per frame.
-- **SPI** — a write failure re-initialises that device up to 3 times with backoff, then marks the screen faulted and skips it. Siblings are unaffected.
+- **SPI** — three *consecutive* write failures fault the screen, which is then skipped entirely: no further `show`, `sleep` or `wake` reaches that backend. A success in between resets the count. The device is not re-initialised — a panel whose bus is failing is rarely one a reset recovers, and re-running an init sequence on a wedged bus is how one bad panel takes a shared bus down with it. Siblings are unaffected either way.
 - **Watchdog** — each worker publishes a heartbeat; the supervisor restarts a wedged one.
 - **Shutdown** — SIGTERM blanks and sleeps every panel before exit.
 
@@ -270,16 +276,28 @@ Per the Core spec §9, made concrete:
   "config_version": 1,
   "screens": [
     {"name": "CPU", "scene": "default", "state": "awake",
-     "last_render": "2026-08-11T21:14:02Z", "renders_per_s": 0.8}
+     "last_render": "2026-08-11T21:14:02+02:00", "renders": 4218}
   ],
   "integrations": [
-    {"name": "prom", "state": "healthy", "latency_ms": 42,
-     "last_success": "2026-08-11T21:14:00Z", "last_error": null}
+    {"name": "prom", "state": "healthy", "stale": false, "latency_ms": 42.0,
+     "last_success": "2026-08-11T21:14:00+02:00", "last_error": null}
   ]
 }
 ```
 
 M3's link client reports this structure upstream verbatim.
+
+Timestamps carry the daemon's configured offset rather than a `Z` suffix — the
+clock is zoned by config, so `+02:00` is what a rack in Amsterdam actually
+emits, and a consumer matching on `Z` alone would drop every one of them.
+`stale` is present on every integration, always: a source can be `unhealthy`
+without yet being stale, and that difference decides whether a panel keeps
+showing its last good reading or falls to `NO DATA`.
+
+`renders` is a lifetime counter, not a rate. A rate needs history the daemon
+deliberately does not keep, and a lifetime average would read as a current
+figure while being dominated by whatever the panel did hours ago — two samples
+of a counter give a true rate to anyone who wants one, including M3.
 
 ## 9. Non-goals for M2
 

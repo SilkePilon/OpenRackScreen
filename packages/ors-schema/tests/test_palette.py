@@ -109,6 +109,28 @@ def test_threshold_palette_with_inline_palette_entries():
     assert tp.thresholds[2].palette == "named_palette"
 
 
+@pytest.mark.parametrize(
+    "palette",
+    [
+        # `Stop`
+        {"kind": "gradient", "stops": [{"at": 0.0, "color": "#000000", "colour": "#ffffff"}]},
+        # `GradientPalette`
+        {"kind": "gradient", "stops": [{"at": 0.0, "color": "#000000"}], "stop": []},
+        # `ThresholdEntry`
+        {"kind": "threshold", "thresholds": [{"at": 0, "palette": "green", "pallete": "red"}]},
+        # `ThresholdPalette`
+        {"kind": "threshold", "thresholds": [{"at": 0, "palette": "green"}], "threshold": []},
+    ],
+)
+def test_unknown_keys_in_a_palette_are_rejected(palette):
+    # The palette models are the deepest thing a config reaches, and they are
+    # the only ones a user writes colours into by hand. An ignored `colour` here
+    # is a wrong colour on the glass with no error anywhere to explain it.
+    with pytest.raises(ValidationError) as excinfo:
+        Holder(color="#ffffff", palette=palette)
+    assert any(error["type"] == "extra_forbidden" for error in excinfo.value.errors())
+
+
 def test_binding_is_a_legal_color():
     # A template parameterises its centre colour as `"color": "{{params.color}}"`,
     # so the pattern has to admit a binding the renderer resolves later.

@@ -13,6 +13,16 @@
 
 ## Global Constraints
 
+> **Naming correction, learned during execution.** Every `self._stop` in this
+> plan's reference code is wrong and the shipped daemon does not use it.
+> `threading.Thread._stop` is a real method that `join()` calls, so a subclass
+> storing its stop event under that name makes every join raise
+> `TypeError: 'Event' object is not callable` — invisible until something joins,
+> which is exactly what SIGTERM does. The shipped code names it `_stop_event`
+> throughout. Anyone reading this plan for M3 should carry that name, not this
+> one.
+
+
 - **Research before implementing.** Spec §0 applies to every task. Verify luma.lcd's current `spi()` signature and framebuffer API, GC9A01 sleep/wake timing (the datasheet requires ≥120 ms after sleep-out), Prometheus's `/api/v1/query` response shapes including how `NaN` appears on the wire, `kubectl port-forward` behaviour on connection loss, and whether `tzdata` must be installed explicitly on Raspberry Pi OS. Where research contradicts this plan, the research wins — raise it, then implement.
 - **TDD.** Failing test first, watch it fail for the expected reason, minimal implementation, watch it pass, commit. No exceptions.
 - **No test may sleep to wait for time to pass.** The clock is injected everywhere. Night transitions, backoff and pacing are tested by advancing a fake clock. A test that calls `time.sleep` to let a thread progress is a plan failure — use `threading.Event` handshakes.
@@ -3361,18 +3371,24 @@ class Supervisor:
         now = time.monotonic()
         for index, worker in enumerate(list(self.workers)):
             if worker.heartbeat and (now - worker.heartbeat) > self._watchdog_timeout:
-                log.error("worker wedged, restarting", extra={"screen": worker.name})
+                log.error("worker wedged, restarting", extra={"screen": worker.screen_name})
                 self.workers[index] = self._restart(worker)
-        write_status(
-            self._status_path,
-            build_status(
-                started_at=self._started_at,
-                now=self._clock(),
-                config_version=self._config.version,
-                screens=self.workers,
-                snapshot=self._store.read(),
-            ),
-        )
+        try:
+            write_status(
+                self._status_path,
+                build_status(
+                    started_at=self._started_at,
+                    now=self._clock(),
+                    config_version=self._config.version,
+                    screens=self.workers,
+                    snapshot=self._store.read(),
+                ),
+            )
+        except OSError as exc:
+            # `write_status` raises deliberately: the module reports, the loop
+            # decides. A read-only /run or a full disk must not darken the rack
+            # -- a status file is a nicety, and the panels are the product.
+            log.warning("could not write the status file", extra={"error": str(exc)})
 
     def run_forever(self, interval: float = 1.0) -> None:
         self.start()
