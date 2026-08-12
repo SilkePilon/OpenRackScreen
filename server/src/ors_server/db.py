@@ -83,10 +83,27 @@ CREATE TABLE IF NOT EXISTS daemon_event (
 );
 """
 
+# An export is a plaintext file beside the database, so nothing credential-bearing
+# may reach it: `secret.ciphertext` is the encrypted credential itself, and
+# `daemon.token_hash` is derived from a pairing token and worthless in an export
+# besides, because a rebuild means re-pairing every daemon anyway.
+#
 # Keyed by the table name in the database being exported, which on a rebuild is
 # the *old* schema's: renaming a table here without keeping its old name would
 # quietly stop redacting the export that matters.
-_REDACTED = {"secret": {"ciphertext"}}
+_REDACTED = {"secret": {"ciphertext"}, "daemon": {"token_hash"}}
+
+# Everything not named above is exported verbatim, `integration.config` included,
+# and that is deliberate: the export exists so a rack's integration configuration
+# survives a schema bump, and a redacted `config` is one you have to retype, which
+# is the whole thing this avoids.
+#
+# The constraint that makes it safe is the integrations API's to enforce:
+# `integration.config` MUST NOT carry a credential. Credentials go in `secret`,
+# encrypted, referenced by `integration.secret_id`. That covers the non-obvious
+# forms too -- a URL may not embed `user:password@`, since `config` is a free
+# string and a `https://user:pw@prom.local:9090` would land in this file in
+# plaintext. Reject them at the boundary; do not redact them here.
 
 
 class Database:
@@ -141,7 +158,7 @@ class Database:
         return export
 
     def export(self) -> dict[str, list[dict[str, Any]]]:
-        """Every row of every table, with secrets redacted."""
+        """Every row of every table, with the credential-bearing columns redacted."""
         dumped: dict[str, list[dict[str, Any]]] = {}
         with closing(self.connect()) as connection:
             tables = [

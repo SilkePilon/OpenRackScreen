@@ -62,6 +62,26 @@ def test_the_export_redacts_secrets(tmp_path):
     assert json.loads(text)["secret"] == [{"id": 1, "ciphertext": "<redacted>"}]
 
 
+def test_the_export_redacts_a_daemon_token_hash(tmp_path):
+    """A hash is credential-derived, and useless here: a rebuild means re-pairing."""
+    path = tmp_path / "ors.db"
+    database = Database(path)
+    database.initialise()
+    with database.connect() as connection:
+        connection.execute(
+            "INSERT INTO daemon (name, token_hash, created_at) VALUES (?, ?, ?)",
+            ("rack-pi", "$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA", "2026-08-12T09:00:00Z"),
+        )
+        connection.execute("PRAGMA user_version = 0")
+
+    export = Database(path).initialise()
+    text = export.read_text()
+
+    assert "argon2id" not in text, "an export is a file on disk; it does not carry a token hash"
+    assert json.loads(text)["daemon"][0]["token_hash"] == "<redacted>"
+    assert json.loads(text)["daemon"][0]["name"] == "rack-pi", "the rest of the row still exports"
+
+
 def test_foreign_keys_are_enforced(tmp_path):
     database = Database(tmp_path / "ors.db")
     database.initialise()
