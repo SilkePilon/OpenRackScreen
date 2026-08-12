@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 """Bumped whenever the schema below changes.
 
 There are no migrations: a bump exports the database and rebuilds it empty.
@@ -20,6 +20,14 @@ CREATE TABLE IF NOT EXISTS daemon (
     id             INTEGER PRIMARY KEY,
     name           TEXT NOT NULL UNIQUE,
     token_hash     TEXT,
+    -- Two credentials with two lifetimes, so two columns. `token_hash` is the
+    -- one-time pairing token and is nulled the moment it is spent; `key_hash`
+    -- is the key issued in its place, which the daemon presents on every
+    -- connect thereafter. Rotating a pairing from the interface is then exactly
+    -- "clear `key_hash`, write a new `token_hash`" -- the daemon is
+    -- disconnected until it is paired again, which is what a rotate button
+    -- should mean. Sharing one column would make that state unwritable.
+    key_hash       TEXT,
     paired_at      TEXT,
     version        TEXT,
     capabilities   TEXT NOT NULL DEFAULT '{}',
@@ -86,12 +94,14 @@ CREATE TABLE IF NOT EXISTS daemon_event (
 # An export is a plaintext file beside the database, so nothing credential-bearing
 # may reach it: `secret.ciphertext` is the encrypted credential itself, and
 # `daemon.token_hash` is derived from a pairing token and worthless in an export
-# besides, because a rebuild means re-pairing every daemon anyway.
+# besides, because a rebuild means re-pairing every daemon anyway. `key_hash` is
+# the same rule and matters more: the key it is derived from is presented on
+# every connect for the life of the pairing, not once.
 #
 # Keyed by the table name in the database being exported, which on a rebuild is
 # the *old* schema's: renaming a table here without keeping its old name would
 # quietly stop redacting the export that matters.
-_REDACTED = {"secret": {"ciphertext"}, "daemon": {"token_hash"}}
+_REDACTED = {"secret": {"ciphertext"}, "daemon": {"token_hash", "key_hash"}}
 
 # Everything not named above is exported verbatim, `integration.config` included,
 # and that is deliberate: the export exists so a rack's integration configuration

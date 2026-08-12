@@ -82,6 +82,30 @@ def test_the_export_redacts_a_daemon_token_hash(tmp_path):
     assert json.loads(text)["daemon"][0]["name"] == "rack-pi", "the rest of the row still exports"
 
 
+def test_the_export_redacts_the_key_a_daemon_reconnects_with(tmp_path):
+    """The longer-lived of the two credentials on that row, and the same rule.
+
+    A pairing token is spent on first use; this hash is derived from the key the
+    daemon presents on every connect for the life of the pairing, so an export
+    carrying it would be a file on disk that lets its reader impersonate a rack.
+    """
+    path = tmp_path / "ors.db"
+    database = Database(path)
+    database.initialise()
+    with database.connect() as connection:
+        connection.execute(
+            "INSERT INTO daemon (name, key_hash, created_at) VALUES (?, ?, ?)",
+            ("rack-pi", "5eaf00d-not-a-real-hash", "2026-08-12T09:00:00Z"),
+        )
+        connection.execute("PRAGMA user_version = 0")
+
+    export = Database(path).initialise()
+    text = export.read_text()
+
+    assert "5eaf00d" not in text, "an export is a file on disk; it does not carry a key hash"
+    assert json.loads(text)["daemon"][0]["key_hash"] == "<redacted>"
+
+
 def test_foreign_keys_are_enforced(tmp_path):
     database = Database(tmp_path / "ors.db")
     database.initialise()
