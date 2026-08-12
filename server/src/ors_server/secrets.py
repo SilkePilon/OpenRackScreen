@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from contextlib import closing
 from pathlib import Path
 
@@ -27,12 +28,45 @@ _KEY_FILE = "secret.key"
 
 
 def load_or_create_key(data_dir: Path, configured: str | None) -> bytes:
-    """The configured key if there is one, else a generated one kept at 0600."""
-    if configured:
-        return configured.encode()
+    """The configured key if there is one, else a generated one kept at 0600.
+
+    Raises `ValueError` if `ORS_SECRET_KEY` is set to something that is not a
+    Fernet key, and `PermissionError` if the key file on disk is readable by
+    anyone but its owner.
+    """
+    if configured is not None:
+        # `is not None`, not truthiness: `ORS_SECRET_KEY=` would otherwise mean
+        # "unset" and quietly fall back to the file's key, which is a silent key
+        # change -- every stored secret undecryptable, no signal, by omission.
+        if not configured.strip():
+            raise ValueError("ORS_SECRET_KEY is set but empty; unset it or give it a key")
+        key = configured.encode()
+        # Checked here rather than left to the first `Fernet(...)`, so a typo in
+        # the environment is a startup failure naming the variable rather than
+        # one integration failing hours later. The key itself is never in the
+        # message.
+        try:
+            Fernet(key)
+        except (ValueError, TypeError) as error:
+            raise ValueError(
+                "ORS_SECRET_KEY is not a Fernet key: it must be 32 url-safe"
+                " base64-encoded bytes, as from Fernet.generate_key()"
+            ) from error
+        return key
 
     path = Path(data_dir) / _KEY_FILE
     if path.exists():
+        # A key anyone can read is not a key, however it got that way -- a
+        # `chmod -R`, a restore that flattened modes, a config-management
+        # default. Refuse rather than warn: nothing else would ever go wrong, so
+        # a warning in a successful boot log is a finding no one comes back to,
+        # and the remedy is one `chmod 600` with nothing lost.
+        mode = stat.S_IMODE(path.stat().st_mode)
+        if mode & 0o077:
+            raise PermissionError(
+                f"{path} is mode {mode:o} and readable by more than its owner;"
+                " every stored credential is encrypted under it. chmod 600 it."
+            )
         return path.read_bytes()
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -42,7 +76,10 @@ def load_or_create_key(data_dir: Path, configured: str | None) -> bytes:
     # open and not from the directory, so a data directory someone left
     # group-writable still gets a private key file -- though anyone with write
     # on that directory can of course replace the file wholesale.
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    #
+    # O_NOFOLLOW because a symlink planted at this path would otherwise send the
+    # new key wherever it points, outside the directory whose mode we control.
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "wb") as handle:
         handle.write(key)
     return key

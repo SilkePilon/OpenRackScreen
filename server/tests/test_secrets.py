@@ -2,7 +2,7 @@ import stat
 from contextlib import closing
 
 import pytest
-from cryptography.fernet import InvalidToken
+from cryptography.fernet import Fernet, InvalidToken
 from ors_server.db import Database
 from ors_server.secrets import SecretStore, load_or_create_key
 
@@ -57,11 +57,82 @@ def test_the_key_file_is_private_even_in_a_permissive_directory(tmp_path):
     assert stat.S_IMODE((data_dir / "secret.key").stat().st_mode) == 0o600
 
 
-def test_a_configured_key_wins_over_the_file(tmp_path):
-    configured = load_or_create_key(tmp_path, "9" * 44)
+def test_a_key_file_anyone_else_can_read_is_refused(tmp_path):
+    """A loose mode is silent forever otherwise: nothing stops working, so nothing tells.
 
-    assert configured == b"9" * 44
+    Reachable by a `chmod -R`, a backup restore that flattens modes, or a
+    config-management default -- and it leaves the key world-readable beside the
+    database holding the ciphertext, which is every credential at once.
+    """
+    path = tmp_path / "secret.key"
+    path.write_bytes(Fernet.generate_key())
+    path.chmod(0o644)
+
+    with pytest.raises(PermissionError) as raised:
+        load_or_create_key(tmp_path, None)
+
+    message = str(raised.value)
+    assert str(path) in message and "644" in message, "an operator has to be told which file"
+    assert path.read_bytes().decode() not in message, "and never told the key"
+
+
+def test_a_key_file_only_the_owner_can_read_is_accepted(tmp_path):
+    path = tmp_path / "secret.key"
+    path.write_bytes(Fernet.generate_key())
+    path.chmod(0o400)
+
+    assert load_or_create_key(tmp_path, None) == path.read_bytes()
+
+
+def test_the_key_path_is_not_followed_through_a_symlink(tmp_path):
+    """A planted symlink would otherwise write the new key outside the data directory."""
+    elsewhere = tmp_path / "elsewhere.key"
+    (tmp_path / "secret.key").symlink_to(elsewhere)
+
+    with pytest.raises(OSError):
+        load_or_create_key(tmp_path, None)
+    assert not elsewhere.exists(), "no key was written through the link"
+
+
+def test_a_configured_key_wins_over_the_file(tmp_path):
+    key = Fernet.generate_key().decode()
+
+    configured = load_or_create_key(tmp_path, key)
+
+    assert configured == key.encode()
     assert not (tmp_path / "secret.key").exists(), "nothing is written when a key is supplied"
+
+
+def test_a_secret_round_trips_under_a_configured_key(tmp_path):
+    """The production path whenever ORS_SECRET_KEY is set, and otherwise untested."""
+    database = Database(tmp_path / "ors.db")
+    database.initialise()
+    key = load_or_create_key(tmp_path, Fernet.generate_key().decode())
+    secrets = SecretStore(database, key)
+
+    secret_id = secrets.put("hunter2")
+
+    assert secrets.get(secret_id) == "hunter2"
+
+
+def test_a_configured_key_that_is_not_a_fernet_key_is_refused_at_load(tmp_path):
+    """At load, where the variable is the obvious suspect -- not hours later at first use."""
+    with pytest.raises(ValueError) as raised:
+        load_or_create_key(tmp_path, "9" * 44)
+
+    message = str(raised.value)
+    assert "ORS_SECRET_KEY" in message, "name the thing the operator has to change"
+    assert "9" * 44 not in message, "and never echo it"
+
+
+def test_an_empty_configured_key_is_refused(tmp_path):
+    """`ORS_SECRET_KEY=` must not fall back to the file: that is a silent key change."""
+    load_or_create_key(tmp_path, None)
+
+    with pytest.raises(ValueError) as raised:
+        load_or_create_key(tmp_path, "")
+
+    assert "ORS_SECRET_KEY" in str(raised.value)
 
 
 def test_a_secret_encrypted_under_another_key_will_not_decrypt(tmp_path):
