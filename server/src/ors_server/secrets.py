@@ -1,0 +1,85 @@
+from __future__ import annotations
+
+import os
+from contextlib import closing
+from pathlib import Path
+
+from cryptography.fernet import Fernet
+
+from ors_server.db import Database
+
+_KEY_FILE = "secret.key"
+
+# Fernet is the `cryptography` recipes layer: AES-128-CBC with an HMAC, one
+# decision to make (the key) and no way to make it wrong. The docs recommend the
+# recipes layer "whenever possible", so nothing here reaches into hazmat.
+#
+# The key is the entire boundary. Lose it and every stored credential is gone;
+# leak it and every stored credential is readable, because the ciphertext lives
+# in a SQLite file sitting right beside it. Hence the mode on the file below.
+#
+# Nothing here rotates a key, and a changed `ORS_SECRET_KEY` therefore turns
+# every stored secret into an `InvalidToken` -- at first use, hours after a boot
+# that looked fine. Detecting that belongs at startup, where the store is wired
+# up: trial-decrypt one existing row and refuse to start. That is a later task's
+# to add; it is recorded here so it is not discovered by an integration failing
+# alone at 3am.
+
+
+def load_or_create_key(data_dir: Path, configured: str | None) -> bytes:
+    """The configured key if there is one, else a generated one kept at 0600."""
+    if configured:
+        return configured.encode()
+
+    path = Path(data_dir) / _KEY_FILE
+    if path.exists():
+        return path.read_bytes()
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = Fernet.generate_key()
+    # Written before the mode is set would leave a readable window, so the
+    # descriptor is opened with the mode already on it. The mode comes from the
+    # open and not from the directory, so a data directory someone left
+    # group-writable still gets a private key file -- though anyone with write
+    # on that directory can of course replace the file wholesale.
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(key)
+    return key
+
+
+class SecretStore:
+    """Credentials at rest. Nothing here ever returns to the browser.
+
+    There is deliberately no accessor for the stored ciphertext: the only ways
+    out are `get`, which decrypts for a snapshot being assembled for a daemon,
+    and the export, which redacts the column.
+    """
+
+    def __init__(self, database: Database, key: bytes) -> None:
+        self.database = database
+        self._fernet = Fernet(key)
+
+    def put(self, plaintext: str) -> int:
+        token = self._fernet.encrypt(plaintext.encode()).decode()
+        with closing(self.database.connect()) as connection:
+            cursor = connection.execute("INSERT INTO secret (ciphertext) VALUES (?)", (token,))
+            return int(cursor.lastrowid)
+
+    def get(self, secret_id: int) -> str:
+        """The plaintext. `KeyError` if the row is gone, `InvalidToken` if the key is wrong.
+
+        The two are distinct on purpose: one means a secret was deleted, the
+        other means this database was encrypted under a different key.
+        """
+        with closing(self.database.connect()) as connection:
+            row = connection.execute(
+                "SELECT ciphertext FROM secret WHERE id = ?", (secret_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"no secret {secret_id}")
+        return self._fernet.decrypt(row["ciphertext"].encode()).decode()
+
+    def delete(self, secret_id: int) -> None:
+        with closing(self.database.connect()) as connection:
+            connection.execute("DELETE FROM secret WHERE id = ?", (secret_id,))
