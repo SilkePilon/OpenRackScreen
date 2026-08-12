@@ -24,7 +24,17 @@ class AppSettings:
 def create_app(settings: AppSettings) -> FastAPI:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
 
-    app = FastAPI(title="OpenRackScreen", docs_url="/api/docs", openapi_url="/api/openapi.json")
+    app = FastAPI(
+        title="OpenRackScreen",
+        # Every framework route lives under /api, because the root belongs to the
+        # SPA. Overriding docs and openapi alone leaves /redoc and
+        # /docs/oauth2-redirect squatting there, and a browser asking for a page
+        # the interface owns would get FastAPI's instead.
+        docs_url="/api/docs",
+        openapi_url="/api/openapi.json",
+        redoc_url="/api/redoc",
+        swagger_ui_oauth2_redirect_url="/api/docs/oauth2-redirect",
+    )
     app.state.settings = settings
 
     api = APIRouter(prefix="/api")

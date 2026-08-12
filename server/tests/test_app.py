@@ -26,3 +26,17 @@ def test_the_data_directory_is_created(tmp_path):
     create_app(AppSettings(data_dir=target))
 
     assert target.is_dir()
+
+
+def test_no_framework_route_squats_outside_the_api_prefix(tmp_path):
+    """The root belongs to the SPA, which is mounted in a later task.
+
+    A route left at its default -- /redoc, /docs/oauth2-redirect -- is a page the
+    interface will one day claim, answered by FastAPI instead, and nothing about
+    the symptom points back here.
+    """
+    app = create_app(AppSettings(data_dir=tmp_path))
+    paths = {route.path for route in app.routes if getattr(route, "path", "").startswith("/")}
+
+    outside = {path for path in paths if not path.startswith("/api")}
+    assert outside == set(), f"these would collide with the SPA: {sorted(outside)}"
