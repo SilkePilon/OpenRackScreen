@@ -48,6 +48,27 @@ class Hello(_Message):
     """
     hostname: str
     daemon_version: str
+    config_version: int | None = None
+    """The `ConfigPush.version` this daemon is running, or None for none at all.
+
+    What makes "daemons reconnect and re-ack their version; nothing is
+    re-pushed if the versions already match" implementable: on a reconnect the
+    server has a version in its database and no way to learn what is actually
+    on the Pi, so without this every reconnect is a push. A push is not cheap
+    -- applying a snapshot revokes every panel, joins every worker and reopens
+    them -- so an unnecessary one is a full teardown and repaint of the rack,
+    and a wifi blip becomes a rack-wide flicker.
+
+    None means "I have no config", which is what a fresh daemon says and what a
+    rebooted one says when its cache is gone. Not 0, which is a version like any
+    other and the one an empty server counts from: a daemon claiming 0 against a
+    server that has pushed nothing would match, and the rack would stay blank.
+    None never matches anything, so the answer to it is always to push.
+
+    It is a claim, not proof. The server may only *skip* a push on a match; the
+    ack remains the only evidence that a config is applied and running, and this
+    field is cleared from the hub's memory on every register for that reason.
+    """
     protocol_version: int = PROTOCOL_VERSION
     capabilities: dict[str, Any] = Field(default_factory=dict)
 

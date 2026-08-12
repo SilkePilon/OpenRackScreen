@@ -52,6 +52,26 @@ def test_hello_carries_what_the_server_needs_to_identify_a_daemon():
     assert hello.protocol_version == PROTOCOL_VERSION
 
 
+def test_a_daemon_says_which_config_version_it_is_already_running():
+    # Without this the reconnect rule in the spec cannot be implemented at all:
+    # the server has no way to learn what the daemon has, so every reconnect is
+    # a push, and a push tears down and repaints the whole rack. A wifi blip
+    # would flicker every panel.
+    hello = Hello(token="abc", hostname="pi-rack", daemon_version="0.1.0", config_version=7)
+
+    assert hello.config_version == 7
+    assert parse_daemon_message(hello.model_dump_json()).config_version == 7
+
+
+def test_a_daemon_with_no_config_says_so_rather_than_claiming_a_version():
+    # A fresh Pi, and a rebooted one whose cache is gone. Zero would be a
+    # version -- and the version an empty database counts from.
+    fresh = Hello(token="abc", hostname="pi-rack", daemon_version="0.1.0")
+
+    assert fresh.config_version is None
+    assert parse_daemon_message(fresh.model_dump_json()).config_version is None
+
+
 def test_a_config_push_carries_a_whole_validated_snapshot():
     push = ConfigPush(version=7, snapshot=DaemonConfig.model_validate(CONFIG))
 
