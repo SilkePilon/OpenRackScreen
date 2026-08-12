@@ -274,3 +274,13 @@ def test_the_link_models_are_reachable_from_the_package_root():
 
     assert exported <= set(ors_schema.__all__)
     assert all(hasattr(ors_schema, name) for name in exported)
+
+
+def test_the_pairing_token_stays_out_of_a_repr():
+    """A repr is what reaches a log or an exception without anyone deciding to."""
+    hello = Hello(token="s3cret-pairing-token", hostname="pi-rack", daemon_version="0.1.0")
+
+    assert "s3cret-pairing-token" not in repr(hello)
+    assert "pi-rack" in repr(hello), "the rest of the message is still useful in a log"
+    assert hello.model_dump()["token"] == "s3cret-pairing-token", "it still travels"
+    assert "s3cret-pairing-token" in hello.model_dump_json()

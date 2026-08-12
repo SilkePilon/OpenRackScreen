@@ -38,7 +38,14 @@ class _Message(BaseModel):
 
 class Hello(_Message):
     type: Literal["hello"] = "hello"
-    token: str
+    token: str = Field(repr=False)
+    """The pairing token. Kept out of `repr` because it is the credential.
+
+    A model's `repr` is what reaches a log the moment anyone writes
+    `log.info("hello", extra={"message": hello})` or drops one into an
+    exception -- and this one pairs a rack. It still serialises normally,
+    because it has to travel; it just does not travel into a log by accident.
+    """
     hostname: str
     daemon_version: str
     protocol_version: int = PROTOCOL_VERSION
