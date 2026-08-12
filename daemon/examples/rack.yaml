@@ -73,7 +73,7 @@ integrations:
 screens:
   - name: CPU
     position: 1
-    display: { backend: gc9a01, spi_bus: 0, spi_cs: 0, dc: 6, rst: 5, hz: 40000000 }
+    display: { backend: gc9a01, spi_bus: 1, spi_cs: 1, dc: 4, rst: 27, hz: 16000000 }
     rotation: 270
     hflip: false
     template: ring-gauge
@@ -87,9 +87,9 @@ screens:
 
   - name: MEM
     position: 2
-    display: { backend: gc9a01, spi_bus: 0, spi_cs: 1, dc: 13, rst: 26, hz: 40000000 }
+    display: { backend: gc9a01, spi_bus: 1, spi_cs: 0, dc: 23, rst: 22, hz: 16000000 }
     rotation: 270
-    hflip: true
+    hflip: false
     template: ring-gauge
     params:
       title: MEM
@@ -103,9 +103,9 @@ screens:
   # it runs at 16 MHz where SPI0 runs at 40. See daemon/README.md.
   - name: PODS
     position: 3
-    display: { backend: gc9a01, spi_bus: 1, spi_cs: 0, dc: 23, rst: 22, hz: 16000000 }
+    display: { backend: gc9a01, spi_bus: 0, spi_cs: 1, dc: 13, rst: 26, hz: 40000000 }
     rotation: 270
-    hflip: true
+    hflip: false
     template: big-number
     params:
       title: PODS
@@ -118,9 +118,9 @@ screens:
   # panel falls back to today, and what it shows now.
   - name: HEALTH
     position: 4
-    display: { backend: gc9a01, spi_bus: 1, spi_cs: 1, dc: 4, rst: 27, hz: 16000000 }
+    display: { backend: gc9a01, spi_bus: 0, spi_cs: 0, dc: 6, rst: 5, hz: 40000000 }
     rotation: 270
-    hflip: true
+    hflip: false
     template: node-health
     params:
       title: NODES
