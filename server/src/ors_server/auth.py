@@ -8,7 +8,8 @@ from typing import Annotated
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
-from fastapi import Cookie, HTTPException, Request
+from fastapi import Cookie, HTTPException
+from starlette.requests import HTTPConnection
 
 from ors_server.db import Database
 
@@ -128,13 +129,27 @@ class Sessions:
         with self._lock:
             self._attempts.setdefault(client, []).append(now)
 
+    def clear_attempts(self, client: str) -> None:
+        """Called when the password was right, so failures already answered for
+        cannot add up to a lockout for the one caller who has proved they know it.
+        """
+        with self._lock:
+            self._attempts.pop(client, None)
+
 
 def require_session(
-    request: Request,
+    connection: HTTPConnection,
     token: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
 ) -> None:
-    """Every API route and both sockets sit behind this."""
-    sessions: Sessions = request.app.state.sessions
+    """Every API route and both sockets sit behind this.
+
+    `HTTPConnection` and not `Request`, because that is the base `Request` and
+    `WebSocket` share. FastAPI fills a `Request` parameter only in an HTTP scope,
+    so a `Request` here was never supplied on a socket and this raised
+    `TypeError` before reading the cookie -- refusing the admin and the stranger
+    alike, which reads as a broken socket rather than as a guard.
+    """
+    sessions: Sessions = connection.app.state.sessions
     if not sessions.valid(token):
         raise HTTPException(status_code=401, detail="not authenticated")
 

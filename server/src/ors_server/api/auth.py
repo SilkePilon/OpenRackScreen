@@ -62,6 +62,7 @@ def login(request: Request, response: Response, body: PasswordBody) -> dict[str,
         sessions.record_attempt(client, now())
         raise HTTPException(status_code=401, detail="wrong password")
 
+    sessions.clear_attempts(client)
     response.set_cookie(
         SESSION_COOKIE,
         sessions.issue(),

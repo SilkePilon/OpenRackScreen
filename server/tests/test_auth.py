@@ -3,29 +3,42 @@ from __future__ import annotations
 import re
 from contextlib import closing
 
+import pytest
 from argon2 import PasswordHasher
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, WebSocket
+from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 from ors_server.app import AppSettings, create_app
 from ors_server.auth import Sessions, claim_password, require_session, verify_password
 from ors_server.db import Database
+from starlette.routing import BaseRoute, WebSocketRoute
+from starlette.testclient import WebSocketDenialResponse
+from starlette.websockets import WebSocketDisconnect
 
 # The key the hash is stored under, duplicated from `auth.py` rather than
 # imported: it is a name on disk, so a rename is a migration, and a test that
 # imported the constant would follow the rename silently.
 PASSWORD_KEY = "admin_password_hash"
 
-# Every documented path that answers without a session. Anything else is a route
-# a future task hung off the open router -- see the last test in this file.
-# FastAPI's own /api/docs and /api/openapi.json are not in the schema and so not
-# in this list: they describe the API, not the rack.
+# Every path that answers without a session. Anything else is a route a future
+# task hung off the open router -- see the sweeps at the end of this file.
 OPEN_PATHS = {
     "/api/health",
     "/api/auth/me",
     "/api/auth/setup",
     "/api/auth/login",
     "/api/auth/logout",
+    # FastAPI's own. They describe the API, not the rack.
+    "/api/docs",
+    "/api/docs/oauth2-redirect",
+    "/api/redoc",
+    "/api/openapi.json",
 }
+
+# And every socket. `/ws/daemon` will belong here when task 8 writes it -- it
+# authenticates with a pairing token, not a session -- and naming it here is
+# what makes that a decision rather than an omission. `/ws/ui` never will.
+OPEN_SOCKETS: set[str] = set()
 
 
 def app_and_client(tmp_path) -> tuple[FastAPI, TestClient]:
@@ -39,6 +52,12 @@ def app_and_client(tmp_path) -> tuple[FastAPI, TestClient]:
     def added_later() -> dict[str, bool]:
         """A route as a later task will write one: on the router, saying nothing."""
         return {"ok": True}
+
+    @app.state.api.websocket("/ws/added-later")
+    async def socket_added_later(websocket: WebSocket) -> None:
+        """And a socket as task 12 will write one. `/ws/ui` is the real one."""
+        await websocket.accept()
+        await websocket.send_json({"ok": True})
 
     return app, TestClient(app)
 
@@ -128,6 +147,36 @@ def test_a_guarded_route_refuses_a_forged_cookie(tmp_path):
     assert client.get("/api/guarded").status_code == 401
 
 
+def test_a_guarded_socket_refuses_a_caller_without_a_session(tmp_path):
+    _, client = app_and_client(tmp_path)
+    setup_password(client)
+
+    with (
+        pytest.raises(WebSocketDenialResponse) as denied,
+        client.websocket_connect("/api/ws/added-later"),
+    ):
+        pass  # pragma: no cover -- the connection never opens
+
+    assert denied.value.status_code == 401
+
+
+def test_a_guarded_socket_lets_the_admin_in(tmp_path):
+    """The half a guard that raises on every socket would still pass.
+
+    `require_session` took a `Request`, which FastAPI does not fill in a socket
+    scope, so it raised `TypeError` before it ever looked at the cookie -- for
+    the admin with a valid session exactly as for a stranger. Failing closed for
+    everyone is not a guard, it is an outage, and the way out of an outage is to
+    move the socket somewhere nothing is checked.
+    """
+    _, client = app_and_client(tmp_path)
+    setup_password(client)
+    client.post("/api/auth/login", json={"password": "correct horse"})
+
+    with client.websocket_connect("/api/ws/added-later") as socket:
+        assert socket.receive_json() == {"ok": True}
+
+
 def test_one_session_is_not_another(tmp_path):
     app, first = app_and_client(tmp_path)
     setup_password(first)
@@ -149,6 +198,23 @@ def test_repeated_failures_are_rate_limited(tmp_path):
     ]
 
     assert 429 in codes, "an unlimited password endpoint is an offline attack with extra steps"
+
+
+def test_proving_the_password_clears_the_count_it_had_to_get_past(tmp_path):
+    """Otherwise the admin who just logged in is one typo from a lockout.
+
+    Nine wrong, then right, then one slip, and the count is at ten from failures
+    that were already answered for. It cannot help an attacker: the branch that
+    clears the count is the branch where they already know the password.
+    """
+    _, client = app_and_client(tmp_path)
+    setup_password(client)
+    for _ in range(9):
+        client.post("/api/auth/login", json={"password": "wrong"})
+
+    assert client.post("/api/auth/login", json={"password": "correct horse"}).status_code == 200
+    assert client.post("/api/auth/login", json={"password": "wrong"}).status_code == 401
+    assert client.post("/api/auth/login", json={"password": "correct horse"}).status_code == 200
 
 
 def test_the_rate_limit_window_passes_without_a_test_sleeping():
@@ -248,17 +314,91 @@ def test_every_other_api_route_is_guarded_including_ones_not_written_yet(tmp_pat
     """
     app, client = app_and_client(tmp_path)
     setup_password(client)
-    schema = app.openapi()["paths"]
 
-    answers = {
-        f"{method.upper()} {path}": getattr(client, method)(fill_in(path)).status_code
-        for path, operations in schema.items()
-        for method in operations
-        if path not in OPEN_PATHS and method in {"get", "post", "put", "patch", "delete"}
+    assert OPEN_PATHS <= {path for path, _ in registered(app)}, "the open list is out of date"
+    assert unguarded_paths(client, app) == set()
+
+
+def test_the_sweep_sees_a_route_that_is_not_in_the_schema(tmp_path):
+    """`include_in_schema=False` is a decorator argument, not a security boundary."""
+    app, client = app_and_client(tmp_path)
+
+    @app.get("/api/hidden", include_in_schema=False)
+    def hidden() -> dict[str, bool]:
+        return {"ok": True}
+
+    assert unguarded_paths(client, app) == {"GET /api/hidden"}
+
+
+def test_every_socket_is_guarded_too(tmp_path):
+    app, client = app_and_client(tmp_path)
+    setup_password(client)
+
+    assert unguarded_sockets(client, app) == set()
+
+
+def test_the_sweep_sees_a_socket_at_all(tmp_path):
+    """The sweep this replaced could not: FastAPI puts no socket in the schema.
+
+    Its path list was identical with and without a socket registered, so the one
+    route type that streams the whole rack live was the one type it was blind to.
+    """
+    app, client = app_and_client(tmp_path)
+
+    @app.websocket("/ws/wide-open")
+    async def wide_open(websocket: WebSocket) -> None:
+        await websocket.accept()
+
+    assert unguarded_sockets(client, app) == {"/ws/wide-open"}
+
+
+def registered(app: FastAPI) -> list[tuple[str, BaseRoute]]:
+    """Every route the app will match, with the path it matches on.
+
+    `app.routes` is not that list: FastAPI 0.141 leaves an internal
+    `_IncludedRouter` behind for each `include_router` and resolves it lazily, so
+    walking it directly finds neither `/api/health` nor any socket. This is the
+    enumeration FastAPI's own OpenAPI generation runs on -- used here instead of
+    the OpenAPI document, which contains no websocket at all and drops anything
+    marked `include_in_schema=False`.
+    """
+    return [
+        # A socket's effective path comes back empty; its own already carries
+        # the prefix of the router it was declared on.
+        (context.path or context.original_route.path, context.original_route)
+        for context in iter_route_contexts(app.routes)
+    ]
+
+
+def unguarded_paths(client: TestClient, app: FastAPI) -> set[str]:
+    """`METHOD /path` for every /api route that answers a caller with no session."""
+    return {
+        f"{method} {path}"
+        for path, route in registered(app)
+        if path.startswith("/api")
+        and path not in OPEN_PATHS
+        and not isinstance(route, WebSocketRoute)
+        for method in sorted(getattr(route, "methods", None) or ())
+        if client.request(method, fill_in(path)).status_code != 401
     }
 
-    assert OPEN_PATHS <= set(schema), "the open list names a route that no longer exists"
-    assert set(answers.values()) == {401}, answers
+
+def unguarded_sockets(client: TestClient, app: FastAPI) -> set[str]:
+    """Every socket, anywhere in the app, that opens for a caller with no session.
+
+    Not filtered to /api: the spec puts `/ws/ui` and `/ws/daemon` at the root, so
+    a prefix is exactly the wrong thing to key on.
+    """
+    opened = set()
+    for path, route in registered(app):
+        if not isinstance(route, WebSocketRoute) or path in OPEN_SOCKETS:
+            continue
+        try:
+            with client.websocket_connect(fill_in(path)):
+                opened.add(path)
+        except (WebSocketDenialResponse, WebSocketDisconnect):
+            pass
+    return opened
 
 
 def fill_in(path: str) -> str:
