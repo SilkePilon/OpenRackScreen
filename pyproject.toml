@@ -24,7 +24,7 @@ ors-server = { workspace = true }
 # around the app and raises at import without one. It is `httpx2`, not `httpx`:
 # starlette 1.6 imports `httpx2` first and only falls back to `httpx` with a
 # `StarletteDeprecationWarning`. FastAPI's testing tutorial still says `httpx`.
-dev = ["pytest>=8.0", "ruff>=0.6", "httpx2>=2.10"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.6", "httpx2>=2.10"]
 
 [tool.pytest.ini_options]
 testpaths = [
@@ -43,6 +43,12 @@ testpaths = [
 # make itself distinct. There is no ini key for it -- `--import-mode` is
 # command-line only.
 addopts = "-q --import-mode=importlib"
+# Without this every `async def test_` is collected, skipped and reported as a
+# warning -- a green run that ran none of them. `auto` rather than a
+# `@pytest.mark.asyncio` on each: a forgotten mark is exactly that silent skip,
+# and this repo has no async test that wants a different loop. It changes
+# nothing for the synchronous suite, which pytest-asyncio does not touch.
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
