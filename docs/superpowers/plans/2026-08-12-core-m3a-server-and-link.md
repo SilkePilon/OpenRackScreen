@@ -3080,6 +3080,8 @@ Expected: FAIL — the routes do not exist.
 
 - [ ] **Step 3: Write minimal implementation**
 
+**A credential must never reach `integration.config`.** That column is exported verbatim on a schema bump — deliberately, because an export exists so a rack's integration configuration survives one — so anything inline in it lands in a plaintext file beside the database. A URL is the way this happens in practice: `https://user:hunter2@prom.local:9090` validates, stores, and exports readable. Credentials go through `secret_id`, encrypted by `SecretStore`. The integrations router is the only place that can enforce it: reject a URL carrying userinfo, and take a credential as its own field that becomes a `secret` row. `db.py` documents the invariant; this is where it is kept.
+
 Each router follows one shape: validate the body with a pydantic model, write the row, then
 
 ```python

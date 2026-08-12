@@ -151,7 +151,7 @@ SQLite, one file, written only by the server.
 | Table | Columns beyond id/timestamps |
 |---|---|
 | `daemon` | `name`, `token_hash`, `paired_at`, `version`, `capabilities` (json), `last_seen`, `status`, `config_version` |
-| `screen` | `daemon_id`, `position`, `name`, `display` (json), `rotation`, `hflip`, `enabled`, `template_id`, `params` (json), `sleep_override` (json) |
+| `screen` | `daemon_id`, `position`, `name`, `display` (json), `rotation`, `hflip`, `enabled`, `template` (its name), `params` (json), `sleep_override` (json) |
 | `template` | `name`, `builtin`, `category`, `scenes` (json), `params_schema` (json) |
 | `integration` | `daemon_id`, `type`, `name`, `config` (json), `secret_id`, `poll_interval`, `enabled` |
 | `secret` | `ciphertext` |
@@ -161,6 +161,8 @@ SQLite, one file, written only by the server.
 **Schema changes.** The database carries a schema version. On a bump the server writes `export-<timestamp>.json` beside it — every table's contents, secrets redacted — then rebuilds empty. You re-pair each daemon; the config you tuned is recoverable from the export rather than retyped. That export is also the beginning of the backup/restore the Core spec wants in M5.
 
 **Secrets** are encrypted at rest with a key from `ORS_SECRET_KEY` or generated on first boot into a `0600` file in the data volume. They are write-only over the API: responses redact them, and the SPA never receives a plaintext credential. They reach the daemon inside the snapshot, over a LAN link; TLS is a reverse proxy's job.
+
+`integration.config` is the one column that carries operator-authored JSON and is exported verbatim, so a credential inline in it — a URL of the form `https://user:pass@host` most plausibly — ends up in a plaintext file beside the database. The integrations API enforces the invariant: credentials become `secret` rows, and a URL carrying userinfo is refused.
 
 ## 7. HTTP API and the interface
 

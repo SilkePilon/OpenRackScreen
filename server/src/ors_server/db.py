@@ -159,7 +159,7 @@ class Database:
 
     def export(self) -> dict[str, list[dict[str, Any]]]:
         """Every row of every table, with the credential-bearing columns redacted."""
-        dumped: dict[str, list[dict[str, Any]]] = {}
+        dumped: dict[str, Any] = {"_schema_version": SCHEMA_VERSION}
         with closing(self.connect()) as connection:
             tables = [
                 row[0]
@@ -175,7 +175,12 @@ class Database:
                 for row in connection.execute(statement):
                     record = dict(row)
                     for column in _REDACTED.get(table, ()):
-                        record[column] = "<redacted>"
+                        # Only if the column is really there: an export is
+                        # written from the *old* schema, which may predate it,
+                        # and inventing a redacted field describes a database
+                        # that never existed.
+                        if column in record:
+                            record[column] = "<redacted>"
                     rows.append(record)
                 dumped[table] = rows
         return dumped

@@ -105,3 +105,27 @@ def test_rows_come_back_as_mappings(tmp_path):
         row = connection.execute("SELECT key, value FROM setting").fetchone()
 
     assert row["key"] == "timezone", "callers read columns by name, not by index"
+
+
+def test_the_export_says_which_schema_produced_it(tmp_path):
+    """An export is a dump of the *old* schema, and a restorer has to know which.
+
+    The filename carries a timestamp and nothing else, and the DDL is not in the
+    artifact, so without this a later restore is reading columns it cannot date.
+    It cannot be retrofitted onto exports already written.
+    """
+    database = Database(tmp_path / "ors.db")
+    database.initialise()
+
+    assert database.export()["_schema_version"] == SCHEMA_VERSION
+
+
+def test_redaction_does_not_invent_a_column_the_old_schema_lacked(tmp_path):
+    path = tmp_path / "ors.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE daemon (id INTEGER PRIMARY KEY, name TEXT)")
+        connection.execute("INSERT INTO daemon (name) VALUES ('old')")
+
+    exported = Database(path).export()["daemon"][0]
+
+    assert exported == {"id": 1, "name": "old"}, "an export describes the database that existed"
