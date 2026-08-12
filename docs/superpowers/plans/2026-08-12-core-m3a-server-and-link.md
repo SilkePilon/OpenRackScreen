@@ -1757,6 +1757,15 @@ git commit -m "feat(server): the link hub — connections, acks and frame fan-ou
 
 ### Task 8: `/ws/daemon` — pairing and the daemon socket
 
+**Carried from task 7 — four obligations this task now owes. Read these before the steps below; two of them are security or correctness holes, not polish.**
+
+1. **Race the read against `connection.closed`.** The hub is handed a `send` callable, not a socket, so it cannot close a superseded connection — it sets an `asyncio.Event` instead. A bare `while True: await socket.receive_text()` leaves the replaced handler blocked in `receive` until uvicorn's ping timeout (~40s at the defaults), still able to act on a message from a daemon that has already gone. Race the read against `connection.closed.wait()` with `asyncio.wait(..., return_when=FIRST_COMPLETED)`, cancel the loser, and close the socket when the event wins.
+2. **`record_ack` now takes the `Connection`, not the daemon id** — it carries the same identity guard `drop` has, so a superseded handler's ack is discarded rather than recorded under the live connection's id.
+3. **Frame ownership, which nothing else can check.** `relay_frame` trusts `frame.screen_id`, and the hub reads no rows by design. A daemon — or a stolen pairing key — can emit frames for a screen belonging to another rack and the hub will fan them out to whoever is watching it. Build a per-connection set of owned screen ids at hello, refresh it on every push, and check it before relaying. This is the only place in the system that can.
+4. **The version comparison the spec's definition of done requires.** `Hello` now carries `config_version: int | None`. Push only on a mismatch; `None` never matches (a fresh daemon says `None`, and `0` would collide with the version an empty server counts from). Still require the ack — the claim is what the daemon says it has, the ack is the only evidence it applied.
+
+Note also that `watched_screens()` is **global** — every screen anyone is watching across all daemons. Resuming that set wholesale on reconnect asks a daemon for screens it does not own; intersect it with the ownership map from (3).
+
 **Files:**
 - Create: `server/src/ors_server/link/ws_daemon.py`, `server/src/ors_server/pairing.py`
 - Modify: `server/src/ors_server/app.py`
@@ -2053,6 +2062,11 @@ git commit -m "feat(server): pairing and the daemon websocket"
 ---
 
 ### Task 9: The daemon's link client
+
+**Carried from task 7:**
+- Send `config_version` in `Hello`, read from the cached snapshot.
+- `_receive` as drafted applies **every** `ConfigPush` unconditionally. Skip the apply when the version already matches what is running — **but still ack**, or the server never learns and pushes again on the next tick.
+- Pick the heartbeat interval, and keep it at or above the server's `SEND_TIMEOUT = 5.0`. Below it, the server's send bound is decoration: it would drop a daemon that is merely between heartbeats.
 
 **Files:**
 - Create: `daemon/src/ors_daemon/link.py`
@@ -2407,6 +2421,11 @@ git commit -m "feat(daemon): the link client"
 ---
 
 ### Task 10: Applying a snapshot in the daemon
+
+**Carried from task 7:**
+- **`Supervisor.apply` must be idempotent on a same-version or same-content push.** As drafted it revokes every panel, joins every worker and reopens — a full teardown and repaint of the rack. That is what turns a redundant push into a visible rack-wide flicker on every wifi blip. Belt and braces with task 9's version skip: the daemon should not apply it, and applying it should not be destructive either.
+- `load_cached_snapshot` must surface the version, because `Hello.config_version` reports it.
+- Fix `_templates` in `daemon/src/ors_daemon/config.py` while you are in that file — already done in `dd7bbf8`, so verify rather than redo.
 
 **Files:**
 - Modify: `daemon/src/ors_daemon/config.py`, `daemon/src/ors_daemon/supervisor.py`, `daemon/src/ors_daemon/__main__.py`
@@ -2802,6 +2821,20 @@ git commit -m "feat(daemon): encode frames on demand"
 
 ### Task 12: `/ws/ui` — status and frame subscriptions
 
+**The rule drafted in Step 3 below is WRONG. Do not implement it. Carried from task 7's review, which traced it against task 11's `FrameStream`.**
+
+`FramesRequest` is **whole-daemon state** — an `enabled` flag plus the complete `screen_ids` list — not a per-screen toggle. Task 11's `FrameStream.enable` does `self._enabled = set(screen_ids)`, a replace, and `disable()` clears everything. So the drafted rule breaks on the four-panel rack canvas, which is the primary screen of the whole interface:
+
+- opening a fifth panel's live view sends `enabled=True, screen_ids=[5]`, replacing the daemon's set — **the other four freeze**;
+- closing any one panel sends `enabled=False` — **all four freeze**;
+- a daemon that reconnects is never re-armed at all, so a wifi blip leaves a frozen canvas until the tab is reloaded.
+
+**Correct rule:** on every subscribe and unsubscribe, recompute that daemon's *full* watched set and send it whole. `enabled=False` only when the set is empty.
+
+That needs a per-daemon view the hub does not have — `watched_screens()` returns a global set. Either the caller maps screen → daemon, or `watched_screens` grows a daemon partition, which means an injected ownership lookup since the hub reads no rows by design. Decide which, and say why in your report.
+
+Also carried: the browser socket must `unsubscribe_frames` in a `finally`. The hub cannot notice a dead queue, so a closed tab otherwise leaves the daemon encoding WebP forever.
+
 **Files:**
 - Create: `server/src/ors_server/link/ws_ui.py`
 - Modify: `server/src/ors_server/app.py`
@@ -2907,6 +2940,12 @@ git commit -m "feat(server): the browser websocket and frame subscriptions"
 ---
 
 ### Task 13: The configuration API
+
+**Carried from task 7 — `Hub` is event-loop-affine, and this task is where that gets broken.**
+
+Every route that touches the hub must be `async def`, the read-only-looking ones included. FastAPI runs a `def` route in a threadpool, and the natural shape of `GET /api/daemons` — blocking `sqlite3` plus `hub.online_ids()` — is exactly that. `online_ids()` builds a set from a dict a reconnect may be resizing, and a threadpool `subscribe_frames` can resize `_watchers` under `relay_frame`. The resulting `RuntimeError: Set changed size during iteration` is neither `WebSocketDisconnect` nor `ValidationError`, so it escapes the daemon socket handler and takes the whole rack offline in the UI rather than failing one request. Reproduced, not theorised.
+
+Also: `PATCH /api/screens/{id}` awaits `hub.push_config` inside the handler. That now returns within `SEND_TIMEOUT` (5s) against a wedged daemon rather than never, but decide whether the push should be fire-and-forget once there is a retry path — the row is already committed and the version already bumped by the time the push is attempted, so the request does not need its result.
 
 **Files:**
 - Create: `server/src/ors_server/api/daemons.py`, `screens.py`, `templates.py`, `integrations.py`, `settings.py`
