@@ -3,25 +3,36 @@ name = "openrackscreen"
 version = "0.1.0"
 description = "Configurable monitoring displays for server racks"
 requires-python = ">=3.11"
-dependencies = ["ors-schema", "ors-render", "ors-daemon"]
+dependencies = ["ors-schema", "ors-render", "ors-daemon", "ors-server"]
 
 [tool.uv]
 package = false
 
 [tool.uv.workspace]
-# `daemon/` sits outside the `packages/*` glob, so it needs its own entry.
-members = ["packages/*", "daemon"]
+# `daemon/` and `server/` sit outside the `packages/*` glob, so they need their
+# own entries.
+members = ["packages/*", "daemon", "server"]
 
 [tool.uv.sources]
 ors-schema = { workspace = true }
 ors-render = { workspace = true }
 ors-daemon = { workspace = true }
+ors-server = { workspace = true }
 
 [dependency-groups]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+# `httpx2` is here for `fastapi.testclient.TestClient`, which wraps a client
+# around the app and raises at import without one. It is `httpx2`, not `httpx`:
+# starlette 1.6 imports `httpx2` first and only falls back to `httpx` with a
+# `StarletteDeprecationWarning`. FastAPI's testing tutorial still says `httpx`.
+dev = ["pytest>=8.0", "ruff>=0.6", "httpx2>=2.10"]
 
 [tool.pytest.ini_options]
-testpaths = ["packages/ors-schema/tests", "packages/ors-render/tests", "daemon/tests"]
+testpaths = [
+    "packages/ors-schema/tests",
+    "packages/ors-render/tests",
+    "daemon/tests",
+    "server/tests",
+]
 # Three test directories, none of them a package, all of them holding files
 # pytest has to import. Under the default `prepend` mode a module's name is its
 # basename, so the first `test_config.py` imported takes that name and any
