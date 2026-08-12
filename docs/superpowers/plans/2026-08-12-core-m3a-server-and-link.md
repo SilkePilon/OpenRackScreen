@@ -3116,23 +3116,229 @@ git commit -m "feat(server): the configuration API"
 - Consumes: everything above
 - Produces: an image serving the API on `:8080` with its database in a volume
 
+**Decisions already made for this task, with the reasons, so the implementer does not re-litigate them:**
+
+- **No Node stage, no SPA, in M3a.** The earlier draft of this task built a placeholder `web/` through a Node builder. A build stage that compiles nothing is a stage that is never exercised, and the first real SPA would meet it already rotted. M3b adds the Node stage together with the thing it builds. This image serves the API only.
+- **`arm64` is the supported target; `armv7` must still build.** Measured against PyPI on 2026-08-12: `cryptography` 50.0.0 publishes `manylinux_2_31_armv7l` wheels, but `argon2-cffi-bindings` 25.1.0 publishes **aarch64 only** — no 32-bit ARM wheel at all. On a 32-bit Raspberry Pi OS, `argon2-cffi-bindings` therefore compiles from its vendored Argon2 C sources, and `python:3.12-slim` has no compiler, so the build dies at `error: command 'gcc' failed: No such file or directory` — a failure that reads like a broken Dockerfile rather than a missing wheel. The builder stage installs `gcc` and `libc6-dev` for exactly this. On arm64 and x86 they cost one apt layer in a stage that is thrown away; on armv7 they are the difference between an image and an hour of confusion. Do not move them to the runtime stage.
+- **The runtime is `python:3.12-slim`, not Alpine.** musl means no manylinux wheel matches and every C dependency rebuilds.
+
 - [ ] **Step 1: Write the failing test**
 
-`server/tests/test_deploy.py` parses the compose files and asserts what actually matters and can be checked without Docker: the data volume is mounted so the database survives a container restart; `ORS_SECRET_KEY` is passed through rather than baked in; the published port matches the server's default; the Pi compose file does *not* try to run the daemon in a container; and the Dockerfile's final stage runs as a non-root user.
+Add `pyyaml>=6` to the root `[dependency-groups] dev` list — the test parses compose files and nothing else in the workspace needs YAML at runtime.
+
+`server/tests/test_deploy.py`. These assertions are the ones that can be made without a Docker daemon, and each is here because the opposite has broken a real deployment:
+
+```python
+from pathlib import Path
+
+import pytest
+import yaml
+
+DEPLOY = Path(__file__).resolve().parents[2] / "deploy"
+
+
+def compose(name: str) -> dict:
+    return yaml.safe_load((DEPLOY / name).read_text())
+
+
+@pytest.fixture
+def dockerfile() -> str:
+    return (DEPLOY / "Dockerfile").read_text()
+
+
+@pytest.mark.parametrize("name", ["compose.pi.yaml", "compose.remote.yaml"])
+def test_the_database_lives_in_a_volume(name):
+    service = compose(name)["services"]["server"]
+
+    mounts = [volume.split(":")[1] for volume in service["volumes"]]
+    assert "/var/lib/openrackscreen" in mounts, (
+        "without this the database dies with the container and the rack unpairs itself"
+    )
+
+
+@pytest.mark.parametrize("name", ["compose.pi.yaml", "compose.remote.yaml"])
+def test_the_secret_key_is_passed_through_and_not_baked_in(name, dockerfile):
+    service = compose(name)["services"]["server"]
+
+    assert "ORS_SECRET_KEY" in str(service.get("environment", "")), "the key must be injectable"
+    assert "${ORS_SECRET_KEY" in str(service["environment"]), "it must come from the host env"
+    assert "ORS_SECRET_KEY" not in dockerfile, "a key in the image is a key in the registry"
+
+
+@pytest.mark.parametrize("name", ["compose.pi.yaml", "compose.remote.yaml"])
+def test_the_published_port_matches_the_servers_default(name):
+    published = compose(name)["services"]["server"]["ports"]
+
+    assert any(str(entry).endswith(":8080") for entry in published), (
+        "ORS_PORT defaults to 8080 in __main__.py; a mismatch here is a silent 404"
+    )
+
+
+def test_the_pi_compose_file_does_not_containerise_the_daemon():
+    services = compose("compose.pi.yaml")["services"]
+
+    assert list(services) == ["server"], (
+        "the daemon needs /dev/spidev and /dev/gpiomem on the host; it stays a systemd unit"
+    )
+
+
+def test_the_final_stage_runs_as_a_non_root_user(dockerfile):
+    stages = dockerfile.split("FROM ")
+
+    assert "USER " in stages[-1], "root in the container is root on the bind-mounted data dir"
+
+
+def test_the_data_directory_is_owned_by_that_user(dockerfile):
+    assert "chown" in dockerfile, (
+        "a named volume inherits the ownership of the image path it shadows; without a chown "
+        "the non-root user cannot create ors.db and the server dies on first boot"
+    )
+
+
+def test_the_image_does_not_ship_a_compiler(dockerfile):
+    final = dockerfile.split("FROM ")[-1]
+
+    assert "gcc" not in final, "build tooling belongs in the discarded builder stage"
+
+
+def test_the_healthcheck_does_not_need_curl(dockerfile):
+    assert "HEALTHCHECK" in dockerfile
+    assert "curl" not in dockerfile, "python:3.12-slim has no curl; the check would always fail"
+```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest server/tests/test_deploy.py -q; echo "exit=$?"`
-Expected: FAIL — the files do not exist.
+Expected: FAIL — `FileNotFoundError` on `deploy/Dockerfile`; not a collection error.
 
 - [ ] **Step 3: Write minimal implementation**
 
-A multi-stage `Dockerfile`: a Node stage that builds the SPA (a placeholder `web/` in this plan; M3b fills it), then a Python stage that installs the workspace and copies the built assets. `compose.pi.yaml` runs only the server, with a note that the daemon stays a host systemd unit and why. `compose.remote.yaml` is the same server with the daemon's host reaching it over the LAN.
+`deploy/Dockerfile`:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+# uv as a binary rather than a base image: the runtime stage below wants plain
+# python:3.12-slim, and copying one static binary into the builder is cheaper
+# than reconciling two different bases.
+FROM ghcr.io/astral-sh/uv:0.5-python3.12-bookworm-slim AS builder
+
+# argon2-cffi-bindings has no 32-bit ARM wheel and compiles its vendored Argon2
+# from C on armv7. Discarded with this stage; see the note in the plan.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+WORKDIR /build
+
+# The lock and every member's manifest first, so a source-only edit reuses the
+# cached dependency layer. `uv sync` needs each workspace member's pyproject to
+# resolve `workspace = true`, including ors-daemon, which this image never runs.
+COPY uv.lock pyproject.toml ./
+COPY packages/ors-schema/pyproject.toml packages/ors-schema/
+COPY packages/ors-render/pyproject.toml packages/ors-render/
+COPY daemon/pyproject.toml daemon/
+COPY server/pyproject.toml server/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-workspace --package ors-server
+
+COPY packages/ packages/
+COPY server/ server/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --package ors-server
+
+FROM python:3.12-slim
+
+RUN useradd --system --create-home --uid 10001 ors \
+    && mkdir -p /var/lib/openrackscreen \
+    && chown ors:ors /var/lib/openrackscreen
+
+COPY --from=builder --chown=ors:ors /build/.venv /app/.venv
+ENV PATH="/app/.venv/bin:$PATH" \
+    ORS_DATA_DIR=/var/lib/openrackscreen \
+    ORS_HOST=0.0.0.0 \
+    ORS_PORT=8080
+
+USER ors
+EXPOSE 8080
+VOLUME ["/var/lib/openrackscreen"]
+
+# No curl in slim, and adding it for a healthcheck is a package and a CVE feed
+# for one HTTP GET the interpreter can already make.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health').read()"]
+
+CMD ["ors-server"]
+```
+
+`deploy/compose.pi.yaml` — server on the same host as the daemon:
+
+```yaml
+# The daemon is deliberately absent. It needs /dev/spidev0.0, /dev/spidev0.1,
+# /dev/spidev1.0, /dev/spidev1.1 and /dev/gpiomem, plus membership of the spi
+# and gpio groups; containerising that means --privileged or a device list that
+# has to be corrected every time the rack is rewired, in exchange for nothing.
+# It stays a systemd unit on the host and reaches this server on localhost.
+services:
+  server:
+    image: ghcr.io/silkepilon/openrackscreen:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Absent, the server generates a key into the data volume on first boot.
+      # Set it to keep the key with your other secrets instead; changing it
+      # afterwards makes every stored integration credential undecryptable.
+      ORS_SECRET_KEY: ${ORS_SECRET_KEY:-}
+    volumes:
+      - ors-data:/var/lib/openrackscreen
+
+volumes:
+  ors-data:
+```
+
+`deploy/compose.remote.yaml` — server anywhere, daemon on the rack:
+
+```yaml
+services:
+  server:
+    image: ghcr.io/silkepilon/openrackscreen:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      ORS_SECRET_KEY: ${ORS_SECRET_KEY:-}
+      # Uvicorn trusts X-Forwarded-For from these hosts only. Behind a reverse
+      # proxy this must name the proxy, or every login arrives from the proxy's
+      # address and the per-IP login limiter throttles the whole rack at once.
+      # Carried from Task 4.
+      FORWARDED_ALLOW_IPS: ${ORS_TRUSTED_PROXIES:-127.0.0.1}
+    volumes:
+      - ors-data:/var/lib/openrackscreen
+
+volumes:
+  ors-data:
+```
+
+`server/README.md` covers: `docker compose -f deploy/compose.pi.yaml up -d`, first-run password setup at `/`, where the key and database live, that the daemon is a host systemd unit and not part of compose, and that `ORS_SECRET_KEY` is unrecoverable once integrations exist.
+
+**Two things the implementer must check rather than assume:**
+1. `FORWARDED_ALLOW_IPS` only takes effect when uvicorn runs with `--proxy-headers`. `__main__.py` calls `uvicorn.run(...)` without it. Check uvicorn's current default for `proxy_headers` — if it is not already on, the variable above is decoration and `__main__.py` needs `proxy_headers=True`. Fix it there and say so.
+2. `load_or_create_key` refuses a key file readable by group or other. Confirm the file it creates inside the volume, under the container's umask and as uid 10001, actually satisfies its own check — a server that cannot start on second boot is worse than one that never started.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest -q; echo "exit=$?"` and, on a machine with Docker, `docker build -f deploy/Dockerfile .`
-Expected: PASS, exit 0; the image builds.
+Run: `uv run pytest -q; echo "exit=$?"`
+Expected: PASS, exit 0.
+
+Then, on a machine with Docker: `docker build -f deploy/Dockerfile .` and, if `docker buildx` is available, `docker buildx build --platform linux/arm64 -f deploy/Dockerfile .`. Report the outcome; if Docker is unavailable in the sandbox, say so plainly rather than claiming the image builds — it goes on the hardware checklist instead.
 
 - [ ] **Step 5: Commit**
 
