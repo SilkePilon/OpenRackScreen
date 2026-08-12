@@ -195,7 +195,7 @@ class _Slot:
 
     screen: ResolvedScreen
     panel: _Panel
-    worker: ScreenWorker
+    worker: ScreenWorker | None = None
     restarts: int = 0
     shut_down: bool = False
     """Claimed by whichever `stop` reaches this slot first, before it does the
@@ -269,7 +269,7 @@ class Supervisor:
         to keep in step. A replaced worker is not here -- it is abandoned, not
         tracked -- which is also what keeps it out of the status file.
         """
-        return [slot.worker for slot in self._slots]
+        return [slot.worker for slot in self._slots if slot.worker is not None]
 
     def start(self) -> None:
         """Bring the rack up: tunnels and pollers first, then panels.
@@ -292,10 +292,23 @@ class Supervisor:
             # than failing to find it at all.
             self._store.register(integration_config.name)
             self._start_integration(integration_config)
+        # Two phases, and the order is not cosmetic. Panels share buses -- on a
+        # Pi 3 SPI0 carries two chip selects and SPI1 carries two more -- so a
+        # worker that starts drawing while its bus-mate is still running its
+        # fifty-command init sequence corrupts that init, and the panel comes up
+        # showing unconfigured RAM. Which panel loses depends on start order, so
+        # the same rack fails differently on every restart and sometimes not at
+        # all. The script this replaces got it right and said so: "Init displays
+        # one at a time (GPIO race prevention)". Nothing is drawn until every
+        # panel is initialised.
         for screen in self._screens:
             if self._stopped:
                 return
-            self._start_screen(screen)
+            self._open_panel(screen)
+        for slot in list(self._slots):
+            if self._stopped:
+                return
+            self._start_worker(slot)
 
     def tick(self) -> None:
         """One watchdog pass and one status write."""
@@ -427,6 +440,11 @@ class Supervisor:
                     # and its panel is off. Re-joining would be free, but
                     # re-warning about a wedged one would not be.
                     continue
+                if slot.worker is None:
+                    # Its panel is open but nothing was ever started on it --
+                    # a stop that landed between the two phases. The panel is
+                    # still slept below; there is simply no thread to wait for.
+                    continue
                 slot.worker.join(remaining())
                 if slot.worker.is_alive():
                     log.warning(
@@ -488,6 +506,9 @@ class Supervisor:
     def _check(self, slot: _Slot, now: float) -> None:
         """Restart the slot's worker if its heartbeat has stopped moving."""
         if slot.restarts > _MAX_RESTARTS:
+            return
+        if slot.worker is None:
+            # Not yet started, so it has no heartbeat to be late with.
             return
         heartbeat = slot.worker.heartbeat
         # Nought means "has not ticked yet", not "last ticked at the epoch".
@@ -551,7 +572,8 @@ class Supervisor:
         poller.start()
         self.pollers.append(poller)
 
-    def _start_screen(self, screen: ResolvedScreen) -> None:
+    def _open_panel(self, screen: ResolvedScreen) -> None:
+        """Open one panel and record it, drawing nothing yet."""
         name = screen.config.name
         try:
             backend = self._display_factory(screen.config, name)
@@ -565,26 +587,8 @@ class Supervisor:
             log.error("screen unavailable", extra={"screen": name, "error": str(exc)})
             self._unavailable.append(UnavailableScreen(name=name, reason=str(exc)))
             return
-        panel = _Panel(backend)
-        worker = self._make_worker(screen, panel)
-        try:
-            # Started before the slot records it, for the reason `_replace` gives.
-            worker.start()
-        except BaseException:
-            # The same class of bug as the signal landing mid-start below, one
-            # line further along, and with the same cost. Between the backend
-            # opening and the slot existing there is a panel nothing else can
-            # reach: `stop` walks `_slots`, so a `RuntimeError("can't start new
-            # thread")` from a Pi under memory pressure would leave this one lit,
-            # its init sequence ended in DISPLAY_ON, with its serial device open
-            # for as long as the process lived. It is still in hand here, so it
-            # is blanked here. The lease is revoked first because the worker may
-            # or may not have got as far as running; revoking is what settles it.
-            panel.revoke()
-            log.error("could not start a worker; blanking its panel", extra={"screen": name})
-            self._shut_down_panel(backend, name)
-            raise
-        self._slots.append(_Slot(screen=screen, panel=panel, worker=worker))
+        slot = _Slot(screen=screen, panel=_Panel(backend))
+        self._slots.append(slot)
         # Recorded first, *then* the flag is read -- never the other way round.
         # `_stopped` only ever goes from false to true, so a stop that has begun
         # at any point up to this line is still visible here, while a stop that
@@ -597,6 +601,37 @@ class Supervisor:
         if self._stopped:
             log.info("stopped while opening a panel; shutting it down", extra={"screen": name})
             self.stop()
+
+    def _start_worker(self, slot: _Slot) -> None:
+        """Give an already-open panel the worker that draws on it."""
+        name = slot.screen.config.name
+        worker = self._make_worker(slot.screen, slot.panel)
+        try:
+            worker.start()
+        except BaseException:
+            # The same class of bug as the signal landing mid-start below, one
+            # line further along, and with the same cost. Between the backend
+            # opening and the slot existing there is a panel nothing else can
+            # reach: `stop` walks `_slots`, so a `RuntimeError("can't start new
+            # thread")` from a Pi under memory pressure would leave this one lit,
+            # its init sequence ended in DISPLAY_ON, with its serial device open
+            # for as long as the process lived. It is still in hand here, so it
+            # is blanked here. The lease is revoked first because the worker may
+            # or may not have got as far as running; revoking is what settles it.
+            # A panel with no worker is still this supervisor's to blank: the
+            # slot already exists, so `stop` can reach it, but nothing will ever
+            # draw on it again. Revoking first settles whether the worker got as
+            # far as running.
+            slot.panel.revoke()
+            # Claimed before it is blanked, exactly as `stop` does it: the slot
+            # is already in the list, so without this the panel is slept and
+            # closed twice -- and a second close on a GC9A01 writes to a serial
+            # device that has already been torn down.
+            slot.shut_down = True
+            log.error("could not start a worker; blanking its panel", extra={"screen": name})
+            self._shut_down_panel(slot.panel.backend, name)
+            raise
+        slot.worker = worker
 
     def _make_worker(self, screen: ResolvedScreen, panel: _Panel) -> ScreenWorker:
         return ScreenWorker(

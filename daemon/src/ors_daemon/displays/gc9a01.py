@@ -62,6 +62,22 @@ _SLEEP_IN = 0x10
 _SLEEP_OUT = 0x11
 _DISPLAY_OFF = 0x28
 _DISPLAY_ON = 0x29
+_RESET_HOLD = 0.010
+_RESET_RELEASE = 0.150
+"""Seconds to hold RESX low, and to wait after releasing it, before the init.
+
+luma defaults both to zero, and this panel's init sequence has no software
+reset -- the hardware one is the only reset it gets. At zero the first command
+can reach a controller that has not finished its own power-on, which does not
+fail: it half-configures, and the panel comes up showing unconfigured RAM as a
+pale rectangle. The script this replaces ran at 0/0 and worked, which is what a
+reset landing inside the power-on window *most* of the time looks like.
+
+The hold clears the datasheet's 10us minimum with room to spare; the release is
+luma's own suggested figure for panels of this class. Together they cost 160ms
+once per panel at startup, and they cannot make a working panel worse.
+"""
+
 _PANEL_SIZE = 240
 """The panel is fixed at 240x240; the driver writes whole frames of that size."""
 
@@ -121,7 +137,13 @@ class GC9A01Display:
             serial_factory = spi
         try:
             self._serial = serial_factory(
-                port=spi_bus, device=spi_cs, gpio_DC=dc, gpio_RST=rst, bus_speed_hz=hz
+                port=spi_bus,
+                device=spi_cs,
+                gpio_DC=dc,
+                gpio_RST=rst,
+                bus_speed_hz=hz,
+                reset_hold_time=_RESET_HOLD,
+                reset_release_time=_RESET_RELEASE,
             )
         except Exception as exc:
             raise DisplayError(f"cannot open SPI{spi_bus}.{spi_cs}: {exc}") from exc

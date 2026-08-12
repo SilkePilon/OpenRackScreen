@@ -205,6 +205,11 @@ def test_driver_opens_the_port_with_lumas_keyword_names(fake_panel):
         "gpio_DC": 6,
         "gpio_RST": 5,
         "bus_speed_hz": 40_000_000,
+        # luma defaults both of these to zero, which gives the controller no
+        # settling time at all before a fifty-command init sequence starts --
+        # and this panel has no software reset to fall back on.
+        "reset_hold_time": 0.010,
+        "reset_release_time": 0.150,
     }
 
 

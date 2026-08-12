@@ -701,7 +701,12 @@ def test_a_panel_whose_worker_will_not_start_is_blanked_on_the_spot(
 
     assert displays["S2"].calls == ["sleep", "close"], "the panel it had just opened"
     assert displays["S1"].calls[-2:] == ["sleep", "close"], "and the one before it"
-    assert "S3" not in displays, "nothing is opened after a failure this bad"
+    # Every panel is opened before any worker draws, so S3 is already open when
+    # S2's worker fails. It is in a slot, which is what makes it reachable: the
+    # shutdown blanks it too, and none of the three is slept twice.
+    assert displays["S3"].calls == ["sleep", "close"], "and the one after it"
+    for name, display in displays.items():
+        assert display.calls.count("close") == 1, f"{name} was closed more than once"
 
 
 def test_a_tick_survives_a_status_path_it_cannot_write(tmp_path: Path) -> None:
@@ -971,3 +976,58 @@ def test_a_tick_after_stop_does_nothing(tmp_path: Path) -> None:
 
     assert not status.exists(), "a stopped supervisor writes no status"
     assert displays["S1"].sleeps == 1, "and does not re-sleep the panel"
+
+
+def test_no_worker_starts_until_every_panel_is_initialised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Panels share buses, so an early worker corrupts a late panel's init.
+
+    A Pi 3 carries two chip selects on SPI0 and two on SPI1. Opening a GC9A01
+    is a hardware reset and a fifty-command init sequence over that shared
+    wire, so a worker that begins drawing while its bus-mate is still
+    initialising tramples it: the second panel comes up showing unconfigured
+    RAM -- a pale rectangle -- and which panel loses depends on the order the
+    supervisor started them in. Observed on the rack, on a config whose only
+    change was which screen held which SPI device, and it came good on some
+    restarts and not others, which is what a race looks like from outside.
+
+    Asserted on the *starts* rather than on the draws: a started worker draws
+    when the scheduler says so, so an assertion about drawing would pass
+    against the interleaved version roughly whenever the timing was kind. The
+    property that actually matters -- nothing is started until everything is
+    open -- is deterministic, and the script this replaces had it: "Init
+    displays one at a time (GPIO race prevention)".
+    """
+    config = DaemonConfig.model_validate(config_dict(tmp_path, screens=4))
+    events: list[str] = []
+    started = ScreenWorker.start
+
+    def start(self: ScreenWorker) -> None:
+        events.append(f"start:{self.screen_name}")
+        started(self)
+
+    monkeypatch.setattr(ScreenWorker, "start", start)
+
+    def display_factory(screen_config: ScreenConfig, name: str) -> RecordingDisplay:
+        events.append(f"open:{name}")
+        return RecordingDisplay()
+
+    supervisor = Supervisor(
+        config=config,
+        screens=resolve_screens(config),
+        store=SnapshotStore(),
+        clock=FakeClock(NOW),
+        status_path=tmp_path / "status.json",
+        display_factory=display_factory,
+        poller_factory=lambda integration_config, url_provider: None,
+    )
+    supervisor.start()
+    try:
+        opens = [i for i, e in enumerate(events) if e.startswith("open:")]
+        starts = [i for i, e in enumerate(events) if e.startswith("start:")]
+
+        assert len(opens) == 4 and len(starts) == 4
+        assert max(opens) < min(starts), f"a worker started mid-bring-up: {events}"
+    finally:
+        supervisor.stop()
