@@ -8,6 +8,7 @@ from ors_schema.daemon import (
     ScreenConfig,
     TunnelConfig,
 )
+from ors_schema.errors import first_error
 from pydantic import ValidationError
 
 MINIMAL = {
@@ -316,3 +317,24 @@ def test_screen_rejects_an_empty_name_or_template(key):
 def test_config_round_trips_through_json():
     config = DaemonConfig.model_validate(MINIMAL)
     assert DaemonConfig.model_validate(config.model_dump(exclude_none=True)) == config
+
+
+def test_first_error_names_the_field_path_and_the_reason():
+    """What both ends put in front of a person: the daemon prefixes the file and
+    the server prefixes the daemon, and neither knows anything about the field
+    that the model did not already say."""
+    with pytest.raises(ValidationError) as error:
+        DaemonConfig.model_validate(
+            {**MINIMAL, "screens": [{**MINIMAL["screens"][0], "rotation": 45}]}
+        )
+
+    assert first_error(error.value).startswith("screens.0.rotation: ")
+
+
+def test_a_failure_about_the_whole_document_still_reads_as_a_message():
+    """`loc` is empty when nothing narrower than the document is at fault, and a
+    message opening with a bare colon reads as a bug in the formatting."""
+    with pytest.raises(ValidationError) as error:
+        DaemonConfig.model_validate([])
+
+    assert first_error(error.value).startswith("(root): ")

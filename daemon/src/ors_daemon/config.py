@@ -22,6 +22,7 @@ from typing import Any
 import yaml
 from ors_render import load_builtin_templates
 from ors_schema.daemon import DaemonConfig, ScreenConfig
+from ors_schema.errors import first_error
 from ors_schema.scene import Scene, Template
 from pydantic import ValidationError
 
@@ -90,11 +91,7 @@ def load_config(path: Path) -> DaemonConfig:
     try:
         return DaemonConfig.model_validate(parsed)
     except ValidationError as exc:
-        # The first error only: pydantic reports every branch of a discriminated
-        # union it tried, and a wall of them buries the one line that matters.
-        first = exc.errors()[0]
-        location = ".".join(str(part) for part in first["loc"]) or "(root)"
-        raise ConfigError(f"{path}: {location}: {first['msg']}") from exc
+        raise ConfigError(f"{path}: {first_error(exc)}") from exc
 
 
 _FINGERPRINT_CHARS = 12

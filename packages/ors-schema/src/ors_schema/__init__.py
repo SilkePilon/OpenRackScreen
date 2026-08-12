@@ -10,6 +10,7 @@ from ors_schema.daemon import (
     ScreenConfig,
     TunnelConfig,
 )
+from ors_schema.errors import first_error
 from ors_schema.link import (
     PROTOCOL_VERSION,
     Ack,
@@ -98,6 +99,7 @@ __all__ = [
     "ThresholdEntry",
     "ThresholdPalette",
     "TunnelConfig",
+    "first_error",
     "parse_daemon_message",
     "parse_server_message",
 ]
