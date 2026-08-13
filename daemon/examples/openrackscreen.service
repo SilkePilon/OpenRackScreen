@@ -57,6 +57,20 @@ RestartSec=5
 RuntimeDirectory=openrackscreen
 RuntimeDirectoryMode=0755
 
+# Creates /var/lib/openrackscreen owned by User=, and unlike RuntimeDirectory it
+# survives a reboot -- which is the point. Two files live there and the daemon
+# writes both: the pairing (`ors-daemon connect --link`, default
+# /var/lib/openrackscreen/link.json) and, beside it, the last snapshot the server
+# pushed. Without this the directory does not exist, `Paired` cannot be saved,
+# and the rack has to be paired again by hand after every restart -- which needs
+# a new token minted in the interface, because the server keeps only a
+# fingerprint of the key it handed over.
+#
+# 0700 because the pairing is the right to reconfigure this rack and draw on its
+# panels. The daemon writes the file 0600 as well; this is the other half.
+StateDirectory=openrackscreen
+StateDirectoryMode=0700
+
 # Derived, not guessed. The daemon spends at most `SHUTDOWN_BUDGET` seconds
 # (`ors_daemon.supervisor`, 10s today) on every thread join and tunnel teardown
 # together -- one deadline for all of them, so the cost does not grow with the
