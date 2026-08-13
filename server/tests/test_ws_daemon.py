@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import logging
 from contextlib import closing
 
 import pytest
 from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
-from ors_schema.link import PROTOCOL_VERSION, Ack, Frame, Heartbeat, Hello, Nack, SourceStatus
+from ors_schema.link import (
+    MAX_FRAME_BYTES,
+    PROTOCOL_VERSION,
+    Ack,
+    Frame,
+    Heartbeat,
+    Hello,
+    Nack,
+    SourceStatus,
+)
 from ors_server.app import AppSettings, create_app
 from ors_server.link import ws_daemon
 from ors_server.link.hub import Hub
@@ -647,6 +658,57 @@ async def test_one_malformed_message_does_not_kill_a_healthy_link(tmp_path):
     await finish(socket, handler)
 
     assert daemon_row(app, daemon_id)["last_seen"] != "long ago", "it kept reading"
+
+
+async def test_a_frame_too_large_to_read_names_the_screen_that_went_quiet(tmp_path, caplog):
+    """The only place in the system that can say which panel stopped.
+
+    An oversized frame is dropped here and the browser watching that screen is
+    told nothing whatever -- the queue simply stops and the page keeps showing
+    the image it last drew -- so `frame.webp: bytes_too_long` on its own leaves
+    a four-panel rack with three suspects. The socket survives either way, which
+    is the other half of the bargain and is what the reads after it prove.
+    """
+    app, daemon_id, token = build(tmp_path)
+    screen_id = add_screen(app, daemon_id)
+    key = await paired_key(app, token)
+    socket, handler = await connected(app, key)
+
+    oversized = json.dumps(
+        {
+            "type": "frame",
+            "screen_id": screen_id,
+            "seq": 1,
+            "webp": base64.urlsafe_b64encode(b"x" * (MAX_FRAME_BYTES + 1)).decode(),
+        }
+    )
+    with caplog.at_level(logging.WARNING):
+        socket.say(oversized)
+        socket.say(Frame(screen_id=screen_id, seq=2, webp=b"RIFF").model_dump_json())
+        await finish(socket, handler)
+
+    [dropped] = [record for record in caplog.records if "unreadable message" in record.message]
+    assert dropped.screen == screen_id
+    assert "webp" in dropped.error
+
+
+async def test_an_unreadable_message_that_names_no_screen_still_logs(tmp_path, caplog):
+    """The id is read out of a payload that has already failed validation, so
+    nothing about its shape may be assumed: anything that is not an object with
+    an integer `screen_id` gets no field rather than a guess."""
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    socket, handler = await connected(app, key)
+
+    with caplog.at_level(logging.WARNING):
+        socket.say('{"type": "frame", "screen_id": "not-a-number", "seq": 1, "webp": "AA=="}')
+        socket.say("[]")
+        socket.say("not json at all")
+        await finish(socket, handler)
+
+    dropped = [record for record in caplog.records if "unreadable message" in record.message]
+    assert len(dropped) == 3
+    assert all(not hasattr(record, "screen") for record in dropped)
 
 
 # --- frames, and who owns a screen ----------------------------------------

@@ -361,7 +361,7 @@ async def _serve(state: State, socket: WebSocket, session: _Session) -> None:
                 # unusable, and it is named in the log.
                 log.warning(
                     "unreadable message from a daemon; skipped",
-                    extra={"daemon": session.daemon_id, **_why(error)},
+                    extra={"daemon": session.daemon_id, **_why(error), **_about(raw)},
                 )
                 continue
             await _handle(state, session, message)
@@ -531,6 +531,36 @@ async def _cancel(task: asyncio.Task) -> None:
     "exception was never retrieved" line in a log nobody can trace back."""
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
+
+
+def _about(raw: str) -> dict[str, int]:
+    """Which screen a message that would not parse was about, if it said.
+
+    `_why` gives the field and the reason -- `frame.webp: bytes_too_long` -- and
+    on a four-panel rack that is most of an answer and not all of one. An
+    oversized frame is dropped here and the browser watching that screen is
+    given no indication at all: the queue simply stops and the page keeps
+    showing the last image it drew. So this log line is the only place in the
+    system that can say *which* panel went quiet, and without the id nobody can
+    tell a wedged encoder on one screen from four of them.
+
+    Deliberately narrow. The payload is a peer's, and it has already failed
+    validation, so nothing here trusts its shape: anything that is not an object
+    with an integer `screen_id` produces no field rather than a guess. The
+    second parse is bounded by `ws_max_size` like the first, and is only ever
+    paid on a message that was already unusable.
+    """
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    screen_id = payload.get("screen_id")
+    # `bool` is an `int` in Python and `{"screen_id": true}` is not a screen.
+    if not isinstance(screen_id, int) or isinstance(screen_id, bool):
+        return {}
+    return {"screen": screen_id}
 
 
 def _why(failure: ValidationError) -> dict[str, str]:
