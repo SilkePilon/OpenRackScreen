@@ -9,6 +9,14 @@ dependencies = [
     "pydantic>=2.7",
     "pyyaml>=6.0",
     "requests>=2.32",
+    # For the link's blocking client. Floored at 13 because `websockets.sync`
+    # arrived in 12 and settled in 13; the workspace lock resolves 17.0.1, which
+    # publishes cp311 wheels for both `manylinux_2_17_aarch64` and
+    # `manylinux_2_31_armv7l` -- checked, because `argon2-cffi-bindings` ships
+    # no armv7l wheel at all and a source build on a Pi 3 is not acceptable.
+    # There is nothing to build here in any case: the C extension is an optional
+    # speedup with a pure-Python fallback.
+    "websockets>=13.0",
 ]
 
 [project.scripts]
