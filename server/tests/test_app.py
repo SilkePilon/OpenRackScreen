@@ -1,5 +1,7 @@
+from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 from ors_server.app import AppSettings, create_app
+from starlette.routing import WebSocketRoute
 
 
 def client(tmp_path) -> TestClient:
@@ -28,15 +30,33 @@ def test_the_data_directory_is_created(tmp_path):
     assert target.is_dir()
 
 
-def test_no_framework_route_squats_outside_the_api_prefix(tmp_path):
+def test_nothing_squats_outside_the_api_prefix_but_the_sockets(tmp_path):
     """The root belongs to the SPA, which is mounted in a later task.
 
     A route left at its default -- /redoc, /docs/oauth2-redirect -- is a page the
     interface will one day claim, answered by FastAPI instead, and nothing about
     the symptom points back here.
+
+    The two sockets are the exception the design writes down: `/ws/daemon` is
+    dialled by a program on a Pi and `/ws/ui` by the SPA itself, and neither can
+    be moved under a prefix after the fact. So they are allowed by shape --
+    a websocket under /ws/ -- rather than by name, and anything else outside
+    /api is still a collision.
+
+    `iter_route_contexts` rather than `app.routes`, which FastAPI resolves
+    lazily: walking it directly finds no included route at all, so this could
+    not see a socket a later task hangs off the root.
     """
     app = create_app(AppSettings(data_dir=tmp_path))
-    paths = {route.path for route in app.routes if getattr(route, "path", "").startswith("/")}
+    routes = [
+        (context.path or context.original_route.path, context.original_route)
+        for context in iter_route_contexts(app.routes)
+    ]
 
-    outside = {path for path in paths if not path.startswith("/api")}
+    outside = {
+        path
+        for path, route in routes
+        if not path.startswith("/api")
+        and not (isinstance(route, WebSocketRoute) and path.startswith("/ws/"))
+    }
     assert outside == set(), f"these would collide with the SPA: {sorted(outside)}"

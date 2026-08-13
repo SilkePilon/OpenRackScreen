@@ -13,7 +13,10 @@ from ors_server import __version__
 from ors_server.api.auth import router as auth_router
 from ors_server.auth import Sessions, require_session
 from ors_server.db import Database
+from ors_server.link.hub import Hub
+from ors_server.link.ws_daemon import router as daemon_socket_router
 from ors_server.secrets import SecretStore, load_or_create_key
+from ors_server.snapshot import seed_builtin_templates
 
 log = logging.getLogger(__name__)
 
@@ -68,11 +71,16 @@ def create_app(settings: AppSettings) -> FastAPI:
     export = database.initialise()
     if export is not None:
         log.warning("schema changed; exported and rebuilt", extra={"export": str(export)})
+    # Before anything can be pushed: `build_snapshot` refuses a screen naming a
+    # template the snapshot does not carry, so on a server whose table is empty
+    # the *whole* rack's first push fails rather than one panel.
+    seed_builtin_templates(database)
     app.state.database = database
     app.state.sessions = Sessions()
     app.state.secrets = SecretStore(
         database, load_or_create_key(settings.data_dir, settings.secret_key)
     )
+    app.state.hub = Hub()
 
     # Two routers under one prefix, and the difference is the whole access
     # control model: `api` carries the session dependency, so a route added to
@@ -94,4 +102,11 @@ def create_app(settings: AppSettings) -> FastAPI:
 
     app.include_router(public)
     app.include_router(api)
+    # And a third, at the root and on neither of the two above. The design puts
+    # the daemon socket at `/ws/daemon`, which is not a path a prefix can be
+    # bolted onto after the fact -- on `api` it would be `/api/ws/daemon`, which
+    # is not what a daemon dials -- and it authenticates with a pairing token or
+    # a daemon key rather than with the admin's session, so the guard `api`
+    # carries would refuse every rack in the building.
+    app.include_router(daemon_socket_router)
     return app

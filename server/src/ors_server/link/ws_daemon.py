@@ -1,0 +1,414 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from contextlib import closing
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from ors_schema.link import (
+    Ack,
+    ConfigPush,
+    DaemonMessage,
+    Frame,
+    FramesRequest,
+    Hello,
+    Nack,
+    Paired,
+    parse_daemon_message,
+)
+from pydantic import ValidationError
+from starlette.datastructures import State
+
+from ors_server.db import Database
+from ors_server.link.hub import Connection
+from ors_server.pairing import authenticate_key, claim_token
+from ors_server.snapshot import SnapshotError, build_snapshot
+
+log = logging.getLogger(__name__)
+router = APIRouter()
+
+# The 4000-4999 range is reserved for the application, so these are ours to
+# define and the daemon's to act on -- a client that cannot tell "your
+# credential is wrong" from "your configuration is unservable" retries the first
+# forever and gives up on the second. One code per reason, and every refusal
+# below closes with exactly one of them.
+CLOSE_MALFORMED = 4400
+"""The first thing said on this socket was not a message this build knows."""
+CLOSE_UNAUTHORIZED = 4401
+"""No credential, or one that matches nothing. Deliberately one code for both.
+
+Two codes would be a probe: whoever is scanning the network learns whether the
+string they sent is a credential the server has heard of before, which is most
+of the work of finding one that is.
+"""
+CLOSE_HELLO_FIRST = 4402
+"""Something arrived before the socket said who it was."""
+CLOSE_SUPERSEDED = 4409
+"""The same daemon connected again and this socket is the old one."""
+CLOSE_UNSERVABLE = 4500
+"""The database holds a configuration this daemon could not be given."""
+
+
+@dataclass
+class _Session:
+    """What the handler knows about the daemon on the other end of this socket.
+
+    Per connection and not per daemon: a reconnect that overtakes this handler's
+    exit is a different session with its own everything, and the `Connection` is
+    what lets the hub tell the two apart.
+    """
+
+    daemon_id: int
+    connection: Connection
+    owned: set[int]
+    """The screens this daemon may send frames for. See `_owns`."""
+    refused: set[int] = field(default_factory=set)
+    """Screen ids already checked against the database and found to be another
+    rack's, so a daemon that keeps sending them cannot make this handler keep
+    re-reading the table."""
+
+
+@router.websocket("/ws/daemon")
+async def daemon_socket(socket: WebSocket) -> None:
+    """One daemon's link to the server, from hello to hang-up."""
+    await socket.accept()
+    state = socket.app.state
+    session: _Session | None = None
+    try:
+        session = await _hello(state, socket)
+        if session is None:
+            return
+        await _serve(state, socket, session)
+    except WebSocketDisconnect:
+        # The ordinary ending, not an error: a Pi rebooted, or the wifi went.
+        log.info("a daemon socket closed", extra={"daemon": getattr(session, "daemon_id", None)})
+    finally:
+        if session is not None:
+            state.hub.drop(session.connection)
+
+
+async def _hello(state: State, socket: WebSocket) -> _Session | None:
+    """Identify the daemon and bring it up to date, or close and return None."""
+    try:
+        first = parse_daemon_message(await socket.receive_text())
+    except ValidationError as error:
+        # Closed rather than skipped, unlike a malformed message on an
+        # established link: an unidentified socket has nothing worth keeping
+        # open, and a peer that cannot manage a `hello` is not about to say
+        # anything this server can act on.
+        log.info("a socket opened and said something that is not a message", extra=_why(error))
+        await socket.close(code=CLOSE_MALFORMED, reason="malformed")
+        return None
+
+    if not isinstance(first, Hello):
+        log.info("a socket spoke before saying hello", extra={"said": first.type})
+        await socket.close(code=CLOSE_HELLO_FIRST, reason="hello first")
+        return None
+
+    database: Database = state.database
+    daemon_id, issued = _authenticate(database, first.token)
+    if daemon_id is None:
+        # The hostname is logged because it is the only thing here worth having
+        # in a log, and it is worth remembering that it is also the only thing
+        # in this message that was not checked. It identifies nobody.
+        log.warning("refused a daemon socket", extra={"claimed_hostname": first.hostname})
+        await socket.close(code=CLOSE_UNAUTHORIZED, reason="unauthorized")
+        return None
+
+    if issued is not None:
+        # Down this socket by name rather than through the hub, and before the
+        # connection is registered. The key belongs to the socket that spent the
+        # token and to no other: routing it through the hub's by-id lookup would
+        # send it to whichever connection the hub happens to hold for this
+        # daemon, which during a reconnect race is somebody else's socket.
+        #
+        # It is sent exactly once, and if it is lost in flight the daemon is
+        # left holding a spent token and cannot get back in. Recovering means
+        # minting a new token from the interface -- the same act as rotating a
+        # key, which the design already calls for.
+        await socket.send_text(Paired(daemon_id=daemon_id, key=issued).model_dump_json())
+
+    _record_hello(database, daemon_id, first)
+
+    try:
+        push = _push_for(state, daemon_id, first.config_version)
+        owned = _owned_screens(database, daemon_id)
+    except (SnapshotError, KeyError) as error:
+        # Unhandled, this leaves the route by raising, which on a socket is a
+        # close with no code the daemon can act on and a traceback in the log of
+        # a server that was asked a perfectly ordinary question. It is a real
+        # state: a column that is not JSON, an integration holding a credential
+        # the wire format cannot carry, or a daemon deleted from the interface
+        # between authenticating and reading its rows.
+        log.error(
+            "a connected daemon cannot be given its configuration",
+            extra={"daemon": daemon_id, "error": str(error)},
+        )
+        await socket.close(code=CLOSE_UNSERVABLE, reason="no snapshot")
+        return None
+
+    # Registered only now, with everything already read: until this line the
+    # hub still routes to whatever connection came before, so a daemon whose
+    # configuration cannot be assembled never displaces a working one. Nothing
+    # awaits between the read and the push either, so the snapshot cannot be
+    # overtaken on the wire by an edit that was minted after it.
+    session = _Session(
+        daemon_id=daemon_id,
+        connection=state.hub.register(daemon_id, socket.send_text),
+        owned=owned,
+    )
+    if push is not None:
+        await state.hub.push_config(daemon_id, push)
+    await _resume_frames(state, session)
+    return session
+
+
+def _authenticate(database: Database, credential: str) -> tuple[int | None, str | None]:
+    """Who this is, and the key to hand back if this connect is what paired them.
+
+    One field on the wire carries both credentials, so both are tried here. They
+    cannot be confused: a token's hash is deleted the moment it is spent, so at
+    most one of the two columns can ever match one string. The key is tried
+    first only because it is what all but the first connect of a daemon's life
+    presents.
+    """
+    daemon_id = authenticate_key(database, credential)
+    if daemon_id is not None:
+        return daemon_id, None
+    claimed = claim_token(database, credential)
+    if claimed is None:
+        return None, None
+    return claimed
+
+
+def _push_for(state: State, daemon_id: int, running: int | None) -> ConfigPush | None:
+    """What this daemon should be given now, or None because it already has it.
+
+    The version compared against is the one on the row, read and not bumped. A
+    connect changes no configuration, so it may not advance the counter -- and
+    bumping here would defeat the comparison twice over: a number minted after
+    the daemon spoke can never match what it claimed, so every reconnect would
+    be a full teardown and repaint of the rack, and a flapping link would walk
+    the counter up forever.
+
+    `running` is a claim, not evidence, and it is only ever allowed to *skip* a
+    push. Nothing here records it as acked: `Hub.register` has just cleared what
+    this daemon had confirmed, and it stays cleared until a real `Ack` answers a
+    real push. So a skipped push leaves the server saying "unknown", which is
+    the conservative answer and the one that costs at most one extra push later.
+
+    Read the version before assembling the snapshot, never after. The number is
+    then never newer than the rows it names, so an edit that lands in between
+    mints a higher one and pushes its own; the other order would push stale rows
+    under a number the daemon has already applied and the correction would be
+    deduped away.
+    """
+    version = _config_version(state.database, daemon_id)
+    if running == version:
+        return None
+    return ConfigPush(
+        version=version, snapshot=build_snapshot(state.database, state.secrets, daemon_id)
+    )
+
+
+async def _resume_frames(state: State, session: _Session) -> None:
+    """Ask a reconnecting daemon for the frames a browser is still waiting on.
+
+    Nothing else will: the interface subscribes when someone opens a screen, and
+    if the Pi reboots after that, the watcher is left holding a queue nobody
+    fills. Intersected with what this daemon owns, because `watched_screens` is
+    global -- every screen anyone is watching across every rack -- and asking a
+    Pi to render screen ids belonging to another one is at best noise in its log
+    and at worst four workers it cannot start.
+    """
+    resumed = state.hub.watched_screens() & session.owned
+    if not resumed:
+        return
+    await state.hub.request_frames(
+        session.daemon_id, FramesRequest(enabled=True, screen_ids=sorted(resumed))
+    )
+
+
+async def _serve(state: State, socket: WebSocket, session: _Session) -> None:
+    """Read this socket until the daemon goes away or the hub replaces it."""
+    # The hub holds a `send` callable, not a socket, so it cannot close this one
+    # when a reconnect supersedes it -- it sets `Connection.closed` and leaves
+    # the closing to whoever owns the socket, which is here. Without racing that
+    # event, a superseded handler stays blocked in `receive` until uvicorn's
+    # ping timeout tens of seconds later, and for all of that time it is still a
+    # reader: still parsing messages, still relaying frames, still handing the
+    # hub acks read from a daemon that has already gone.
+    superseded = asyncio.create_task(session.connection.closed.wait())
+    try:
+        while True:
+            reader = asyncio.create_task(socket.receive_text())
+            done, _ = await asyncio.wait({reader, superseded}, return_when=asyncio.FIRST_COMPLETED)
+            if superseded in done:
+                # Checked first, because both can finish in the same pass and a
+                # message read from a connection the hub has already forgotten
+                # must not be acted on.
+                await _cancel(reader)
+                log.info("closing a superseded daemon socket", extra={"daemon": session.daemon_id})
+                await socket.close(code=CLOSE_SUPERSEDED, reason="superseded")
+                return
+            raw = reader.result()
+            try:
+                message = parse_daemon_message(raw)
+            except ValidationError as error:
+                # One unreadable message is not worth a whole rack's link. The
+                # alternative -- closing -- turns a single bad frame into a
+                # reconnect loop that re-pushes the configuration every time
+                # round, and every panel with it. It is safe to skip because of
+                # what `extra="forbid"` and the tagged union buy: a malformed
+                # message cannot be quietly mistaken for a well-formed one of
+                # another type, so what is dropped here is exactly what was
+                # unusable, and it is named in the log.
+                log.warning(
+                    "unreadable message from a daemon; skipped",
+                    extra={"daemon": session.daemon_id, **_why(error)},
+                )
+                continue
+            await _handle(state, session, message)
+    finally:
+        await _cancel(superseded)
+
+
+async def _handle(state: State, session: _Session, message: DaemonMessage) -> None:
+    if isinstance(message, Ack):
+        # The `Connection`, not the id: this handler may be reading a socket the
+        # hub has already replaced, and an ack recorded under the id would
+        # describe the daemon's previous boot. The hub refuses that -- but only
+        # if it is handed something whose identity it can check.
+        state.hub.record_ack(session.connection, message.config_version)
+    elif isinstance(message, Nack):
+        # An error level, because a rack that refused its configuration is a
+        # rack showing something other than what the interface says it shows,
+        # and the server is where the person who just saved the edit is looking.
+        log.error(
+            "a daemon refused a snapshot",
+            extra={
+                "daemon": session.daemon_id,
+                "version": message.config_version,
+                "reason": message.reason,
+            },
+        )
+    elif isinstance(message, Frame):
+        if not _owns(state.database, session, message.screen_id):
+            log.warning(
+                "a daemon sent a frame for a screen it does not own",
+                extra={"daemon": session.daemon_id, "screen": message.screen_id},
+            )
+            return
+        await state.hub.relay_frame(message)
+    else:
+        log.debug(
+            "a daemon said something",
+            extra={"daemon": session.daemon_id, "said": message.type},
+        )
+
+    if not isinstance(message, Frame):
+        # Every message is evidence the daemon is alive, but frames arrive
+        # several times a second per screen and `last_seen` is a coarse field
+        # nothing reads at that resolution -- the hub, not this column, is what
+        # says whether a rack is online. A write per frame would put a SQLite
+        # write on the event loop at 2 fps per panel and buy nothing.
+        _touch(state.database, session.daemon_id)
+
+
+def _owns(database: Database, session: _Session, screen_id: int) -> bool:
+    """Whether this daemon may send frames for this screen.
+
+    The only place in the system that can ask. `Hub.relay_frame` trusts
+    `frame.screen_id` and reads no rows by design, so without this a daemon --
+    or anyone holding a daemon's key -- can paint over a panel belonging to a
+    rack it has nothing to do with, and every browser watching that screen shows
+    it.
+
+    Re-read once on a miss rather than trusted from hello, because the set does
+    go stale under a live connection: adding a screen in the interface pushes a
+    new configuration through the hub, which knows nothing about this handler.
+    The re-read is bounded by `refused` so that a daemon sending frames for an
+    id that really is not its own cannot turn each one into a query.
+    """
+    if screen_id in session.owned:
+        return True
+    if screen_id in session.refused:
+        return False
+    session.owned = _owned_screens(database, session.daemon_id)
+    if screen_id in session.owned:
+        return True
+    session.refused.add(screen_id)
+    return False
+
+
+def _owned_screens(database: Database, daemon_id: int) -> set[int]:
+    # `closing`, here and below, rather than `with database.connect()`: sqlite3's
+    # own context manager commits a transaction and leaves the connection open,
+    # so the obvious spelling would leak one per message read on this socket.
+    with closing(database.connect()) as connection:
+        return {
+            int(row["id"])
+            for row in connection.execute("SELECT id FROM screen WHERE daemon_id = ?", (daemon_id,))
+        }
+
+
+def _config_version(database: Database, daemon_id: int) -> int:
+    with closing(database.connect()) as connection:
+        row = connection.execute(
+            "SELECT config_version FROM daemon WHERE id = ?", (daemon_id,)
+        ).fetchone()
+    if row is None:
+        raise KeyError(f"no daemon {daemon_id}")
+    return int(row["config_version"])
+
+
+def _record_hello(database: Database, daemon_id: int, hello: Hello) -> None:
+    """What the daemon says about itself, which is everything except who it is.
+
+    `status` is deliberately not written here. Pairing is what sets it, and a
+    hello that could set it too would be a daemon deciding its own standing with
+    the server on the strength of having connected.
+    """
+    with closing(database.connect()) as connection:
+        connection.execute(
+            "UPDATE daemon SET version = ?, capabilities = ?, last_seen = ? WHERE id = ?",
+            (
+                hello.daemon_version,
+                json.dumps(hello.capabilities),
+                datetime.now(UTC).isoformat(),
+                daemon_id,
+            ),
+        )
+
+
+def _touch(database: Database, daemon_id: int) -> None:
+    with closing(database.connect()) as connection:
+        connection.execute(
+            "UPDATE daemon SET last_seen = ? WHERE id = ?",
+            (datetime.now(UTC).isoformat(), daemon_id),
+        )
+
+
+async def _cancel(task: asyncio.Task) -> None:
+    """Cancel a task and collect it, so nothing is left for the loop to complain
+    about at exit -- a cancelled receive whose result is never retrieved is an
+    "exception was never retrieved" line in a log nobody can trace back."""
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+def _why(failure: ValidationError) -> dict[str, str]:
+    """A parse failure as a log field, without the payload that caused it.
+
+    `str(error)` on a `ValidationError` includes the input it rejected, and the
+    input on this socket is a `hello` carrying a credential.
+    """
+    return {
+        "error": "; ".join(
+            f"{'.'.join(str(part) for part in error['loc'])}: {error['type']}"
+            for error in failure.errors()
+        )
+    }

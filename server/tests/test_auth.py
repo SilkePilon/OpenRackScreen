@@ -35,10 +35,13 @@ OPEN_PATHS = {
     "/api/openapi.json",
 }
 
-# And every socket. `/ws/daemon` will belong here when task 8 writes it -- it
-# authenticates with a pairing token, not a session -- and naming it here is
-# what makes that a decision rather than an omission. `/ws/ui` never will.
-OPEN_SOCKETS: set[str] = set()
+# And every socket. `/ws/daemon` is here because it authenticates with a pairing
+# token or the daemon key issued in its place -- credentials a rack holds and the
+# admin's browser does not -- so `require_session` would refuse every Pi in the
+# building. Naming it here is what makes that a decision rather than an omission,
+# and `test_a_daemon_socket_still_refuses_a_stranger` below is what stops the
+# entry from becoming a way in. `/ws/ui` never belongs here.
+OPEN_SOCKETS = {"/ws/daemon"}
 
 
 def app_and_client(tmp_path) -> tuple[FastAPI, TestClient]:
@@ -335,6 +338,27 @@ def test_every_socket_is_guarded_too(tmp_path):
     setup_password(client)
 
     assert unguarded_sockets(client, app) == set()
+
+
+def test_a_daemon_socket_still_refuses_a_stranger(tmp_path):
+    """What being on the open list does and does not buy.
+
+    It opens: a socket with no session is accepted rather than denied at the
+    handshake, because the credential travels in the first message. It is then
+    refused there instead, and this is the test that says the exemption is about
+    *where* the check happens rather than whether there is one.
+    """
+    app, client = app_and_client(tmp_path)
+    setup_password(client)
+
+    with client.websocket_connect("/ws/daemon") as socket:
+        socket.send_text(
+            '{"type": "hello", "token": "", "hostname": "pi-rack", "daemon_version": "0.1.0"}'
+        )
+        with pytest.raises(WebSocketDisconnect) as closed:
+            socket.receive_text()
+
+    assert closed.value.code == 4401
 
 
 def test_the_sweep_sees_a_socket_at_all(tmp_path):
