@@ -21,6 +21,7 @@ from ors_server.link.ws_daemon import (
     CLOSE_UNSERVABLE,
     _authenticate,
     _handle,
+    _serve,
     _Session,
     daemon_socket,
 )
@@ -964,6 +965,35 @@ async def test_cancelling_a_handler_leaves_no_reader_behind_either(tmp_path):
         await handler
 
     assert running_tasks() <= before
+
+
+async def test_serve_cleans_up_the_tasks_it_made_without_help_from_its_caller(tmp_path):
+    """The waiter, which from outside looks like it cleans itself up.
+
+    It does, today, and by accident: the handler's own `finally` drops the
+    connection, and dropping it sets the very event the waiter is blocked on. So
+    every test above passes whether or not `_serve` cancels it, and the one line
+    that does reads as decoration.
+
+    It is not decoration, it is ownership -- and the way to say so is to run
+    `_serve` without the caller whose bookkeeping is covering for it. A second
+    exit path in `daemon_socket`, or any other caller, and the cover is gone.
+    """
+    app, daemon_id, token = build(tmp_path)
+    await paired_key(app, token)
+    socket = FakeSocket(app, hang_up=False)
+    session = _Session(
+        daemon_id=daemon_id, connection=app.state.hub.register(daemon_id, nowhere), owned=set()
+    )
+    before = running_tasks()
+
+    serving = asyncio.create_task(_serve(app.state, socket, session))
+    await socket.handled()
+    serving.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await serving
+
+    assert running_tasks() <= before, "the reader, and the waiter nobody else was going to wake"
 
 
 async def nowhere(payload: str) -> None:
