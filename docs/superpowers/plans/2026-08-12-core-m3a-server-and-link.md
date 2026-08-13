@@ -2422,6 +2422,12 @@ git commit -m "feat(daemon): the link client"
 
 ### Task 10: Applying a snapshot in the daemon
 
+**Carried from task 9 — two obligations, the first with a measured deadline.**
+
+**`Supervisor.apply` must bound how long it takes, and the bound is seconds rather than tens of them.** It is called as `on_snapshot` synchronously on the link thread — the thread that reads the socket and the thread that consults the stop event — so its duration is added directly to how long a SIGTERM takes to be noticed, and it is spent out of `SHUTDOWN_BUDGET = 10.0` for the whole daemon, alongside `RECV_TIMEOUT_S = 1.0` and `CLOSE_TIMEOUT_S = 2.0`. Measured on the draft: a 3s apply delayed `join()` by the full 3s. Overrun the budget and systemd SIGKILLs before `Supervisor.stop` sleeps the panels — four panels lit until someone pulls the power; abandon the apply mid-teardown instead and it is four dark circles. The link refuses to *start* an apply once the stop event is set, which is as much as it can do; it cannot interrupt one already running. Task 10 owns the bound itself.
+
+**It must raise on a configuration it cannot serve rather than partially applying it.** A raise is a nack, which is how the person who saved the edit finds out.
+
 **Carried from task 7:**
 - **`Supervisor.apply` must be idempotent on a same-version or same-content push.** As drafted it revokes every panel, joins every worker and reopens — a full teardown and repaint of the rack. That is what turns a redundant push into a visible rack-wide flicker on every wifi blip. Belt and braces with task 9's version skip: the daemon should not apply it, and applying it should not be destructive either.
 - `load_cached_snapshot` must surface the version, because `Hello.config_version` reports it.
