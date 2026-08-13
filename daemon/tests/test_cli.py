@@ -166,13 +166,22 @@ def capture_firing_signals(monkeypatch: Any) -> list[tuple[int, Any]]:
     -- so a passing test spends none of its `--hold`. Only the arming: firing a
     *restore* would call whatever was there before, which is pytest's own SIGINT
     handler or `SIG_DFL`, and the latter is not callable at all.
+
+    `callable` is what enforces that, and it is not belt and braces. This patch
+    is live for the whole test, and pytest-timeout disarms its own alarm with
+    `signal.signal(SIGALRM, SIG_DFL)` -- a number this fixture has never seen,
+    so the first-time rule would let it through and call an integer. That raises
+    `TypeError` inside pytest's own teardown, which surfaces as an
+    INTERNALERROR: every real failure in the run is replaced by a traceback
+    about signals. It only happens on an already-interrupted run, which is
+    exactly when the real failures are the thing worth reading.
     """
     calls: list[tuple[int, Any]] = []
     fired: set[int] = set()
 
     def fake_signal(number: int, handler: Any) -> None:
         calls.append((number, handler))
-        if number not in fired:
+        if number not in fired and callable(handler):
             fired.add(number)
             handler(number, None)
 
