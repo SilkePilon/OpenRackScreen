@@ -66,14 +66,23 @@ addopts = "-q --import-mode=importlib"
 # and this repo has no async test that wants a different loop. It changes
 # nothing for the synchronous suite, which pytest-asyncio does not touch.
 asyncio_mode = "auto"
-# Per test, and generous: the whole suite runs in under ten seconds, so no
-# passing test comes within an order of magnitude of this. It is a backstop
-# against a hang, not a performance budget -- picking a tight number would turn
-# a loaded CI runner into a flaky one, which is the failure mode that gets a
-# deadline deleted. The default `signal` method interrupts the test where it is
-# blocked and reports a normal failure with the traceback that shows the line,
-# which is the whole point: a wedged run tells you nothing.
-timeout = 60
+# Per test. The default `signal` method interrupts the test where it is blocked
+# and reports a normal failure with the traceback that names the line, which is
+# the whole point: a wedged run tells you nothing at all.
+#
+# Ten seconds is seventeen times the slowest test in the suite -- 0.58s, and
+# argon2 by design -- so nothing reaches it by being slow on a loaded runner,
+# which is the failure mode that gets a deadline deleted. It is also twice the
+# in-test deadline `test_ws_daemon.py` sets for itself, which is the right
+# relationship: anything a test can put a `wait_for` around fails at five
+# seconds and this never sees it, so all this has to cover is the code that has
+# no deadline available to it at all.
+#
+# Not larger, because this is a *per test* budget and a change that wedges the
+# link wedges a dozen tests at once. At sixty seconds, two of the three one-line
+# edits measured against this route took the whole run past two minutes -- the
+# same useless wait as no deadline, arriving by a different road.
+timeout = 10
 
 [tool.ruff]
 line-length = 100
