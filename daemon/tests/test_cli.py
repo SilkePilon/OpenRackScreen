@@ -520,7 +520,10 @@ def test_run_installs_a_handler_for_both_signals_before_it_loops(
     RecordingSupervisor.instances.clear()
     path = write_virtual_config(tmp_path)
 
-    assert main(["run", "--config", str(path), "--status", str(tmp_path / "status.json")]) == 0
+    argv = ["run", "--config", str(path), "--status", str(tmp_path / "status.json")]
+    # `--link` is pinned rather than left at its default, so this test says the
+    # same thing on a Pi that really is paired as it does on a build machine.
+    assert main([*argv, "--link", str(tmp_path / "link.json")]) == 0
     supervisor = RecordingSupervisor.instances[-1]
     assert supervisor.ran == 1
     assert supervisor.handlers_when_run == {signal.SIGTERM, signal.SIGINT}
@@ -538,7 +541,7 @@ def test_run_writes_its_status_where_the_unit_file_expects_it_by_default(
     RecordingSupervisor.instances.clear()
     path = write_virtual_config(tmp_path)
 
-    assert main(["run", "--config", str(path)]) == 0
+    assert main(["run", "--config", str(path), "--link", str(tmp_path / "link.json")]) == 0
     supervisor = RecordingSupervisor.instances[-1]
     assert supervisor.kwargs["status_path"] == DEFAULT_STATUS_PATH
     assert len(supervisor.kwargs["screens"]) == 4

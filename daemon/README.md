@@ -64,10 +64,10 @@ for:
   If you rewire, check that first: a DC line quietly shared with a bus pin looks
   exactly like a dead panel.
 
-## The four commands
+## The five commands
 
-Every command takes `--config`. None of them needs the server, and two of them
-need no hardware at all.
+Every command except `connect` takes `--config`. Two of them need no hardware at
+all, and only `connect` and `run` have anything to do with a server.
 
 ```bash
 # Check a config without a rack: parses it, resolves every screen's template,
@@ -91,6 +91,15 @@ ors-daemon identify --config /etc/openrackscreen/rack.yaml --hold 30
 ors-daemon run --config /etc/openrackscreen/rack.yaml \
     --status /run/openrackscreen/status.json
 
+# Pair the rack with a server, using a token minted in its interface. This
+# writes the pairing and dials nothing: the token is spent by `run`, on the
+# first connect, and the server hands back a key that only the daemon can save.
+ors-daemon connect --server http://rack-server:8080 --token PASTE-TOKEN-HERE
+
+# It refuses to overwrite a pairing that already works, because the key behind
+# it cannot be recovered -- re-pairing means minting a new token.
+ors-daemon connect --server http://rack-server:8080 --token NEW-TOKEN --force
+
 # --log-level belongs to the program, not to the subcommand, so it goes BEFORE
 # it. DEBUG | INFO (default) | WARNING | ERROR | CRITICAL, one JSON object per
 # line on stderr. This is the usual thing to get wrong:
@@ -105,6 +114,23 @@ panel missing from the printed map is a panel you cannot trust the map about.
 `render` and `identify` name their output after each screen's `name`, which the
 schema does not force to be unique: two screens called `CPU` write one
 `CPU.png` between them. Give them distinct names, or read the ordinals.
+
+Once a rack is paired, the server is where its configuration comes from. `run`
+boots from the last snapshot the server pushed if it has a usable one, and from
+`--config` otherwise -- so the file is the fallback that keeps a server outage
+from darkening anything, and a rack that has never been paired runs exactly as
+it did before there was a server at all. A pushed configuration is applied to
+the running process: only the screens that actually changed are stopped and
+reopened, so a redundant push is not a rack-wide flicker.
+
+The pairing and the cached snapshot live in `/var/lib/openrackscreen`, which the
+shipped unit's `StateDirectory=` creates. `--link` moves them; the cache follows
+it unless `--cache` says otherwise.
+
+Two things `run` does *not* pick up from a push: the integrations (a poller and
+its `kubectl port-forward` cannot be replaced inside the apply's budget, and the
+daemon logs a warning naming the change) and the timezone. Both need a restart,
+which is `systemctl restart openrackscreen`.
 
 ## Run it under systemd
 

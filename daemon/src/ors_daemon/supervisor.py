@@ -21,22 +21,36 @@ number of threads is a fact about the config and systemd's patience is not.
 *The watchdog watches screen workers and nothing else.* A poller backs off up to
 60s between polls, which is longer than the watchdog's timeout: watching one
 would restart a healthy poller in the middle of its backoff.
+
+*A reconfiguration is a diff, not a restart.* `apply` is the only thing here
+that deliberately stops a panel that is working, so it stops as few as it can:
+a screen whose resolved configuration is unchanged keeps its worker, keeps its
+SPI device and does not blink. It resolves the new config before it touches the
+old one, it bounds how long it waits (`APPLY_BUDGET`), and it never leaves a
+rack that is half of each configuration.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from ors_schema.daemon import DaemonConfig, IntegrationConfig, ScreenConfig, TunnelConfig
+from ors_schema.daemon import (
+    DaemonConfig,
+    IntegrationConfig,
+    NightWindow,
+    ScreenConfig,
+    TunnelConfig,
+)
 from PIL import Image
 
 from ors_daemon.clock import Clock
-from ors_daemon.config import ResolvedScreen, config_fingerprint, system_scenes
+from ors_daemon.config import ResolvedScreen, config_fingerprint, resolve_screens, system_scenes
 from ors_daemon.displays import DisplayBackend, build_display
 from ors_daemon.integrations import UrlProvider, build_integration
 from ors_daemon.poller import Poller
@@ -107,6 +121,40 @@ one nothing: they have all been leaving since the first line of `stop`.
 """
 
 
+APPLY_BUDGET = 3.0
+"""How long `apply` may spend *waiting* for the rack it is replacing, in seconds.
+
+One deadline for the whole apply, for the reason `SHUTDOWN_BUDGET` gives: how
+many screens a snapshot holds is the server's decision, so a timeout each is
+multiplied by a number this module does not choose.
+
+Three seconds, and the number is bounded from both ends.
+
+The ceiling is a shutdown. `apply` runs synchronously as the link's
+`on_snapshot`, on the thread that reads the socket and the thread that consults
+the stop event, so every second it spends is a second a SIGTERM waits -- spent
+out of `SHUTDOWN_BUDGET`'s ten for the *whole* daemon, alongside the link's
+`RECV_TIMEOUT_S` of 1.0 and `CLOSE_TIMEOUT_S` of 2.0. Those three come to six,
+which leaves four for `stop` itself to join four workers, a poller and a tunnel
+and then sleep the panels. Measured on the draft: a three-second apply delayed
+`join()` by the full three seconds, so this is not a bound on paper. Past the
+budget systemd sends SIGKILL before `Supervisor.stop` sleeps the panels, and
+four GC9A01s stay lit until somebody pulls the power.
+
+The floor is a real reconfiguration. A worker asked to stop is parked on its own
+event or on the store and returns in milliseconds; the only thing that spends
+this is a worker wedged inside an SPI write, which is a screen already lost.
+Three seconds is enough for several of those to be given up on in turn and short
+enough that a whole rack's worth still fits.
+
+What it bounds is the waiting, and deliberately nothing else. Overrunning does
+not abandon the apply: a worker that will not stop has its lease revoked and its
+panel slept and closed anyway, and the replacement rack is opened and started in
+full. Abandoning halfway is four panels showing half of each configuration, with
+an ack that says otherwise -- which is worse than being late.
+"""
+
+
 def _deadline(budget: float, monotonic: Callable[[], float]) -> Callable[[], float]:
     """A function answering how much of `budget` is left. Never negative.
 
@@ -120,6 +168,60 @@ def _deadline(budget: float, monotonic: Callable[[], float]) -> Callable[[], flo
         return max(0.0, end - monotonic())
 
     return remaining
+
+
+def _unchanged(
+    running: ResolvedScreen,
+    pushed: ResolvedScreen,
+    running_night: NightWindow,
+    pushed_night: NightWindow,
+) -> bool:
+    """Whether a running screen and a pushed one are the same screen.
+
+    "The same" has to mean *everything a `ScreenWorker` reads*, because anything
+    it reads and this misses is an edit the server believes has landed and the
+    glass disagrees with. That is:
+
+    - `config`, which is the whole `ScreenConfig` and therefore the display
+      wiring (a different SPI device is a different panel), the rotation and
+      hflip the frame is transposed by, the position, the name, the raw params
+      and the screen's own night override. Compared as one model rather than
+      field by field, so a field added to the schema is covered by default
+      instead of silently falling out of the diff.
+    - `scenes` and `params`, which is what a *template* edit changes. The name
+      of the template is in `config`, but its contents are not: a snapshot that
+      redraws `ring-gauge` names the same template on the same screen, and
+      comparing the config alone would leave the old layout on the glass.
+    - `depends_on`, which is what decides whether a screen shows `connecting`.
+      It is derived from the scenes, the params and the *integration names*, so
+      a screen can change here without changing anything above it.
+    - the effective night window, which is the one comparison that cannot be
+      made between the two `ResolvedScreen`s alone: the rack's window lives on
+      `DaemonConfig`, and the worker takes it at construction and never re-reads
+      it. Hence the two `night` arguments -- what the running worker was built
+      with, and what the push asks for. Without it a rack told to sleep an hour
+      earlier sleeps at the old hour, and nothing anywhere says why.
+
+    What it deliberately does not cover, recorded rather than hidden:
+
+    - the integrations themselves. A screen keeps its worker when a Prometheus
+      URL moves under it, because `apply` cannot restart a poller or a tunnel
+      inside its budget -- see `apply`, which logs that case.
+    - `DaemonConfig.timezone`. The clock is built once, in `__main__`, and is
+      shared by every worker and poller; swapping it under a running rack is a
+      change to a component this class is handed rather than one it owns.
+    - anything that compares equal but behaves differently, which for a
+      `Template` means nothing today: `Scene` is a pydantic model compared by
+      value all the way down.
+    """
+    return (
+        running.config == pushed.config
+        and running.scenes == pushed.scenes
+        and running.params == pushed.params
+        and running.depends_on == pushed.depends_on
+        and (running.config.sleep_override or running_night)
+        == (pushed.config.sleep_override or pushed_night)
+    )
 
 
 def _url_of(tunnel: Tunnel) -> UrlProvider:
@@ -202,6 +304,28 @@ class _Slot:
     work. It is what makes shutdown repeatable without being repeated: `stop`
     runs more than once by design, and a panel may only be slept and closed
     once."""
+    stop: threading.Event = field(default_factory=threading.Event)
+    """What this slot's worker waits on, and what retires it.
+
+    Per slot rather than one shared by the rack, and that is the mechanism the
+    whole of `apply` rests on. A worker parks on this event -- in `run`'s loop
+    guard and in every branch of `_wait` -- so setting it releases the thread at
+    once, whether it is between two frames or eight hours into a night park. The
+    alternative, a flag the worker checks between waits, would be noticed up to
+    a whole `_NIGHT_PARK_CHUNK` later: twenty seconds against a three-second
+    budget is a join that always times out.
+
+    The supervisor's own `_stop_event` cannot serve, because it is one event for
+    the rack: setting it to retire one screen stops the other three, the poller
+    and the tunnel. `stop` therefore sets every one of these as well as that one.
+
+    It belongs to the slot and not to the worker, so a worker the watchdog has
+    abandoned is retired by the same set that retires its replacement.
+
+    Never named `_stop` anywhere it could reach a `Thread`: `threading.Thread`
+    has a real `_stop` that `join` calls, and shadowing it makes every join raise
+    `TypeError` -- invisible until SIGTERM.
+    """
 
 
 class Supervisor:
@@ -219,6 +343,7 @@ class Supervisor:
         tunnel_factory: TunnelFactory | None = None,
         watchdog_timeout: float = DEFAULT_WATCHDOG_TIMEOUT,
         shutdown_budget: float = SHUTDOWN_BUDGET,
+        apply_budget: float = APPLY_BUDGET,
         shutdown_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if watchdog_timeout <= _NIGHT_PARK_CHUNK:
@@ -239,6 +364,7 @@ class Supervisor:
         self._tunnel_factory = tunnel_factory or (lambda cfg, stop: Tunnel(config=cfg, stop=stop))
         self._watchdog_timeout = watchdog_timeout
         self._shutdown_budget = shutdown_budget
+        self._apply_budget = apply_budget
         # The only injectable clock of the two this class reads, and deliberately
         # so: the watchdog below compares against a heartbeat the *workers* stamp
         # with `time.monotonic`, and a supervisor measuring that against anything
@@ -259,6 +385,19 @@ class Supervisor:
 
         self.pollers: list[Poller] = []
         self.tunnels: list[Tunnel] = []
+
+    @property
+    def stop_event(self) -> threading.Event:
+        """What everything the supervisor does not own parks on. Read, never set.
+
+        The link thread is the caller: it has to refuse to *start* an apply once
+        a shutdown has begun -- an apply is a teardown and repaint of four panels
+        run against a supervisor that is being torn down underneath it -- and it
+        can only do that if it is watching the same event `stop` sets first.
+        Handing out a second event would mean a link that learns about a SIGTERM
+        after the panels have already been slept.
+        """
+        return self._stop_event
 
     @property
     def workers(self) -> list[ScreenWorker]:
@@ -310,6 +449,231 @@ class Supervisor:
                 return
             self._start_worker(slot)
 
+    def apply(self, config: DaemonConfig) -> None:
+        """Swap to a pushed configuration, without restarting the process.
+
+        *It is a diff, not a teardown.* A screen whose resolved configuration is
+        identical is not stopped, its panel is not closed and its glass does not
+        blink. That is the difference between a redundant push and a rack-wide
+        flicker -- and the server pushes on every connect it cannot prove is
+        redundant, so a wifi blip is a connect. It also bounds the work: a
+        one-screen edit costs one screen, against a budget measured in seconds
+        and a screen count this module does not choose.
+
+        *It resolves before it touches anything.* `resolve_screens` runs against
+        the new config alone and raises `ConfigError` on a template no screen can
+        name, while the previous configuration is still driving the panels. The
+        raise becomes a nack, which is how the person who saved the edit finds
+        out; a rack torn down first and found unservable second is four dark
+        panels and a server that believes it is fine.
+
+        *The order inside is the same order `stop` uses, and for the same
+        reason.* Nothing touches a backend while a thread that might also touch
+        it is still running, and nothing is drawn until every panel is
+        initialised:
+
+        1. retire: revoke the leases, set the retiring slots' stop events, join;
+        2. off the bus: hold every *kept* worker off its panel, blank the retired
+           panels, open the new ones -- a changed screen's SPI device cannot be
+           opened until the old one has let go of it, and a bus-mate that kept
+           drawing across a fifty-command init sequence is the M2 race arriving
+           by a different road;
+        3. start: every new worker, once every new panel is open.
+
+        The whole of it runs under `_shutdown_lock`, so a SIGTERM landing
+        midway waits for a coherent rack rather than shutting down half of one.
+        That wait is what `APPLY_BUDGET` bounds.
+
+        What it does *not* do is reconfigure the integrations: pollers and
+        tunnels keep running the set they were started with. Taking a tunnel down
+        is a `kubectl` SIGTERM-then-SIGKILL wait measured at ten seconds in M2,
+        which is the entire shutdown budget, so it does not fit here and is
+        logged loudly instead of done quietly.
+        """
+        # First, and outside the lock: nothing has moved, and nothing may.
+        replacement = resolve_screens(config)
+
+        with self._shutdown_lock:
+            if self._stopped:
+                # The link refuses to start an apply once the stop event is set,
+                # which is as much as it can do from there -- this is the same
+                # check on the other side of the handover, where a signal that
+                # landed in between is still visible.
+                raise RuntimeError("this daemon is stopping; not applying a configuration")
+
+            # The whole list, compared as models. A first pass compared the
+            # *names* as well, which reads as thoroughness and is dead code: two
+            # integration lists whose names differ are already unequal, so the
+            # extra clause could never decide anything -- and a mutation of it
+            # survived the whole suite, which is how it was found.
+            if self._config.integrations != config.integrations:
+                log.warning(
+                    "this snapshot changes the rack's integrations; "
+                    "the daemon has to be restarted before that takes effect",
+                    extra={"integrations": [item.name for item in config.integrations]},
+                )
+
+            kept, fresh, retired = self._diff(replacement, config.night)
+            self._config = config
+            self._config_fingerprint = config_fingerprint(config)
+            self._screens = replacement
+            if not fresh and not retired:
+                # Everything the workers read is already what the push asks for,
+                # so there is nothing to do at the glass. Not merely fast: no
+                # panel is closed, so nothing blinks and no SPI device changes
+                # hands. The config above is still adopted, because the
+                # fingerprint the status file reports is about the document.
+                log.info("the pushed configuration is the one already running")
+                return
+
+            remaining = _deadline(self._apply_budget, self._shutdown_clock)
+            self._retire(retired, remaining)
+            # Reassigned before the opens, not after, so `_open_panel` appends
+            # into the list a concurrent `stop` will walk. There is no instant at
+            # which a panel is open and unreachable by a shutdown.
+            self._slots = kept
+            self._unavailable = []
+            with self._off_the_bus(kept, remaining):
+                for slot in retired:
+                    slot.shut_down = True
+                    self._shut_down_panel(slot.panel.backend, slot.screen.config.name)
+                for screen in fresh:
+                    self._open_panel(screen)
+            for slot in list(self._slots):
+                if slot.worker is not None or slot.shut_down:
+                    continue
+                try:
+                    self._start_worker(slot)
+                except Exception as exc:
+                    # A Pi too short of memory to fork. `_start_worker` has
+                    # already revoked the lease, claimed the slot and blanked the
+                    # panel, so what is left is to say so where a headless rack
+                    # is read -- without this the screen simply vanishes from the
+                    # status file, and four screens with two dead ones report
+                    # what a healthy two-screen rack reports.
+                    #
+                    # Not re-raised. The rest of the rack is on the new
+                    # configuration, and a nack would have the server push the
+                    # whole thing again on every connect to fix a machine that is
+                    # out of threads.
+                    name = slot.screen.config.name
+                    log.error("screen unavailable", extra={"screen": name, "error": str(exc)})
+                    self._unavailable.append(UnavailableScreen(name=name, reason=str(exc)))
+            # Panel order, which is what `workers` and the status file promise.
+            # By identity: every slot's screen is one of the objects in
+            # `_screens`, kept slots included, because `_diff` re-points them.
+            rank = {id(screen): index for index, screen in enumerate(self._screens)}
+            self._slots.sort(key=lambda slot: rank[id(slot.screen)])
+            if remaining() <= 0.0:
+                log.error(
+                    "applying a configuration overran its budget; "
+                    "a screen would not stop, and a SIGTERM now has that much less time",
+                    extra={"budget_s": self._apply_budget},
+                )
+
+    def _diff(
+        self, replacement: list[ResolvedScreen], night: NightWindow
+    ) -> tuple[list[_Slot], list[ResolvedScreen], list[_Slot]]:
+        """Split the new screens into what is already running and what is not.
+
+        Matched by content and not by name or by position, because neither
+        identifies a screen: the schema makes `name` unique over nothing, and a
+        screen that moved position is a screen that draws somewhere else. So a
+        slot is reused only when *everything the worker reads* is equal -- see
+        `_unchanged` for the list and for what it deliberately leaves out.
+
+        A screen with no slot is a fresh one, and that includes a screen whose
+        panel failed to open on the last attempt: it is opened again here, which
+        is the only thing in the daemon that retries an open. A ribbon reseated
+        between two pushes comes back without a restart.
+        """
+        # Read before `apply` adopts the new config, which is the only moment
+        # the window the running workers were built with is still knowable.
+        running_night = self._config.night
+        unclaimed = list(self._slots)
+        kept: list[_Slot] = []
+        fresh: list[ResolvedScreen] = []
+        for screen in replacement:
+            match = next(
+                (
+                    slot
+                    for slot in unclaimed
+                    if _unchanged(slot.screen, screen, running_night, night)
+                ),
+                None,
+            )
+            if match is None:
+                fresh.append(screen)
+                continue
+            unclaimed.remove(match)
+            # Re-pointed at the new object although the two compare equal, so
+            # that the ordering below can key on identity rather than on an
+            # equality that two identical screens would both satisfy.
+            match.screen = screen
+            kept.append(match)
+        return kept, fresh, unclaimed
+
+    def _retire(self, retired: list[_Slot], remaining: Callable[[], float]) -> None:
+        """Take the retiring workers off their panels and wait for them to leave.
+
+        Leases first and all of them, before the first join: a revoked lease
+        forwards nothing, so from this line on the only thread that can reach any
+        of these panels is this one -- which is what makes it safe to blank them
+        afterwards whether or not the joins succeed.
+
+        The joins share one deadline. A worker that does not make it is logged
+        and abandoned, exactly as `stop` abandons one, because there is no way to
+        kill a Python thread and waiting longer buys nothing.
+        """
+        for slot in retired:
+            slot.panel.revoke()
+            slot.stop.set()
+        for slot in retired:
+            if slot.worker is None:
+                continue
+            slot.worker.join(remaining())
+            if slot.worker.is_alive():
+                log.warning(
+                    "a screen would not stop for a reconfigure; "
+                    "its panel is being handed over anyway",
+                    extra={"screen": slot.screen.config.name},
+                )
+
+    @contextlib.contextmanager
+    def _off_the_bus(self, kept: list[_Slot], remaining: Callable[[], float]) -> Iterator[None]:
+        """Hold every kept worker off its panel for the block.
+
+        Because the block opens panels, and panels share buses. M2 measured what
+        that costs when they interleave: one panel worked and the others came up
+        showing unconfigured RAM, non-deterministically, and the fix was to open
+        every panel before starting any worker. On a rack that is already running
+        the kept workers are the ones drawing, so the same rule needs this to
+        hold at all.
+
+        A worker that will not come off is logged and drawn past rather than
+        waited on: it is wedged inside an SPI write, which is a screen already
+        lost, and spending the rest of the budget on it would delay the panels
+        that are fine. Released in a `finally` whatever the block does, or a
+        failed open would leave three panels frozen for the life of the process.
+        """
+        held: list[ScreenWorker] = []
+        try:
+            for slot in kept:
+                worker = slot.worker
+                if worker is None:
+                    continue
+                if worker.pause(remaining()):
+                    held.append(worker)
+                else:
+                    log.warning(
+                        "a screen would not come off its panel while another is opened",
+                        extra={"screen": slot.screen.config.name},
+                    )
+            yield
+        finally:
+            for worker in held:
+                worker.resume()
+
     def tick(self) -> None:
         """One watchdog pass and one status write."""
         if self._stopped:
@@ -329,10 +693,11 @@ class Supervisor:
                     started_at=self._started_at,
                     now=self._clock(),
                     config_schema_version=self._config.version,
-                    # Computed once, at construction: the config cannot change
-                    # under a running supervisor in M2, and hashing it on every
-                    # tick would put a serialisation of the whole document on the
-                    # once-a-second path for an answer that cannot have moved.
+                    # Computed at construction and again in `apply`, which are
+                    # the only two moments the config can move: hashing it here
+                    # would put a serialisation of the whole document on the
+                    # once-a-second path for an answer that changes at most once
+                    # a push.
                     config_fingerprint=self._config_fingerprint,
                     # Every configured screen, not only the ones that came up.
                     screens=[*self.workers, *self._unavailable],
@@ -418,6 +783,20 @@ class Supervisor:
             # both read it to decide whether the rack is still coming up.
             self._stopped = True
             self._stop_event.set()
+            for slot in self._slots:
+                # A screen worker waits on an event of its slot's own, so that a
+                # reconfigure can retire one screen without stopping the rack --
+                # which means the shared event above reaches the poller and the
+                # tunnel and nothing else. Set here, before the first join, or
+                # every worker would be joined without ever having been asked to
+                # leave: the whole budget spent, and then four panels slept
+                # underneath four threads still drawing on them.
+                #
+                # Every call re-walks the list rather than remembering it, for
+                # the same reason the blanking below does: `stop` can run while
+                # `start` is still opening panels, and the slots recorded after
+                # it are reached by the next call.
+                slot.stop.set()
             # Releases every `wait_for_change`, which is where a screen worker
             # spends nearly all of its time. `ScreenWorker.run` says this is the
             # supervisor's to arrange, since the supervisor is what owns both.
@@ -539,7 +918,7 @@ class Supervisor:
         """
         slot.panel.revoke()
         panel = _Panel(slot.panel.backend)
-        worker = self._make_worker(slot.screen, panel)
+        worker = self._make_worker(slot.screen, panel, slot.stop)
         # Recorded only once it is running. `Thread.join` on a thread that was
         # never started raises, so a slot holding an unstarted worker would turn
         # a machine too short of memory to fork into a shutdown that leaves the
@@ -605,7 +984,7 @@ class Supervisor:
     def _start_worker(self, slot: _Slot) -> None:
         """Give an already-open panel the worker that draws on it."""
         name = slot.screen.config.name
-        worker = self._make_worker(slot.screen, slot.panel)
+        worker = self._make_worker(slot.screen, slot.panel, slot.stop)
         try:
             worker.start()
         except BaseException:
@@ -633,13 +1012,22 @@ class Supervisor:
             raise
         slot.worker = worker
 
-    def _make_worker(self, screen: ResolvedScreen, panel: _Panel) -> ScreenWorker:
+    def _make_worker(
+        self, screen: ResolvedScreen, panel: _Panel, stop: threading.Event
+    ) -> ScreenWorker:
+        """One worker for one panel, waiting on the event its slot owns.
+
+        Not `self._stop_event`, and that is the whole mechanism `apply` needs:
+        the shared event is one event for the rack, so setting it to retire one
+        screen would stop the other three, the poller and the tunnel. See
+        `_Slot.stop`, and note that `stop` sets both.
+        """
         return ScreenWorker(
             screen=screen,
             store=self._store,
             display=panel,
             system=system_scenes(),
             night=self._config.night,
-            stop=self._stop_event,
+            stop=stop,
             clock=self._clock,
         )

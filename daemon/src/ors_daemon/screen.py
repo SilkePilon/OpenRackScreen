@@ -111,10 +111,11 @@ class ScreenWorker(threading.Thread):
         # Serialises everything that touches the backend, for any caller that
         # arrives while this loop is mid-tick: `show` is several sequential SPI
         # commands (address window, then the frame), so two interleaved writes do
-        # not merely race for the last frame -- they corrupt both. Nothing races
-        # it today -- `identify`'s only caller is `__main__._identify`, on a
-        # worker it never starts -- and the lock is kept anyway, because it is
-        # also what makes a tick atomic against itself. Held across the render, so
+        # not merely race for the last frame -- they corrupt both. Two callers
+        # arrive from outside: `identify`, from `__main__._identify` on a worker
+        # it never starts, and `pause`, which is the supervisor taking this
+        # worker off a bus it is about to open another panel on. It is also what
+        # makes a tick atomic against itself. Held across the render, so
         # the counters and `current_scene` a status report reads always describe
         # the frame that is actually on the glass. Not an `RLock`: nothing here
         # re-enters, and a plain lock keeps that provable.
@@ -143,6 +144,16 @@ class ScreenWorker(threading.Thread):
         Monotonic, unlike everything else here, because it answers "is this
         thread still turning" -- a question an NTP step must not be able to
         answer for it, in either direction.
+        """
+        self.held_off = False
+        """Whether something outside this worker is holding it off its panel.
+
+        Set by `pause` and cleared by `resume`, and published rather than kept
+        private because "who is holding this lock" is not a question a lock can
+        answer. The supervisor is the only caller and reads it back nowhere; it
+        exists so that the property *can* be observed, since the alternative --
+        a test that infers it from a wait that does not finish -- proves nothing
+        about a lock that was simply busy.
         """
 
     def tick(self) -> None:
@@ -218,6 +229,42 @@ class ScreenWorker(threading.Thread):
             scene = self._system["identify"]
             context = RenderContext(data={"params": {"ordinal": ordinal}})
             self._show(render_scene(scene, context), "identify")
+
+    def pause(self, timeout: float) -> bool:
+        """Keep this worker off its panel until `resume`. True if it took.
+
+        For the supervisor, and for one situation: it is about to open a panel
+        that shares an SPI bus with this one. Opening a GC9A01 is a hardware
+        reset and a fifty-command init sequence over that shared wire, and a
+        worker drawing across it corrupts the init -- the other panel comes up
+        showing unconfigured RAM, non-deterministically, depending on which of
+        them the scheduler favoured. On a rack coming up, ordering all the opens
+        before all the starts is enough, because nothing is drawing yet; on a
+        rack being *reconfigured*, the panels that are staying are drawing
+        throughout, and this is the only thing that stops them.
+
+        It takes the tick lock, so it waits out a `show` that is already on the
+        wire rather than interrupting it -- which is the whole point: the window
+        it closes is the one where two threads are on the bus at once.
+
+        Bounded, and the answer is returned rather than raised, because it can
+        legitimately fail: a worker wedged inside an SPI write never gives its
+        panel up, and an apply that waited for one would spend its entire budget
+        on a screen that is already lost. The caller proceeds and logs.
+
+        Not re-entrant, deliberately: `self._lock` is a plain `Lock`, so a second
+        `pause` answers False rather than double-counting a hold that one
+        `resume` would then release.
+        """
+        taken = self._lock.acquire(timeout=max(0.0, timeout))
+        if taken:
+            self.held_off = True
+        return taken
+
+    def resume(self) -> None:
+        """Give the panel back. Only ever called after a `pause` that returned True."""
+        self.held_off = False
+        self._lock.release()
 
     def run(self) -> None:
         """Draw until stopped. Nothing gets out of here.

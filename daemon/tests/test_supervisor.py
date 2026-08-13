@@ -8,13 +8,13 @@ from typing import Any
 
 import pytest
 from ors_daemon.clock import FakeClock
-from ors_daemon.config import resolve_screens
+from ors_daemon.config import ConfigError, resolve_screens
 from ors_daemon.displays import DisplayError
 from ors_daemon.screen import _NIGHT_PARK_CHUNK as NIGHT_PARK_CHUNK
 from ors_daemon.screen import ScreenWorker
 from ors_daemon.snapshot import SnapshotStore
 from ors_daemon.supervisor import _MAX_RESTARTS as MAX_RESTARTS
-from ors_daemon.supervisor import SHUTDOWN_BUDGET, Supervisor, _Panel, _Slot
+from ors_daemon.supervisor import APPLY_BUDGET, SHUTDOWN_BUDGET, Supervisor, _Panel, _Slot
 from ors_schema.daemon import DaemonConfig, NightWindow, ScreenConfig
 from PIL import Image
 
@@ -1029,5 +1029,762 @@ def test_no_worker_starts_until_every_panel_is_initialised(
 
         assert len(opens) == 4 and len(starts) == 4
         assert max(opens) < min(starts), f"a worker started mid-bring-up: {events}"
+    finally:
+        supervisor.stop()
+
+
+# --- applying a pushed snapshot ---------------------------------------------
+#
+# The one code path in this daemon that deliberately stops a panel that is
+# working. Every test below is the same question from a different side: what did
+# it touch that it did not have to?
+
+
+class TracedDisplay(RecordingDisplay):
+    """A recording panel that writes into a rack-wide timeline as well.
+
+    The timeline is what the ordering assertions read. Which panel was closed
+    before which other one was opened is the whole question an apply has to
+    answer on a bus whose devices are exclusive, and a per-panel record cannot
+    express it.
+    """
+
+    def __init__(self, events: list[str], name: str) -> None:
+        super().__init__()
+        self._events = events
+        self._name = name
+        events.append(f"open:{name}")
+
+    def sleep(self) -> None:
+        self._events.append(f"sleep:{self._name}")
+        super().sleep()
+
+    def close(self) -> None:
+        self._events.append(f"close:{self._name}")
+        super().close()
+
+
+class Rack:
+    """A supervisor over virtual panels that records every one it opens.
+
+    `opens` is a list rather than a dict keyed by name, because the question
+    every test below asks is whether a *second* panel was opened for a screen
+    whose name did not change -- which a dict would answer by overwriting the
+    first one and losing the evidence.
+    """
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        screens: int = 2,
+        on_open: Callable[[str], None] | None = None,
+        night: dict[str, Any] | None = None,
+        each_screen: dict[str, Any] | None = None,
+        shutdown_budget: float = SHUTDOWN_BUDGET,
+        apply_budget: float = APPLY_BUDGET,
+    ) -> None:
+        self.events: list[str] = []
+        self.opens: list[tuple[str, TracedDisplay]] = []
+        self.on_open = on_open
+        self.raw = config_dict(tmp_path, screens)
+        if night is not None:
+            self.raw["night"] = night
+        if each_screen is not None:
+            self.raw["screens"] = [{**screen, **each_screen} for screen in self.raw["screens"]]
+        config = DaemonConfig.model_validate(self.raw)
+        self.supervisor = Supervisor(
+            config=config,
+            screens=resolve_screens(config),
+            store=SnapshotStore(),
+            clock=FakeClock(NIGHT if night else NOW),
+            status_path=tmp_path / "status.json",
+            display_factory=self._open,
+            poller_factory=lambda integration_config, url_provider: None,
+            shutdown_budget=shutdown_budget,
+            apply_budget=apply_budget,
+        )
+
+    def _open(self, screen_config: ScreenConfig, name: str) -> TracedDisplay:
+        display = TracedDisplay(self.events, name)
+        self.opens.append((name, display))
+        if self.on_open is not None:
+            self.on_open(name)
+        return display
+
+    def panels(self, name: str) -> list[TracedDisplay]:
+        return [display for opened, display in self.opens if opened == name]
+
+    def worker(self, name: str) -> ScreenWorker:
+        return next(worker for worker in self.supervisor.workers if worker.screen_name == name)
+
+
+def edited(raw: dict[str, Any], index: int = 0, **changes: Any) -> DaemonConfig:
+    """`raw` with one screen amended -- the shape of every real config edit."""
+    screens = [dict(screen) for screen in raw["screens"]]
+    screens[index] = {**screens[index], **changes}
+    return DaemonConfig.model_validate({**raw, "screens": screens})
+
+
+def with_template(raw: dict[str, Any], text: str = "hello", default: str = "d") -> DaemonConfig:
+    """`raw` with every screen on one template the config itself declares.
+
+    Which is what lets a test move a template's *body* without moving anything
+    on the screen that names it -- the case a diff over `ScreenConfig` alone
+    cannot see, and the one M3b's template editor produces on every save.
+    """
+    return DaemonConfig.model_validate(
+        {
+            **raw,
+            "templates": {
+                "house": {
+                    "name": "house",
+                    "params_schema": {"label": {"type": "string", "default": default}},
+                    "scenes": [
+                        {
+                            "name": "main",
+                            "elements": [
+                                {"type": "text", "text": text, "cx": 0.5, "cy": 0.5, "size": 20}
+                            ],
+                        }
+                    ],
+                }
+            },
+            "screens": [{**screen, "template": "house", "params": {}} for screen in raw["screens"]],
+        }
+    )
+
+
+def test_apply_swaps_the_running_config_and_restarts_the_screens(tmp_path: Path) -> None:
+    """A pushed snapshot reaches the glass without restarting the process."""
+    rack = Rack(tmp_path, screens=1)
+    rack.supervisor.start()
+    try:
+        before = rack.supervisor.workers[0]
+
+        rack.supervisor.apply(edited(rack.raw, name="RENAMED"))
+
+        assert [worker.screen_name for worker in rack.supervisor.workers] == ["RENAMED"]
+        assert before.is_alive() is False, "the old worker is stopped, not orphaned"
+    finally:
+        rack.supervisor.stop()
+
+
+def test_apply_leaves_the_previous_config_running_when_the_new_one_is_unusable(
+    tmp_path: Path,
+) -> None:
+    """Resolution happens against the new config alone, before anything moves.
+
+    The raise is what becomes a nack, and the nack is how the person who saved
+    the edit finds out. A rack torn down first and found unservable second is
+    four dark panels and a server that believes it is fine.
+    """
+    rack = Rack(tmp_path, screens=2)
+    rack.supervisor.start()
+    try:
+        with pytest.raises(ConfigError, match="no-such-template"):
+            rack.supervisor.apply(edited(rack.raw, template="no-such-template"))
+
+        assert [worker.screen_name for worker in rack.supervisor.workers] == ["S1", "S2"]
+        assert rack.events == ["open:S1", "open:S2"], "no panel was touched at all"
+        assert all(worker.is_alive() for worker in rack.supervisor.workers)
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_push_that_matches_what_is_running_touches_no_panel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The reason this is a diff and not a teardown.
+
+    The server pushes on every connect it cannot prove is redundant, and a wifi
+    blip is a connect. As drafted, each one revoked every panel, joined every
+    worker and reopened the lot -- a rack-wide flicker for a configuration that
+    had not changed. This test fails if a single panel is closed and reopened,
+    and it fails if a running worker is so much as held off its panel.
+    """
+    rack = Rack(tmp_path, screens=4)
+    rack.supervisor.start()
+    held: list[str] = []
+    paused = ScreenWorker.pause
+
+    def pause(self: ScreenWorker, timeout: float) -> bool:
+        held.append(self.screen_name)
+        return paused(self, timeout)
+
+    monkeypatch.setattr(ScreenWorker, "pause", pause)
+    try:
+        before = list(rack.supervisor.workers)
+
+        with caplog.at_level("INFO"):
+            rack.supervisor.apply(DaemonConfig.model_validate(rack.raw))
+
+        assert rack.events == ["open:S1", "open:S2", "open:S3", "open:S4"]
+        assert rack.supervisor.workers == before, "the same threads are still drawing"
+        assert all(worker.is_alive() for worker in before)
+        assert all(display.sleeps == 0 for _, display in rack.opens)
+        assert all(display.closed == 0 for _, display in rack.opens)
+        assert held == [], "a redundant push interrupted a worker that had nothing to change"
+        assert any("already running" in record.getMessage() for record in caplog.records)
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_rack_pushed_to_over_and_over_holds_one_racks_worth_of_state(tmp_path: Path) -> None:
+    """The new configuration replaces the old one; it does not accumulate beside it.
+
+    A daemon is pushed to on every connect the server cannot prove is redundant,
+    for months at a time, and it runs on a Pi 3B+ with 1 GiB shared with the GPU.
+    An `apply` that appended rather than replaced would hold a `ResolvedScreen`
+    -- its bound params and every scene of its template -- for each screen of
+    each push, forever, and nothing else here reads that list often enough to
+    notice. It is a leak that only shows up as a rack that dies in the night
+    weeks after the change that caused it.
+    """
+    rack = Rack(tmp_path, screens=2)
+    rack.supervisor.start()
+    try:
+        for index in range(20):
+            rack.supervisor.apply(edited(rack.raw, name=f"S{index}"))
+
+        assert len(rack.supervisor._screens) == 2
+        assert len(rack.supervisor._slots) == 2
+        assert len(rack.supervisor.workers) == 2
+    finally:
+        rack.supervisor.stop()
+
+
+def test_apply_leaves_alone_every_screen_the_edit_did_not_name(tmp_path: Path) -> None:
+    """A one-screen edit costs one screen, which is what bounds the work as well
+    as what keeps three panels from blinking for a change to the fourth."""
+    rack = Rack(tmp_path, screens=4)
+    rack.supervisor.start()
+    try:
+        untouched = [rack.worker(name) for name in ("S1", "S2", "S4")]
+
+        rack.supervisor.apply(edited(rack.raw, index=2, name="RENAMED"))
+
+        assert [worker.screen_name for worker in rack.supervisor.workers] == [
+            "S1",
+            "S2",
+            "RENAMED",
+            "S4",
+        ], "and the panels keep their order"
+        assert [rack.worker(name) for name in ("S1", "S2", "S4")] == untouched
+        for name in ("S1", "S2", "S4"):
+            display = rack.panels(name)[0]
+            assert display.sleeps == 0 and display.closed == 0, name
+        assert len(rack.panels("S3")) == 1, "the changed screen's panel is not reopened as S3"
+    finally:
+        rack.supervisor.stop()
+
+
+@pytest.mark.parametrize(
+    ("what", "change"),
+    [
+        ("its name", {"name": "RENAMED"}),
+        ("its parameters", {"params": {"title": "S1", "value": "{{prom.cpu}}", "big": "0"}}),
+        ("its template", {"template": "text-only", "params": {"big": "hi"}}),
+        ("its rotation", {"rotation": 180}),
+        ("its mirroring", {"hflip": True}),
+        ("its position", {"position": 9}),
+        ("its own night window", {"sleep_override": {"start": "01:00", "end": "02:00"}}),
+        ("which panel it drives", {"display": {"backend": "virtual", "out_dir": "/tmp/elsewhere"}}),
+    ],
+)
+def test_a_screen_is_restarted_when_anything_that_changes_what_it_draws_changes(
+    tmp_path: Path, what: str, change: dict[str, Any]
+) -> None:
+    """The diff has to cover everything the worker reads, not just the name.
+
+    Each of these is invisible from the screen's name and each one changes what
+    lands on the glass or where it lands -- a rotation the panel is not bolted
+    at, a parameter bound to a different query, a different SPI device
+    altogether. A comparison that missed any of them would leave the old worker
+    drawing the old thing while the server believed the edit had taken.
+    """
+    rack = Rack(tmp_path, screens=2)
+    rack.supervisor.start()
+    try:
+        before = rack.worker("S1")
+        kept = rack.worker("S2")
+
+        rack.supervisor.apply(edited(rack.raw, **change))
+
+        assert before.is_alive() is False, f"a change to {what} did not restart the screen"
+        assert len(rack.opens) == 3, f"a change to {what} did not reopen the panel"
+        assert kept.is_alive() is True, "and its bus-mate was left alone"
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_screen_is_restarted_when_the_racks_night_window_moves(tmp_path: Path) -> None:
+    """The one comparison that cannot be made between two screens alone.
+
+    A worker takes the night window at construction and never re-reads it, and
+    the rack's window lives on `DaemonConfig` rather than on the screen -- so
+    every `ScreenConfig` in a snapshot that moves lights-out an hour earlier is
+    byte-identical to the one running. Without this the rack goes on sleeping at
+    the old hour, and there is nothing in the config, the status file or the log
+    that disagrees with it.
+    """
+    rack = Rack(tmp_path, screens=2)
+    rack.supervisor.start()
+    try:
+        before = list(rack.supervisor.workers)
+
+        rack.supervisor.apply(
+            DaemonConfig.model_validate(
+                {**rack.raw, "night": {"enabled": True, "start": "22:00", "end": "06:00"}}
+            )
+        )
+
+        assert [worker.is_alive() for worker in before] == [False, False]
+        assert len(rack.opens) == 4, "both panels were handed to workers that know the new window"
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_screen_with_its_own_night_window_is_left_alone_when_the_racks_moves(
+    tmp_path: Path,
+) -> None:
+    """The other side of the same comparison: what is compared is the window the
+    screen *effectively* runs on, so one that overrides the rack's is untouched
+    by a change to it -- a lights-out NAS panel that never sleeps does not blink
+    because somebody moved the rack's evening."""
+    rack = Rack(
+        tmp_path,
+        screens=1,
+        each_screen={"sleep_override": {"enabled": False, "start": "01:00", "end": "02:00"}},
+    )
+    rack.supervisor.start()
+    try:
+        before = list(rack.supervisor.workers)
+        opened = len(rack.opens)
+
+        rack.supervisor.apply(
+            DaemonConfig.model_validate(
+                {**rack.raw, "night": {"enabled": True, "start": "22:00", "end": "06:00"}}
+            )
+        )
+
+        assert [worker.is_alive() for worker in before] == [True]
+        assert len(rack.opens) == opened, "its panel was not touched"
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_screen_is_restarted_when_its_templates_scenes_change(tmp_path: Path) -> None:
+    """The case a diff over `ScreenConfig` alone cannot see, and the one M3b's
+    template editor produces on every save: the screen names the same template,
+    with the same parameters, and the template now draws something else. Without
+    this the old layout stays on the glass and the server is told it landed."""
+    rack = Rack(tmp_path, screens=2)
+    rack.supervisor.start()
+    try:
+        rack.supervisor.apply(with_template(rack.raw, text="before"))
+        drawing = rack.worker("S1")
+        opened = len(rack.opens)
+
+        rack.supervisor.apply(with_template(rack.raw, text="after"))
+
+        assert drawing.is_alive() is False
+        assert len(rack.opens) == opened + 2, "both screens draw that template"
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_screen_is_restarted_when_its_templates_parameter_defaults_change(
+    tmp_path: Path,
+) -> None:
+    """Same template, same scenes, and a different value bound into them.
+
+    `bind_params` is where a template's declared default meets a screen's own
+    overrides, and a screen that overrides nothing takes the default whole. It is
+    resolved once, at load, and handed to the worker -- so a default edited on
+    the server is a number on the glass that never changes.
+    """
+    rack = Rack(tmp_path, screens=1)
+    rack.supervisor.start()
+    try:
+        rack.supervisor.apply(with_template(rack.raw, default="before"))
+        drawing = rack.worker("S1")
+        opened = len(rack.opens)
+
+        rack.supervisor.apply(with_template(rack.raw, default="after"))
+
+        assert drawing.is_alive() is False
+        assert len(rack.opens) == opened + 1
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_screen_is_restarted_when_the_integration_it_depends_on_is_renamed(
+    tmp_path: Path,
+) -> None:
+    """`depends_on` is what decides whether a screen shows `connecting`, and it
+    is derived from the integration *names*. Rename one and the screen's bindings
+    resolve against nothing -- but the worker holds the old set, so it goes on
+    gating its scenes on a source that no longer exists."""
+    rack = Rack(tmp_path, screens=1)
+    rack.supervisor.start()
+    try:
+        before = rack.supervisor.workers[0]
+        assert before._screen.depends_on == frozenset({"prom"})
+        renamed = {
+            **rack.raw,
+            "integrations": [{**rack.raw["integrations"][0], "name": "metrics"}],
+        }
+
+        rack.supervisor.apply(DaemonConfig.model_validate(renamed))
+
+        assert before.is_alive() is False
+        assert rack.supervisor.workers[0]._screen.depends_on == frozenset()
+    finally:
+        rack.supervisor.stop()
+
+
+def test_apply_closes_a_retired_panel_before_it_opens_its_replacement(tmp_path: Path) -> None:
+    """SPI devices are exclusive: `/dev/spidev0.0` cannot be opened twice.
+
+    So a changed screen's panel has to be given up before the replacement can
+    take it, and an apply that opened first would fail on the hardware while
+    passing against any backend that does not mind.
+    """
+    rack = Rack(tmp_path, screens=2)
+    rack.supervisor.start()
+    try:
+        rack.supervisor.apply(edited(rack.raw, name="RENAMED"))
+
+        assert rack.events == ["open:S1", "open:S2", "sleep:S1", "close:S1", "open:RENAMED"]
+    finally:
+        rack.supervisor.stop()
+
+
+def test_apply_opens_every_panel_before_it_starts_any_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two-phase rule M2 paid for, kept on a rack that is already running.
+
+    A Pi 3 carries two chip selects on SPI0 and two more on SPI1, and opening a
+    GC9A01 is a hardware reset and a fifty-command init sequence over that shared
+    wire. A worker that begins drawing while its bus-mate is still initialising
+    tramples the init: the other panel comes up showing unconfigured RAM, and
+    which one loses depends on the order they were started in. The script this
+    daemon replaces said it out loud -- "Init displays one at a time (GPIO race
+    prevention)".
+    """
+    rack = Rack(tmp_path, screens=4)
+    rack.supervisor.start()
+    started = ScreenWorker.start
+    events: list[str] = []
+
+    def start(self: ScreenWorker) -> None:
+        events.append(f"start:{self.screen_name}")
+        started(self)
+
+    try:
+        rack.on_open = lambda name: events.append(f"open:{name}")
+        monkeypatch.setattr(ScreenWorker, "start", start)
+        raw = {
+            **rack.raw,
+            "screens": [
+                {**screen, "name": f"N{n}"} for n, screen in enumerate(rack.raw["screens"])
+            ],
+        }
+
+        rack.supervisor.apply(DaemonConfig.model_validate(raw))
+
+        opens = [index for index, event in enumerate(events) if event.startswith("open:")]
+        starts = [index for index, event in enumerate(events) if event.startswith("start:")]
+        assert len(opens) == 4 and len(starts) == 4
+        assert max(opens) < min(starts), f"a worker started mid-bring-up: {events}"
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_kept_worker_is_held_off_its_panel_while_another_is_opened(tmp_path: Path) -> None:
+    """The other half of the two-phase rule, and the half only an apply needs.
+
+    On a rack coming up there is nothing drawing yet, so ordering the opens
+    before the starts is enough. On a rack that is *running*, the panel being
+    initialised has a bus-mate whose worker is drawing right now -- the same
+    interleaving, arriving by a different road. So the kept workers are held off
+    their panels for exactly as long as the opens take.
+    """
+    rack = Rack(tmp_path, screens=2)
+    rack.supervisor.start()
+    held: list[bool] = []
+    try:
+        kept = rack.worker("S2")
+        rack.on_open = lambda name: held.append(kept.held_off)
+
+        rack.supervisor.apply(edited(rack.raw, name="RENAMED"))
+
+        assert held == [True], "a panel was initialised while a bus-mate could still draw"
+        assert kept.held_off is False, "and it is given its panel back afterwards"
+    finally:
+        rack.supervisor.stop()
+
+
+def test_pause_says_whether_it_took_the_panel(tmp_path: Path) -> None:
+    """It can fail, and the caller has to be able to tell. A worker wedged inside
+    an SPI write never gives its panel up, and an apply that waited for one
+    would spend its whole budget on a screen that is already lost."""
+    config = DaemonConfig.model_validate(config_dict(tmp_path, screens=1))
+    worker = ScreenWorker(
+        screen=resolve_screens(config)[0],
+        store=SnapshotStore(),
+        display=RecordingDisplay(),
+        system={},
+        night=NightWindow(enabled=False),
+        stop=threading.Event(),
+        clock=FakeClock(NOW),
+    )
+
+    assert worker.pause(0.0) is True
+    assert worker.held_off is True
+    assert worker.pause(0.0) is False, "a second hold must not claim a panel it did not take"
+    worker.resume()
+    assert worker.held_off is False
+    assert worker.pause(0.0) is True
+    worker.resume()
+
+
+def test_apply_stops_only_the_worker_whose_screen_changed(tmp_path: Path) -> None:
+    """Which is why a worker cannot wait on the supervisor's shared stop event:
+    setting that one stops the whole rack, and there is no reconfiguration for
+    which that is the right answer."""
+    rack = Rack(tmp_path, screens=3)
+    rack.supervisor.start()
+    try:
+        retired = rack.worker("S2")
+        kept = [rack.worker("S1"), rack.worker("S3")]
+
+        rack.supervisor.apply(edited(rack.raw, index=1, name="RENAMED"))
+        retired.join(WAIT)
+
+        assert retired.is_alive() is False
+        assert all(worker.is_alive() for worker in kept)
+        assert rack.supervisor._stop_event.is_set() is False, "and the rack is not shutting down"
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_retired_worker_can_no_longer_reach_its_panel(tmp_path: Path) -> None:
+    """It may be wedged, and a wedged thread cannot be killed. What can be taken
+    away is its lease -- otherwise the replacement and the abandoned one are two
+    threads writing one SPI device, which corrupts both frames rather than
+    racing for the last one."""
+    rack = Rack(tmp_path, screens=1)
+    rack.supervisor.start()
+    try:
+        panel = rack.supervisor.workers[0]._display
+
+        rack.supervisor.apply(edited(rack.raw, name="RENAMED"))
+
+        assert panel.live is False
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_worker_that_will_not_stop_loses_its_panel_anyway(tmp_path: Path) -> None:
+    """The case the lease exists for, and the one a healthy rack hides.
+
+    A worker that leaves gives its own lease up on the way out, so revoking is
+    invisible until the worker does *not* leave -- which is exactly when it
+    matters, because the replacement is about to start writing to the device it
+    is still holding. Here the join is given nothing and the thread is a fiction
+    that never ends, which is what a screen wedged inside an SPI write is.
+    """
+    clock = FakeMonotonic()
+    supervisor, _ = wedged_rack(tmp_path, clock, screens=1, tunnels=0, pollers=0)
+    panel = supervisor._slots[0].panel
+
+    supervisor.apply(edited(config_dict(tmp_path, screens=1), name="RENAMED"))
+    try:
+        assert panel.live is False
+        assert supervisor._slots[0].panel is not panel, "and the replacement has its own lease"
+    finally:
+        supervisor.stop()
+
+
+def test_stop_stops_a_worker_parked_for_the_night(tmp_path: Path) -> None:
+    """A screen worker now waits on an event of its slot's own, so that a
+    reconfigure can retire one without stopping the rack. `stop` therefore has to
+    set every one of them.
+
+    Proved on a *sleeping* rack, which is the only place it shows. Awake, a
+    worker parks on the snapshot store and `stop` closes that, so it leaves
+    whether or not it was asked to. Asleep it parks on its stop event in
+    `_NIGHT_PARK_CHUNK` chunks -- twenty seconds at a time, which nothing else
+    interrupts -- so a shutdown that set only the supervisor's event would spend
+    its whole budget joining four threads that had never been told to leave, and
+    then sleep the panels underneath them.
+    """
+    parked = threading.Event()
+    rack = Rack(
+        tmp_path,
+        screens=1,
+        night={"enabled": True, "start": "23:00", "end": "07:00"},
+        shutdown_budget=0.5,
+    )
+    # Armed as the panel is opened, not after `start` returns: the worker is
+    # already asleep by then on a fast machine, and the handshake would wait for
+    # an event that had fired before anything was listening.
+    rack.on_open = lambda name: setattr(rack.opens[-1][1], "on_sleep", parked.set)
+    rack.supervisor.start()
+    worker = rack.supervisor.workers[0]
+    assert parked.wait(WAIT), "the worker never reached its night park"
+
+    rack.supervisor.stop()
+
+    worker.join(WAIT)
+    assert worker.is_alive() is False
+
+
+def test_apply_refuses_a_snapshot_once_the_daemon_is_stopping(tmp_path: Path) -> None:
+    """Both endings are dark panels: overrun `SHUTDOWN_BUDGET` and systemd
+    SIGKILLs before the panels are slept, or abandon the apply and leave the rack
+    halfway through a repaint. Refusing is a nack, and the next connect gets the
+    push again."""
+    rack = Rack(tmp_path, screens=1)
+    rack.supervisor.start()
+    rack.supervisor.stop()
+
+    with pytest.raises(RuntimeError, match="stopping"):
+        rack.supervisor.apply(edited(rack.raw, name="RENAMED"))
+
+    assert len(rack.opens) == 1, "no panel was opened by a daemon on its way out"
+    assert rack.opens[0][1].closed == 1
+
+
+def test_apply_retries_a_panel_that_would_not_open_before(tmp_path: Path) -> None:
+    """A ribbon reseated between two pushes is the case, and the status file is
+    where the failure was reported. Nothing else in the daemon retries an open."""
+    config = DaemonConfig.model_validate(config_dict(tmp_path, screens=2))
+    opened: list[str] = []
+    broken = {"S1"}
+
+    def display_factory(screen_config: ScreenConfig, name: str) -> RecordingDisplay:
+        if name in broken:
+            raise DisplayError(f"cannot open SPI for {name}")
+        opened.append(name)
+        return RecordingDisplay()
+
+    supervisor = Supervisor(
+        config=config,
+        screens=resolve_screens(config),
+        store=SnapshotStore(),
+        clock=FakeClock(NOW),
+        status_path=tmp_path / "status.json",
+        display_factory=display_factory,
+        poller_factory=lambda integration_config, url_provider: None,
+    )
+    supervisor.start()
+    try:
+        assert opened == ["S2"]
+        broken.clear()
+
+        supervisor.apply(config)
+
+        assert opened == ["S2", "S1"]
+        assert sorted(worker.screen_name for worker in supervisor.workers) == ["S1", "S2"]
+        assert supervisor._unavailable == [], "and it is no longer reported unavailable"
+    finally:
+        supervisor.stop()
+
+
+def test_apply_reports_the_new_configs_fingerprint(tmp_path: Path) -> None:
+    """The one number the server uses to decide whether the Pi is running what it
+    pushed. Computed once at construction in M2 because the config could not
+    change under a running supervisor; it can now."""
+    rack = Rack(tmp_path, screens=1)
+    rack.supervisor.start()
+    try:
+        supervisor = rack.supervisor
+        supervisor.tick()
+        before = json.loads((tmp_path / "status.json").read_text())["config_fingerprint"]
+
+        supervisor.apply(edited(rack.raw, name="RENAMED"))
+        supervisor.tick()
+
+        after = json.loads((tmp_path / "status.json").read_text())
+        assert after["config_fingerprint"] != before
+        assert [screen["name"] for screen in after["screens"]] == ["RENAMED"]
+    finally:
+        rack.supervisor.stop()
+
+
+def test_apply_says_out_loud_that_it_cannot_reconfigure_an_integration(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """It does not restart pollers or tunnels, and a rack whose snapshot names a
+    different Prometheus would otherwise poll the old one forever with nothing
+    anywhere saying why. Taking a tunnel down is a `kubectl` SIGTERM-then-SIGKILL
+    wait measured at ten seconds in M2, which is the whole shutdown budget -- so
+    it is out of scope here, and loud instead of quiet."""
+    rack = Rack(tmp_path, screens=1)
+    rack.supervisor.start()
+    try:
+        moved = {
+            **rack.raw,
+            "integrations": [{**rack.raw["integrations"][0], "url": "http://elsewhere:9090"}],
+        }
+
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="ors_daemon.supervisor"):
+            rack.supervisor.apply(DaemonConfig.model_validate(moved))
+
+        assert [record.getMessage() for record in caplog.records] == [
+            "this snapshot changes the rack's integrations; "
+            "the daemon has to be restarted before that takes effect"
+        ]
+    finally:
+        rack.supervisor.stop()
+
+
+def test_apply_is_bounded_by_one_deadline_however_many_screens_changed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """It runs on the link thread -- the thread that reads the socket and the one
+    that consults the stop event -- so every second it spends is a second a
+    SIGTERM waits, out of ten for the whole daemon. A timeout *each* would be
+    multiplied by a number this module does not choose: how many screens a
+    snapshot holds is the server's decision, and four wedged workers at three
+    seconds apiece is a shutdown systemd SIGKILLs. So there is one deadline, and
+    sixteen screens cost what four do.
+
+    What the deadline bounds is the *waiting*, and nothing else. A worker that
+    will not stop has its lease revoked and its panel slept and closed anyway,
+    and the replacement rack is brought up in full -- because the one thing an
+    apply may not leave behind is a rack that is half of each configuration.
+    """
+    clock = FakeMonotonic()
+    supervisor, displays = wedged_rack(tmp_path, clock, screens=4, tunnels=0, pollers=0)
+    retired = [slot.worker for slot in supervisor._slots]
+    raw = config_dict(tmp_path, screens=4)
+    replacement = DaemonConfig.model_validate(
+        {**raw, "screens": [{**screen, "name": f"N{n}"} for n, screen in enumerate(raw["screens"])]}
+    )
+    started = clock.now
+
+    try:
+        with caplog.at_level("ERROR"):
+            supervisor.apply(replacement)
+
+        assert clock.now - started <= APPLY_BUDGET
+        granted = [timeout for worker in retired for timeout in worker.granted]  # type: ignore[union-attr]
+        assert granted[0] == APPLY_BUDGET, "the first wedged worker may spend the lot"
+        assert granted[-1] == 0.0, "and the last is given nothing, not three seconds more"
+        assert all(display.calls == ["sleep", "close"] for display in displays), (
+            "and every retired panel is blanked regardless"
+        )
+        assert sorted(worker.screen_name for worker in supervisor.workers) == [
+            "N0",
+            "N1",
+            "N2",
+            "N3",
+        ], "and the pushed configuration is fully on the rack, not half of it"
+        assert any("budget" in record.getMessage() for record in caplog.records)
     finally:
         supervisor.stop()

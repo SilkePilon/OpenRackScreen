@@ -1,9 +1,18 @@
-"""The daemon's front door: `run`, `validate`, `render`, `identify`.
+"""The daemon's front door: `run`, `connect`, `validate`, `render`, `identify`.
 
-Four commands, one config path, and a deliberate split down the middle of them:
+Five commands, one config path, and a deliberate split down the middle of them:
 `validate` and `render` touch no hardware at all, so they are what a person runs
 on a laptop before a config ever reaches the Pi; `run` and `identify` open
-panels, so they are what runs in front of the rack.
+panels, so they are what runs in front of the rack. `connect` touches neither --
+it writes the pairing a later `run` dials with.
+
+*Where a running rack's configuration comes from.* `run` boots from the last
+snapshot the server pushed if there is a usable one, and from the local file
+otherwise -- in that order, because the server is the source of truth once a
+rack is paired and the file is the fallback that keeps a server outage from
+darkening anything. Neither being usable is the one case with no good answer:
+there is nothing to draw and no panel is open yet, so it is a message and a
+non-zero exit rather than a traceback or a rack that pretends.
 
 *`render` goes through the renderer, not through a backend.* It is the reason
 the shipped `examples/rack.yaml` -- four GC9A01 panels on two SPI buses -- can
@@ -40,11 +49,20 @@ from ors_daemon.clock import Clock, ClockError, system_clock
 from ors_daemon.config import (
     ConfigError,
     ResolvedScreen,
+    load_cached_snapshot,
     load_config,
     resolve_screens,
     system_scenes,
 )
 from ors_daemon.displays import DisplayBackend, build_display
+from ors_daemon.link import (
+    LinkClient,
+    LinkError,
+    LinkSettings,
+    load_link_settings,
+    websocket_url,
+    write_link_settings,
+)
 from ors_daemon.logging import setup_logging
 from ors_daemon.screen import ScreenWorker
 from ors_daemon.snapshot import SnapshotStore
@@ -60,6 +78,21 @@ is where it belongs on the Pi: `RuntimeDirectory=` creates that directory owned
 by the daemon's own user on every start, and clears it on stop. The default is
 `/tmp` because that is the one path a person running the daemon by hand from a
 checkout can always write to.
+"""
+
+DEFAULT_LINK_PATH = Path("/var/lib/openrackscreen/link.json")
+"""Where the pairing lives when nothing says otherwise.
+
+Not beside `--config`, and the difference matters: the config file is a document
+an operator edits and copies around, and this one holds the credential that
+grants a server the right to reconfigure this rack and draw on its panels. It
+belongs in the daemon's own state directory -- `StateDirectory=` in the shipped
+unit, which systemd creates 0700 owned by the daemon's user -- and it is written
+0600 on top of that.
+
+The snapshot cache sits beside it by default, for the same reason and one more:
+the pair are rewritten together when a daemon pairs, and a rename is only atomic
+within one filesystem.
 """
 
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -90,6 +123,28 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_STATUS_PATH,
         help=f"where to write the status file (default: {DEFAULT_STATUS_PATH})",
     )
+    run.add_argument(
+        "--link",
+        type=Path,
+        default=DEFAULT_LINK_PATH,
+        help=f"the pairing written by `connect` (default: {DEFAULT_LINK_PATH}). "
+        "Absent means this rack runs from its config file and dials nothing.",
+    )
+
+    connect = subparsers.add_parser("connect", help="pair this rack with a server")
+    connect.add_argument("--server", required=True, help="the server's URL, e.g. http://rack:8080")
+    connect.add_argument("--token", required=True, help="a pairing token minted in the interface")
+    connect.add_argument("--link", type=Path, default=DEFAULT_LINK_PATH, help="where to write it")
+    connect.add_argument(
+        "--cache",
+        type=Path,
+        help="where to keep the pushed snapshot (default: snapshot.json beside --link)",
+    )
+    connect.add_argument(
+        "--force",
+        action="store_true",
+        help="replace an existing pairing. The key it holds cannot be recovered afterwards.",
+    )
 
     subparsers.add_parser("validate", help="check the config and say what it describes")
 
@@ -109,10 +164,15 @@ def _parser() -> argparse.ArgumentParser:
         help="seconds to hold the ordinals on the glass (default: until interrupted)",
     )
 
-    # Added last and to every subparser, so `--config` reads the same wherever
-    # it appears rather than being positional in one command and not another.
-    for sub in subparsers.choices.values():
-        sub.add_argument("--config", required=True, type=Path, help="path to rack.yaml")
+    # Added last and to every subparser that has a config to read, so `--config`
+    # reads the same wherever it appears rather than being positional in one
+    # command and not another. `connect` is the exception and deliberately so:
+    # pairing happens before a rack has a configuration, and afterwards the
+    # configuration comes from the server -- requiring it here would make the
+    # first thing an operator runs the one thing they cannot yet supply.
+    for name, sub in subparsers.choices.items():
+        if name != "connect":
+            sub.add_argument("--config", required=True, type=Path, help="path to rack.yaml")
     return parser
 
 
@@ -136,6 +196,15 @@ def main(argv: list[str] | None = None) -> int:
 
     setup_logging(args.log_level)
 
+    # Both before the config is read, and for opposite reasons: `connect` has no
+    # config to read, and `run` decides for itself what its configuration is --
+    # a pushed snapshot outranks the file, and neither being readable is a
+    # different answer from the one below.
+    if args.command == "connect":
+        return _connect(args)
+    if args.command == "run":
+        return _run(args)
+
     try:
         config = load_config(args.config)
         screens = resolve_screens(config)
@@ -153,31 +222,223 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "render":
         return _render(screens, args.out, args.data)
-    if args.command == "identify":
-        return _identify(screens, config, clock, args.hold)
     # The parser's `choices` is what makes this exhaustive; the assert is how
-    # that reaches a reader, and how a fifth subcommand added without a branch
+    # that reaches a reader, and how a sixth subcommand added without a branch
     # here fails loudly instead of quietly driving the rack.
-    assert args.command == "run"
-    return _run(config, screens, clock, args.status)
+    assert args.command == "identify"
+    return _identify(screens, config, clock, args.hold)
 
 
-def _run(
-    config: DaemonConfig, screens: list[ResolvedScreen], clock: Clock, status_path: Path
-) -> int:
-    """Drive the rack until a signal arrives."""
+def _connect(args: argparse.Namespace) -> int:
+    """Write the pairing a later `run` dials with. Opens no socket.
+
+    Deliberately offline. The token is spent on the first connect, by the
+    daemon, and a `connect` that dialled would spend it here -- leaving the
+    server holding a key this command would then have to write, and a failure
+    anywhere in between unrecoverable without minting a new token. Writing the
+    file is the whole job; `LinkClient` does the rest and persists what comes
+    back.
+
+    Three things are refused rather than written, because each of them is a
+    failure that would otherwise only show up as a daemon dialling nothing once
+    a backoff, forever, with the reason in its own log:
+
+    *A URL nothing can dial.* `--server rack:8080` names no host, which is the
+    typo M2's tunnel already had to learn to reject.
+
+    *An existing pairing, without `--force`.* The file holds the key the server
+    minted, the server keeps only its fingerprint, and there is no recovery
+    short of minting a new token in the interface. Judged on whether one can be
+    *loaded*, not on whether the path exists: a corrupt file holds no working
+    key, and refusing over one would leave a rack unpairable for the sake of
+    protecting nothing.
+
+    *A path that cannot be written.* Silently carrying on would report a rack as
+    paired when the next boot has nothing.
+
+    `--force` clears the cached snapshot as well, and that is the same decision
+    `LinkClient._paired` makes rather than an extra one: the cache holds a
+    configuration from the server this rack is being pointed away from, and a
+    reboot between here and the first successful connect would boot from it and
+    claim its version.
+    """
+    try:
+        websocket_url(args.server)
+    except LinkError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    path = Path(args.link)
+    if load_link_settings(path) is not None and not args.force:
+        print(
+            f"{path}: this rack is already paired with a server. "
+            "Pass --force to replace that pairing; the key it holds cannot be recovered.",
+            file=sys.stderr,
+        )
+        return 1
+
+    cache = Path(args.cache) if args.cache else path.with_name("snapshot.json")
+    try:
+        cache.unlink(missing_ok=True)
+        write_link_settings(
+            path, LinkSettings(server_url=args.server, cache_path=cache, token=args.token)
+        )
+    except (OSError, ValueError) as exc:
+        print(f"cannot write {path}: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"paired with {args.server}; the pairing is in {path}")
+    return 0
+
+
+def _run(args: argparse.Namespace) -> int:
+    """Drive the rack until a signal arrives, taking configuration as it comes.
+
+    The link is started before the loop, because the loop does not return until
+    the daemon is stopping, and it is handed `supervisor.stop_event` rather than
+    one of its own so that a SIGTERM stops it from *beginning* an apply.
+
+    A link that will not start is logged and stepped over. That is the rule the
+    whole module works under -- no failure of the server, of the socket or of the
+    network may darken the rack -- and a Pi too short of memory to fork one more
+    thread is exactly such a failure: the configuration is already loaded and
+    perfectly servable.
+    """
+    # Read once and handed on, so the pairing that decides where the cache is
+    # and the pairing the link dials with cannot be two different readings of a
+    # file somebody is editing.
+    settings = load_link_settings(args.link)
+    booted = _boot(args, settings)
+    if booted is None:
+        return 1
+    config, screens, clock, version = booted
+
     supervisor = Supervisor(
         config=config,
         screens=screens,
         store=SnapshotStore(),
         clock=clock,
-        status_path=status_path,
+        status_path=args.status,
     )
     _install_signal_handlers(supervisor.stop)
-    # `run_forever` shuts down from its own `finally`, including when `start`
-    # fails partway -- so there is nothing to unwind here.
-    supervisor.run_forever()
+    link = _link(args, settings, supervisor, clock, version)
+    try:
+        # `run_forever` shuts down from its own `finally`, including when `start`
+        # fails partway -- so there is nothing to unwind here.
+        supervisor.run_forever()
+    finally:
+        if link is not None:
+            # The event it parks on is already set: `stop` sets it first, and
+            # `run_forever` calls `stop` whatever happens. So this is a wait for
+            # a thread that is leaving, not a request that it should.
+            link.join(LINK_JOIN_TIMEOUT)
+            if link.is_alive():
+                # It is a daemon thread, so the process still exits. Said out
+                # loud because the only way to get here is the failure the link's
+                # own send watchdog exists for.
+                log.warning("the link thread did not stop; leaving it to the process exit")
     return 0
+
+
+LINK_JOIN_TIMEOUT = 3.0
+"""How long `run` waits for the link thread once the rack is down, in seconds.
+
+Out of the same ten seconds `Supervisor.SHUTDOWN_BUDGET` divides, and spent
+after it: the panels are already slept and closed by the time this runs, so what
+it protects is only the process exiting before `TimeoutStopSec`. Three is above
+the link's `RECV_TIMEOUT_S` of one -- which is how long the receive loop can be
+mid-`recv` when the event is set -- with room for a `close()` handshake bounded
+at two, and it is a daemon thread either way.
+"""
+
+
+def _link(
+    args: argparse.Namespace,
+    settings: LinkSettings | None,
+    supervisor: Supervisor,
+    clock: Clock,
+    version: int | None,
+) -> LinkClient | None:
+    """The link to the server, if this rack has ever been paired. Raises nothing.
+
+    `config_version` is what the rack is *running*, which only this function
+    knows: `_boot` returns it as None whenever the cache was not what the panels
+    were brought up from, and reading the number out of the file here would claim
+    a configuration that is not on the glass. Claiming it wrongly in the
+    optimistic direction is a push the server skips and a rack left showing the
+    previous configuration forever.
+    """
+    if settings is None:
+        log.info(
+            "this rack has no pairing; running from its config file", extra={"path": str(args.link)}
+        )
+        return None
+    try:
+        client = LinkClient(
+            settings=settings,
+            settings_path=Path(args.link),
+            on_snapshot=lambda snapshot, pushed: supervisor.apply(snapshot),
+            stop=supervisor.stop_event,
+            clock=clock,
+            config_version=version,
+        )
+        client.start()
+    except Exception:
+        log.exception("could not start the link; this rack runs from what it already has")
+        return None
+    return client
+
+
+def _boot(
+    args: argparse.Namespace, settings: LinkSettings | None
+) -> tuple[DaemonConfig, list[ResolvedScreen], Clock, int | None] | None:
+    """What to put on the panels, and which version of it this rack is running.
+
+    The cache first. It is the last thing the server pushed, so it is what the
+    rack was showing when it was last powered down, and preferring the local file
+    would mean every reboot during a server outage silently reverted the rack to
+    a document somebody edited months ago.
+
+    "Usable" means resolved and clocked, not merely validated: a snapshot naming
+    a template this build does not ship validates perfectly and then resolves to
+    nothing, and one naming a timezone the host cannot resolve is one the daemon
+    refuses to start on. Both fall back to the file, because a fallback is what
+    the file is for.
+
+    Falling back returns a version of None -- see `_link`.
+
+    Neither being usable is the one case with no good answer. Nothing has been
+    opened, so there is nothing to darken and nothing to keep alive; both reasons
+    go to stderr, where `journalctl` will have them after a `systemctl start`
+    that did not take, and the exit code is what makes the unit's `Restart=`
+    keep trying. What must not happen is a traceback.
+    """
+    cache = (
+        Path(settings.cache_path)
+        if settings is not None
+        else Path(args.link).with_name("snapshot.json")
+    )
+
+    cached = load_cached_snapshot(cache)
+    if cached is not None:
+        config, version = cached
+        try:
+            return config, resolve_screens(config), system_clock(config.timezone), version
+        except (ConfigError, ClockError) as exc:
+            log.error(
+                "the cached snapshot cannot be served; falling back to the config file",
+                extra={"path": str(cache), "error": str(exc)},
+            )
+            cache_error = f"{cache}: {exc}"
+    else:
+        cache_error = f"{cache}: no usable cached snapshot"
+
+    try:
+        config = load_config(args.config)
+        return config, resolve_screens(config), system_clock(config.timezone), None
+    except (ConfigError, ClockError) as exc:
+        print(f"nothing to run: {cache_error}; {exc}", file=sys.stderr)
+        return None
 
 
 def _install_signal_handlers(stop: Callable[[], None]) -> bool:

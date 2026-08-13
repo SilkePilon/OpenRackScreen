@@ -6,6 +6,10 @@ Three products, all decided once at startup rather than per frame:
 - each enabled screen's template scenes and bound parameters, in panel order;
 - each screen's *dependencies* -- which integrations it needs before it can show
   anything real, which is what drives the worker's two-stage scene selection.
+
+Plus one thing that is not from the YAML at all: `load_cached_snapshot` reads
+the last configuration the server pushed, which is what a rack boots from when
+the server is unreachable. Same model, same resolution, different source.
 """
 
 from __future__ import annotations
@@ -92,6 +96,51 @@ def load_config(path: Path) -> DaemonConfig:
         return DaemonConfig.model_validate(parsed)
     except ValidationError as exc:
         raise ConfigError(f"{path}: {first_error(exc)}") from exc
+
+
+def load_cached_snapshot(path: Path) -> tuple[DaemonConfig, int] | None:
+    """The last snapshot the server pushed, and its version. None if unusable.
+
+    A daemon boots from this when the server is unreachable, which is the whole
+    reason a server outage does not darken the rack. The version comes back
+    alongside the configuration because `Hello.config_version` reports it, and
+    reporting it is what lets the server skip a push that would otherwise be a
+    teardown and repaint of four panels on every reconnect.
+
+    *Anything unreadable is treated as absent rather than fatal, and the promise
+    is load-bearing.* This is read at startup, before a single panel is open, so
+    a loader that raised would turn a truncated file into four dark panels and a
+    traceback. Task 9's `load_link_settings` promised exactly this in its
+    docstring and raised on three shapes of corrupt file, which is the mistake
+    not to repeat -- so the guard is written against what a *file* can be, not
+    against what the schema can reject:
+
+    - `OSError`: absent, a directory, unreadable.
+    - `json.JSONDecodeError`: a half-written file, which is what a power cut in
+      the middle of `_write_cache` leaves behind on a filesystem without atomic
+      renames.
+    - `UnicodeDecodeError` (a `ValueError`): bytes rather than characters, which
+      is the same power cut on a filesystem that zero-fills.
+    - `TypeError`: a top-level array, string or number -- none of which can be
+      subscripted by a key -- and a `version` that is a list.
+    - `ValueError`: a `version` that is a string `int` will not take.
+    - `KeyError`: either key missing.
+    - `ValidationError`: a snapshot the schema refuses.
+
+    The warning is deliberate. An ignored cache is a rack that quietly falls
+    back to its local file and draws the configuration somebody edited months
+    ago, which from the front of the rack looks exactly like a working one.
+    """
+    path = Path(path)
+    try:
+        raw = json.loads(path.read_text())
+        return DaemonConfig.model_validate(raw["snapshot"]), int(raw["version"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError, ValidationError) as exc:
+        log.warning(
+            "ignoring an unusable snapshot cache; this rack boots from its config file",
+            extra={"path": str(path), "error": f"{type(exc).__name__}: {exc}"},
+        )
+        return None
 
 
 _FINGERPRINT_CHARS = 12
