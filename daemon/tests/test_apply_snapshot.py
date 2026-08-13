@@ -203,6 +203,38 @@ def test_a_cache_that_cannot_be_read_is_no_cache_rather_than_a_crash(
     assert load_cached_snapshot(cache) is None, what
 
 
+@pytest.mark.parametrize(
+    ("what", "written"),
+    [
+        ("a version past what a float can hold", '{"version": 1e400, "snapshot": {}}'),
+        ("a version that is JSON's own infinity", '{"version": Infinity, "snapshot": {}}'),
+        ("a document nested deeper than the parser's stack", "[" * 20_000 + "]" * 20_000),
+    ],
+    # Named, or the third case puts forty kilobytes of brackets in the test id.
+    ids=["1e400", "Infinity", "20k nested arrays"],
+)
+def test_a_cache_no_narrow_guard_could_have_named_is_no_cache(
+    tmp_path: Path, what: str, written: str
+) -> None:
+    """The third time this class of bug has shipped in this milestone.
+
+    `1e400` and `Infinity` both parse to a float `int()` refuses with
+    `OverflowError`, which is an `ArithmeticError`; twenty thousand nested arrays
+    exhaust the parser's stack with `RecursionError`, which is a `RuntimeError`.
+    Neither is in any list of "what a corrupt file looks like" written from
+    experience, and both escaped `_boot`, `_run` and `main` -- which under the
+    shipped unit's `Restart=always` and `StartLimitIntervalSec=0` is a
+    five-second restart loop with four dark circles.
+
+    This is why the guard is broad: the file is untrusted input on the boot path,
+    and nothing in it is worth killing the daemon over.
+    """
+    cache = tmp_path / "snapshot.json"
+    cache.write_text(written)
+
+    assert load_cached_snapshot(cache) is None, what
+
+
 def test_a_cache_that_is_not_text_at_all_is_no_cache(tmp_path: Path) -> None:
     """A truncated write on a Pi that lost power leaves bytes, not characters.
 

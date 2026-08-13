@@ -110,22 +110,25 @@ def load_cached_snapshot(path: Path) -> tuple[DaemonConfig, int] | None:
     *Anything unreadable is treated as absent rather than fatal, and the promise
     is load-bearing.* This is read at startup, before a single panel is open, so
     a loader that raised would turn a truncated file into four dark panels and a
-    traceback. Task 9's `load_link_settings` promised exactly this in its
-    docstring and raised on three shapes of corrupt file, which is the mistake
-    not to repeat -- so the guard is written against what a *file* can be, not
-    against what the schema can reject:
+    traceback -- and under the shipped unit's `Restart=always` and
+    `StartLimitIntervalSec=0`, into a five-second restart loop that re-runs the
+    GC9A01 init sequence on four panels for as long as the file survives.
 
-    - `OSError`: absent, a directory, unreadable.
-    - `json.JSONDecodeError`: a half-written file, which is what a power cut in
-      the middle of `_write_cache` leaves behind on a filesystem without atomic
-      renames.
-    - `UnicodeDecodeError` (a `ValueError`): bytes rather than characters, which
-      is the same power cut on a filesystem that zero-fills.
-    - `TypeError`: a top-level array, string or number -- none of which can be
-      subscripted by a key -- and a `version` that is a list.
-    - `ValueError`: a `version` that is a string `int` will not take.
-    - `KeyError`: either key missing.
-    - `ValidationError`: a snapshot the schema refuses.
+    *So the guard is `Exception`, deliberately, and the breadth is the point.*
+    Three narrower ones have shipped in this milestone and each was found by
+    someone holding a file the list did not name. The first listed `OSError` and
+    `JSONDecodeError`; then `TypeError`, `ValueError`, `KeyError` and
+    `ValidationError` were added for a top-level array, a `version` of "abc", a
+    missing key and a snapshot the schema refuses. That list was written against
+    what a *file* can be rather than against what the schema can reject, which
+    was the right idea and still missed two shapes a real file takes:
+    `{"version": 1e400}` and `{"version": Infinity}` both parse to a float
+    `int()` answers with `OverflowError` (an `ArithmeticError`), and twenty
+    thousand nested arrays exhaust the parser's stack with `RecursionError` (a
+    `RuntimeError`). Neither is exotic and neither is in any list anyone would
+    write from memory -- which is the argument: this is untrusted input on the
+    boot path, and *nothing* it can do is worth the rack going dark. A narrower
+    guard buys a diagnosis nobody wants at the cost of the panels.
 
     The warning is deliberate. An ignored cache is a rack that quietly falls
     back to its local file and draws the configuration somebody edited months
@@ -135,7 +138,7 @@ def load_cached_snapshot(path: Path) -> tuple[DaemonConfig, int] | None:
     try:
         raw = json.loads(path.read_text())
         return DaemonConfig.model_validate(raw["snapshot"]), int(raw["version"])
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError, ValidationError) as exc:
+    except Exception as exc:
         log.warning(
             "ignoring an unusable snapshot cache; this rack boots from its config file",
             extra={"path": str(path), "error": f"{type(exc).__name__}: {exc}"},
