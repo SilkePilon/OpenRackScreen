@@ -188,7 +188,7 @@ Every route and both sockets require the session cookie. A `/ws/ui` that skipped
 Vite + React + TypeScript + Tailwind + shadcn/ui, installed and extended **only** through the official CLI. The shell is the `sidebar-04` block: floating sidebar, collapsible to icons. Types are generated from the server's OpenAPI schema, not hand-maintained. Data via TanStack Query; live updates over one `/ws/ui` connection.
 
 - **Daemons** — pair, status, per-daemon events, key rotation.
-- **Screens** — the approved layout: a horizontal rack of round live panels as the canvas, a tabbed inspector on the right (Config / Data / Sleep), and the add-screen wizard with **identify**, which paints an ordinal on the glass so a physical panel can be mapped to a config line.
+- **Screens** — the approved layout: a horizontal rack of round live panels as the canvas, a tabbed inspector on the right (Config / Data / Sleep), and the add-screen wizard with **identify**, which paints an ordinal on the glass so a physical panel can be mapped to a config line. Live panels arrive **before** the mount correction — the daemon streams the rendered frame, not the copy it transposes by `rotation` and `hflip` — so the browser shows a panel the same way up as a person standing at the rack sees it, and the interface must not rotate it again. `rotation` describes how a panel is bolted in (all four in `examples/rack.yaml` are `270`), which is a fact about the rack's carpentry and not about the picture.
 - **Templates** — list, assign, detach. Not the visual editor, which is phase 2.
 - **Integrations** — add and configure a Prometheus integration, edit its fields, and **Test**, which dry-runs every field and shows live values.
 - **Settings** — admin password, timezone, global night window.
