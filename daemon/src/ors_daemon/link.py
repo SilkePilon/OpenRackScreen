@@ -317,11 +317,28 @@ def load_link_settings(path: Path) -> LinkSettings | None:
     half-written file or a hand-edited one looks like, and treating it as one
     would have the daemon open a socket it can only be refused on, once per
     backoff, forever.
+
+    *"There is no pairing" and "there is one I cannot read" are the same answer
+    and different news.* Only the first is ordinary: an unpaired rack is the M2
+    rack, and it runs from its config file exactly as it always did. The second
+    is `sudo ors-daemon connect` -- which writes the file root-owned and 0600
+    while the daemon runs as `User=openrackscreen` under the shipped unit, so
+    every read of it raises `PermissionError`. Reported as absence, that is a
+    rack which silently runs unpaired for ever behind one INFO line saying it
+    was never paired, which is the one thing the person who just ran `connect`
+    knows to be false. So a file that exists and cannot be turned into a pairing
+    is an ERROR naming the path, and only `FileNotFoundError` is quiet.
     """
     path = Path(path)
     try:
         raw = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        log.error(
+            "this rack has a pairing file it cannot read; it is running unpaired",
+            extra={"path": str(path), "error": f"{type(exc).__name__}: {exc}"},
+        )
         return None
     if not isinstance(raw, dict) or not raw.get("server_url"):
         log.warning("link settings name no server; ignoring them", extra={"path": str(path)})

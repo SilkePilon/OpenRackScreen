@@ -1478,6 +1478,47 @@ def test_an_unreadable_settings_file_means_an_unpaired_daemon(tmp_path: Path) ->
     assert load_link_settings(path) is None
 
 
+def test_a_pairing_this_user_cannot_open_is_said_out_loud(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`sudo ors-daemon connect` is how a rack unpairs itself silently.
+
+    The file lands root-owned and 0600, the daemon runs as `User=openrackscreen`,
+    and every read of it is a `PermissionError`. Answering that with the same
+    silent None as "there is no pairing" leaves the rack running unpaired for
+    ever behind one INFO line saying it was never paired -- which is the one
+    thing the person who just ran `connect` knows to be false. A file that is
+    *there* and cannot be read is a different fact, and it is reported as one.
+    """
+    path = tmp_path / "link.json"
+    path.write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    def refuse(self: Path, *args: object, **kwargs: object) -> str:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "read_text", refuse)
+    with caplog.at_level(logging.ERROR):
+        assert load_link_settings(path) is None
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "this rack has a pairing file it cannot read; it is running unpaired"
+    ]
+    assert "PermissionError" in caplog.records[0].error
+
+
+def test_no_pairing_at_all_is_not_an_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A rack that has never been paired is the M2 rack, and it is not a fault.
+
+    The distinction only says anything if the ordinary case stays quiet.
+    """
+    with caplog.at_level(logging.WARNING):
+        assert load_link_settings(tmp_path / "absent.json") is None
+
+    assert caplog.records == []
+
+
 def test_settings_whose_fields_are_the_wrong_shape_are_no_pairing(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

@@ -34,6 +34,7 @@ import argparse
 import contextlib
 import json
 import logging
+import os
 import signal
 import sys
 import threading
@@ -229,6 +230,28 @@ def main(argv: list[str] | None = None) -> int:
     return _identify(screens, config, clock, args.hold)
 
 
+def _cache_beside(link: Path) -> Path | None:
+    """Where the snapshot cache lives when `--cache` names nothing. None if nowhere.
+
+    Beside the pairing, because the two are rewritten together when a daemon
+    pairs and a rename is only atomic within one filesystem.
+
+    None rather than a raise, and this function exists for that one word.
+    `--link /`, `--link .` and `--link ""` are paths with no filename, so there
+    is no name to put `snapshot.json` beside and `Path.with_name` says so with
+    `ValueError` -- not `OSError`, which is what every guard around a path is
+    written for. That is exactly M2's `--status /`, which the ledger records as
+    an infinite restart loop: `Supervisor.tick` and `LinkClient._write_cache`
+    both defend against it by name, and the two derivations here did not. The
+    callers differ on what to do about it -- `connect` refuses, `run` boots from
+    its config file -- and neither may traceback.
+    """
+    try:
+        return link.with_name("snapshot.json")
+    except ValueError:
+        return None
+
+
 def _connect(args: argparse.Namespace) -> int:
     """Write the pairing a later `run` dials with. Opens no socket.
 
@@ -256,11 +279,22 @@ def _connect(args: argparse.Namespace) -> int:
     *A path that cannot be written.* Silently carrying on would report a rack as
     paired when the next boot has nothing.
 
-    `--force` clears the cached snapshot as well, and that is the same decision
-    `LinkClient._paired` makes rather than an extra one: the cache holds a
-    configuration from the server this rack is being pointed away from, and a
-    reboot between here and the first successful connect would boot from it and
-    claim its version.
+    *Every* successful connect clears the cached snapshot, `--force` or not,
+    which is the same decision `LinkClient._paired` makes rather than an extra
+    one. The docstring used to say `--force` did it, and the code was right: the
+    cache holds a configuration pushed by *some* server, and this command is what
+    decides which server this rack answers to. A reboot between here and the
+    first successful connect boots from that cache -- and `_boot` hands its
+    version to `_link`, which claims it in `Hello.config_version`, so the new
+    server can match the number, skip the push it would otherwise send, and leave
+    the rack showing the previous server's rack for ever. Deleting a cache costs
+    one boot from the config file, which is what the config file is for; keeping
+    a wrong one costs the rack.
+
+    That covers the connect allowed through *because the pairing file was
+    corrupt* as well, and deliberately: a pairing that cannot be read cannot say
+    which server the cache beside it came from, and an unanswerable question
+    about a credential is not one to answer optimistically.
     """
     try:
         websocket_url(args.server)
@@ -277,7 +311,14 @@ def _connect(args: argparse.Namespace) -> int:
         )
         return 1
 
-    cache = Path(args.cache) if args.cache else path.with_name("snapshot.json")
+    cache = Path(args.cache) if args.cache else _cache_beside(path)
+    if cache is None:
+        print(
+            f"{path}: --link has to name a file to write the pairing to, not a directory",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         cache.unlink(missing_ok=True)
         write_link_settings(
@@ -288,7 +329,34 @@ def _connect(args: argparse.Namespace) -> int:
         return 1
 
     print(f"paired with {args.server}; the pairing is in {path}")
+    _warn_if_the_daemon_will_not_be_able_to_read_it(path)
     return 0
+
+
+def _warn_if_the_daemon_will_not_be_able_to_read_it(path: Path) -> None:
+    """Say something when `connect` is run as root, because the daemon is not.
+
+    `sudo ors-daemon connect` is the natural thing to type -- the pairing lives
+    under `/var/lib/openrackscreen`, and the first instinct about a path under
+    `/var/lib` is that it needs root -- and it is the one way to unpair a rack
+    without touching it. The file lands root-owned and 0600, the shipped unit
+    runs the daemon as `User=openrackscreen`, and every read of it from there is
+    a `PermissionError`. `load_link_settings` reports that loudly on the daemon's
+    side; this is the same fact said at the moment it is created, to the person
+    who can still fix it in one command.
+
+    A note rather than a failure: this may be a rack where the daemon really does
+    run as root, and the file *has* been written correctly either way.
+    """
+    geteuid = getattr(os, "geteuid", None)  # not POSIX everywhere; the rack is
+    if geteuid is None or geteuid() != 0:
+        return
+    print(
+        f"note: {path} is owned by root. The shipped unit runs the daemon as "
+        "User=openrackscreen, which cannot read a root-owned 0600 file -- that rack would "
+        f"run unpaired. `chown openrackscreen: {path}`, or run this command as that user.",
+        file=sys.stderr,
+    )
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -413,14 +481,15 @@ def _boot(
     that did not take, and the exit code is what makes the unit's `Restart=`
     keep trying. What must not happen is a traceback.
     """
-    cache = (
-        Path(settings.cache_path)
-        if settings is not None
-        else Path(args.link).with_name("snapshot.json")
-    )
+    cache = Path(settings.cache_path) if settings is not None else _cache_beside(Path(args.link))
 
-    cached = load_cached_snapshot(cache)
-    if cached is not None:
+    cached = load_cached_snapshot(cache) if cache is not None else None
+    if cache is None:
+        # `--link /`: a pairing path with no filename, so there is no cache
+        # beside it to boot from. Not fatal -- there is a config file, and this
+        # rack is not paired either way. See `_cache_beside`.
+        cache_error = f"{args.link}: names no file, so there is no snapshot cache beside it"
+    elif cached is not None:
         config, version = cached
         try:
             return config, resolve_screens(config), system_clock(config.timezone), version

@@ -14,6 +14,7 @@ wires them, not what they do once wired.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -307,20 +308,70 @@ def test_connect_replaces_a_pairing_when_it_is_told_to(tmp_path: Path) -> None:
     assert json.loads(link.read_text())["token"] == "b"
 
 
-def test_connect_drops_the_previous_servers_cached_snapshot(tmp_path: Path) -> None:
+@pytest.mark.parametrize("force", [[], ["--force"]])
+def test_connect_drops_the_previous_servers_cached_snapshot(
+    tmp_path: Path, force: list[str]
+) -> None:
     """Otherwise the next boot draws the old server's rack and claims its version.
 
     `LinkClient._paired` clears the cache when the server answers, which covers
     the pairing that completes. This covers the window before it: between
-    `connect --force` and the first successful connect there is a reboot, and
-    the cache on disk names a configuration from a server this rack has been
-    pointed away from.
+    `connect` and the first successful connect there is a reboot, and the cache
+    on disk names a configuration from a server this rack has been pointed away
+    from. `_boot` hands that cache's *version* to `_link`, which claims it in
+    `Hello.config_version` -- so the new server can match the number, skip the
+    push, and leave the previous server's rack on the glass for ever.
+
+    Both invocations, and that is the point of the parametrisation: the docstring
+    used to say `--force` cleared the cache and the code cleared it always. The
+    code was right. A pairing file too corrupt to read is precisely a file that
+    cannot say which server the cache beside it came from, and `--force` is not
+    needed to get past one of those.
     """
     link = tmp_path / "link.json"
     cache = write_cache(tmp_path / "snapshot.json")
-    main(["connect", "--server", "http://s", "--token", "a", "--link", str(link)])
+    if force:
+        main(["connect", "--server", "http://old", "--token", "a", "--link", str(link)])
+        cache = write_cache(tmp_path / "snapshot.json")
+
+    main(["connect", "--server", "http://s", "--token", "a", "--link", str(link), *force])
 
     assert not cache.exists()
+
+
+def test_connect_run_as_root_says_the_daemon_may_not_be_able_to_read_it(
+    tmp_path: Path, capsys: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`sudo ors-daemon connect` writes a pairing the daemon's own user cannot read.
+
+    Which unpairs the rack silently: the daemon sees a `PermissionError`, runs
+    from its config file and says it was never paired. The file itself is
+    correct, so this is a note and not a failure -- said to the person who can
+    still fix it with one `chown`.
+    """
+    link = tmp_path / "link.json"
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    assert main(["connect", "--server", "http://s", "--token", "t", "--link", str(link)]) == 0
+
+    error = capsys.readouterr().err
+    assert "chown" in error
+    assert "User=openrackscreen" in error
+
+
+def test_connect_as_an_ordinary_user_says_nothing_about_ownership(
+    tmp_path: Path, capsys: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The note only says anything if the ordinary case is quiet."""
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+
+    assert (
+        main(
+            ["connect", "--server", "http://s", "--token", "t", "--link", str(tmp_path / "l.json")]
+        )
+        == 0
+    )
+    assert capsys.readouterr().err == ""
 
 
 def test_connect_refuses_a_server_url_nothing_can_dial(tmp_path: Path, capsys: Any) -> None:
@@ -349,6 +400,57 @@ def test_connect_reports_a_path_it_cannot_write_without_a_traceback(
     captured = capsys.readouterr()
     assert "Traceback" not in captured.err
     assert captured.err.strip()
+
+
+@pytest.mark.parametrize("hostile", ["/", ".", ""])
+def test_connect_refuses_a_link_path_with_no_filename_rather_than_raising(
+    capsys: Any, hostile: str
+) -> None:
+    """`--link /` is M2's `--status /` bug, byte for byte.
+
+    A path with no filename has no name to derive the cache beside, and
+    `Path.with_name` answers that with `ValueError` rather than `OSError` -- so
+    it went past every guard here and out of `main` as a traceback. `main`
+    promises a message and an exit code for anything a person can mistype.
+    """
+    assert main(["connect", "--server", "http://s", "--token", "t", "--link", hostile]) == 1
+
+    error = capsys.readouterr().err
+    assert "Traceback" not in error
+    assert hostile in error or "no file name" in error
+
+
+@pytest.mark.parametrize("hostile", ["/", ".", ""])
+def test_run_boots_from_its_config_file_when_the_link_path_has_no_filename(
+    tmp_path: Path, hostile: str
+) -> None:
+    """The same typo on the other command, where the cost is higher.
+
+    `Supervisor.tick` and `LinkClient._write_cache` each defend against this by
+    name; the cache path `run` derives did not. Under `Restart=always` that is a
+    five-second restart loop with four dark circles, over a flag that names no
+    pairing this rack was ever going to find. There is a perfectly servable
+    config file, so the rack runs from it.
+    """
+    write_config(tmp_path)
+
+    assert (
+        main(
+            [
+                "run",
+                "--config",
+                str(tmp_path / "rack.yaml"),
+                "--status",
+                str(tmp_path / "status.json"),
+                "--link",
+                hostile,
+            ]
+        )
+        == 0
+    )
+    assert [
+        screen.config.name for screen in RecordingSupervisor.instances[-1].kwargs["screens"]
+    ] == ["LOCAL"]
 
 
 def test_connect_needs_no_config_file(tmp_path: Path) -> None:
