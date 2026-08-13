@@ -10,7 +10,7 @@ import pytest
 from ors_daemon.clock import FakeClock
 from ors_daemon.config import ConfigError, resolve_screens
 from ors_daemon.displays import DisplayError
-from ors_daemon.frames import FrameStream
+from ors_daemon.frames import MAX_FPS, FrameStream
 from ors_daemon.screen import _NIGHT_PARK_CHUNK as NIGHT_PARK_CHUNK
 from ors_daemon.screen import ScreenWorker
 from ors_daemon.snapshot import SnapshotStore
@@ -62,10 +62,16 @@ class RecordingDisplay:
         self.sleeps = 0
         self.closed = 0
         self.on_sleep: Callable[[], None] | None = None
+        self.on_show: Callable[[], None] | None = None
+        """Fired once a frame has reached the glass, for a test that has to wait
+        for one. `on_sleep` cannot stand in: it fires on the way down, by which
+        time whatever was being observed has already happened or has not."""
 
     def show(self, image: Image.Image) -> None:
         self.calls.append("show")
         self.images.append(image)
+        if self.on_show is not None:
+            self.on_show()
 
     def sleep(self) -> None:
         self.calls.append("sleep")
@@ -2601,19 +2607,40 @@ class RecordingStream:
     def __init__(self) -> None:
         self.offers: list[tuple[int, Image.Image]] = []
         self.arrived = threading.Event()
+        self.retired: list[set[int]] = []
 
     def offer(self, screen_id: int, image: Image.Image) -> bool:
         self.offers.append((screen_id, image))
         self.arrived.set()
         return True
 
+    def retire(self, screen_ids: set[int]) -> None:
+        self.retired.append(set(screen_ids))
 
-def with_ids(tmp_path: Path, screens: int = 1) -> DaemonConfig:
-    """The rack's configuration as a server assembles it: every screen has a row id."""
+    def wait_for(self, screen_id: int) -> bool:
+        """True once this screen has offered a frame. Its own handshake per id.
+
+        `arrived` cannot serve after a reconfiguration: it is already set by
+        whatever the rack offered before the push, so waiting on it would return
+        instantly and prove nothing about the worker that replaced it.
+        """
+        for _ in range(int(WAIT / 0.02)):
+            if any(offered == screen_id for offered, _ in self.offers):
+                return True
+            time.sleep(0.02)
+        return False
+
+
+def raw_with_ids(tmp_path: Path, screens: int = 1) -> dict[str, Any]:
     raw = config_dict(tmp_path, screens)
     for index, screen in enumerate(raw["screens"], start=1):
         screen["id"] = index * 10
-    return DaemonConfig.model_validate(raw)
+    return raw
+
+
+def with_ids(tmp_path: Path, screens: int = 1) -> DaemonConfig:
+    """The rack's configuration as a server assembles it: every screen has a row id."""
+    return DaemonConfig.model_validate(raw_with_ids(tmp_path, screens))
 
 
 def test_a_worker_offers_its_frames_under_the_servers_screen_id(tmp_path: Path) -> None:
@@ -2633,20 +2660,138 @@ def test_a_worker_offers_its_frames_under_the_servers_screen_id(tmp_path: Path) 
 
 def test_a_screen_with_no_server_id_offers_no_frames(tmp_path: Path) -> None:
     """A hand-written config has never been through a server, so nothing on it
-    can be addressed by a browser. It still draws, which is the whole point."""
+    can be addressed by a browser. It still draws, which is the whole point.
+
+    The wait is on a frame reaching the *glass*, and it has to be: without one
+    the assertion below is that nothing was offered by a worker that may not
+    have drawn anything yet, which passes on a rack that is broken. It used to
+    build a `threading.Event`, hang it off the display after `start` had already
+    returned, and never wait on it.
+    """
     frames = RecordingStream()
     config = DaemonConfig.model_validate(config_dict(tmp_path, screens=1))
-    supervisor, store, displays = build(config, tmp_path, frames=frames)
+    drawn = threading.Event()
+    display = RecordingDisplay()
+    display.on_show = drawn.set
+    supervisor, store, displays = build(config, tmp_path, display=display, frames=frames)
     supervisor.start()
     try:
         store.put("prom", {"cpu": 42.0}, latency_ms=1.0, now=NOW)
-        drawn = threading.Event()
-        displays["S1"].on_sleep = drawn.set
+        assert drawn.wait(WAIT), "the panel never drew anything"
     finally:
         supervisor.stop()
 
     assert frames.offers == []
     assert displays["S1"].images != []
+
+
+def test_a_screen_that_cannot_be_streamed_says_so_once(tmp_path: Path, caplog) -> None:
+    """Otherwise the whole thing is silent in both of the cases that produce it.
+
+    A hand-written YAML has no ids at all, and a server too old to send them
+    produces the same document -- so the symptom is a browser panel that never
+    fills in while the daemon draws perfectly and its log says nothing whatever.
+    One line at INFO, because it is a fact about the configuration rather than a
+    fault, and once because the alternative is a line per watchdog restart.
+    """
+    frames = RecordingStream()
+    config = DaemonConfig.model_validate(config_dict(tmp_path, screens=1))
+    supervisor, _, _ = build(config, tmp_path, frames=frames)
+    with caplog.at_level("INFO"):
+        supervisor.start()
+        try:
+            supervisor._frame_handler(supervisor._screens[0])
+        finally:
+            supervisor.stop()
+
+    lines = [record for record in caplog.records if "cannot be streamed" in record.message]
+    assert len(lines) == 1
+    assert getattr(lines[0], "screen", None) == "S1"
+
+
+def test_a_screen_whose_row_id_changed_offers_frames_under_the_new_one(
+    tmp_path: Path,
+) -> None:
+    """`_unchanged` has to read `ScreenConfig.id`, and nothing else can catch it.
+
+    `_frame_handler` captures the id in a closure when the worker is built, so a
+    slot kept across a push that changed it goes on addressing frames by the old
+    number for ever. The server's `_owns` then refuses every one of them, and
+    the browser panel is permanently blank while the server's log blames the
+    daemon -- the sticky refusal task 8's fix round removed, arriving by a
+    different road.
+
+    Comparing `config.model_dump(exclude={'id'})` passes the whole suite without
+    this, which is why it is written end to end rather than against `_unchanged`:
+    what has to hold is that the *frames* move, not that a helper returns False.
+    """
+    frames = RecordingStream()
+    raw = raw_with_ids(tmp_path, screens=1)
+    supervisor, store, _ = build(DaemonConfig.model_validate(raw), tmp_path, frames=frames)
+    supervisor.start()
+    try:
+        store.put("prom", {"cpu": 42.0}, latency_ms=1.0, now=NOW)
+        assert frames.wait_for(10), "no frame was ever offered"
+
+        moved = {**raw, "screens": [{**raw["screens"][0], "id": 20}]}
+        supervisor.apply(DaemonConfig.model_validate(moved))
+        store.put("prom", {"cpu": 43.0}, latency_ms=1.0, now=NOW)
+
+        assert frames.wait_for(20), "the worker kept the id it was built with"
+    finally:
+        supervisor.stop()
+
+
+def test_a_screen_a_push_deletes_stops_being_streamed(tmp_path: Path) -> None:
+    """Nothing else clears it. The subscription is whole-daemon state that only a
+    `frames` request replaces, so a screen removed from the configuration would
+    stay in the set for the life of the connection -- and the pump would go on
+    waking for an id with no worker, no panel and no row behind it."""
+    frames = RecordingStream()
+    raw = raw_with_ids(tmp_path, screens=2)
+    supervisor, _, _ = build(DaemonConfig.model_validate(raw), tmp_path, frames=frames)
+    supervisor.start()
+    try:
+        supervisor.apply(DaemonConfig.model_validate({**raw, "screens": [raw["screens"][0]]}))
+    finally:
+        supervisor.stop()
+
+    assert frames.retired == [{20}]
+
+
+def test_deleting_a_screen_that_never_had_a_row_id_retires_nothing(tmp_path: Path) -> None:
+    """None is an absence and not a value, so there is nothing here to stop.
+
+    A screen with no id could never have been streamed, and `retire` takes a set
+    of screen ids -- handing it a None is a type this stream has no answer for
+    and, one refactor from now, an exception on the link's own thread.
+    """
+    frames = RecordingStream()
+    raw = raw_with_ids(tmp_path, screens=2)
+    raw["screens"][1].pop("id")
+    supervisor, _, _ = build(DaemonConfig.model_validate(raw), tmp_path, frames=frames)
+    supervisor.start()
+    try:
+        supervisor.apply(DaemonConfig.model_validate({**raw, "screens": [raw["screens"][0]]}))
+    finally:
+        supervisor.stop()
+
+    assert [ids for ids in frames.retired if ids] == []
+
+
+def test_a_push_that_keeps_every_screen_retires_none_of_them(tmp_path: Path) -> None:
+    """A worker rebuilt for any other reason is the same screen, still watched."""
+    frames = RecordingStream()
+    raw = raw_with_ids(tmp_path, screens=2)
+    supervisor, _, _ = build(DaemonConfig.model_validate(raw), tmp_path, frames=frames)
+    supervisor.start()
+    try:
+        renamed = {**raw, "screens": [{**raw["screens"][0], "name": "RENAMED"}, raw["screens"][1]]}
+        supervisor.apply(DaemonConfig.model_validate(renamed))
+    finally:
+        supervisor.stop()
+
+    assert [ids for ids in frames.retired if ids] == []
 
 
 def test_a_sequence_survives_the_worker_being_replaced(tmp_path: Path) -> None:
@@ -2670,6 +2815,35 @@ def test_a_sequence_survives_the_worker_being_replaced(tmp_path: Path) -> None:
         supervisor.stop()
 
     assert (first, second) == (0, 1)
+
+
+def test_the_status_file_carries_what_the_frame_stream_dropped(tmp_path: Path) -> None:
+    """The counter is on the stream and the supervisor is the only thing that can
+    see both it and the file. Without this line it is published to nobody."""
+    ticker = FakeMonotonic()
+    frames = FrameStream(fps=MAX_FPS, monotonic=ticker)
+    frames.enable({10})
+    status_path = tmp_path / "status.json"
+    supervisor, _, _ = build(with_ids(tmp_path), tmp_path, status_path=status_path, frames=frames)
+    for _ in range(4):
+        frames.offer(10, Image.new("RGB", (240, 240)))
+        ticker.advance(1.0)
+    supervisor.tick()
+
+    assert json.loads(status_path.read_text())["frames_dropped"] == 3
+
+
+def test_an_unpaired_rack_reports_no_dropped_frames_rather_than_failing_to_write(
+    tmp_path: Path,
+) -> None:
+    """There is no stream at all, and nought is the honest answer: nothing was
+    dropped because nothing was ever offered."""
+    status_path = tmp_path / "status.json"
+    supervisor, _, _ = make(tmp_path, screens=1, status_path=status_path)
+
+    supervisor.tick()
+
+    assert json.loads(status_path.read_text())["frames_dropped"] == 0
 
 
 def drain(frames: FrameStream) -> int:

@@ -82,6 +82,7 @@ def build_status(
     config_fingerprint: str,
     screens: Sequence[ScreenWorker | UnavailableScreen],
     snapshot: Snapshot,
+    frames_dropped: int = 0,
 ) -> dict[str, Any]:
     """Assemble what a person over SSH -- and later the server -- needs to see.
 
@@ -109,11 +110,23 @@ def build_status(
     where there is one, an `UnavailableScreen` where the panel would not open.
     A screen missing from this list is a screen the daemon has forgotten, not a
     screen that is broken, and the file must be able to tell those apart.
+
+    `frames_dropped` is `FrameStream.dropped`: panels replaced before anything
+    could encode them, since the daemon started. It is here because it is
+    invisible everywhere else by design -- a dropped frame is one nothing sends,
+    nothing logs and nothing counts anywhere but there -- so it is the only
+    measure of how far behind the link is running against what the rack is
+    drawing. A total rather than a rate, for the reason the counter is: a rack
+    that has been up for a month reads as one number, and whoever is watching
+    subtracts two readings if they want a rate. Nought for an unpaired rack,
+    which has no stream at all, and nought is the honest answer there -- nothing
+    was dropped because nothing was ever offered.
     """
     return {
         "uptime_s": int((now - started_at).total_seconds()),
         "config_schema_version": config_schema_version,
         "config_fingerprint": config_fingerprint,
+        "frames_dropped": frames_dropped,
         "screens": [_screen(entry) for entry in screens],
         "integrations": [
             {

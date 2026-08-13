@@ -716,21 +716,50 @@ def test_a_frames_request_from_the_server_reaches_the_stream_the_workers_offer_t
     assert handler.__self__ is frames
 
 
+def test_a_link_that_drops_stops_the_stream_it_started(
+    tmp_path: Path,
+) -> None:
+    """The other end of the same wire. A subscription arrives on a socket, so
+    the daemon may not go on encoding for one that has gone -- the server asks
+    again on every connect, which is what makes forgetting free."""
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+
+    handler = FakeLink.instances[0].kwargs["on_link_down"]
+    frames = RecordingSupervisor.instances[-1].kwargs["frames"]
+    assert handler.__self__ is frames
+    assert handler.__func__ is FrameStream.disable
+
+
 def test_the_pump_sends_what_it_encodes_down_the_link(tmp_path: Path) -> None:
+    """That `_frame_pump` wires the pump's `send` to *this* link's, driven by hand.
+
+    The pump's own thread is stopped before anything is offered, and that is the
+    fix for a race rather than a tidiness: the thread this function starts calls
+    `take()` in a loop, so a test that then calls `take()` itself is two readers
+    of a queue holding one item, and whichever loses indexes an empty list. It
+    did not reproduce in 300 repetitions, and the pump was doing nothing the
+    test needed -- what is being asked is where the frames go, not that a thread
+    can carry them, which the pump's own suite covers.
+    """
     frames = FrameStream()
     supervisor = RecordingSupervisor()
+    supervisor.stop_event.set()
     link = FakeLink()
 
     pump = _frame_pump(frames, supervisor, link)
 
     assert pump is not None
+    pump.join(5.0)
+    assert not pump.is_alive(), "the pump is still racing this test for the queue"
     try:
         frames.request(FramesRequest(enabled=True, screen_ids=[7]))
         frames.offer(7, Image.new("RGB", (240, 240), (0, 128, 255)))
         pump._one(*frames.take(1.0)[0])
     finally:
         frames.close()
-        pump.join(5.0)
     assert [message.screen_id for message in link.sent] == [7]
 
 

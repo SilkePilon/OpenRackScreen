@@ -1,3 +1,4 @@
+import contextlib
 import threading
 import time
 
@@ -11,7 +12,7 @@ from ors_daemon.frames import (
 from ors_render import load_builtin_templates, render_scene, select_scene
 from ors_render.context import RenderContext
 from ors_render.render import expand_params
-from ors_schema.link import MAX_FRAME_BYTES, Frame, FramesRequest
+from ors_schema.link import MAX_FRAME_BYTES, MAX_REQUESTED_FPS, Frame, FramesRequest
 from PIL import Image
 
 WAIT = 5.0
@@ -293,16 +294,85 @@ def test_the_rate_is_measured_on_elapsed_time_and_never_on_the_wall_clock():
 
 
 def test_a_server_cannot_ask_for_more_frames_than_the_cap():
-    """Nothing the browser does may slow the panels down."""
+    """Nothing the browser does may slow the panels down.
+
+    `MAX_REQUESTED_FPS` rather than an arbitrary large number, because the two
+    bounds are separate on purpose: the schema refuses what is not a rate at
+    all, and this cap is what a Pi will actually spend. The fastest rate the
+    wire will carry is twelve times what this daemon will do about it.
+    """
     frames, ticker = stream()
 
-    frames.request(FramesRequest(enabled=True, screen_ids=[1], fps=1_000.0))
+    frames.request(FramesRequest(enabled=True, screen_ids=[1], fps=MAX_REQUESTED_FPS))
 
     assert frames.offer(1, panel()) is True
     ticker.advance(1.0 / MAX_FPS / 2)
     assert frames.offer(1, panel()) is False
     ticker.advance(1.0 / MAX_FPS)
     assert frames.offer(1, panel()) is True
+
+
+def test_a_rate_that_is_not_a_number_produces_no_frames_rather_than_every_frame():
+    """The one value `min` and `<` both answer False to, in the wrong direction.
+
+    It cannot reach here off the wire any more -- `FramesRequest.fps` refuses a
+    NaN -- and the guard that decides how much of a Pi a browser may spend does
+    not get to depend on the peer having validated its own message. Measured
+    without it: 100 of 100 offers accepted with the clock frozen, where the cap
+    allows one, and sticky for the life of the process because nothing reset it.
+    """
+    frames, _ = stream()
+    frames.enable({1}, fps=float("nan"))
+
+    assert [frames.offer(1, panel()) for _ in range(100)].count(True) == 0
+
+
+def test_an_infinite_rate_is_the_cap_rather_than_no_rate_at_all():
+    frames, ticker = stream()
+    frames.enable({1}, fps=float("inf"))
+
+    assert frames.offer(1, panel()) is True
+    ticker.advance(1.0 / MAX_FPS / 2)
+    assert frames.offer(1, panel()) is False
+    ticker.advance(1.0 / MAX_FPS)
+    assert frames.offer(1, panel()) is True
+
+
+def test_an_enable_and_a_disable_are_not_a_way_around_the_cap():
+    """The limiter's memory may not be resettable from the far end of the socket.
+
+    `disable` used to drop `_last`, so a server alternating the two messages got
+    one frame per offer whatever `MAX_FPS` said: measured at 100 accepted out of
+    100 with the clock frozen. It is one message per round trip on an
+    authenticated socket, and each accepted offer is a WebP encode on the same
+    cores that are drawing four panels.
+    """
+    frames, _ = stream()
+    accepted = 0
+    for _ in range(100):
+        frames.enable({1})
+        if frames.offer(1, panel()):
+            accepted += 1
+        frames.disable()
+
+    assert accepted == 1, "the clock never moved; one frame was due"
+
+
+def test_changing_the_watched_set_is_not_a_way_around_the_cap_either():
+    """The same hole by the other road, and the reason the fix is not in `disable`.
+
+    Every `frames` request replaces the whole set, so a browser opening and
+    closing a second panel walks screen 1's entry out of the table and back in
+    without `disable` ever being called.
+    """
+    frames, _ = stream()
+    frames.enable({1})
+    assert frames.offer(1, panel()) is True
+
+    frames.enable({2})
+    frames.enable({1})
+
+    assert frames.offer(1, panel()) is False, "the clock never moved"
 
 
 def test_zero_frames_a_second_means_no_frames():
@@ -317,9 +387,15 @@ def test_zero_frames_a_second_means_no_frames():
 
 
 def test_a_negative_rate_means_no_frames():
+    """Driven through `enable`, because the wire refuses a negative outright.
+
+    `FramesRequest.fps` is bounded at `ge=0.0`, so this is no longer a message
+    that can be sent -- and the runtime answer is kept and pinned anyway, which
+    is the same defence in depth `_capped` applies to a NaN.
+    """
     frames, _ = stream()
 
-    frames.request(FramesRequest(enabled=True, screen_ids=[1], fps=-2.0))
+    frames.enable({1}, fps=-2.0)
 
     assert frames.offer(1, panel()) is False
 
@@ -460,12 +536,12 @@ def test_a_frame_over_the_bound_is_dropped_rather_than_sent(caplog):
 # --- what is remembered about screens that are gone -------------------------
 
 
-def test_a_screen_nobody_watches_any_more_is_forgotten():
-    """A screen id is a row id on the server, and rows are deleted and remade.
+def test_a_panel_nobody_watches_any_more_is_dropped_rather_than_held():
+    """`_pending` is the one table that goes with the subscription.
 
-    The rate limiter's memory of one is worth nothing once nobody is watching
-    it, so it goes with the set it belonged to rather than accumulating for the
-    life of a daemon that is never restarted.
+    An image held while nobody is watching is a stale panel picture if anything
+    ever sends it, and there is nothing about holding one that a later
+    subscriber would want back.
     """
     frames, _ = stream()
     frames.enable({1})
@@ -473,10 +549,28 @@ def test_a_screen_nobody_watches_any_more_is_forgotten():
 
     frames.enable({2})
 
-    assert frames._last.keys() == set()
+    assert frames.take(0.0) == []
 
 
-def test_the_sequence_table_does_not_grow_without_bound():
+def test_when_a_screen_last_sent_a_frame_survives_the_subscription_that_asked():
+    """The counterpart, and the reason the cap cannot be reset from the socket.
+
+    This used to be dropped with the subscription, which reads reasonably --
+    a screen nobody watches has no rate to limit -- and made every change to the
+    watched set a reset of the one thing enforcing `MAX_FPS`. It is bounded by
+    weight instead, exactly as `_seq` is.
+    """
+    frames, _ = stream()
+    frames.enable({1})
+    frames.offer(1, panel())
+
+    frames.enable({2})
+
+    assert frames._last.keys() == {1}
+
+
+def test_neither_of_the_tables_kept_per_screen_grows_without_bound():
+    """Both, because both are now kept across subscriptions and for the same reason."""
     frames, ticker = stream(fps=MAX_FPS)
     for screen_id in range(_MAX_TRACKED_SCREENS + 10):
         frames.enable({screen_id})
@@ -485,6 +579,60 @@ def test_the_sequence_table_does_not_grow_without_bound():
         ticker.advance(1.0)
 
     assert len(frames._seq) <= _MAX_TRACKED_SCREENS
+    assert len(frames._last) <= _MAX_TRACKED_SCREENS
+
+
+# --- screens that stop existing ---------------------------------------------
+
+
+def test_a_retired_screen_is_no_longer_streamed():
+    """`apply` deleting a screen is not a message the server's watcher sends.
+
+    Nothing else clears the id: the subscription is whole-daemon state replaced
+    only by a `frames` request, so a screen removed from a pushed configuration
+    would stay in the set for the life of the connection.
+    """
+    frames, _ = stream()
+    frames.enable({1, 2})
+
+    frames.retire({1})
+
+    assert frames.offer(1, panel()) is False
+    assert frames.offer(2, panel()) is True
+
+
+def test_retiring_a_screen_drops_the_panel_it_was_still_holding():
+    frames, _ = stream()
+    frames.enable({1})
+    frames.offer(1, panel())
+
+    frames.retire({1})
+
+    assert frames.take(0.0) == []
+
+
+def test_retiring_a_screen_leaves_the_others_watched_and_their_sequences_alone():
+    """A row id is remade, so the count may not restart under a page that is open."""
+    frames, ticker = stream(fps=MAX_FPS)
+    frames.enable({1})
+    frames.offer(1, panel())
+    assert encoded(frames)[0].seq == 0
+
+    frames.retire({1})
+    frames.enable({1})
+    ticker.advance(1.0)
+    frames.offer(1, panel())
+
+    assert encoded(frames)[0].seq == 1
+
+
+def test_retiring_nothing_changes_nothing():
+    frames, _ = stream()
+    frames.enable({1})
+
+    frames.retire(set())
+
+    assert frames.offer(1, panel()) is True
 
 
 # --- the pump ---------------------------------------------------------------
@@ -492,6 +640,27 @@ def test_the_sequence_table_does_not_grow_without_bound():
 
 def pump(frames: FrameStream, send, stop: threading.Event | None = None) -> FramePump:
     return FramePump(frames=frames, send=send, stop=stop or threading.Event(), poll=0.01)
+
+
+@contextlib.contextmanager
+def running(worker: FramePump, frames: FrameStream):
+    """Run a pump for the block, and insist that it stops afterwards.
+
+    The insisting is the point, and it is about the run rather than about any
+    one test. A pump whose `closed` guard is gone does not fail an assertion --
+    it comes straight back round, finds nothing, and spins a core -- so every
+    test that merely joined it with a timeout left a live thread behind and went
+    green. Enough of those and the whole suite is a `timeout 150` that expires,
+    which reports as an exit code rather than as a named failure. One assertion
+    here turns that into the first pump test failing by name.
+    """
+    worker.start()
+    try:
+        yield worker
+    finally:
+        frames.close()
+        worker.join(WAIT)
+        assert not worker.is_alive(), "the pump did not stop when its stream closed"
 
 
 def test_the_pump_sends_what_a_screen_offers():
@@ -505,15 +674,62 @@ def test_the_pump_sends_what_a_screen_offers():
         arrived.set()
         return True
 
-    worker = pump(frames, send)
-    worker.start()
-    try:
+    with running(pump(frames, send), frames):
         frames.offer(1, panel())
         assert arrived.wait(WAIT)
-    finally:
-        frames.close()
-        worker.join(WAIT)
     assert sent[0].screen_id == 1
+
+
+class SlowImage:
+    """An image whose encode a test holds open, and lets go of when it likes.
+
+    A real encode is 0.73ms here and 7-15ms on a Pi, which is too short to
+    observe from another thread and long enough to matter four panels at a time.
+    This makes the same interval arbitrarily long so that the question "was the
+    lock held across it" has an answer a test can read.
+    """
+
+    def __init__(self) -> None:
+        self.inside = threading.Event()
+        self.release = threading.Event()
+
+    def save(self, buffer: object, **kwargs: object) -> None:
+        self.inside.set()
+        self.release.wait(WAIT)
+        panel().save(buffer, **kwargs)  # type: ignore[arg-type]
+
+
+def test_a_worker_may_offer_a_panel_while_the_pump_is_halfway_through_an_encode():
+    """The invariant this whole module is arranged around, from the only side that can see it.
+
+    `test_offering_a_panel_encodes_nothing_on_the_calling_thread` proves the
+    weaker half -- that `offer` does not itself encode -- and that stays true
+    when the pump encodes while holding the lock `offer` takes. Moving
+    `image.save` inside `with self._condition` passed the entire suite.
+
+    What it costs is the thing the module exists to prevent: `offer` runs inside
+    a screen worker's tick lock, so a pump holding this lock across an encode
+    puts 7-15ms of Pi into every worker that offers a frame while it is busy --
+    four of them serialising behind one encoder, against ~23ms of SPI each --
+    and it is spent because somebody left a browser tab open.
+    """
+    frames, _ = stream(fps=MAX_FPS)
+    frames.enable({1, 2})
+    slow = SlowImage()
+
+    with running(pump(frames, lambda frame: True), frames):
+        try:
+            frames.offer(1, slow)
+            assert slow.inside.wait(WAIT), "the pump never reached the encode"
+
+            started = time.monotonic()
+            assert frames.offer(2, panel()) is True
+            elapsed = time.monotonic() - started
+
+            assert not slow.release.is_set(), "the encode finished before it was let go"
+            assert elapsed < PROMPT, f"a worker waited {elapsed:.3f}s on somebody else's encode"
+        finally:
+            slow.release.set()
 
 
 def test_a_send_that_will_not_return_leaves_the_render_loop_alone():
@@ -527,25 +743,22 @@ def test_a_send_that_will_not_return_leaves_the_render_loop_alone():
     frames, ticker = stream(fps=MAX_FPS)
     frames.enable({1})
     parked = ParkedSend()
-    worker = pump(frames, parked)
-    worker.start()
-    try:
-        assert frames.offer(1, panel()) is True
-        assert parked.inside.wait(WAIT), "the pump never reached the link"
+    with running(pump(frames, parked), frames):
+        try:
+            assert frames.offer(1, panel()) is True
+            assert parked.inside.wait(WAIT), "the pump never reached the link"
 
-        started = time.monotonic()
-        for _ in range(20):
-            ticker.advance(1.0)
-            frames.offer(1, panel())
-        elapsed = time.monotonic() - started
+            started = time.monotonic()
+            for _ in range(20):
+                ticker.advance(1.0)
+                frames.offer(1, panel())
+            elapsed = time.monotonic() - started
 
-        assert parked.inside.is_set() and not parked.released.is_set()
-        assert elapsed < PROMPT, f"the render loop waited on the link for {elapsed:.3f}s"
-        assert len(frames.take(0.0)) == 1, "a wedged link may not grow a queue"
-    finally:
-        parked.released.set()
-        frames.close()
-        worker.join(WAIT)
+            assert parked.inside.is_set() and not parked.released.is_set()
+            assert elapsed < PROMPT, f"the render loop waited on the link for {elapsed:.3f}s"
+            assert len(frames.take(0.0)) == 1, "a wedged link may not grow a queue"
+        finally:
+            parked.released.set()
 
 
 def test_a_send_that_fails_does_not_end_the_pump():
@@ -561,9 +774,7 @@ def test_a_send_that_fails_does_not_end_the_pump():
         second.set()
         return True
 
-    worker = pump(frames, send)
-    worker.start()
-    try:
+    with running(pump(frames, send), frames):
         frames.offer(1, panel())
         ticker.advance(1.0)
         for _ in range(200):
@@ -572,9 +783,6 @@ def test_a_send_that_fails_does_not_end_the_pump():
             frames.offer(1, panel())
             ticker.advance(1.0)
         assert second.is_set(), "one failed send ended the frame pump"
-    finally:
-        frames.close()
-        worker.join(WAIT)
 
 
 def test_an_image_that_will_not_encode_does_not_end_the_pump():
@@ -585,9 +793,7 @@ def test_an_image_that_will_not_encode_does_not_end_the_pump():
     frames, ticker = stream(fps=MAX_FPS)
     frames.enable({1})
     arrived = threading.Event()
-    worker = pump(frames, lambda frame: bool(arrived.set()) or True)
-    worker.start()
-    try:
+    with running(pump(frames, lambda frame: bool(arrived.set()) or True), frames):
         frames.offer(1, Unencodable())
         ticker.advance(1.0)
         for _ in range(200):
@@ -596,9 +802,6 @@ def test_an_image_that_will_not_encode_does_not_end_the_pump():
             frames.offer(1, panel())
             ticker.advance(1.0)
         assert arrived.is_set(), "one unencodable panel ended the frame pump"
-    finally:
-        frames.close()
-        worker.join(WAIT)
 
 
 def test_a_shutdown_is_felt_between_two_frames_rather_than_after_the_batch():

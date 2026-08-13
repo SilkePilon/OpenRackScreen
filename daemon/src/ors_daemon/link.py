@@ -501,6 +501,7 @@ class LinkClient(threading.Thread):
         config_version: int | None = None,
         on_command: CommandHandler | None = None,
         on_frames_request: FramesHandler | None = None,
+        on_link_down: Callable[[], None] | None = None,
         heartbeat: float = HEARTBEAT_INTERVAL_S,
         backoff_floor: float = BACKOFF_FLOOR_S,
         backoff_cap: float = BACKOFF_CAP_S,
@@ -534,6 +535,9 @@ class LinkClient(threading.Thread):
         self._on_snapshot = on_snapshot
         self._on_command = on_command
         self._on_frames_request = on_frames_request
+        # The other half of `on_frames_request`: a subscription arrives on a
+        # socket and has to end with it. See `_dispatch_link_down`.
+        self._on_link_down = on_link_down
         self._stop_event = stop
         self._clock = clock
         self._connect = connect_factory or _default_connect
@@ -616,6 +620,16 @@ class LinkClient(threading.Thread):
             self.connected = False
             with self._send_lock:
                 self._connection = None
+            # A subscription is not a fact about this daemon; it is a fact about
+            # a browser the server was relaying to, and the socket that carried
+            # it has gone. Without this the frame stream keeps a set of screen
+            # ids that nothing can be sent for, and the pump keeps waking and
+            # encoding WebP for them -- 7-15ms of a Pi per panel per frame,
+            # spent for nobody, for as long as the server is away. A reconnect
+            # is what turns it back on: `_resume_frames` asks again on every
+            # connect, precisely so that a browser that is still watching does
+            # not have to wait for a person to reload the page.
+            self._dispatch_link_down()
             if watchdog is not None:
                 watchdog.stop()
             self._settle(_elapsed(opened, self._clock()), hopeless=hopeless)
@@ -908,6 +922,25 @@ class LinkClient(threading.Thread):
             handler(message)
         except Exception:
             log.exception("a link handler raised", extra={"said": what})
+
+    def _dispatch_link_down(self) -> None:
+        """Tell whoever is listening that this connection has ended. Raises nothing.
+
+        On the `finally` of every attempt, including the ones that never
+        connected: it means "there is no socket", which is as true of a dial
+        that was refused as of a link that dropped, and the answer -- stop
+        producing for a peer that cannot be reached -- is the same either way.
+
+        Guarded like `_dispatch` and for the same reason. This runs inside the
+        cleanup of the thread that is the rack's only way of being
+        reconfigured, so a listener that raises here must not be able to end it.
+        """
+        if self._on_link_down is None:
+            return
+        try:
+            self._on_link_down()
+        except Exception:
+            log.exception("a link-down handler raised")
 
     def _unreadable(self, connection: Any, raw: str, error: ValidationError) -> None:
         """Answer a message this build could not parse.

@@ -716,6 +716,55 @@ def test_a_frames_request_reaches_its_handler(tmp_path: Path) -> None:
     assert [request.screen_ids for request in seen] == [[1, 2]]
 
 
+def test_a_connection_ending_is_told_to_whoever_was_producing_for_it(tmp_path: Path) -> None:
+    """A subscription is a fact about a socket, and it has to end with one.
+
+    `on_frames_request` turns the frame path on and nothing turned it off: the
+    daemon went on encoding WebP -- 7-15ms of a Pi per panel per frame -- for a
+    browser it could no longer reach, for as long as the server was away, which
+    on a flapping wifi link is most of the time. The server asks again on every
+    connect, so forgetting costs nothing and remembering costs the panels.
+    """
+    down: list[int] = []
+    client, _ = make(
+        tmp_path,
+        [FramesRequest(enabled=True, screen_ids=[1]).model_dump_json()],
+        on_link_down=lambda: down.append(1),
+    )
+
+    client.tick_once()
+
+    assert down == [1]
+
+
+def test_a_dial_that_never_connected_says_the_link_is_down_too(tmp_path: Path) -> None:
+    """ "There is no socket" is as true of a refused dial as of one that dropped."""
+    down: list[int] = []
+    client, _ = make(tmp_path, connect_factory=_refuses, on_link_down=lambda: down.append(1))
+
+    client.tick_once()
+
+    assert down == [1]
+
+
+def _refuses(url: str) -> Any:
+    raise OSError("connection refused")
+
+
+def test_a_link_down_handler_that_raises_does_not_end_the_link(tmp_path: Path) -> None:
+    """It runs in the cleanup of the one thread that can reconfigure the rack."""
+
+    def explode() -> None:
+        raise RuntimeError("the frame stream is on fire")
+
+    client, _ = make(tmp_path, [push(7)], on_link_down=explode)
+
+    client.tick_once()
+    client.tick_once()
+
+    assert client.retry_in > 0.0, "the link is still backing off and retrying"
+
+
 def test_a_message_nobody_is_listening_for_costs_nothing(tmp_path: Path) -> None:
     applied: list[int] = []
     client, _ = make(

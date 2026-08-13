@@ -508,6 +508,12 @@ def _link(
             # or draws. See `FrameStream.request` on why the message is
             # whole-daemon state rather than one screen's subscription.
             on_frames_request=frames.request,
+            # And the other end of it. A subscription arrives on a socket, so it
+            # ends with that socket: without this the pump goes on encoding
+            # WebP for a browser nothing can reach, for as long as the server is
+            # away. The server asks again on every connect (`_resume_frames`),
+            # so nothing is lost by forgetting.
+            on_link_down=frames.disable,
         )
         client.start()
     except Exception:

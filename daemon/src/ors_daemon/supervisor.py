@@ -250,6 +250,24 @@ def _unchanged(
       and the screen's own night override. Compared as one model rather than
       field by field, so a field added to the schema is covered by default
       instead of silently falling out of the diff.
+
+      `id` is in there, and it is the one field of the model that describes
+      nothing about the panel -- so it is worth saying why it still counts.
+      `_frame_handler` captures it in a closure when the worker is built, and a
+      worker never re-reads it, so a slot kept across a push that moved the id
+      addresses frames by the old number for the rest of the process. The
+      server's `_owns` refuses every one of them: a browser panel that is
+      permanently blank, while the server's log blames the daemon for sending
+      screens it does not own.
+
+      The flip side is accepted rather than fixed. Because `id` is inside
+      `ScreenConfig` equality, a screen deleted and recreated server-side with
+      byte-identical settings gets a new row id and therefore a retired worker
+      and a rebuilt panel -- a brief dark circle for a field that changes
+      nothing about what is drawn. Keeping the worker instead would need the id
+      to be re-readable by a running worker, which means it stops being a
+      closure and starts being shared mutable state on the render loop's path.
+      One blink on an operation that is already a delete is the cheaper end.
     - `scenes` and `params`, which is what a *template* edit changes. The name
       of the template is in `config`, but its contents are not: a snapshot that
       redraws `ring-gauge` names the same template on the same screen, and
@@ -295,6 +313,16 @@ def _unchanged(
         and (running.config.sleep_override or running_night)
         == (pushed.config.sleep_override or pushed_night)
     )
+
+
+def _screen_ids(screens: list[ResolvedScreen]) -> set[int]:
+    """The server row ids in a list of screens. A screen without one is not in it.
+
+    None is "no server has ever named this screen", so it is an absence rather
+    than a value -- and there is nothing to stop streaming for a screen that
+    could never have been streamed.
+    """
+    return {screen.config.id for screen in screens if screen.config.id is not None}
 
 
 def _bus_of(display: DisplayConfig) -> tuple[str, int]:
@@ -597,6 +625,9 @@ class Supervisor:
         self._sources: list[_Source] = []
         self._reaper: _Reaper | None = None
         self._unavailable: list[UnavailableScreen] = []
+        # Which screens have already been reported as unstreamable, by
+        # (position, name). See `_say_it_cannot_be_streamed`.
+        self._unaddressable: set[tuple[int, str]] = set()
         self._shutdown_lock = threading.RLock()
         self._stopped = False
         self._shutdown_deadline: Callable[[], float] | None = None
@@ -708,6 +739,13 @@ class Supervisor:
         and is then handed to the reaper. A source whose configuration moved is a
         removal and an addition, because nothing can edit a running poller. What
         does *not* happen here is the waiting: see `_Reaper`.
+
+        *It tells the frame stream which screens have stopped existing.* A
+        subscription is whole-daemon state that only a `frames` request
+        replaces, so a screen this push deletes would otherwise stay in the
+        watched set for the life of the connection -- an id with no worker, no
+        panel and no row behind it, kept alive against `_MAX_TRACKED_SCREENS`'s
+        pruning at the expense of screens that do exist.
         """
         # First, and outside the lock: nothing has moved, and nothing may.
         replacement = resolve_screens(config)
@@ -721,6 +759,12 @@ class Supervisor:
                 raise RuntimeError("this daemon is stopping; not applying a configuration")
 
             kept, fresh, retired = self._diff(replacement, config.night)
+            # Read while `self._screens` is still what the rack is running, which
+            # is the only moment the two sets can be compared. Not the retired
+            # *slots*: `_diff` retires a slot whose contents moved and rebuilds
+            # the same screen straight afterwards, so a set taken from there
+            # would stop streaming a panel that is merely being repainted.
+            gone = _screen_ids(self._screens) - _screen_ids(replacement)
             # Adopted before the panels move, because `_make_worker` reads the
             # night window off it and `_open_panel` is about to run -- and rolled
             # back if anything below raises. What that protects is the *claim*:
@@ -792,6 +836,14 @@ class Supervisor:
                 # `_screens`, kept slots included, because `_diff` re-points them.
                 rank = {id(screen): index for index, screen in enumerate(self._screens)}
                 self._slots.sort(key=lambda slot: rank[id(slot.screen)])
+                # Last, and only on the path that did not raise. A push that
+                # nacks has rolled the claim back and will be sent again, so
+                # leaving the stream alone is the conservative direction: a
+                # screen kept in the watched set costs a subscription entry,
+                # where one taken out of it is a browser panel that stops
+                # filling in with nothing anywhere saying why.
+                if self._frames is not None:
+                    self._frames.retire(gone)
                 if remaining() <= 0.0:
                     log.error(
                         "applying a configuration overran its budget; "
@@ -1108,6 +1160,11 @@ class Supervisor:
                     # Every configured screen, not only the ones that came up.
                     screens=[*self.workers, *self._unavailable],
                     snapshot=self._store.read(),
+                    # One plain attribute read of an int, off the render loop
+                    # and off the pump: the counter is written under the
+                    # stream's own lock and read without it, which is the same
+                    # bargain `build_status` makes about the workers' fields.
+                    frames_dropped=0 if self._frames is None else self._frames.dropped,
                 ),
             )
         except (OSError, ValueError) as exc:
@@ -1516,13 +1573,48 @@ class Supervisor:
         A function rather than a closure written inline at the call site, so that
         `screen` is a parameter of *this* call: written inline in a loop it would
         capture the loop variable and give every panel the last screen's id.
+
+        The capture is also why `_unchanged` has to read `ScreenConfig.id`: the
+        number is fixed here, at construction, and a worker that kept its slot
+        across a push that moved it would address frames by the old one for ever.
+
+        The second of the two Nones is said out loud, once. A rack whose screens
+        carry no ids draws perfectly and streams nothing at all, which from a
+        browser is a panel that never fills in and from the daemon's log was
+        previously indistinguishable from a rack nobody is watching. Both ways
+        of getting there -- a hand-written YAML, and a server too old to put the
+        column in its snapshot -- are things an operator can act on once they
+        are told.
         """
         frames = self._frames
         screen_id = screen.config.id
-        if frames is None or screen_id is None:
+        if frames is None:
+            return None
+        if screen_id is None:
+            self._say_it_cannot_be_streamed(screen)
             return None
 
         def offer(image: Image.Image) -> None:
             frames.offer(screen_id, image)
 
         return offer
+
+    def _say_it_cannot_be_streamed(self, screen: ResolvedScreen) -> None:
+        """One INFO line per screen that carries no server id, and not one more.
+
+        Keyed by name and position together, because neither is unique on its
+        own and the pair is what the status file and `identify` already use to
+        tell two screens apart. Per supervisor and not per worker, so the
+        watchdog restarting a panel four times does not say it four times, and
+        an `apply` that changes nothing about a screen does not repeat it
+        either -- but a rack reconfigured to add a screen with no id still says
+        so about the new one.
+        """
+        key = (screen.config.position, screen.config.name)
+        if key in self._unaddressable:
+            return
+        self._unaddressable.add(key)
+        log.info(
+            "this screen cannot be streamed to a browser: it carries no server id",
+            extra={"screen": screen.config.name, "position": screen.config.position},
+        )

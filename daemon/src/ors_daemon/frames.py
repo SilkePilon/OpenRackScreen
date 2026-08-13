@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -70,13 +71,21 @@ MAX_FPS = 5.0
 `FramesRequest.fps` is a number chosen at the far end of an authenticated
 socket, and an unbounded one is a browser deciding how much of a Pi's CPU the
 rack may spend on being looked at. Four panels at this cap is twenty encodes a
-second, which on a Pi 3B+ is on the order of a tenth of one core -- and it is a
-ceiling rather than a rate: nothing here can produce a frame the render loop did
-not draw, and a static rack draws about 0.8 times a second.
+second, which at the 7-15ms an encode costs on a Pi 3B+ is between a seventh and
+a third of one core -- corrected from "a tenth", which was about two times
+optimistic against this module's own measurement. It is a ceiling rather than a
+rate: nothing here can produce a frame the render loop did not draw, and a
+static rack draws about 0.8 times a second.
 
 Five rather than something cinematic because these are monitoring panels: their
 data arrives at a poll interval measured in seconds, and the interface is
 showing what is on the glass, not animating it.
+
+`FramesRequest.fps` is bounded in the schema as well, and neither bound makes
+the other redundant. The schema's is about the *message* -- it is what stops a
+NaN or an infinity parsing at all, which is a value no comparison here can
+refuse -- and this one is about this hardware. A build for something other than
+a Pi would move this number and leave that one alone.
 """
 
 PUMP_POLL_S = 0.5
@@ -90,15 +99,26 @@ this is only the floor under a caller that forgets.
 """
 
 _MAX_TRACKED_SCREENS = 256
-"""How many screens' sequence numbers are remembered at once.
+"""How many screens' sequence numbers and frame times are remembered at once.
 
 Bounded because a screen id is a row id on somebody else's database, and rows
 are deleted and remade: over the life of a daemon that is never restarted, the
 set of ids that have ever been watched only grows. Pruned to what is currently
-enabled when it passes this, and only then, because the counter is exactly what
-a receiver uses to drop stale frames -- dropping it for a screen somebody is
-still watching would restart the count under them and make every later frame
-look older than the one on their page.
+enabled when it passes this, and only then -- which is the whole rule for both
+tables, and for each of them the "only then" is the load-bearing half.
+
+For `_seq`, because the counter is exactly what a receiver uses to drop stale
+frames: dropping it for a screen somebody is still watching would restart the
+count under them and make every later frame look older than the one on their
+page.
+
+For `_last`, because it is the rate limiter's memory and forgetting it is how
+the cap is bypassed. It used to go with the subscription, which reads
+reasonably -- a screen nobody watches has no rate to limit -- and made
+`enable`/`disable` a reset button on the far end of the socket: measured, 100
+offers accepted out of 100 with the clock frozen, against a cap that allows one.
+The same is true of `enable({1}); enable({2}); enable({1})`, so it is the
+subscription change and not `disable` that had to stop clearing it.
 
 Two hundred and fifty-six is two orders of magnitude past a rack, so nothing
 that is watching a rack ever reaches it.
@@ -189,10 +209,50 @@ class FrameStream:
         What is already waiting to be encoded goes with it. A frame held while
         nobody is watching is a stale panel image if anything ever sends it, and
         the browser that asked for it has gone.
+
+        What does *not* go with it is `_last`. See `_MAX_TRACKED_SCREENS`: the
+        rate limiter's memory is the only thing standing between a browser and
+        four panels' worth of encodes, and clearing it here made an
+        enable/disable loop a way of asking for every frame the render loop
+        draws. Nothing is lost by keeping it -- the readings are monotonic, so a
+        screen re-enabled a minute later is due a frame immediately either way.
+
+        Three things call this: a `frames` request that says `enabled=False`,
+        the link when a connection drops, and `run` on the way down. The middle
+        one matters most, because a subscription is not a fact about the socket
+        that carried it: without it, a Pi whose server has gone away goes on
+        encoding WebP for a browser that cannot be reached until the link comes
+        back and says otherwise, which on a flapping wifi link is most of the
+        time.
         """
         with self._condition:
             self._enabled = set()
             self._forget_unwatched()
+
+    def retire(self, screen_ids: set[int]) -> None:
+        """Stop streaming these screens, because they no longer exist.
+
+        For `Supervisor.apply`, and the one caller that knows something the
+        server's subscription cannot: a screen deleted from a pushed
+        configuration has no worker, no panel and no row, so a subscription that
+        still names it is a subscription to nothing. Without this the id stays
+        in `_enabled` for as long as the connection lasts -- harmless in the
+        sense that nothing offers frames for it, and not harmless in the sense
+        that `_MAX_TRACKED_SCREENS` prunes to what is *enabled*, so a rack
+        reconfigured often enough would protect ids that had been gone for
+        months and drop ones that had not.
+
+        Deliberately not a `disable`: the other screens are still watched. And
+        deliberately not `_seq`, for the reason `_MAX_TRACKED_SCREENS` gives --
+        a row id is reused, and a receiver cannot tell a restarted counter from
+        a flood of stale frames.
+        """
+        if not screen_ids:
+            return
+        with self._condition:
+            self._enabled -= screen_ids
+            for screen_id in screen_ids:
+                self._pending.pop(screen_id, None)
 
     def close(self) -> None:
         """Nothing further will be streamed. Releases whoever is parked in `take`."""
@@ -276,6 +336,14 @@ class FrameStream:
         from. A frame nobody could send takes no sequence number, so the count
         stays a count of frames that were actually produced.
         """
+        # Outside `self._condition`, and that is this module's whole thesis
+        # rather than an accident of where the line sits. This lock is the one a
+        # screen worker takes in `offer`, from inside its own tick lock: holding
+        # it across the encode would move 7-15ms of Pi onto every worker that
+        # offered a frame while the pump was busy, four of them serialising
+        # behind one encoder, against ~23ms of SPI each. The lock is taken below
+        # for the four dictionary operations it exists for, once the bytes are
+        # already made.
         buffer = io.BytesIO()
         image.save(buffer, format="WEBP", quality=QUALITY, method=METHOD)
         webp = buffer.getvalue()
@@ -309,20 +377,26 @@ class FrameStream:
     def _forget_unwatched(self) -> None:
         """Drop what is remembered about screens nobody is watching. Lock held.
 
-        `_pending` and `_last` go with the subscription: an image nobody asked
-        for must not be sent, and a rate limiter's memory of a screen is worth
-        nothing once there are no frames to limit. `_seq` deliberately does not
-        -- see `_MAX_TRACKED_SCREENS` for why, and for the bound that keeps it
-        from growing for ever anyway.
+        `_pending` goes with the subscription, and only `_pending`: an image
+        nobody asked for must not be sent, and there is nothing about holding
+        one that a later subscriber would want back.
+
+        `_last` and `_seq` are pruned by weight rather than by subscription, and
+        that is this function keeping the promise `_MAX_TRACKED_SCREENS` makes
+        -- "pruned to what is currently enabled when it passes this, and only
+        then". `_last` used to be cleared here on every call, which meant that
+        the one thing enforcing `MAX_FPS` was reset by any change to the watched
+        set, `disable` included. See `_MAX_TRACKED_SCREENS` for the measurement.
         """
         self._pending = {
             screen_id: image
             for screen_id, image in self._pending.items()
             if screen_id in self._enabled
         }
-        self._last = {
-            screen_id: at for screen_id, at in self._last.items() if screen_id in self._enabled
-        }
+        if len(self._last) > _MAX_TRACKED_SCREENS:
+            self._last = {
+                screen_id: at for screen_id, at in self._last.items() if screen_id in self._enabled
+            }
         if len(self._seq) > _MAX_TRACKED_SCREENS:
             self._seq = {
                 screen_id: seq for screen_id, seq in self._seq.items() if screen_id in self._enabled
@@ -330,7 +404,24 @@ class FrameStream:
 
 
 def _capped(fps: float) -> float:
-    """What the daemon will actually do about a rate the server asked for."""
+    """What the daemon will actually do about a rate the server asked for.
+
+    `min` is the whole answer for every number: an infinity clamps to `MAX_FPS`,
+    a negative stays negative and `_interval` reads it as no frames at all.
+
+    NaN is the exception, and it is the reason this is a function. It compares
+    False against everything, so `min(nan, MAX_FPS)` is `nan`, `nan <= 0.0` is
+    False -- so `_interval` does not read it as "no frames" either -- and
+    `now - last < nan` is False for every offer for ever. Measured before this
+    line: 100 offers accepted out of 100 with the clock frozen, where the cap
+    allows one. It cannot arrive off the wire any more (`FramesRequest.fps` is
+    bounded and refuses one), and it is answered here as well because the guard
+    that stops a browser spending a Pi's CPU should not depend on a peer having
+    validated its own message. No frames rather than the cap, because a rate
+    that is not a number is not a request for any particular rate.
+    """
+    if math.isnan(fps):
+        return 0.0
     return min(fps, MAX_FPS)
 
 
