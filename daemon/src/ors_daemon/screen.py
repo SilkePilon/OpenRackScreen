@@ -96,6 +96,7 @@ class ScreenWorker(threading.Thread):
         stop: threading.Event,
         clock: Clock,
         floor: float = 5.0,
+        on_frame: Callable[[Image.Image], None] | None = None,
     ) -> None:
         super().__init__(name=f"screen-{screen.config.name}", daemon=True)
         self._screen = screen
@@ -108,6 +109,15 @@ class ScreenWorker(threading.Thread):
         self._stop_event = stop
         self._clock = clock
         self._floor = floor
+        # Where a frame goes when somebody is watching this panel in a browser,
+        # or None when nothing is. The contract is the whole reason this is a
+        # callback rather than a component: it is called with this worker's tick
+        # lock held, so it must not encode, must not send and must not block --
+        # `FrameStream.offer` stores one reference and returns. A panel is the
+        # product and a preview is not, so nothing behind this may cost the
+        # render loop anything it can measure.
+        self._on_frame = on_frame
+        self._logged_frame_error: str | None = None
         # Serialises everything that touches the backend, for any caller that
         # arrives while this loop is mid-tick: `show` is several sequential SPI
         # commands (address window, then the frame), so two interleaved writes do
@@ -503,6 +513,15 @@ class ScreenWorker(threading.Thread):
         selection asked for; they differ only for the `error` scene, which is
         drawn in place of a scene that would not render.
         """
+        rendered = image
+        """The frame as the renderer drew it, before the mount is corrected for.
+
+        What a browser is shown, and deliberately not what goes down the SPI
+        bus. `rotation` and `hflip` below compensate for how the panel is bolted
+        into the rack, so the image the *glass* takes is transposed precisely so
+        that a person standing in front of it sees this one. Sending the
+        transposed copy would show the interface a panel lying on its side.
+        """
         rotation = self._screen.config.rotation
         if rotation:
             # Negative: the panel is bolted in rotated by `rotation`, and the
@@ -522,3 +541,38 @@ class ScreenWorker(threading.Thread):
         self._selected_scene = drawn if selected is None else selected
         self.last_render = self._clock()
         self.renders += 1
+        # Last, and only on the path where the backend took the frame. A browser
+        # showing something the glass refused would be describing a rack that
+        # does not exist -- and it is after the counters so that nothing on the
+        # way to a browser can change what a status report reads.
+        self._offer_frame(rendered)
+
+    def _offer_frame(self, image: Image.Image) -> None:
+        """Hand the frame to whoever is streaming this panel. Raises nothing.
+
+        Guarded because of where it runs. This is inside the tick lock on a
+        thread whose only job is the panel, and the code behind the callback
+        exists for a web page: an exception out of it would leave the screen
+        frozen on its last frame with a traceback in the journal blaming the
+        renderer, which is the one failure this whole module is built to prevent.
+
+        Once per distinct reason, the same bargain `_render_and_show` makes: a
+        frame path that is broken is broken every frame, and a line each fills a
+        Pi's journal overnight and buries the first one. Cleared on the next good
+        frame, so a fault that returns after a recovery is logged as the new
+        incident it is.
+        """
+        if self._on_frame is None:
+            return
+        try:
+            self._on_frame(image)
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            if message != self._logged_frame_error:
+                log.error(
+                    "could not offer a frame; the panel is unaffected",
+                    extra={"screen": self.screen_name, "error": message},
+                )
+                self._logged_frame_error = message
+            return
+        self._logged_frame_error = None

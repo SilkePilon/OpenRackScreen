@@ -56,6 +56,7 @@ from ors_daemon.config import (
     system_scenes,
 )
 from ors_daemon.displays import DisplayBackend, build_display
+from ors_daemon.frames import FramePump, FrameStream
 from ors_daemon.link import (
     LinkClient,
     LinkError,
@@ -381,20 +382,33 @@ def _run(args: argparse.Namespace) -> int:
         return 1
     config, screens, clock, version = booted
 
+    # Built whether or not this rack is paired, and idle until something asks:
+    # the supervisor takes it at construction, so a stream created later could
+    # only be given to workers that do not exist yet. It costs an unwatched rack
+    # a set membership test per rendered frame.
+    frames = FrameStream()
     supervisor = Supervisor(
         config=config,
         screens=screens,
         store=SnapshotStore(),
         clock=clock,
         status_path=args.status,
+        frames=frames,
     )
     _install_signal_handlers(supervisor.stop)
-    link = _link(args, settings, supervisor, clock, version)
+    link = _link(args, settings, supervisor, clock, version, frames)
+    pump = _frame_pump(frames, supervisor, link)
     try:
         # `run_forever` shuts down from its own `finally`, including when `start`
         # fails partway -- so there is nothing to unwind here.
         supervisor.run_forever()
     finally:
+        # Before the link is joined, and closed before it is joined at all: the
+        # pump parks on the stream rather than on the stop event, so closing is
+        # what releases it now instead of at its next poll.
+        frames.close()
+        if pump is not None:
+            pump.join(FRAMES_JOIN_TIMEOUT)
         if link is not None:
             # The event it parks on is already set: `stop` sets it first, and
             # `run_forever` calls `stop` whatever happens. So this is a wait for
@@ -406,6 +420,45 @@ def _run(args: argparse.Namespace) -> int:
                 # own send watchdog exists for.
                 log.warning("the link thread did not stop; leaving it to the process exit")
     return 0
+
+
+FRAMES_JOIN_TIMEOUT = 1.0
+"""How long `run` waits for the frame pump once the rack is down, in seconds.
+
+Short, because of what it can be doing and what it cannot. The panels are
+already slept and closed by the time this runs, so nothing this thread does can
+darken anything; the most it can be holding is one `send` that the link's own
+watchdog takes apart after `SEND_DEADLINE_S`, and one WebP encode of a 240x240
+panel, which is milliseconds. It is a daemon thread either way, so the process
+exits regardless -- this is here so that the ordinary shutdown is tidy rather
+than to bound a failure, and it is a second rather than three because it is
+spent *after* `SHUTDOWN_BUDGET`, out of the same `TimeoutStopSec` the link's
+join comes from.
+"""
+
+
+def _frame_pump(
+    frames: FrameStream, supervisor: Supervisor, link: LinkClient | None
+) -> FramePump | None:
+    """The thread that encodes panels and sends them, if there is anywhere to send.
+
+    None for an unpaired rack: with no link there is nothing that could ask for
+    frames and nowhere to put them, so the thread would be a lifetime of parking
+    and waking on a machine with four panels to draw.
+
+    A pump that will not start is logged and stepped over, the same bargain
+    `_link` makes: a Pi too short of memory for one more thread is still a rack
+    that can draw, and the only thing lost is a preview in a browser.
+    """
+    if link is None:
+        return None
+    pump = FramePump(frames=frames, send=link.send, stop=supervisor.stop_event)
+    try:
+        pump.start()
+    except Exception:
+        log.exception("could not start the frame pump; this rack draws but cannot be watched")
+        return None
+    return pump
 
 
 LINK_JOIN_TIMEOUT = 3.0
@@ -426,6 +479,7 @@ def _link(
     supervisor: Supervisor,
     clock: Clock,
     version: int | None,
+    frames: FrameStream,
 ) -> LinkClient | None:
     """The link to the server, if this rack has ever been paired. Raises nothing.
 
@@ -449,6 +503,11 @@ def _link(
             stop=supervisor.stop_event,
             clock=clock,
             config_version=version,
+            # Handled on the link's own thread, which is what it is for: it
+            # replaces a set and clamps a number, and nothing behind it encodes
+            # or draws. See `FrameStream.request` on why the message is
+            # whole-daemon state rather than one screen's subscription.
+            on_frames_request=frames.request,
         )
         client.start()
     except Exception:

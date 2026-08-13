@@ -112,6 +112,7 @@ def make(
     template: str = "ring-gauge",
     depends: tuple[str, ...] = ("prom",),
     floor: float = 5.0,
+    on_frame: Callable[[Image.Image], None] | None = None,
 ) -> tuple[ScreenWorker, SnapshotStore, Any]:
     resolved = ResolvedScreen(
         config=ScreenConfig(
@@ -140,6 +141,7 @@ def make(
         stop=threading.Event(),
         clock=clock or FakeClock(NOW),
         floor=floor,
+        on_frame=on_frame,
     )
     return worker, store, worker._display
 
@@ -696,3 +698,78 @@ def test_the_thread_draws_until_it_is_told_to_stop() -> None:
     assert not worker.is_alive()
     assert worker.renders >= 1
     assert display.closed == 1
+
+
+def test_a_frame_is_offered_for_what_reached_the_glass() -> None:
+    offered: list[Image.Image] = []
+    worker, store, display = make(on_frame=offered.append)
+    publish(store)
+
+    worker.tick()
+
+    assert len(display.images) == 1
+    assert len(offered) == 1
+    assert offered[0].size == (240, 240)
+
+
+def test_nothing_is_offered_for_a_frame_the_panel_refused() -> None:
+    """A browser must not be shown something the glass never took."""
+    offered: list[Image.Image] = []
+    worker, store, _ = make(display=RecordingDisplay(fail_times=1), on_frame=offered.append)
+    publish(store)
+
+    worker.tick()
+
+    assert offered == []
+
+
+def test_the_frame_offered_is_the_image_before_the_mount_correction() -> None:
+    """`rotation` compensates for how the panel is bolted in, so what a person
+    standing at the rack sees is the *un*rotated render. Sending the transposed
+    image would show the browser a panel lying on its side."""
+    offered: list[Image.Image] = []
+    worker, store, display = make(on_frame=offered.append)
+    worker._screen.config.rotation = 90
+    publish(store)
+
+    worker.tick()
+
+    assert offered[0].tobytes() != display.images[0].tobytes()
+    assert offered[0].rotate(-90).tobytes() == display.images[0].tobytes()
+
+
+def test_a_frame_callback_that_raises_does_not_stop_the_panel() -> None:
+    """Nothing on the way to a browser may darken a panel."""
+
+    def explode(image: Image.Image) -> None:
+        raise RuntimeError("the frame path is broken")
+
+    worker, store, display = make(on_frame=explode)
+    publish(store)
+
+    worker.tick()
+    store.put("prom", {"cpu": 51.0}, latency_ms=1.0, now=NOW)
+    worker.tick()
+
+    assert len(display.images) == 2
+    assert worker.renders == 2
+    assert not worker.faulted
+
+
+def test_a_frame_callback_that_raises_is_logged_once_per_reason(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A line per frame overnight is a full journal and a buried first line."""
+
+    def explode(image: Image.Image) -> None:
+        raise RuntimeError("the frame path is broken")
+
+    worker, store, _ = make(on_frame=explode)
+    publish(store)
+
+    with caplog.at_level(logging.ERROR):
+        for reading in (1.0, 2.0, 3.0):
+            store.put("prom", {"cpu": reading}, latency_ms=1.0, now=NOW)
+            worker.tick()
+
+    assert len([record for record in caplog.records if record.levelno >= logging.ERROR]) == 1

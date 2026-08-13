@@ -20,9 +20,12 @@ from typing import Any
 
 import pytest
 import yaml
-from ors_daemon.__main__ import DEFAULT_LINK_PATH, main
+from ors_daemon.__main__ import DEFAULT_LINK_PATH, _frame_pump, main
 from ors_daemon.config import load_cached_snapshot
+from ors_daemon.frames import FramePump, FrameStream
 from ors_schema.daemon import DaemonConfig
+from ors_schema.link import FramesRequest
+from PIL import Image
 
 SNAPSHOT: dict[str, Any] = {
     "version": 1,
@@ -115,7 +118,13 @@ class FakeLink:
         self.started = 0
         self.joins: list[float | None] = []
         self.alive = False
+        self.sent: list[Any] = []
         FakeLink.instances.append(self)
+
+    def send(self, message: Any) -> bool:
+        """What the frame pump is handed. A real link answers False when it is down."""
+        self.sent.append(message)
+        return False
 
     def start(self) -> None:
         self.started += 1
@@ -686,3 +695,75 @@ def test_the_default_link_path_is_the_one_the_shipped_unit_creates() -> None:
     assert DEFAULT_LINK_PATH.name == "link.json"
     assert "StateDirectory=openrackscreen" in unit
     assert DEFAULT_LINK_PATH.parent == Path("/var/lib/openrackscreen")
+
+
+# --- frames -----------------------------------------------------------------
+
+
+def test_a_frames_request_from_the_server_reaches_the_stream_the_workers_offer_to(
+    tmp_path: Path,
+) -> None:
+    """One stream, wired to both ends: the link asks it for frames and the
+    supervisor's workers hand it panels. Two would be a rack that encodes
+    nothing for a browser that is asking, with nothing anywhere saying why."""
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+
+    handler = FakeLink.instances[0].kwargs["on_frames_request"]
+    frames = RecordingSupervisor.instances[-1].kwargs["frames"]
+    assert handler.__self__ is frames
+
+
+def test_the_pump_sends_what_it_encodes_down_the_link(tmp_path: Path) -> None:
+    frames = FrameStream()
+    supervisor = RecordingSupervisor()
+    link = FakeLink()
+
+    pump = _frame_pump(frames, supervisor, link)
+
+    assert pump is not None
+    try:
+        frames.request(FramesRequest(enabled=True, screen_ids=[7]))
+        frames.offer(7, Image.new("RGB", (240, 240), (0, 128, 255)))
+        pump._one(*frames.take(1.0)[0])
+    finally:
+        frames.close()
+        pump.join(5.0)
+    assert [message.screen_id for message in link.sent] == [7]
+
+
+def test_the_frame_stream_is_closed_when_the_daemon_stops(tmp_path: Path) -> None:
+    """The pump parks on the stream, not on the stop event, so a stream left
+    open is a thread that leaves at its next poll rather than at once."""
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+
+    assert RecordingSupervisor.instances[-1].kwargs["frames"].closed is True
+
+
+def test_an_unpaired_rack_starts_no_frame_pump(tmp_path: Path) -> None:
+    """Nothing could ask for a frame and there is nowhere to put one, so the
+    thread would be a lifetime of parking and waking on a Pi with four panels."""
+    write_config(tmp_path)
+
+    assert run(tmp_path) == 0
+
+    assert FakeLink.instances == []
+    assert _frame_pump(FrameStream(), RecordingSupervisor(), None) is None
+
+
+def test_a_pump_that_will_not_start_leaves_the_rack_drawing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Pi too short of memory for one more thread still has four panels."""
+    monkeypatch.setattr(FramePump, "start", _raises)
+
+    assert _frame_pump(FrameStream(), RecordingSupervisor(), FakeLink()) is None
+
+
+def _raises(*args: Any, **kwargs: Any) -> None:
+    raise RuntimeError("can't start new thread")

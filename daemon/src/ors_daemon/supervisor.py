@@ -63,6 +63,7 @@ from PIL import Image
 from ors_daemon.clock import Clock
 from ors_daemon.config import ResolvedScreen, config_fingerprint, resolve_screens, system_scenes
 from ors_daemon.displays import DisplayBackend, build_display
+from ors_daemon.frames import FrameStream
 from ors_daemon.integrations import UrlProvider, build_integration
 from ors_daemon.poller import Poller
 from ors_daemon.screen import _NIGHT_PARK_CHUNK, ScreenWorker
@@ -555,6 +556,7 @@ class Supervisor:
         shutdown_budget: float = SHUTDOWN_BUDGET,
         apply_budget: float = APPLY_BUDGET,
         shutdown_clock: Callable[[], float] = time.monotonic,
+        frames: FrameStream | None = None,
     ) -> None:
         if watchdog_timeout <= _NIGHT_PARK_CHUNK:
             raise ValueError(
@@ -573,6 +575,11 @@ class Supervisor:
         self._poller_factory = poller_factory
         self._tunnel_factory = tunnel_factory or (lambda cfg, stop: Tunnel(config=cfg, stop=stop))
         self._watchdog_timeout = watchdog_timeout
+        # Held by the supervisor and not by the workers, which is what makes a
+        # screen's sequence numbers survive the worker that draws it: the
+        # watchdog replaces workers and `apply` retires them, and a browser that
+        # drops frames older than the last it drew must not be able to tell.
+        self._frames = frames
         self._shutdown_budget = shutdown_budget
         self._apply_budget = apply_budget
         # The only injectable clock of the two this class reads, and deliberately
@@ -1492,4 +1499,30 @@ class Supervisor:
             night=self._config.night,
             stop=stop,
             clock=self._clock,
+            on_frame=self._frame_handler(screen),
         )
+
+    def _frame_handler(self, screen: ResolvedScreen) -> Callable[[Image.Image], None] | None:
+        """Where this screen's frames go, or None if they go nowhere.
+
+        Two ways of getting None, and both are ordinary. There may be no stream
+        at all -- an unpaired rack has no link to send anything down. And the
+        screen may carry no `id`, which is what a hand-written YAML file looks
+        like: the id is the server's row id, it is what a frame is addressed by,
+        and there is no substitute for it here. `name` and `position` are not
+        unique in the schema, so a daemon that guessed one would be asking the
+        server to paint over a panel belonging to another rack.
+
+        A function rather than a closure written inline at the call site, so that
+        `screen` is a parameter of *this* call: written inline in a loop it would
+        capture the loop variable and give every panel the last screen's id.
+        """
+        frames = self._frames
+        screen_id = screen.config.id
+        if frames is None or screen_id is None:
+            return None
+
+        def offer(image: Image.Image) -> None:
+            frames.offer(screen_id, image)
+
+        return offer

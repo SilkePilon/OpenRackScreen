@@ -10,6 +10,7 @@ import pytest
 from ors_daemon.clock import FakeClock
 from ors_daemon.config import ConfigError, resolve_screens
 from ors_daemon.displays import DisplayError
+from ors_daemon.frames import FrameStream
 from ors_daemon.screen import _NIGHT_PARK_CHUNK as NIGHT_PARK_CHUNK
 from ors_daemon.screen import ScreenWorker
 from ors_daemon.snapshot import SnapshotStore
@@ -274,6 +275,7 @@ def build(
     poller_factory: Any = None,
     tunnel_factory: Any = None,
     shutdown_clock: Any = None,
+    frames: Any = None,
 ) -> tuple[Supervisor, SnapshotStore, dict[str, RecordingDisplay]]:
     store = SnapshotStore()
     displays: dict[str, RecordingDisplay] = {}
@@ -292,6 +294,7 @@ def build(
         display_factory=display_factory,
         poller_factory=poller_factory or (lambda integration_config, url_provider: None),
         tunnel_factory=tunnel_factory,
+        frames=frames,
         **extra,
     )
     return supervisor, store, displays
@@ -2587,3 +2590,92 @@ def test_the_event_the_supervisor_publishes_is_the_one_its_own_stop_sets(tmp_pat
     assert published.is_set() is False
     supervisor.stop()
     assert published.is_set(), "the one `stop` sets first, before it joins anything"
+
+
+# --- frames -----------------------------------------------------------------
+
+
+class RecordingStream:
+    """A frame stream that records what a worker offered it, and encodes nothing."""
+
+    def __init__(self) -> None:
+        self.offers: list[tuple[int, Image.Image]] = []
+        self.arrived = threading.Event()
+
+    def offer(self, screen_id: int, image: Image.Image) -> bool:
+        self.offers.append((screen_id, image))
+        self.arrived.set()
+        return True
+
+
+def with_ids(tmp_path: Path, screens: int = 1) -> DaemonConfig:
+    """The rack's configuration as a server assembles it: every screen has a row id."""
+    raw = config_dict(tmp_path, screens)
+    for index, screen in enumerate(raw["screens"], start=1):
+        screen["id"] = index * 10
+    return DaemonConfig.model_validate(raw)
+
+
+def test_a_worker_offers_its_frames_under_the_servers_screen_id(tmp_path: Path) -> None:
+    """The server routes a frame by its own row id, and task 8 refuses one for a
+    screen this daemon does not own -- so the id has to travel in the snapshot."""
+    frames = RecordingStream()
+    supervisor, store, _ = build(with_ids(tmp_path), tmp_path, frames=frames)
+    supervisor.start()
+    try:
+        store.put("prom", {"cpu": 42.0}, latency_ms=1.0, now=NOW)
+        assert frames.arrived.wait(WAIT), "no frame was ever offered"
+    finally:
+        supervisor.stop()
+
+    assert {screen_id for screen_id, _ in frames.offers} == {10}
+
+
+def test_a_screen_with_no_server_id_offers_no_frames(tmp_path: Path) -> None:
+    """A hand-written config has never been through a server, so nothing on it
+    can be addressed by a browser. It still draws, which is the whole point."""
+    frames = RecordingStream()
+    config = DaemonConfig.model_validate(config_dict(tmp_path, screens=1))
+    supervisor, store, displays = build(config, tmp_path, frames=frames)
+    supervisor.start()
+    try:
+        store.put("prom", {"cpu": 42.0}, latency_ms=1.0, now=NOW)
+        drawn = threading.Event()
+        displays["S1"].on_sleep = drawn.set
+    finally:
+        supervisor.stop()
+
+    assert frames.offers == []
+    assert displays["S1"].images != []
+
+
+def test_a_sequence_survives_the_worker_being_replaced(tmp_path: Path) -> None:
+    """The browser drops frames by `seq`. A watchdog restart is invisible to it,
+    so a counter living on the worker would restart the count under a page that
+    is still open and every frame after it would look stale."""
+    ticker = FakeMonotonic()
+    frames = FrameStream(fps=2.0, monotonic=ticker)
+    frames.enable({10})
+    supervisor, store, _ = build(with_ids(tmp_path), tmp_path, frames=frames)
+    supervisor.start()
+    try:
+        store.put("prom", {"cpu": 42.0}, latency_ms=1.0, now=NOW)
+        first = drain(frames)
+        supervisor.workers[0].heartbeat = LONG_AGO
+        supervisor.tick()
+        ticker.advance(10.0)
+        store.put("prom", {"cpu": 43.0}, latency_ms=1.0, now=NOW)
+        second = drain(frames)
+    finally:
+        supervisor.stop()
+
+    assert (first, second) == (0, 1)
+
+
+def drain(frames: FrameStream) -> int:
+    """The seq of the next frame the pump would send. Waits for one to exist."""
+    for screen_id, image in frames.take(WAIT):
+        frame = frames.encode(screen_id, image)
+        assert frame is not None
+        return frame.seq
+    raise AssertionError("no frame was offered")
