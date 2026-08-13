@@ -362,3 +362,51 @@ def test_a_hand_written_screen_has_no_server_id():
 def test_a_screen_id_is_a_row_id_rather_than_a_position():
     with pytest.raises(ValidationError):
         ScreenConfig.model_validate({**MINIMAL["screens"][0], "id": 0})
+
+
+def test_two_screens_may_not_carry_the_same_server_id():
+    """Unlike `name` and `position`, which the schema deliberately leaves alone.
+
+    An id is what a frame is addressed by at both ends, so two screens sharing
+    one is not an untidy document but a rack that cannot be watched: they
+    compete for one entry in the daemon's rate-limiter table, the loser's offer
+    is refused inside the interval the winner just claimed, and it is not even
+    counted as a drop. The browser then shows two different panels alternating
+    under one screen, and nothing anywhere says why.
+
+    Checked here and not in the daemon because the daemon is not the only
+    producer -- a hand-written YAML can set the field, which is the whole reason
+    this is reachable -- and a rule about the *set* of screens has nowhere else
+    to live.
+    """
+    with pytest.raises(ValidationError) as error:
+        DaemonConfig.model_validate(
+            {
+                **MINIMAL,
+                "screens": [
+                    {**MINIMAL["screens"][0], "id": 5, "position": 1},
+                    {**MINIMAL["screens"][0], "id": 5, "position": 2},
+                ],
+            }
+        )
+
+    assert "5" in first_error(error.value)
+
+
+def test_screens_with_no_server_id_do_not_collide_with_each_other():
+    """None is "no server has ever named this screen", not a value to be unique.
+
+    Which is every screen of a hand-written rack, so reading the absence as a
+    duplicate would refuse the ordinary M2 config outright.
+    """
+    config = DaemonConfig.model_validate(
+        {
+            **MINIMAL,
+            "screens": [
+                {**MINIMAL["screens"][0], "position": 1},
+                {**MINIMAL["screens"][0], "position": 2},
+            ],
+        }
+    )
+
+    assert [screen.id for screen in config.screens] == [None, None]

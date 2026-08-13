@@ -5,6 +5,7 @@ import pytest
 from ors_schema.daemon import DaemonConfig
 from ors_schema.link import (
     MAX_FRAME_BYTES,
+    MAX_REQUESTED_FPS,
     PROTOCOL_VERSION,
     Ack,
     Command,
@@ -157,6 +158,43 @@ def test_a_frames_request_names_the_screens_and_the_rate():
 
     assert request.screen_ids == [1, 2]
     assert FramesRequest(enabled=False).screen_ids == []
+
+
+@pytest.mark.parametrize("fps", ["NaN", "Infinity", "-Infinity"])
+def test_a_rate_that_is_not_a_number_does_not_parse_off_the_wire(fps: str):
+    """The one value that gets past a rate limit written with `min` and `<`.
+
+    Pydantic's `allow_inf_nan` defaults to true and a bare `float` takes it, so
+    `{"fps": NaN}` used to parse. Every comparison a limiter makes against NaN is
+    then False: `min(nan, cap)` is `nan`, `nan <= 0` is False so it is not read
+    as "no frames", and `now - last < nan` is False for ever -- so the daemon
+    accepts every frame the render loop draws, for four panels, for the life of
+    the process. Measured before this bound: 100 offers accepted out of 100 with
+    the clock frozen, where the cap allows one.
+    """
+    with pytest.raises(ValidationError):
+        parse_server_message(
+            f'{{"type": "frames", "enabled": true, "screen_ids": [1], "fps": {fps}}}'
+        )
+
+
+@pytest.mark.parametrize("fps", [-1.0, MAX_REQUESTED_FPS + 1.0, 1e9])
+def test_a_rate_outside_what_a_screen_could_ever_show_does_not_parse(fps: float):
+    """The far end of this socket is a browser, and the bound is a security one.
+
+    Not the daemon's ceiling -- `ors_daemon.frames.MAX_FPS` is far lower and is
+    a policy about one Pi's CPU -- but the bound on the *message*, which is what
+    the two ends have to agree about. Negative is refused rather than read as
+    "no frames" because a rate below nought is not a rate; the daemon clamps one
+    anyway, and that redundancy is the point.
+    """
+    with pytest.raises(ValidationError):
+        FramesRequest(enabled=True, screen_ids=[1], fps=fps)
+
+
+def test_the_fastest_rate_a_server_may_ask_for_still_parses():
+    assert FramesRequest(enabled=True, fps=MAX_REQUESTED_FPS).fps == MAX_REQUESTED_FPS
+    assert FramesRequest(enabled=True, fps=0.0).fps == 0.0
 
 
 def test_a_frame_carries_bytes_and_a_sequence_number():
@@ -414,3 +452,55 @@ def test_an_oversized_frame_off_the_wire_is_refused_after_it_is_decoded():
 
     with pytest.raises(ValidationError):
         parse_daemon_message(oversized)
+
+
+def test_a_frame_at_the_bound_still_parses_although_its_wire_form_is_larger():
+    """Which of the two lengths `max_length` counts, said with a case that can tell.
+
+    The refusal above cannot: `MAX_FRAME_BYTES + 1` bytes is over the bound as
+    decoded payload *and* over it as base64, so it fails either way and pins
+    neither reading. This one is 262,144 decoded and 349,528 on the wire, so it
+    parses only if the bound counts what the base64 carries -- which is what
+    `Frame.webp`'s comment claims and what makes the number comparable to
+    anything else measured in frame bytes.
+
+    It matters beyond tidiness, because it says where the reader's own limit has
+    to sit: the payload is 4/3 of this before it is decoded, so a `ws_max_size`
+    set to `MAX_FRAME_BYTES` would close the socket over a frame this schema
+    accepts. See `ors_server.__main__`, which sizes it from here.
+    """
+    at_bound = json.dumps(
+        {
+            "type": "frame",
+            "screen_id": 1,
+            "seq": 1,
+            "webp": base64.urlsafe_b64encode(b"x" * MAX_FRAME_BYTES).decode(),
+        }
+    )
+    assert len(at_bound) > MAX_FRAME_BYTES
+
+    parsed = parse_daemon_message(at_bound)
+
+    assert isinstance(parsed, Frame)
+    assert len(parsed.webp) == MAX_FRAME_BYTES
+
+
+def test_the_bound_on_a_frame_is_a_quarter_of_a_mebibyte_and_not_uvicorn_s_default():
+    """The one absolute assertion about this number, and it is not decoration.
+
+    Every other test here uses the constant relatively, so raising it changes
+    nothing anybody notices -- and there is exactly one value it must not drift
+    towards. uvicorn's `ws_max_size` defaults to 16,777,216, which is the reader
+    limit on the server end of this link, so a `MAX_FRAME_BYTES` at 16 MiB puts
+    the schema's bound at or above the transport's and re-opens the failure this
+    bound exists to close: a frame the daemon believes is legal, the socket
+    closed under it by `websockets`, a reconnect, a push and the same frame
+    again. A daemon holding a valid key would also be making the server allocate
+    that much per message before any bound could refuse it.
+
+    A quarter of a mebibyte is eight times the worst 240x240 panel anything can
+    encode (32,992 bytes of uniform random noise, which no template draws), so
+    the margin is in the direction that costs nothing.
+    """
+    assert MAX_FRAME_BYTES == 256 * 1024 == 262_144
+    assert MAX_FRAME_BYTES * 64 == 16 * 1024 * 1024, "uvicorn's default is 64 of these"

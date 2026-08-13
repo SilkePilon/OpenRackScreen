@@ -188,6 +188,16 @@ absolute worst case for that geometry -- uniform random noise, which no template
 can produce -- is 32,992. A quarter of a mebibyte is eight times that worst case
 and a fiftieth of the daemon's own `MAX_MESSAGE_BYTES`, so a screen size or an
 encoder setting can move by a lot before this has to.
+
+It is bounded from above as well, and by a specific number rather than by taste.
+uvicorn's `ws_max_size` defaults to 16,777,216 -- sixty-four of these -- and
+that is the reader limit on the server's end of this link. This bound is only
+worth having while it is comfortably *under* the transport's: at 16 MiB the two
+coincide and the reconnect loop above is reachable again, and long before that a
+daemon holding a valid key is making the server allocate whatever it sends,
+per message, before any field bound can look at it. The server therefore sets
+`ws_max_size` explicitly from this number (see `ors_server.__main__`) instead of
+inheriting a default that has nothing to do with a panel.
 """
 
 
@@ -278,11 +288,38 @@ class Command(_Message):
     screen_id: int | None = None
 
 
+MAX_REQUESTED_FPS = 60.0
+"""The fastest rate this link will carry in a `frames` request at all.
+
+A bound on the *message*, which is this module's business, and not the daemon's
+ceiling, which is not: `ors_daemon.frames.MAX_FPS` is five, it is a policy about
+how much of one Pi's CPU a browser may spend, and a rack with different hardware
+could reasonably choose differently. Both exist, and the redundancy is the
+point -- `MAX_FPS` says why in the threat-model terms this end cannot see.
+
+What it is really for is the values that are not rates. `fps` was a bare
+`float`, and pydantic's `allow_inf_nan` defaults to true, so `{"fps": NaN}`
+parsed off the wire and then defeated every comparison a rate limiter makes:
+`min(nan, cap)` is `nan`, `nan <= 0.0` is False so it does not read as "no
+frames", and `now - last < nan` is False for ever. Measured: 100 offers accepted
+out of 100 with the clock frozen, against a cap that allows one -- and sticky,
+because nothing reset the number afterwards. Sixty because it is past anything a
+panel could show and far past anything one would ask a Pi for, so a legitimate
+request never meets it.
+"""
+
+
 class FramesRequest(_Message):
     type: Literal["frames"] = "frames"
     enabled: bool
     screen_ids: list[int] = Field(default_factory=list)
-    fps: float = 2.0
+    # `allow_inf_nan=False` as well as the two bounds, although either would
+    # refuse a NaN on its own -- every comparison against one is False, so
+    # `ge` rejects it. Said explicitly because the *reason* it must be rejected
+    # is the infinity and the not-a-number rather than the range, and a later
+    # edit that loosened the range would otherwise quietly take the other bound
+    # with it. See `MAX_REQUESTED_FPS`.
+    fps: float = Field(default=2.0, ge=0.0, le=MAX_REQUESTED_FPS, allow_inf_nan=False)
 
 
 DaemonMessage = Annotated[
