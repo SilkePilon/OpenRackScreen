@@ -628,3 +628,37 @@ def test_a_bump_is_durable(tmp_path):
             "SELECT config_version FROM daemon WHERE id = ?", (daemon_id,)
         ).fetchone()[0]
     assert stored == 1, "an uncommitted bump is a version the daemon never sees"
+
+
+def test_a_snapshot_names_each_screen_by_the_row_id_frames_are_routed_with(tmp_path):
+    """The one number that makes the frame path implementable end to end.
+
+    `_owns` refuses a frame for a screen this daemon does not own, and the hub
+    fans one out by `frame.screen_id` -- both of which are `screen.id` here. The
+    daemon has no other way to learn it: it sees a snapshot and nothing else, and
+    neither `name` nor `position` is unique in this schema.
+    """
+    database, secrets, daemon_id = fixtures(tmp_path)
+    with closing(database.connect()) as connection:
+        # Positions that are nothing like the row ids, deliberately: the fixture
+        # rack's first screen sits at position 1 with id 1, so a snapshot sending
+        # the *position* under the name `id` passes any assertion made against a
+        # rack whose panels were never reordered. Measured -- that mutant lived.
+        second = add_screen(connection, daemon_id, position=9, name="MEM")
+        third = add_screen(connection, daemon_id, position=5, name="NET")
+        rows = {
+            row["name"]: row["id"]
+            for row in connection.execute(
+                "SELECT id, name FROM screen WHERE daemon_id = ?", (daemon_id,)
+            )
+        }
+
+    snapshot = build_snapshot(database, secrets, daemon_id)
+
+    assert {screen.name: screen.id for screen in snapshot.screens} == rows
+    assert (rows["MEM"], rows["NET"]) == (second, third)
+    assert [(screen.id, screen.position) for screen in snapshot.screens] == [
+        (1, 1),
+        (third, 5),
+        (second, 9),
+    ]

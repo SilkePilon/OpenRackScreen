@@ -150,6 +150,12 @@ def _screens(connection: sqlite3.Connection, daemon_id: int) -> list[dict[str, A
     ).fetchall()
     return [
         {
+            # The row id travels, and it is the only field here that is not
+            # about the panel. It is what a frame from this rack is addressed
+            # by -- `_owns` refuses one naming a screen the daemon does not own,
+            # and the hub fans it out to whoever is watching that id -- and the
+            # daemon cannot derive it from anything else it is sent.
+            "id": row["id"],
             "name": row["name"],
             "position": row["position"],
             "display": _json_column(row["display"], "screen", "display", row["id"]),
