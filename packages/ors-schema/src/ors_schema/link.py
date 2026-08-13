@@ -170,6 +170,27 @@ class SourceStatus(_Message):
     latency_ms: float | None = None
 
 
+MAX_FRAME_BYTES = 256 * 1024
+"""The largest encoded panel image either end of this link will carry.
+
+The one number about a frame that both ends have to agree on, which is why it
+lives here rather than in the daemon that encodes them or the server that reads
+them. A message past a reader's limit is not a dropped message: `websockets`
+closes the socket over it, so a daemon that produced one would reconnect, be
+pushed to, send the same frame again and close again -- a loop in which the rack
+keeps drawing, the browser shows nothing, and neither end's log says why. With a
+bound on the field, an oversized frame is one `ValidationError` the server logs
+and skips, and a number the daemon can check against before it writes anything.
+
+Measured rather than guessed. A rendered 240x240 panel is 738 bytes
+(`multi-ring`) to 5,042 (`ring-gauge`) as WebP at quality 60, method 0; the
+absolute worst case for that geometry -- uniform random noise, which no template
+can produce -- is 32,992. A quarter of a mebibyte is eight times that worst case
+and a fiftieth of the daemon's own `MAX_MESSAGE_BYTES`, so a screen size or an
+encoder setting can move by a lot before this has to.
+"""
+
+
 class Frame(_Message):
     """One rendered panel image, on its way to a browser watching the rack.
 
@@ -177,12 +198,23 @@ class Frame(_Message):
     `ser_json_bytes="base64"`: pydantic's default would try to decode a WebP as
     UTF-8. `seq` is what lets a congested link drop rather than queue -- the
     newest frame wins, and the receiver can tell which one that is.
+
+    `seq` counts per screen and is not reset by a subscription ending, a
+    reconfiguration or a worker being replaced, because a receiver that drops
+    anything not newer than the last frame it drew cannot tell a restarted
+    counter from a flood of stale frames. It does restart when the daemon does,
+    so a receiver should read a `seq` that has gone *backwards* as a new stream
+    rather than as something to drop.
     """
 
     type: Literal["frame"] = "frame"
     screen_id: int
     seq: int
-    webp: bytes
+    # Bounded on the decoded bytes and not on the base64 that carries them: the
+    # wire form is 4/3 of this, and the thing that has to fit in a reader's
+    # limit is the message, so the bound has to be on the payload it is derived
+    # from. See `MAX_FRAME_BYTES` for what a real panel weighs.
+    webp: bytes = Field(max_length=MAX_FRAME_BYTES)
 
 
 class LogLine(_Message):

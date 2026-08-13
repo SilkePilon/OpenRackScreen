@@ -4,6 +4,7 @@ import json
 import pytest
 from ors_schema.daemon import DaemonConfig
 from ors_schema.link import (
+    MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
     Ack,
     Command,
@@ -383,3 +384,33 @@ def test_the_daemon_key_stays_out_of_a_repr_too():
     assert "3" in repr(paired), "the rest of the message is still useful in a log"
     assert paired.model_dump()["key"] == "s3cret-daemon-key", "it still travels"
     assert "s3cret-daemon-key" in paired.model_dump_json()
+
+
+def test_a_frame_is_bounded_by_a_number_both_ends_can_read():
+    """An oversized frame must be a dropped frame, never a dropped connection.
+
+    A message past the reader's limit makes `websockets` close the socket, so a
+    daemon that encoded one too large would reconnect, be pushed to, and send it
+    again -- a loop neither end can explain. Bounding the field turns that into
+    one unreadable message the server logs and skips, and gives the daemon a
+    number to check against before it writes anything.
+    """
+    assert Frame(screen_id=1, seq=1, webp=b"x" * MAX_FRAME_BYTES).seq == 1
+
+    with pytest.raises(ValidationError):
+        Frame(screen_id=1, seq=1, webp=b"x" * (MAX_FRAME_BYTES + 1))
+
+
+def test_an_oversized_frame_off_the_wire_is_refused_after_it_is_decoded():
+    """Base64 is 4/3 of what it carries, so the bound has to be on the bytes."""
+    oversized = json.dumps(
+        {
+            "type": "frame",
+            "screen_id": 1,
+            "seq": 1,
+            "webp": base64.urlsafe_b64encode(b"x" * (MAX_FRAME_BYTES + 1)).decode(),
+        }
+    )
+
+    with pytest.raises(ValidationError):
+        parse_daemon_message(oversized)

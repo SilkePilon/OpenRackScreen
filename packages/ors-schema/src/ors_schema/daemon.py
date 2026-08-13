@@ -185,6 +185,23 @@ class ScreenConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    id: int | None = Field(default=None, ge=1)
+    """The server's row id for this screen, or None for a hand-written config.
+
+    The one field here that describes nothing about the panel. It exists because
+    frames are addressed by it: the server relays a frame to the browsers
+    watching `screen.id`, and refuses one naming a screen the sending daemon does
+    not own. Without it in the snapshot the daemon has no way to learn the
+    number at all -- it sees a configuration and nothing else -- and neither
+    `name` nor `position` can stand in, because this schema makes neither unique
+    and a rack that guessed would paint over another rack's panel.
+
+    None means "no server has ever named this screen", which is what a YAML file
+    on a Pi says. Such a screen draws exactly as any other and simply cannot be
+    streamed to a browser, which is the truth about it. Not 0: an id is a
+    SQLite rowid and those start at 1, so nought would be a real-looking number
+    that matches no row.
+    """
     name: str = Field(min_length=1)
     # Which physical panel in the rack, left to right, counted from 1: the rack
     # has a first panel, not a zeroth one, and every example config and every

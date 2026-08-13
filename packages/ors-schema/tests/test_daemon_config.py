@@ -338,3 +338,27 @@ def test_a_failure_about_the_whole_document_still_reads_as_a_message():
         DaemonConfig.model_validate([])
 
     assert first_error(error.value).startswith("(root): ")
+
+
+def test_a_screen_carries_the_id_the_server_routes_frames_by():
+    """The daemon has no other way to learn it, and frames are addressed by it.
+
+    The server routes a frame to a browser by its own `screen.id` and refuses one
+    naming a screen the sending daemon does not own, so a snapshot that did not
+    carry the number would make the whole frame path unimplementable -- and
+    matching by name or position is not available, because the schema makes
+    neither unique.
+    """
+    screen = ScreenConfig.model_validate({**MINIMAL["screens"][0], "id": 42})
+
+    assert screen.id == 42
+
+
+def test_a_hand_written_screen_has_no_server_id():
+    """A YAML file has never been through a server, so there is no row to name."""
+    assert DaemonConfig.model_validate(MINIMAL).screens[0].id is None
+
+
+def test_a_screen_id_is_a_row_id_rather_than_a_position():
+    with pytest.raises(ValidationError):
+        ScreenConfig.model_validate({**MINIMAL["screens"][0], "id": 0})
