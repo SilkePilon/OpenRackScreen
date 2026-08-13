@@ -2841,6 +2841,11 @@ That needs a per-daemon view the hub does not have — `watched_screens()` retur
 
 Also carried: the browser socket must `unsubscribe_frames` in a `finally`. The hub cannot notice a dead queue, so a closed tab otherwise leaves the daemon encoding WebP forever.
 
+**Carried from task 11:**
+- **A dropped frame is invisible to the browser.** An oversized frame is refused by the schema and skipped by `ws_daemon` (which now logs the screen id), but the watcher's queue simply stops and the page keeps its stale image with no indication. There is no channel to tell a watcher "this screen's stream stalled". Either add that event to `/ws/ui` or give the panel component a staleness indicator driven by frame arrival.
+- **`FramesRequest.screen_ids` is an unbounded `list[int]` chosen by the far end**, and the daemon's `_enabled` set is sized by it. Task 11 closed two holes of this family (`fps: NaN` parsed off the wire and defeated the rate cap; an enable/disable cycle reset the limiter's memory) and left this third one open deliberately, because this task decides how many screens one request may legitimately name. Bound it here.
+- The daemon sends frames **before** the mount correction, so the browser shows what a person standing at the rack sees. Do not rotate again. Now stated in the spec, §7.2.
+
 **Files:**
 - Create: `server/src/ors_server/link/ws_ui.py`
 - Modify: `server/src/ors_server/app.py`
@@ -2952,6 +2957,10 @@ git commit -m "feat(server): the browser websocket and frame subscriptions"
 **A re-pair endpoint.** A leaked daemon key is permanent. `mint_token` only INSERTs and `daemon.name` is UNIQUE, so re-pairing an existing daemon is impossible without hand-written SQL or deleting the row — which cascades its screens away. Until an endpoint exists, a key read off a Pi is full impersonation of that rack for as long as the rack exists, with no way to revoke it that does not also destroy the configuration. This task owes a re-pair action on an existing daemon: clear `key_hash`, write a fresh `token_hash`, set `status` back to `unpaired`, and show the new token exactly once, the way creation does. The schema now enforces `CHECK (token_hash IS NULL OR key_hash IS NULL)`, so clearing the key is not optional — writing a token onto a row that still holds a key raises `IntegrityError`, which is the point of the constraint. The connected daemon is dropped by the next connect it cannot authenticate, which is what a rotate button should mean.
 
 **A "push configuration now" action, per daemon.** `Hello.config_version` is a claim the server cannot verify, and the server only ever *skips* a push on a match — so a daemon that claims a version it does not really have gets nothing, and nothing re-pushes until an unrelated edit bumps the counter. M3a closed the worst case (the connect that pairs now always pushes, whatever it claims) but every later reconnect still trusts the claim by design, because distrusting it means repainting the whole rack on every wifi blip. A button that pushes the current snapshot regardless of the comparison is the only way out of a blank rack that does not involve editing a screen you did not want to change.
+
+**Carried from task 11:**
+- **`FrameStream.dropped` reaches `status.json` as `frames_dropped`** (a running total, never reset) and nothing carries it further: `Heartbeat.status` is still sent empty and there is no Prometheus exporter in this repo — `integrations/prometheus.py` is the poller, not an exporter. Whichever of those two this task builds should read that key, because it is the only measure of how far behind the link is running.
+- `_MAX_TRACKED_SCREENS` prunes the rate limiter's memory as well as the sequence table, keeping only currently-enabled ids. A peer cycling more than 256 distinct ids could still evict a real screen's entry. Two orders of magnitude past a rack, so it is a note rather than a task — unless this task ever lets one server drive many racks through one daemon.
 
 **Carried from task 7 — `Hub` is event-loop-affine, and this task is where that gets broken.**
 
@@ -3385,7 +3394,7 @@ volumes:
 `server/README.md` covers: `docker compose -f deploy/compose.pi.yaml up -d`, first-run password setup at `/`, where the key and database live, that the daemon is a host systemd unit and not part of compose, and that `ORS_SECRET_KEY` is unrecoverable once integrations exist.
 
 **Two things the implementer must check rather than assume:**
-1. `FORWARDED_ALLOW_IPS` only takes effect when uvicorn runs with `--proxy-headers`. `__main__.py` calls `uvicorn.run(...)` without it. Check uvicorn's current default for `proxy_headers` — if it is not already on, the variable above is decoration and `__main__.py` needs `proxy_headers=True`. Fix it there and say so.
+1. ~~`FORWARDED_ALLOW_IPS` only takes effect when uvicorn runs with `--proxy-headers`.~~ **Settled in task 11's fix round, and my premise was wrong:** uvicorn 0.52.1 already defaults `proxy_headers=True`, and `forwarded_allow_ips=None` falls back to `os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1")`. So the variable was never decoration. `__main__.py` now passes both explicitly anyway — with a test asserting them against uvicorn's own signature, so a release that flips the default fails here rather than in production. Nothing left to do in this task.
 2. `load_or_create_key` refuses a key file readable by group or other. Confirm the file it creates inside the volume, under the container's umask and as uid 10001, actually satisfies its own check — a server that cannot start on second boot is worse than one that never started.
 
 - [ ] **Step 4: Run test to verify it passes**
