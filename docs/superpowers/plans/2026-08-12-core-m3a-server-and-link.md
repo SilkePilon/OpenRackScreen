@@ -3404,6 +3404,17 @@ git commit -m "feat(deploy): server image and compose files"
 
 ---
 
+## Known gaps carried out of task 10
+
+Recorded here rather than fixed, each with the reason. Tasks 11-13 should read these before assuming a behaviour exists.
+
+- **`system_scenes()` still ignores the config.** A server-side edit to `connecting`, `stale`, `error` or `identify` validates, caches, acks and changes nothing on the glass. Named in `_unchanged`'s exclusion list beside `timezone`. Making it act means routing the config's own `system` template through `system_scenes` and adding it to the diff as a rack-wide comparison, the way `night` is.
+- **`DaemonConfig.timezone` is not reconfigurable by a push.** The clock is built once in `__main__` and shared by every worker and poller.
+- **The panel opens inside `_off_the_bus` are unbounded**, and they now run with every kept worker's tick lock held. Recorded as a residual risk in the docstring: bounding a blocking open needs a thread whose late return hands back a backend for a device nothing owns and nothing will close — an unopenable panel forever, which is worse than the freeze it prevents. If it is ever bounded, the owner of the late backend has to be decided first.
+- **A dark panel is only retried by the next push.** That covers an open that failed, a worker that would not start, and a panel skipped because a bus-mate would not stop drawing. A rack that gets no further push keeps a dark circle with `status.json` saying why and nothing acting on it. A bounded, backed-off retry in `tick` is the obvious answer and was out of scope for task 10.
+- **`stop` can abandon the source reaper** if a `kubectl` teardown outlasts the shutdown deadline, so that child can outlive the daemon by up to its own SIGKILL wait. The same bargain as any other thread here, but it is new surface.
+- **Still open from task 9: `DaemonConfig.screens` has no `max_length`.** A well-formed push naming 10,000 screens reaches the apply path — now with a poller per integration and a reaper thread as well. The only thing in front of it is the daemon's own `MAX_MESSAGE_BYTES`, a byte count the server does not share, so the two ends can disagree about what is servable and only the rack finds out.
+
 ## Definition of done for M3a
 
 - `uv run pytest` passes from a clean checkout with no hardware; ruff clean; CI green.
