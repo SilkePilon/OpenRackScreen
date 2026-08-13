@@ -7,18 +7,24 @@ from contextlib import closing
 import pytest
 from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
-from ors_schema.link import Ack, Frame, Heartbeat, Hello, Nack, SourceStatus
+from ors_schema.link import PROTOCOL_VERSION, Ack, Frame, Heartbeat, Hello, Nack, SourceStatus
 from ors_server.app import AppSettings, create_app
+from ors_server.link import ws_daemon
 from ors_server.link.hub import Hub
 from ors_server.link.ws_daemon import (
     CLOSE_HELLO_FIRST,
     CLOSE_MALFORMED,
+    CLOSE_PROTOCOL_SKEW,
+    CLOSE_SLOW_HELLO,
     CLOSE_SUPERSEDED,
     CLOSE_UNAUTHORIZED,
     CLOSE_UNSERVABLE,
+    _authenticate,
+    _handle,
+    _Session,
     daemon_socket,
 )
-from ors_server.pairing import mint_token
+from ors_server.pairing import _fingerprint, mint_token
 from starlette.websockets import WebSocketDisconnect
 
 DISPLAY = {"backend": "virtual", "out_dir": "/tmp/p"}
@@ -109,6 +115,7 @@ class FakeSocket:
         self.inbox: asyncio.Queue[str | None] = asyncio.Queue()
         self.close_code: int | None = None
         self.close_reason: str | None = None
+        self.idle = asyncio.Event()
         for line in script:
             self.inbox.put_nowait(line)
         if hang_up:
@@ -118,10 +125,26 @@ class FakeSocket:
         self.accepted = True
 
     async def receive_text(self) -> str:
+        if self.inbox.empty():
+            # Asking for a message there is nothing to answer with is the one
+            # moment that says everything queued has been handled: the loop
+            # reads, handles, and only then reads again. See `handled`.
+            self.idle.set()
         raw = await self.inbox.get()
         if raw is None:
             raise WebSocketDisconnect(1006)
         return raw
+
+    async def handled(self) -> None:
+        """Wait until everything said so far has been read and acted on.
+
+        A test that changes a row between two frames has to know which frame saw
+        the change, and a refused frame produces nothing else to wait on -- that
+        is what being refused means. Yielding to the loop a fixed number of
+        times would pass for the wrong reason as readily as the right one.
+        """
+        self.idle.clear()
+        await asyncio.wait_for(self.idle.wait(), PROMPTLY)
 
     async def send_text(self, payload: str) -> None:
         self.sent.append(payload)
@@ -145,8 +168,49 @@ class FakeSocket:
         return [json.loads(payload) for payload in self.sent]
 
 
+class VanishingSocket(FakeSocket):
+    """A socket whose first send is the moment this daemon is deleted.
+
+    Not contrived. `Paired` goes on the wire between the read that authenticates
+    a daemon and the read that gets its configuration version, and that write is
+    the only place in `_hello` that yields to the event loop -- so a
+    `DELETE /api/daemons/{id}` landing in the gap really does leave the second
+    read with no row.
+    """
+
+    async def send_text(self, payload: str) -> None:
+        await super().send_text(payload)
+        with closing(self.app.state.database.connect()) as connection:
+            connection.execute(
+                "DELETE FROM daemon WHERE id = ?", (json.loads(payload)["daemon_id"],)
+            )
+
+
 async def run(socket: FakeSocket) -> None:
     await asyncio.wait_for(daemon_socket(socket), PROMPTLY)
+
+
+def running_tasks() -> set[asyncio.Task]:
+    """Everything still on this loop, which is how a leaked reader is visible.
+
+    `asyncio.wait` does not cancel the awaitables it was handed, so a handler
+    cancelled mid-race leaves its `receive_text()` behind and nothing else in
+    the test can see it -- the socket looks closed and the handler looks gone.
+    """
+    return {task for task in asyncio.all_tasks() if not task.done()}
+
+
+def counted(monkeypatch) -> list[int]:
+    """Every ownership query, so a bound on them can be asserted rather than hoped."""
+    calls: list[int] = []
+    real = ws_daemon._owned_screens
+
+    def counting(database, daemon_id: int) -> set[int]:
+        calls.append(daemon_id)
+        return real(database, daemon_id)
+
+    monkeypatch.setattr(ws_daemon, "_owned_screens", counting)
+    return calls
 
 
 async def connected(app, credential: str) -> tuple[FakeSocket, asyncio.Task]:
@@ -352,12 +416,38 @@ async def test_a_daemon_already_running_this_version_is_not_pushed_to_again(tmp_
     them, so an unnecessary push turns a wifi blip into a rack-wide flicker.
     """
     app, daemon_id, token = build(tmp_path)
+    add_screen(app, daemon_id)
     key = await paired_key(app, token)
 
     socket = FakeSocket(app, hello(key, config_version=0))
     await run(socket)
 
     assert socket.messages == [], "the daemon said it already had this one"
+
+
+async def test_the_connect_that_pairs_is_pushed_to_whatever_it_claims(tmp_path):
+    """A first pairing cannot be talked out of its configuration.
+
+    The version comparison asks "does the daemon already have what I would
+    send?", and at the moment a token is spent the answer is known outright:
+    this server has given this daemon nothing. So on that one connect the claim
+    is not admissible, and it is the connect where believing it is worst -- a
+    re-imaged Pi with a stale cache claims 0, an untouched server is on the
+    schema default of 0, and the two match exactly.
+
+    Nothing recovers from that. `Hub.register` has just cleared the ack, so the
+    server's record of what this daemon is running stays "unknown" rather than
+    becoming "0", and no push is retried until an unrelated edit bumps the
+    counter. The rack sits blank against a server that thinks it is up to date.
+    """
+    app, daemon_id, token = build(tmp_path)
+    add_screen(app, daemon_id)
+
+    socket = FakeSocket(app, hello(token, config_version=0))
+    await run(socket)
+
+    assert [message["type"] for message in socket.messages] == ["paired", "config"]
+    assert socket.messages[1]["snapshot"]["screens"][0]["name"] == "CPU"
 
 
 async def test_a_daemon_running_something_else_is_pushed_to(tmp_path):
@@ -432,12 +522,10 @@ async def test_a_snapshot_no_daemon_could_run_closes_the_socket_rather_than_cras
 
 
 async def test_an_ack_is_recorded_for_the_connection_that_sent_it(tmp_path):
-    """Recorded against the `Connection`, not the id.
+    """The happy path: a live daemon answers its push and the hub believes it.
 
-    A superseded handler is still a reader, and the ack it is holding was read
-    from a socket the daemon has already left; under the id it would describe
-    the previous boot. The hub refuses that -- but only if it is handed
-    something it can check the identity of.
+    Only that. What the ack is recorded *against* is the next test's -- this one
+    passes whether the handler hands the hub a `Connection` or a bare id.
     """
     app, daemon_id, token = build(tmp_path)
     hub = app.state.hub = WatchfulHub()
@@ -452,6 +540,52 @@ async def test_an_ack_is_recorded_for_the_connection_that_sent_it(tmp_path):
     assert hub.acked_version(daemon_id) == push["version"]
     socket.hang_up()
     await asyncio.wait_for(handler, PROMPTLY)
+
+
+async def test_an_ack_from_a_superseded_handler_is_discarded(tmp_path):
+    """The guard the previous test cannot reach, and the reason it takes a `Connection`.
+
+    A handler whose socket the hub has replaced is still a reader, and the ack
+    it is holding was read from the boot the daemon has already left. Recorded
+    under the daemon id it describes that dead boot -- so a caller comparing
+    versions before pushing sees a match, pushes nothing, and leaves a freshly
+    rebooted Pi blank against a server that believes it is up to date. Which is
+    exactly what `Hub.register` clears the ack to prevent.
+
+    Whitebox, because the loop is built so this cannot be provoked from
+    outside: `superseded` is checked before the message, so an ack read in the
+    same pass as the replacement is never handled at all. That is the belt; this
+    is the braces, and braces nothing pulls on are not braces.
+    """
+    app, daemon_id, token = build(tmp_path)
+    hub = app.state.hub
+    stale = _Session(daemon_id=daemon_id, connection=hub.register(daemon_id, nowhere), owned=set())
+    hub.register(daemon_id, nowhere)  # the daemon rebooted; this is the live socket
+
+    await _handle(app.state, stale, Ack(config_version=7))
+
+    assert hub.acked_version(daemon_id) is None, "an ack from a boot that is over"
+
+
+async def test_a_hello_does_not_get_to_say_what_this_daemon_s_standing_is(tmp_path):
+    """`status` is pairing's to write, and connecting is not pairing.
+
+    `_record_hello` writes everything the daemon says about itself, and its
+    standing with the server is the one thing that is not that. A hello that
+    could set it would let a rack an operator has just taken out of service put
+    itself back the moment its link came up -- on no authority beyond having
+    reconnected with a key it already had.
+    """
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    with closing(app.state.database.connect()) as connection:
+        connection.execute("UPDATE daemon SET status = 'disabled' WHERE id = ?", (daemon_id,))
+
+    await run(FakeSocket(app, hello(key)))
+
+    row = daemon_row(app, daemon_id)
+    assert row["status"] == "disabled"
+    assert row["version"] == "0.1.0", "and it did record the things that are the daemon's to say"
 
 
 async def test_a_heartbeat_keeps_the_daemon_from_looking_lost(tmp_path):
@@ -588,6 +722,100 @@ async def test_a_screen_added_after_hello_is_not_a_stranger(tmp_path):
     await finish(socket, handler)
 
 
+async def test_frames_for_screens_nobody_owns_cost_one_query_and_one_line_a_window(
+    tmp_path, monkeypatch, caplog
+):
+    """`screen_id` is an unbounded int, and frames arrive as fast as the socket.
+
+    Measured before this bound: 500 frames naming 500 *distinct* ids produced
+    500 ownership queries -- synchronous SQLite, on the event loop, at 74
+    microseconds each -- 500 entries in a per-connection set nothing ever
+    cleared, and 500 WARNING lines. All three are attacker-chosen, from a
+    daemon that only has to be able to send frames.
+
+    A window rather than a memo of the ids already refused: one re-read per
+    window bounds the queries whatever ids arrive, the memory is a counter, and
+    the log gets one line carrying how many frames it stands for.
+    """
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    queries = counted(monkeypatch)
+    socket, handler = await connected(app, key)
+    caplog.set_level("WARNING", logger="ors_server.link.ws_daemon")
+    del queries[:]  # the hello's read, which is not what is being bounded
+
+    for screen_id in range(1000, 1500):
+        socket.say(Frame(screen_id=screen_id, seq=1, webp=b"RIFF").model_dump_json())
+    # A message the handler answers, so the test knows all 500 have been read
+    # without polling for something that is supposed not to happen.
+    with closing(app.state.database.connect()) as connection:
+        connection.execute("UPDATE daemon SET last_seen = 'long ago' WHERE id = ?", (daemon_id,))
+    socket.say(Heartbeat().model_dump_json())
+    await finish(socket, handler)
+
+    assert daemon_row(app, daemon_id)["last_seen"] != "long ago", "all of them were read"
+    assert queries == [daemon_id], "one window, one query, however many ids arrive"
+    assert len(caplog.records) == 1, "one line, however many frames it stands for"
+    assert caplog.records[0].dropped == 1
+
+
+async def test_the_frames_a_window_swallowed_are_counted_into_the_next_line(
+    tmp_path, monkeypatch, caplog
+):
+    """Rate-limited, not thrown away: the count is what the line is worth reading for."""
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    socket, handler = await connected(app, key)
+    caplog.set_level("WARNING", logger="ors_server.link.ws_daemon")
+
+    for screen_id in range(1000, 1004):
+        socket.say(Frame(screen_id=screen_id, seq=1, webp=b"RIFF").model_dump_json())
+        await socket.handled()
+    # Standing in for the window elapsing, which a test may not spend seconds on.
+    monkeypatch.setattr(ws_daemon, "OWNERSHIP_REFRESH_S", 0.0)
+    socket.say(Frame(screen_id=1004, seq=1, webp=b"RIFF").model_dump_json())
+    await socket.handled()
+    await finish(socket, handler)
+
+    assert [record.dropped for record in caplog.records] == [1, 4]
+
+
+async def test_a_screen_handed_to_this_daemon_stops_being_refused(tmp_path, monkeypatch):
+    """A refusal that never expires is a panel that stays blank until a reconnect.
+
+    Screens move between racks -- it is a field in the interface. The set was
+    re-read once on a miss and the id then memoised as refused forever, so the
+    daemon that was *given* the screen went on dropping its frames for the life
+    of the connection, with a log line blaming it each time. Re-reading on a
+    schedule fixes that for free, which is most of why it is a schedule.
+    """
+    app, daemon_id, token = build(tmp_path)
+    with closing(app.state.database.connect()) as connection:
+        stranger = int(
+            connection.execute(
+                "INSERT INTO daemon (name, status, created_at) VALUES ('other', 'paired', 'x')"
+            ).lastrowid
+        )
+    screen_id = add_screen(app, stranger, name="Moving")
+    key = await paired_key(app, token)
+    socket, handler = await connected(app, key)
+    watching: asyncio.Queue = asyncio.Queue()
+    app.state.hub.subscribe_frames(screen_id, watching)
+
+    socket.say(Frame(screen_id=screen_id, seq=1, webp=b"RIFF").model_dump_json())
+    await socket.handled()
+    assert watching.empty(), "it was another rack's when the first frame arrived"
+
+    with closing(app.state.database.connect()) as connection:
+        connection.execute("UPDATE screen SET daemon_id = ? WHERE id = ?", (daemon_id, screen_id))
+    monkeypatch.setattr(ws_daemon, "OWNERSHIP_REFRESH_S", 0.0)
+    socket.say(Frame(screen_id=screen_id, seq=2, webp=b"RIFF").model_dump_json())
+    frame = await asyncio.wait_for(watching.get(), PROMPTLY)
+
+    assert frame.seq == 2, "the first was another rack's; the second was this one's"
+    await finish(socket, handler)
+
+
 async def test_frame_streaming_resumes_only_for_the_screens_this_daemon_owns(tmp_path):
     """`watched_screens()` is every screen anyone is watching, across all racks.
 
@@ -698,8 +926,153 @@ async def test_a_message_arriving_as_the_connection_is_replaced_is_not_acted_on(
     assert watching.empty(), "a frame from a socket the hub had already replaced"
 
 
+async def test_a_superseded_handler_leaves_no_reader_behind(tmp_path):
+    """`asyncio.wait` does not cancel the awaitables it was handed.
+
+    So the receive that lost the race is still pending when the handler
+    returns: one orphaned read per supersede, holding a socket object, a
+    coroutine frame and a place in the loop's ready queue for as long as the
+    server runs. Invisible from anywhere else in a test -- the socket is closed
+    and the handler is gone -- which is why this counts tasks.
+    """
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    before = running_tasks()
+    socket, handler = await connected(app, key)
+
+    app.state.hub.register(daemon_id, nowhere)
+    await asyncio.wait_for(handler, PROMPTLY)
+
+    assert socket.close_code == CLOSE_SUPERSEDED
+    assert running_tasks() <= before, "the receive the superseded handler lost the race with"
+
+
+async def test_cancelling_a_handler_leaves_no_reader_behind_either(tmp_path):
+    """The other exit, and the one that happens to every connection at shutdown.
+
+    Cancelling the handler raises inside `asyncio.wait`, which cancels neither
+    of the two tasks it was given -- so a server going down orphans one receive
+    per connected rack, and so does any outer deadline that ever wraps this.
+    """
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    before = running_tasks()
+    socket, handler = await connected(app, key)
+
+    handler.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await handler
+
+    assert running_tasks() <= before
+
+
 async def nowhere(payload: str) -> None:
     """The send of the connection that supersedes one, going nowhere."""
+
+
+# --- what an unauthenticated socket is allowed to cost -----------------------
+
+
+async def test_a_socket_that_never_says_hello_does_not_park_a_handler(tmp_path, monkeypatch):
+    """Accepting a socket is free; waiting on it forever is not.
+
+    Nothing else ever wakes this handler: the daemon is not obliged to send
+    anything after connecting, uvicorn's ping timeout is about a socket that has
+    gone away rather than one that is deliberately quiet, and there is no
+    credential yet to hold anyone to account with. Forty of these were held open
+    against the server with no authentication of any kind.
+    """
+    monkeypatch.setattr(ws_daemon, "HELLO_TIMEOUT_S", 0.01)
+    app, daemon_id, _ = build(tmp_path)
+    socket = FakeSocket(app, hang_up=False)
+
+    await run(socket)
+
+    assert (socket.close_code, socket.close_reason) == (CLOSE_SLOW_HELLO, "no hello")
+    assert app.state.hub.is_online(daemon_id) is False
+
+
+def test_a_daemon_speaking_another_protocol_version_is_told_which(tmp_path):
+    """`PROTOCOL_VERSION` exists so a server meeting an older daemon can say so.
+
+    A code of its own, because the whole reason the 4000 range is split up is
+    that a client has to tell "retry this" from "stop". Skew is neither: it is
+    "this build cannot talk to that build", and a daemon that reads it can say
+    so on its own console instead of reconnecting forever against a server that
+    will never understand it.
+
+    Checked before the credential is looked at, and this asserts as much: a
+    message this build cannot interpret is not one to act on, whoever sent it.
+    """
+    client, daemon_id, token = client_for(tmp_path)
+
+    with client.websocket_connect("/ws/daemon") as socket:
+        socket.send_text(hello(token, protocol_version=PROTOCOL_VERSION + 1))
+        with pytest.raises(WebSocketDisconnect) as closed:
+            socket.receive_text()
+
+    assert closed.value.code == CLOSE_PROTOCOL_SKEW
+    row = daemon_row(client.app, daemon_id)
+    assert row["token_hash"] is not None, "and its token was not spent on the way"
+    assert row["status"] == "unpaired"
+
+
+def test_a_key_is_tried_before_a_pairing_token(tmp_path):
+    """Both orders authenticate. Only one of them does so without side effects.
+
+    Two rows, one holding a string as its key and another holding the same
+    string as an unspent token. Astronomically improbable and entirely
+    constructible, and the schema's new CHECK is about one row rather than two.
+
+    Trying the token first would make an ordinary reconnect -- which the key
+    already answers -- spend an unrelated daemon's pairing token as a side
+    effect. That daemon is then holding a token the server has forgotten, and
+    the only way back is a new one from the interface.
+    """
+    app, _, _ = build(tmp_path)
+    database = app.state.database
+    credential = "one-string-two-rows"
+    with closing(database.connect()) as connection:
+        keyed = int(
+            connection.execute(
+                "INSERT INTO daemon (name, key_hash, status, created_at)"
+                " VALUES ('paired-one', ?, 'paired', 'now')",
+                (_fingerprint(credential),),
+            ).lastrowid
+        )
+        tokened = int(
+            connection.execute(
+                "INSERT INTO daemon (name, token_hash, created_at) VALUES ('unpaired-one', ?, ?)",
+                (_fingerprint(credential), "now"),
+            ).lastrowid
+        )
+
+    assert _authenticate(database, credential) == (keyed, None)
+
+    with closing(database.connect()) as connection:
+        still_there = connection.execute(
+            "SELECT token_hash FROM daemon WHERE id = ?", (tokened,)
+        ).fetchone()["token_hash"]
+    assert still_there is not None, "and nobody else's pairing was spent on the way"
+
+
+async def test_a_daemon_deleted_while_it_is_pairing_is_closed_rather_than_crashed(tmp_path):
+    """The row is read twice, and the interface can delete it in between.
+
+    `Paired` is written to the wire between those two reads and is the only
+    thing in `_hello` that yields, so the gap is real rather than theoretical.
+    The second read then raises `KeyError`, which unhandled leaves the route by
+    raising -- on a socket that is a close with no code the daemon can act on,
+    and a traceback in the log of a server that was asked an ordinary question.
+    """
+    app, daemon_id, token = build(tmp_path)
+
+    socket = VanishingSocket(app, hello(token))
+    await run(socket)
+
+    assert socket.close_code == CLOSE_UNSERVABLE
+    assert [message["type"] for message in socket.messages] == ["paired"]
+    assert app.state.hub.is_online(daemon_id) is False, "it never became a connection"
 
 
 # --- the route, where the app puts it --------------------------------------

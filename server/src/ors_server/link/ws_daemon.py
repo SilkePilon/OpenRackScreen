@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from contextlib import closing
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from ors_schema.link import (
+    PROTOCOL_VERSION,
     Ack,
     ConfigPush,
     DaemonMessage,
@@ -46,10 +48,56 @@ of the work of finding one that is.
 """
 CLOSE_HELLO_FIRST = 4402
 """Something arrived before the socket said who it was."""
+CLOSE_SLOW_HELLO = 4408
+"""The socket was accepted and then said nothing. Mirrors HTTP 408."""
 CLOSE_SUPERSEDED = 4409
 """The same daemon connected again and this socket is the old one."""
+CLOSE_PROTOCOL_SKEW = 4426
+"""The two ends do not speak the same version of this protocol. Mirrors HTTP 426.
+
+Distinct from every other refusal here because a daemon can do something about
+it and the something is not "retry": reconnecting against a build that cannot
+understand you never gets anywhere, and the operator has to be told to upgrade
+one end or the other.
+"""
 CLOSE_UNSERVABLE = 4500
 """The database holds a configuration this daemon could not be given."""
+
+HELLO_TIMEOUT_S = 10.0
+"""How long an accepted socket may say nothing before it is closed.
+
+Nothing else ever wakes that handler. The daemon is under no obligation to speak
+again once connected, uvicorn's ping timeout is about a peer that has gone away
+rather than one that is deliberately quiet, and there is no credential yet to
+hold anyone to account with -- so without this, anyone who can reach the port
+parks a handler, a socket and a task by connecting, and can do it as many times
+as the operating system will let them. Forty were held open at once.
+
+Ten seconds because a daemon's `hello` is one small write it makes immediately,
+with no work in front of it: what has to fit here is a congested LAN, a
+reverse proxy, and a Pi that is still finishing its boot, not anything the
+daemon computes. It is a liveness bound and not a rate limit -- a peer that
+sends a well-formed `hello` with a wrong credential every ten seconds is still
+free to, and bounding *that* means a connection cap, which is a piece of
+infrastructure this route should not be growing on its own. Residual risk,
+recorded rather than solved.
+"""
+
+OWNERSHIP_REFRESH_S = 5.0
+"""How stale one connection's idea of which screens it owns may get.
+
+The bound on `_owns`, and it has to be a bound rather than a memo of the ids
+already refused. `screen_id` is an unbounded int chosen by the daemon: 500
+frames naming 500 distinct ids produced 500 ownership queries -- synchronous
+SQLite on the event loop -- 500 entries in a set nothing ever cleared, and 500
+WARNING lines. A window costs one query and one line however many ids arrive.
+
+Five seconds is the whole cost of the window as well: a screen moved to this
+rack in the interface has its first frames dropped for up to that long, which
+is ten frames at the 2 fps the daemon is asked for, against an edit whose
+config push is in flight anyway. Shorter buys a promptness nobody can perceive;
+much longer starts to look like the panel is broken.
+"""
 
 
 @dataclass
@@ -65,10 +113,14 @@ class _Session:
     connection: Connection
     owned: set[int]
     """The screens this daemon may send frames for. See `_owns`."""
-    refused: set[int] = field(default_factory=set)
-    """Screen ids already checked against the database and found to be another
-    rack's, so a daemon that keeps sending them cannot make this handler keep
-    re-reading the table."""
+    refreshed_at: float | None = None
+    """`time.monotonic()` when a frame last made `owned` be re-read, or None
+    because no frame has yet named a screen that was not already in it."""
+    refused: int = 0
+    """Frames dropped since the last refusal was logged, including that one.
+
+    A counter and not the set of ids, which is the difference between memory
+    this connection's peer chooses the size of and memory it does not."""
 
 
 @router.websocket("/ws/daemon")
@@ -93,7 +145,17 @@ async def daemon_socket(socket: WebSocket) -> None:
 async def _hello(state: State, socket: WebSocket) -> _Session | None:
     """Identify the daemon and bring it up to date, or close and return None."""
     try:
-        first = parse_daemon_message(await socket.receive_text())
+        raw = await asyncio.wait_for(socket.receive_text(), HELLO_TIMEOUT_S)
+    except TimeoutError:
+        # Nothing else would ever wake this handler: a peer that connects and
+        # says nothing is not a peer that has gone away, so no ping timeout
+        # applies, and there is no credential yet to hold it to account with.
+        log.info("a socket was accepted and never said hello")
+        await socket.close(code=CLOSE_SLOW_HELLO, reason="no hello")
+        return None
+
+    try:
+        first = parse_daemon_message(raw)
     except ValidationError as error:
         # Closed rather than skipped, unlike a malformed message on an
         # established link: an unidentified socket has nothing worth keeping
@@ -106,6 +168,19 @@ async def _hello(state: State, socket: WebSocket) -> _Session | None:
     if not isinstance(first, Hello):
         log.info("a socket spoke before saying hello", extra={"said": first.type})
         await socket.close(code=CLOSE_HELLO_FIRST, reason="hello first")
+        return None
+
+    if first.protocol_version != PROTOCOL_VERSION:
+        # Before the credential is looked at, because a message this build
+        # cannot interpret is not one to act on whoever sent it -- and because
+        # the daemon deserves the real answer rather than being turned away as
+        # unauthorised for reasons that have nothing to do with its key. The
+        # version is not a secret; it is a build number both ends already know.
+        log.warning(
+            "a daemon speaks a protocol version this server does not",
+            extra={"claimed_protocol": first.protocol_version, "protocol": PROTOCOL_VERSION},
+        )
+        await socket.close(code=CLOSE_PROTOCOL_SKEW, reason=f"protocol {PROTOCOL_VERSION}")
         return None
 
     database: Database = state.database
@@ -134,7 +209,7 @@ async def _hello(state: State, socket: WebSocket) -> _Session | None:
     _record_hello(database, daemon_id, first)
 
     try:
-        push = _push_for(state, daemon_id, first.config_version)
+        push = _push_for(state, daemon_id, first.config_version, pairing=issued is not None)
         owned = _owned_screens(database, daemon_id)
     except (SnapshotError, KeyError) as error:
         # Unhandled, this leaves the route by raising, which on a socket is a
@@ -170,10 +245,16 @@ def _authenticate(database: Database, credential: str) -> tuple[int | None, str 
     """Who this is, and the key to hand back if this connect is what paired them.
 
     One field on the wire carries both credentials, so both are tried here. They
-    cannot be confused: a token's hash is deleted the moment it is spent, so at
-    most one of the two columns can ever match one string. The key is tried
-    first only because it is what all but the first connect of a daemon's life
-    presents.
+    cannot be confused within a row -- a token's hash is deleted the moment it is
+    spent, and the schema's `CHECK` says a row holds one or the other -- so at
+    most one column of any one row can match a string.
+
+    The key is tried first, and the order matters for a reason beyond it being
+    what all but the first connect of a daemon's life presents: claiming a token
+    *spends* it. Trying the token first would make an ordinary reconnect capable
+    of burning a pairing that belongs to another row, and the daemon holding
+    that token could then never use it. Authenticate with the credential that
+    has no side effects before reaching for the one that does.
     """
     daemon_id = authenticate_key(database, credential)
     if daemon_id is not None:
@@ -184,7 +265,9 @@ def _authenticate(database: Database, credential: str) -> tuple[int | None, str 
     return claimed
 
 
-def _push_for(state: State, daemon_id: int, running: int | None) -> ConfigPush | None:
+def _push_for(
+    state: State, daemon_id: int, running: int | None, *, pairing: bool
+) -> ConfigPush | None:
     """What this daemon should be given now, or None because it already has it.
 
     The version compared against is the one on the row, read and not bumped. A
@@ -200,6 +283,16 @@ def _push_for(state: State, daemon_id: int, running: int | None) -> ConfigPush |
     real push. So a skipped push leaves the server saying "unknown", which is
     the conservative answer and the one that costs at most one extra push later.
 
+    `pairing` is the one connect on which the claim is not admissible at all.
+    The comparison asks "does this daemon already have what I would send?", and
+    at the moment a token is spent the server knows outright that it has given
+    this daemon nothing -- so there is nothing for the claim to be a claim
+    about. It is also the connect where believing it is worst: a re-imaged Pi
+    with a stale cache says 0, an untouched server is on the schema default of
+    0, and nothing recovers, because the ack was just cleared and no push is
+    retried until an unrelated edit bumps the counter. The rack sits blank
+    against a server that believes it is up to date.
+
     Read the version before assembling the snapshot, never after. The number is
     then never newer than the rows it names, so an edit that lands in between
     mints a higher one and pushes its own; the other order would push stale rows
@@ -207,7 +300,7 @@ def _push_for(state: State, daemon_id: int, running: int | None) -> ConfigPush |
     deduped away.
     """
     version = _config_version(state.database, daemon_id)
-    if running == version:
+    if running == version and not pairing:
         return None
     return ConfigPush(
         version=version, snapshot=build_snapshot(state.database, state.secrets, daemon_id)
@@ -242,6 +335,7 @@ async def _serve(state: State, socket: WebSocket, session: _Session) -> None:
     # reader: still parsing messages, still relaying frames, still handing the
     # hub acks read from a daemon that has already gone.
     superseded = asyncio.create_task(session.connection.closed.wait())
+    reader: asyncio.Task[str] | None = None
     try:
         while True:
             reader = asyncio.create_task(socket.receive_text())
@@ -250,7 +344,6 @@ async def _serve(state: State, socket: WebSocket, session: _Session) -> None:
                 # Checked first, because both can finish in the same pass and a
                 # message read from a connection the hub has already forgotten
                 # must not be acted on.
-                await _cancel(reader)
                 log.info("closing a superseded daemon socket", extra={"daemon": session.daemon_id})
                 await socket.close(code=CLOSE_SUPERSEDED, reason="superseded")
                 return
@@ -273,7 +366,20 @@ async def _serve(state: State, socket: WebSocket, session: _Session) -> None:
                 continue
             await _handle(state, session, message)
     finally:
+        # Both, on every way out of this function, and here rather than at each
+        # exit because there are more of them than there look: `asyncio.wait`
+        # cancels neither of the awaitables it was handed, so a handler
+        # cancelled mid-race -- at shutdown, or under any outer deadline that is
+        # ever put around this -- leaves its `receive_text()` pending, one per
+        # connected rack. The superseded branch left one behind too.
+        #
+        # `_cancel` on a task that is already finished is a no-op that collects
+        # its result, which is what the ordinary path through here wants: the
+        # reader either returned the message just handled or raised the
+        # disconnect on its way out, and either way something has to retrieve it.
         await _cancel(superseded)
+        if reader is not None:
+            await _cancel(reader)
 
 
 async def _handle(state: State, session: _Session, message: DaemonMessage) -> None:
@@ -296,11 +402,9 @@ async def _handle(state: State, session: _Session, message: DaemonMessage) -> No
             },
         )
     elif isinstance(message, Frame):
+        # The refusal is logged inside `_owns`, which is the only thing that
+        # knows how many frames a single line is standing for.
         if not _owns(state.database, session, message.screen_id):
-            log.warning(
-                "a daemon sent a frame for a screen it does not own",
-                extra={"daemon": session.daemon_id, "screen": message.screen_id},
-            )
             return
         await state.hub.relay_frame(message)
     else:
@@ -327,20 +431,49 @@ def _owns(database: Database, session: _Session, screen_id: int) -> bool:
     rack it has nothing to do with, and every browser watching that screen shows
     it.
 
-    Re-read once on a miss rather than trusted from hello, because the set does
-    go stale under a live connection: adding a screen in the interface pushes a
-    new configuration through the hub, which knows nothing about this handler.
-    The re-read is bounded by `refused` so that a daemon sending frames for an
-    id that really is not its own cannot turn each one into a query.
+    Re-read on a miss rather than trusted from hello, because the set does go
+    stale under a live connection: screens are added and moved between racks in
+    the interface, which pushes a new configuration through the hub, and the hub
+    knows nothing about this handler.
+
+    The re-read is bounded by time and not by which ids have already been
+    refused, and the difference is the whole of what this function gets wrong
+    otherwise. `screen_id` is an unbounded int the daemon chooses, so a memo of
+    refused ids is a query, a set entry and a log line per *distinct* id, all
+    three sized by the peer -- 500 frames naming 500 ids produced exactly that.
+    Worse, a memo consulted before the re-read never expires, so a screen
+    legitimately handed to this daemon stayed blank for the rest of the
+    connection while the log blamed the daemon for sending it. Re-reading on a
+    schedule bounds the first problem and cannot have the second.
+
+    A window of silence is the price, and it is paid in the right direction: a
+    frame refused during it is a frame that would have been refused a moment
+    earlier anyway, and one that should now be relayed is only late.
     """
     if screen_id in session.owned:
         return True
-    if screen_id in session.refused:
+
+    now = time.monotonic()
+    if session.refreshed_at is not None and now - session.refreshed_at < OWNERSHIP_REFRESH_S:
+        # Inside the window: the table was read recently enough that reading it
+        # again would say the same thing. Drop it, count it, and say nothing.
+        session.refused += 1
         return False
+
     session.owned = _owned_screens(database, session.daemon_id)
+    session.refreshed_at = now
     if screen_id in session.owned:
         return True
-    session.refused.add(screen_id)
+
+    session.refused += 1
+    log.warning(
+        "dropped frames for screens this daemon does not own",
+        # The count is what makes one line worth as much as the flood it
+        # replaces: without it, rate-limiting the log hides the volume, which is
+        # the most interesting thing about a daemon sending ids that are not its.
+        extra={"daemon": session.daemon_id, "screen": screen_id, "dropped": session.refused},
+    )
+    session.refused = 0
     return False
 
 
