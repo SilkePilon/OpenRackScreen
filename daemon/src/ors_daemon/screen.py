@@ -262,7 +262,32 @@ class ScreenWorker(threading.Thread):
         return taken
 
     def resume(self) -> None:
-        """Give the panel back. Only ever called after a `pause` that returned True."""
+        """Give the panel back. A no-op on a worker that was never held off.
+
+        Robust rather than paired by convention, and the cost of the convention
+        is measured. `Lock.release` on a lock this thread never took raises
+        `RuntimeError`, and the only caller makes these calls from a `finally`
+        that runs *after* the retired panels have been closed and the new ones
+        opened -- so the raise escapes `apply` and the link nacks a snapshot that
+        is in fact on the glass, while every kept worker that *did* pause is
+        never resumed and stays frozen on its last frame for the life of the
+        process. One panel's pairing bug must not cost the other three.
+
+        `held_off` is what makes that decidable, which is a second reason for it
+        to be a field: it is set only by a `pause` that took the lock, so it
+        answers "did this worker hand its panel over" without asking a lock a
+        question locks cannot answer. Not re-entrant either way -- a second
+        `pause` returns False and never sets it, so one `resume` releases one
+        hold.
+
+        Still a warning, because a caller resuming what it never held is a bug in
+        the caller and this is the only place it can be seen from.
+        """
+        if not self.held_off:
+            log.warning(
+                "a screen was resumed that was never held off", extra={"screen": self.screen_name}
+            )
+            return
         self.held_off = False
         self._lock.release()
 

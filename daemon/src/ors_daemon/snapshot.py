@@ -51,6 +51,23 @@ class SnapshotStore:
         with self._condition:
             self._health.setdefault(name, IntegrationHealth())
 
+    def unregister(self, name: str) -> None:
+        """Forget an integration this rack no longer has. Idempotent.
+
+        For a reconfiguration that drops a source: the status file reports every
+        name the store knows, and a rack that reports readings from a Prometheus
+        nobody is polling any more is a rack describing a configuration it is not
+        running. The data goes with the health, so a screen that still names the
+        namespace renders nothing rather than the last value from before the push.
+
+        No `notify_all`: like `fail`, this does not move the version, and nothing
+        waits on anything else. The screens that depended on this source have
+        already been retired by the same apply.
+        """
+        with self._condition:
+            self._health.pop(name, None)
+            self._data.pop(name, None)
+
     def put(self, name: str, fields: dict[str, Any], latency_ms: float, now: datetime) -> None:
         with self._condition:
             # Copied on the way in as well as out: `fields` belongs to the

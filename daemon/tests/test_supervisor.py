@@ -13,9 +13,26 @@ from ors_daemon.displays import DisplayError
 from ors_daemon.screen import _NIGHT_PARK_CHUNK as NIGHT_PARK_CHUNK
 from ors_daemon.screen import ScreenWorker
 from ors_daemon.snapshot import SnapshotStore
+from ors_daemon.supervisor import _BUS_GUARD_PER_SCREEN as BUS_GUARD_PER_SCREEN
 from ors_daemon.supervisor import _MAX_RESTARTS as MAX_RESTARTS
-from ors_daemon.supervisor import APPLY_BUDGET, SHUTDOWN_BUDGET, Supervisor, _Panel, _Slot
-from ors_schema.daemon import DaemonConfig, NightWindow, ScreenConfig
+from ors_daemon.supervisor import (
+    APPLY_BUDGET,
+    BUS_GUARD_BUDGET,
+    SHUTDOWN_BUDGET,
+    SOURCE_TEARDOWN_BUDGET,
+    Supervisor,
+    _Panel,
+    _Reaper,
+    _Slot,
+    _Source,
+)
+from ors_schema.daemon import (
+    DaemonConfig,
+    IntegrationConfig,
+    NightWindow,
+    ScreenConfig,
+    TunnelConfig,
+)
 from PIL import Image
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
@@ -91,6 +108,7 @@ class RecordingPoller:
         self.url_provider = url_provider
         self.started = 0
         self.joined = 0
+        self.stop: threading.Event | None = None
 
     def start(self) -> None:
         self.started += 1
@@ -98,25 +116,37 @@ class RecordingPoller:
     def join(self, timeout: float | None = None) -> None:
         self.joined += 1
 
+    def is_alive(self) -> bool:
+        return False
+
 
 class FakeTunnel:
     """A tunnel that opens nothing: no kubectl, no subprocess, no local port."""
 
-    def __init__(self, config: Any) -> None:
+    def __init__(self, config: Any, stop: threading.Event | None = None) -> None:
         self.config = config
+        self.stop = stop
         self.base_url = f"http://localhost:{config.local_port}"
         self.started = 0
         self.shutdowns = 0
         self.joined = 0
+        self.shutdown_timeouts: list[float | None] = []
+        self.on_shutdown: Callable[[], None] | None = None
 
     def start(self) -> None:
         self.started += 1
 
     def shutdown(self, timeout: float | None = None) -> None:
         self.shutdowns += 1
+        self.shutdown_timeouts.append(timeout)
+        if self.on_shutdown is not None:
+            self.on_shutdown()
 
     def join(self, timeout: float | None = None) -> None:
         self.joined += 1
+
+    def is_alive(self) -> bool:
+        return False
 
 
 class FakeMonotonic:
@@ -150,6 +180,19 @@ class Wedged:
         self._clock = clock
         self.screen_name = name
         self.granted: list[float] = []
+        # Nought is "has not ticked yet", so a watchdog pass over a slot holding
+        # one of these leaves it alone rather than reading an attribute a real
+        # worker has and this does not.
+        self.heartbeat = 0.0
+        # What a status write reads off a worker. A wedged screen is still a
+        # screen the status file has to be able to describe -- that is most of
+        # why the file exists -- so a double standing in for one answers the
+        # same questions.
+        self.current_scene: str | None = None
+        self.last_render = None
+        self.renders = 0
+        self.faulted = False
+        self.asleep = False
 
     def join(self, timeout: float | None = None) -> None:
         self._spend(timeout)
@@ -162,6 +205,20 @@ class Wedged:
 
     def is_alive(self) -> bool:
         return True
+
+    def pause(self, timeout: float) -> bool:
+        """A worker inside an SPI write never comes off its panel, and spends the wait.
+
+        Which is the case the bus guard exists for and the one a healthy rack
+        hides: `pause` takes the tick lock, so a worker wedged on the wire holds
+        it until the timeout runs out and then answers False.
+        """
+        self.granted.append(timeout)
+        self._clock.advance(timeout)
+        return False
+
+    def resume(self) -> None:
+        raise AssertionError("a worker that refused to pause must never be resumed")
 
     def _spend(self, timeout: float | None) -> None:
         assert timeout is not None, "a shutdown with no deadline is not a shutdown"
@@ -771,7 +828,7 @@ def test_a_tunnelled_integration_gets_a_tunnel(tmp_path: Path) -> None:
     tunnels: list[FakeTunnel] = []
 
     def tunnel_factory(tunnel_config: Any, stop: threading.Event) -> FakeTunnel:
-        tunnels.append(FakeTunnel(tunnel_config))
+        tunnels.append(FakeTunnel(tunnel_config, stop))
         return tunnels[-1]
 
     supervisor, _, _ = build(config, tmp_path, tunnel_factory=tunnel_factory)
@@ -779,11 +836,18 @@ def test_a_tunnelled_integration_gets_a_tunnel(tmp_path: Path) -> None:
     try:
         assert len(supervisor.tunnels) == 1
         assert tunnels[0].started == 1
+        assert tunnels[0].stop is not supervisor.stop_event, (
+            "a tunnel parks on its own source's event, or retiring one integration "
+            "stops the whole rack"
+        )
     finally:
         supervisor.stop()
 
     assert tunnels[0].shutdowns == 1
     assert tunnels[0].joined == 1
+    assert tunnels[0].stop.is_set(), (
+        "and `stop` has to set every one of those, since the shared event no longer reaches them"
+    )
 
 
 def test_each_tunnelled_integration_polls_through_its_own_tunnel(tmp_path: Path) -> None:
@@ -1080,28 +1144,39 @@ class Rack:
         on_open: Callable[[str], None] | None = None,
         night: dict[str, Any] | None = None,
         each_screen: dict[str, Any] | None = None,
+        displays: list[dict[str, Any]] | None = None,
         shutdown_budget: float = SHUTDOWN_BUDGET,
         apply_budget: float = APPLY_BUDGET,
+        shutdown_clock: Any = None,
+        poller_factory: Any = None,
     ) -> None:
         self.events: list[str] = []
         self.opens: list[tuple[str, TracedDisplay]] = []
         self.on_open = on_open
+        self.store = SnapshotStore()
         self.raw = config_dict(tmp_path, screens)
         if night is not None:
             self.raw["night"] = night
         if each_screen is not None:
             self.raw["screens"] = [{**screen, **each_screen} for screen in self.raw["screens"]]
+        if displays is not None:
+            self.raw["screens"] = [
+                {**screen, "display": display}
+                for screen, display in zip(self.raw["screens"], displays, strict=True)
+            ]
         config = DaemonConfig.model_validate(self.raw)
+        extra: dict[str, Any] = {} if shutdown_clock is None else {"shutdown_clock": shutdown_clock}
         self.supervisor = Supervisor(
             config=config,
             screens=resolve_screens(config),
-            store=SnapshotStore(),
+            store=self.store,
             clock=FakeClock(NIGHT if night else NOW),
             status_path=tmp_path / "status.json",
             display_factory=self._open,
-            poller_factory=lambda integration_config, url_provider: None,
+            poller_factory=poller_factory or (lambda integration_config, url_provider: None),
             shutdown_budget=shutdown_budget,
             apply_budget=apply_budget,
+            **extra,
         )
 
     def _open(self, screen_config: ScreenConfig, name: str) -> TracedDisplay:
@@ -1550,6 +1625,43 @@ def test_pause_says_whether_it_took_the_panel(tmp_path: Path) -> None:
     worker.resume()
 
 
+def test_resuming_a_worker_that_never_paused_costs_nothing_but_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`Lock.release` on a lock this thread never took raises `RuntimeError`.
+
+    From `_off_the_bus`'s `finally`, which runs after the retired panels are
+    closed and the new ones opened -- so that raise escapes `apply` and the link
+    nacks a snapshot that is in fact on the glass, and the kept workers that
+    *did* pause are never resumed: up to three panels frozen on their last frame
+    for the life of the process. One panel's pairing bug must not cost the rack.
+    """
+    config = DaemonConfig.model_validate(config_dict(tmp_path, screens=1))
+    worker = ScreenWorker(
+        screen=resolve_screens(config)[0],
+        store=SnapshotStore(),
+        display=RecordingDisplay(),
+        system={},
+        night=NightWindow(enabled=False),
+        stop=threading.Event(),
+        clock=FakeClock(NOW),
+    )
+
+    with caplog.at_level("WARNING", logger="ors_daemon.screen"):
+        worker.resume()
+        worker.pause(0.0)
+        worker.resume()
+        worker.resume()
+
+    assert worker.held_off is False
+    assert worker.pause(0.0) is True, "and the lock is left in a state a later pause can take"
+    worker.resume()
+    assert [record.getMessage() for record in caplog.records] == [
+        "a screen was resumed that was never held off",
+        "a screen was resumed that was never held off",
+    ]
+
+
 def test_apply_stops_only_the_worker_whose_screen_changed(tmp_path: Path) -> None:
     """Which is why a worker cannot wait on the supervisor's shared stop event:
     setting that one stops the whole rack, and there is no reconfiguration for
@@ -1715,30 +1827,265 @@ def test_apply_reports_the_new_configs_fingerprint(tmp_path: Path) -> None:
         rack.supervisor.stop()
 
 
-def test_apply_says_out_loud_that_it_cannot_reconfigure_an_integration(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """It does not restart pollers or tunnels, and a rack whose snapshot names a
-    different Prometheus would otherwise poll the old one forever with nothing
-    anywhere saying why. Taking a tunnel down is a `kubectl` SIGTERM-then-SIGKILL
-    wait measured at ten seconds in M2, which is the whole shutdown budget -- so
-    it is out of scope here, and loud instead of quiet."""
-    rack = Rack(tmp_path, screens=1)
+# --- reconfiguring the integrations -----------------------------------------
+#
+# A push that moves an integration used to warn and carry on. That is worse than
+# it sounds: `_diff` retires every screen whose `depends_on` moved, and the
+# replacement worker's health gate finds no entry for the new source, so the
+# panel that was showing a live reading shows `connecting` until somebody
+# restarts the daemon.
+
+
+def recording_pollers() -> tuple[list[RecordingPoller], Callable[[Any, Any], RecordingPoller]]:
+    pollers: list[RecordingPoller] = []
+
+    def factory(integration_config: Any, url_provider: Any) -> RecordingPoller:
+        pollers.append(RecordingPoller(integration_config, url_provider))
+        return pollers[-1]
+
+    return pollers, factory
+
+
+def with_integrations(raw: dict[str, Any], *integrations: dict[str, Any]) -> DaemonConfig:
+    """`raw` with a different set of sources, and one screen bound to the first."""
+    first = integrations[0]["name"]
+    screens = [dict(screen) for screen in raw["screens"]]
+    screens[0] = {
+        **screens[0],
+        "params": {
+            "title": "S1",
+            "value": f"{{{{{first}.cpu}}}}",
+            "big": f"{{{{{first}.cpu | round:0}}}}%",
+        },
+    }
+    return DaemonConfig.model_validate(
+        {**raw, "integrations": list(integrations), "screens": screens}
+    )
+
+
+def test_apply_starts_a_poller_for_a_source_the_push_adds(tmp_path: Path) -> None:
+    """Otherwise the screens that depend on it show `connecting` for ever.
+
+    Measured on the draft, on a push that pointed one screen at a new `qb`
+    source: `depends_on={'qb'}`, `store health keys=['prom']`, `pollers=0`,
+    `current_scene='connecting'`. The screen had been showing a live reading a
+    moment earlier -- `_diff` retires a screen whose `depends_on` moved, and the
+    replacement worker's health gate finds nothing for the new name -- so a push
+    that warned and carried on left a panel worse off than a push that did
+    nothing at all, until someone restarted the daemon.
+    """
+    pollers, poller_factory = recording_pollers()
+    rack = Rack(tmp_path, screens=1, poller_factory=poller_factory)
     rack.supervisor.start()
     try:
-        moved = {
-            **rack.raw,
-            "integrations": [{**rack.raw["integrations"][0], "url": "http://elsewhere:9090"}],
-        }
+        rack.supervisor.apply(with_integrations(rack.raw, integration_dict("qb")))
 
+        assert [poller.config.name for poller in rack.supervisor.pollers] == ["qb"]
+        assert pollers[-1].config.name == "qb" and pollers[-1].started == 1
+        assert "qb" in rack.store.read().health, (
+            "a screen depending on a source with no health entry shows `connecting`"
+        )
+        worker = rack.supervisor.workers[0]
+        assert worker._screen.depends_on == frozenset({"qb"})
+    finally:
+        rack.supervisor.stop()
+
+
+def test_apply_takes_down_the_poller_and_tunnel_of_a_source_the_push_drops(
+    tmp_path: Path,
+) -> None:
+    """And the health entry goes with it: the status file describes this rack.
+
+    The teardown is done by the reaper rather than by the apply -- see the test
+    below -- so `stop`, which joins it, is where a test can be sure it happened.
+    """
+    pollers, poller_factory = recording_pollers()
+    tunnels: list[FakeTunnel] = []
+    raw = config_dict(tmp_path, screens=1)
+    raw["integrations"] = [integration_dict("prom", local_port=19090)]
+    rack = Rack(tmp_path, screens=1, poller_factory=poller_factory)
+    rack.raw = raw
+    config = DaemonConfig.model_validate(raw)
+    rack.supervisor = Supervisor(
+        config=config,
+        screens=resolve_screens(config),
+        store=rack.store,
+        clock=FakeClock(NOW),
+        status_path=tmp_path / "status.json",
+        display_factory=rack._open,
+        poller_factory=poller_factory,
+        tunnel_factory=lambda tunnel_config, stop: (
+            tunnels.append(FakeTunnel(tunnel_config, stop)) or tunnels[-1]
+        ),
+    )
+    rack.supervisor.start()
+    rack.store.put("prom", {"cpu": 41.0}, latency_ms=3.0, now=NOW)
+
+    rack.supervisor.apply(
+        DaemonConfig.model_validate(
+            {**raw, "integrations": [], "screens": [{**raw["screens"][0], "params": {"big": "x"}}]}
+        )
+    )
+    # Recorded rather than waited for. The reaper is a thread, so "it finished"
+    # is not a fact a test can assert by looking afterwards -- it would pass
+    # whenever the thread happened to be quick, which is always, until the
+    # machine is loaded. What makes the assertions below true is that `stop`
+    # *joins* it, out of the same deadline as everything else, so that is what is
+    # pinned.
+    reaped = rack.supervisor._reaper
+    assert reaped is not None
+    joins: list[float | None] = []
+    joined = reaped.join
+
+    def record(timeout: float | None = None) -> None:
+        joins.append(timeout)
+        joined(timeout)
+
+    reaped.join = record  # type: ignore[method-assign]
+    rack.supervisor.stop()
+
+    assert joins and all(timeout is not None and timeout > 0.0 for timeout in joins), (
+        "a shutdown that does not wait for the reaper is one that returns mid-teardown"
+    )
+
+    assert rack.supervisor.pollers == [] and rack.supervisor.tunnels == []
+    assert tunnels[0].stop.is_set(), (
+        "which is what actually stops them, and costs the apply nothing"
+    )
+    assert pollers[0].joined == 1, "the retired poller is waited on, not abandoned"
+    assert (tunnels[0].shutdowns, tunnels[0].joined) == (1, 1), "and kubectl is signalled"
+    assert all(
+        timeout is not None and 0.0 < timeout <= SOURCE_TEARDOWN_BUDGET
+        for timeout in tunnels[0].shutdown_timeouts
+    ), "a teardown with no deadline is not a teardown"
+    snapshot = rack.store.read()
+    assert "prom" not in snapshot.health, "a source this rack no longer has"
+    assert "prom" not in snapshot.data, "and its last readings go with it, not into a screen"
+
+
+def test_apply_does_not_wait_for_a_kubectl_teardown(tmp_path: Path) -> None:
+    """M2 measured that teardown at ten seconds: the whole of `SHUTDOWN_BUDGET`.
+
+    `apply` runs on the link thread -- the thread that reads the socket and the
+    one that consults the stop event -- so every second it spends is a second a
+    SIGTERM waits. Setting the source's stop event costs nothing and is done
+    here; waiting for `kubectl` to die is handed to the reaper, which `stop`
+    joins inside the budget it already has.
+    """
+    pollers, poller_factory = recording_pollers()
+    tunnels: list[FakeTunnel] = []
+    raw = config_dict(tmp_path, screens=1)
+    raw["integrations"] = [integration_dict("prom", local_port=19090)]
+    config = DaemonConfig.model_validate(raw)
+    rack = Rack(tmp_path, screens=1)
+    rack.supervisor = Supervisor(
+        config=config,
+        screens=resolve_screens(config),
+        store=rack.store,
+        clock=FakeClock(NOW),
+        status_path=tmp_path / "status.json",
+        display_factory=rack._open,
+        poller_factory=poller_factory,
+        tunnel_factory=lambda tunnel_config, stop: (
+            tunnels.append(FakeTunnel(tunnel_config, stop)) or tunnels[-1]
+        ),
+    )
+    rack.supervisor.start()
+    entered = threading.Event()
+    released = threading.Event()
+
+    def slow_teardown() -> None:
+        entered.set()
+        released.wait(WAIT)
+
+    tunnels[0].on_shutdown = slow_teardown
+    started = time.monotonic()
+
+    rack.supervisor.apply(
+        DaemonConfig.model_validate(
+            {**raw, "integrations": [], "screens": [{**raw["screens"][0], "params": {"big": "x"}}]}
+        )
+    )
+    elapsed = time.monotonic() - started
+
+    assert entered.wait(WAIT), "the reaper never reached the teardown"
+    released.set()
+    rack.supervisor.stop()
+    assert elapsed < WAIT / 2, f"the apply waited {elapsed:.3f}s for a kubectl teardown"
+
+
+def test_apply_replaces_the_poller_of_a_source_whose_configuration_moved(tmp_path: Path) -> None:
+    """A changed source is a removal and an addition, not an edit in place.
+
+    A rack whose snapshot names a different Prometheus used to poll the old one
+    for ever with a warning as the only sign. Nothing here can edit a running
+    poller -- it holds an `Integration` built from the config it was handed --
+    so the honest reconfiguration is to take it down and start another.
+    """
+    pollers, poller_factory = recording_pollers()
+    rack = Rack(tmp_path, screens=1, poller_factory=poller_factory)
+    rack.supervisor.start()
+    moved = {**rack.raw["integrations"][0], "url": "http://elsewhere:9090"}
+
+    rack.supervisor.apply(with_integrations(rack.raw, moved))
+    rack.supervisor.stop()
+
+    assert [poller.config.url for poller in rack.supervisor.pollers] == ["http://elsewhere:9090"]
+    assert len(pollers) == 2, "a poller was built for the new configuration"
+    assert pollers[0].joined == 1, "and the one on the old URL was taken down"
+    assert "prom" in rack.store.read().health, (
+        "the name is still configured, so its health entry is not dropped under the new poller"
+    )
+
+
+def test_a_source_that_is_only_reordered_is_left_running(tmp_path: Path) -> None:
+    """The diff is over the models, so a snapshot that lists the same sources in
+    another order does not take four panels' data source down and up."""
+    pollers, poller_factory = recording_pollers()
+    raw = config_dict(tmp_path, screens=1)
+    raw["integrations"] = [integration_dict("prom"), integration_dict("qb")]
+    rack = Rack(tmp_path, screens=1, poller_factory=poller_factory)
+    rack.raw = raw
+    config = DaemonConfig.model_validate(raw)
+    rack.supervisor = Supervisor(
+        config=config,
+        screens=resolve_screens(config),
+        store=rack.store,
+        clock=FakeClock(NOW),
+        status_path=tmp_path / "status.json",
+        display_factory=rack._open,
+        poller_factory=poller_factory,
+    )
+    rack.supervisor.start()
+    try:
+        rack.supervisor.apply(
+            DaemonConfig.model_validate(
+                {**raw, "integrations": [integration_dict("qb"), integration_dict("prom")]}
+            )
+        )
+
+        assert len(pollers) == 2, "no poller was started or stopped"
+        assert all(poller.joined == 0 for poller in pollers)
+    finally:
+        rack.supervisor.stop()
+
+
+def test_apply_says_what_it_did_to_the_integrations(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """It used to say it could not do it at all. What replaced that has to be
+    just as readable from a journal: which sources went, and which arrived."""
+    pollers, poller_factory = recording_pollers()
+    rack = Rack(tmp_path, screens=1, poller_factory=poller_factory)
+    rack.supervisor.start()
+    try:
         caplog.clear()
-        with caplog.at_level("WARNING", logger="ors_daemon.supervisor"):
-            rack.supervisor.apply(DaemonConfig.model_validate(moved))
+        with caplog.at_level("INFO", logger="ors_daemon.supervisor"):
+            rack.supervisor.apply(with_integrations(rack.raw, integration_dict("qb")))
 
-        assert [record.getMessage() for record in caplog.records] == [
-            "this snapshot changes the rack's integrations; "
-            "the daemon has to be restarted before that takes effect"
-        ]
+        message = next(record for record in caplog.records if "integration" in record.getMessage())
+        assert message.added == ["qb"]
+        assert message.retired == ["prom"]
     finally:
         rack.supervisor.stop()
 
@@ -1788,3 +2135,455 @@ def test_apply_is_bounded_by_one_deadline_however_many_screens_changed(
         assert any("budget" in record.getMessage() for record in caplog.records)
     finally:
         supervisor.stop()
+
+
+# --- a panel that would not start, and one that would not come off its bus ---
+
+
+def refusing_to_start(monkeypatch: pytest.MonkeyPatch, refuse: set[str]) -> None:
+    """Make `ScreenWorker.start` answer as a Pi too short of memory to fork does."""
+    started = ScreenWorker.start
+
+    def start(self: ScreenWorker) -> None:
+        if self.screen_name in refuse:
+            raise RuntimeError("can't start new thread")
+        started(self)
+
+    monkeypatch.setattr(ScreenWorker, "start", start)
+
+
+def test_a_screen_whose_worker_would_not_start_keeps_no_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its panel has been slept and closed, so the slot describes nothing.
+
+    Kept, it was matched as *unchanged* by every later diff -- so the start loop
+    skipped it, the watchdog skipped it, and one dark circle stayed dark for the
+    life of the process while `_diff`'s own docstring promised a failed panel
+    "is opened again here".
+    """
+    rack = Rack(tmp_path, screens=2)
+    rack.supervisor.start()
+    try:
+        refusing_to_start(monkeypatch, {"RENAMED"})
+
+        rack.supervisor.apply(edited(rack.raw, name="RENAMED"))
+
+        assert [slot.screen.config.name for slot in rack.supervisor._slots] == ["S2"]
+        assert [worker.screen_name for worker in rack.supervisor.workers] == ["S2"]
+        assert [entry.name for entry in rack.supervisor._unavailable] == ["RENAMED"]
+        assert rack.panels("RENAMED")[0].calls == ["sleep", "close"], "its panel was blanked"
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_screen_whose_worker_would_not_start_is_still_reported_after_an_unrelated_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One dark circle, permanently, and absent from the status file.
+
+    Measured on the draft: after the failed start, `unavailable=['R1']` and
+    `workers=['S2']`; after a push that touched only the *other* screen,
+    `unavailable=[]`, `workers=['R2']`, `status screens=['R2']` -- a four-panel
+    rack with a dead panel reporting exactly what a healthy one-panel rack
+    reports. That is verbatim the case `UnavailableScreen` exists to prevent.
+    """
+    rack = Rack(tmp_path, screens=2)
+    rack.supervisor.start()
+    try:
+        refusing_to_start(monkeypatch, {"R1"})
+        rack.supervisor.apply(edited(rack.raw, name="R1"))
+        renamed = {
+            **rack.raw,
+            "screens": [{**rack.raw["screens"][0], "name": "R1"}, *rack.raw["screens"][1:]],
+        }
+
+        rack.supervisor.apply(edited(renamed, index=1, name="R2"))
+        rack.supervisor.tick()
+
+        assert [entry.name for entry in rack.supervisor._unavailable] == ["R1"]
+        reported = json.loads((tmp_path / "status.json").read_text())["screens"]
+        by_name = {screen["name"]: screen for screen in reported}
+        assert set(by_name) == {"R1", "R2"}, "every configured screen is reported"
+        assert by_name["R1"]["state"] == "unavailable"
+        assert "can't start new thread" in by_name["R1"]["error"]
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_screen_whose_worker_would_not_start_is_started_again_by_the_next_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same promise `_diff` makes about a panel that would not open.
+
+    A Pi that was out of threads for a moment is a rack that comes back on the
+    next push, without a restart -- and nothing else in the daemon retries this.
+    """
+    rack = Rack(tmp_path, screens=2)
+    rack.supervisor.start()
+    try:
+        refuse = {"R1"}
+        refusing_to_start(monkeypatch, refuse)
+        rack.supervisor.apply(edited(rack.raw, name="R1"))
+        renamed = {
+            **rack.raw,
+            "screens": [{**rack.raw["screens"][0], "name": "R1"}, *rack.raw["screens"][1:]],
+        }
+        refuse.clear()
+
+        rack.supervisor.apply(edited(renamed, index=1, name="R2"))
+
+        assert sorted(worker.screen_name for worker in rack.supervisor.workers) == ["R1", "R2"]
+        assert rack.supervisor._unavailable == []
+        assert len(rack.panels("R1")) == 2, "a fresh panel, because the first one was closed"
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_retirement_that_overran_the_budget_still_holds_the_kept_workers_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bus guard gets its own deadline, not the joins' leftovers.
+
+    One wedged retiring worker spends the whole of `APPLY_BUDGET`, and every kept
+    worker was then offered `pause(0.0)` -- which returns False whenever that
+    worker is inside `tick`. Measured on the draft with four screens and one
+    wedged retirement: `pause timeouts granted to kept workers: [0.0, 0.0, 0.0]`.
+    At ~23ms of SPI per frame on four panels, catching one mid-`show` is likely,
+    and that is the M2 interleaving that produced the pale grey rectangle: the
+    init registers are wrong afterwards, not just the framebuffer.
+    """
+    clock = FakeMonotonic()
+    rack = Rack(tmp_path, screens=2, shutdown_clock=clock)
+    rack.supervisor.start()
+    try:
+        retiring = rack.supervisor._slots[0]
+        retiring.worker = Wedged(clock, "S1")  # type: ignore[assignment]
+        granted: list[float] = []
+        paused = ScreenWorker.pause
+
+        def pause(self: ScreenWorker, timeout: float) -> bool:
+            granted.append(timeout)
+            return paused(self, timeout)
+
+        monkeypatch.setattr(ScreenWorker, "pause", pause)
+
+        rack.supervisor.apply(edited(rack.raw, name="RENAMED"))
+
+        assert retiring.worker.granted == [APPLY_BUDGET]  # type: ignore[union-attr]
+        assert granted == [BUS_GUARD_PER_SCREEN], (
+            "the kept worker was offered whatever the retirement left, which was nothing"
+        )
+    finally:
+        rack.supervisor.stop()
+
+
+def test_the_bus_guard_is_bounded_however_many_screens_are_kept(tmp_path: Path) -> None:
+    """M27 from the other side: a whole budget per pause is 12s for four panels.
+
+    The guard is one deadline for the rack, like every other wait here, because
+    how many screens a snapshot holds is the server's decision and not this
+    module's. What each screen is *promised* is `BUS_GUARD_PER_SCREEN`, which is
+    an order of magnitude more than a frame costs; what the rack can spend in
+    total is `BUS_GUARD_BUDGET`, whatever the count.
+
+    Six screens, so that five kept ones ask for more than the budget holds: the
+    two halves of that sentence only disagree past four panels, and a rack is
+    allowed to grow a screen.
+    """
+    clock = FakeMonotonic()
+    rack = Rack(tmp_path, screens=6, shutdown_clock=clock)
+    rack.supervisor.start()
+    try:
+        wedged = [Wedged(clock, slot.screen.config.name) for slot in rack.supervisor._slots[1:]]
+        for slot, worker in zip(rack.supervisor._slots[1:], wedged, strict=True):
+            slot.worker = worker  # type: ignore[assignment]
+        started = clock.now
+
+        rack.supervisor.apply(edited(rack.raw, name="RENAMED"))
+
+        assert clock.now - started <= BUS_GUARD_BUDGET, "the whole guard, not one per screen"
+        assert [timeout for worker in wedged for timeout in worker.granted] == [
+            BUS_GUARD_PER_SCREEN,
+            BUS_GUARD_PER_SCREEN,
+            BUS_GUARD_PER_SCREEN,
+            BUS_GUARD_PER_SCREEN,
+            0.0,
+        ], "each is promised a real hold, and the last is given what is left, which is nothing"
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_screen_that_will_not_come_off_the_bus_stops_the_opens_on_that_bus(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Proceeding silently is what this is about: an overrun guard is not a guard.
+
+    A fifty-command init sequence run while a bus-mate is drawing comes up
+    showing unconfigured RAM, and it stays wrong afterwards because the init
+    *registers* are wrong rather than the framebuffer. A panel that is dark and
+    says so in the status file is diagnosable; a pale grey rectangle is not, and
+    the next push retries the open either way.
+    """
+    clock = FakeMonotonic()
+    rack = Rack(tmp_path, screens=2, shutdown_clock=clock)
+    rack.supervisor.start()
+    try:
+        rack.supervisor._slots[1].worker = Wedged(clock, "S2")  # type: ignore[assignment]
+
+        with caplog.at_level("ERROR", logger="ors_daemon.supervisor"):
+            rack.supervisor.apply(edited(rack.raw, name="RENAMED"))
+        rack.supervisor.tick()
+
+        assert rack.panels("RENAMED") == [], "a panel was initialised on a bus still being drawn on"
+        assert [entry.name for entry in rack.supervisor._unavailable] == ["RENAMED"]
+        assert any("bus" in record.getMessage() for record in caplog.records), (
+            "the log has to say the guard was skipped, not only that a screen would not stop"
+        )
+        reported = json.loads((tmp_path / "status.json").read_text())["screens"]
+        assert [screen["state"] for screen in reported if screen["name"] == "RENAMED"] == [
+            "unavailable"
+        ]
+    finally:
+        rack.supervisor.stop()
+
+
+def gc9a01(bus: int, cs: int) -> dict[str, Any]:
+    """A panel on a real SPI device, so that two screens can be on two buses."""
+    return {"backend": "gc9a01", "spi_bus": bus, "spi_cs": cs, "dc": 25, "rst": 27}
+
+
+def test_a_panel_on_another_bus_is_opened_although_one_screen_would_not_come_off(
+    tmp_path: Path,
+) -> None:
+    """The skip is per bus, because the hazard is: a Pi 3 carries two chip
+    selects on SPI0 and two on SPI1, and a worker drawing on SPI1 cannot corrupt
+    an init sequence clocked out of SPI0. Skipping every open over one wedged
+    screen would darken panels that were never in danger."""
+    clock = FakeMonotonic()
+    rack = Rack(
+        tmp_path,
+        screens=2,
+        displays=[gc9a01(bus=0, cs=0), gc9a01(bus=1, cs=0)],
+        shutdown_clock=clock,
+    )
+    rack.supervisor.start()
+    try:
+        rack.supervisor._slots[1].worker = Wedged(clock, "S2")  # type: ignore[assignment]
+
+        rack.supervisor.apply(edited(rack.raw, name="RENAMED"))
+
+        assert len(rack.panels("RENAMED")) == 1, "it shares no wire with the screen that wedged"
+        assert rack.supervisor._unavailable == []
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_panel_sharing_a_bus_with_a_different_chip_select_is_still_skipped(
+    tmp_path: Path,
+) -> None:
+    """Two chip selects on SPI0 is the shipped rack, and the M2 failure exactly.
+
+    A chip select picks a device on a bus; it does not give it one. So a screen
+    on SPI0.1 that will not stop drawing is a screen writing the same wire the
+    init sequence for SPI0.0 would be clocked out of.
+    """
+    clock = FakeMonotonic()
+    rack = Rack(
+        tmp_path,
+        screens=2,
+        displays=[gc9a01(bus=0, cs=0), gc9a01(bus=0, cs=1)],
+        shutdown_clock=clock,
+    )
+    rack.supervisor.start()
+    try:
+        rack.supervisor._slots[1].worker = Wedged(clock, "S2")  # type: ignore[assignment]
+
+        rack.supervisor.apply(edited(rack.raw, name="RENAMED"))
+
+        assert rack.panels("RENAMED") == []
+        assert [entry.name for entry in rack.supervisor._unavailable] == ["RENAMED"]
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_failed_apply_does_not_leave_the_status_file_claiming_the_pushed_config(
+    tmp_path: Path,
+) -> None:
+    """The link nacks, and the server's answer to a nack is to push again.
+
+    So the fingerprint must not already claim the snapshot that failed: a server
+    told the push landed does not send it again, and that is a rack left half of
+    each configuration with nothing anywhere disagreeing. The other direction
+    corrects itself -- an under-claim is one more push.
+    """
+    rack = Rack(tmp_path, screens=2)
+    rack.supervisor.start()
+    try:
+        rack.supervisor.tick()
+        before = json.loads((tmp_path / "status.json").read_text())["config_fingerprint"]
+
+        class Exploding(Wedged):
+            """Raises once, on the apply's join, and behaves on the shutdown's.
+
+            What is under test is the rollback, not what a supervisor does with a
+            thread that raises twice -- and a `stop` that could not join the rack
+            would hide the assertion behind a second traceback.
+            """
+
+            raised = False
+
+            def join(self, timeout: float | None = None) -> None:
+                if not Exploding.raised:
+                    Exploding.raised = True
+                    raise RuntimeError("a bug on the way through the retirement")
+
+        rack.supervisor._slots[0].worker = Exploding(FakeMonotonic(), "S1")  # type: ignore[assignment]
+        with pytest.raises(RuntimeError, match="a bug on the way through"):
+            rack.supervisor.apply(edited(rack.raw, name="RENAMED"))
+
+        rack.supervisor.tick()
+        after = json.loads((tmp_path / "status.json").read_text())
+        assert after["config_fingerprint"] == before
+    finally:
+        rack.supervisor.stop()
+
+
+def test_the_reaper_finishes_what_it_has_been_handed_when_it_is_closed(tmp_path: Path) -> None:
+    """`stop` closes it and then joins it, and a source dropped between those two
+    is a `kubectl port-forward` holding a local port with nobody left to signal
+    it. So closing means "finish and leave", not "leave"."""
+    store = SnapshotStore()
+    reaper = _Reaper(store)
+    tunnels = [
+        FakeTunnel(TunnelConfig(kubeconfig="/tmp/kc", namespace="n", remote_port=1, local_port=p))
+        for p in (19090, 19091)
+    ]
+    sources = [
+        _Source(
+            config=IntegrationConfig.model_validate(integration_dict(name)),
+            stop=threading.Event(),
+            tunnels=[tunnel],
+        )
+        for name, tunnel in zip(("prom", "qb"), tunnels, strict=True)
+    ]
+    entered = threading.Event()
+    released = threading.Event()
+
+    def hold() -> None:
+        entered.set()
+        assert released.wait(WAIT)
+
+    tunnels[0].on_shutdown = hold
+    reaper.start()
+
+    for source in sources:
+        reaper.retire(source, drop_health=True)
+    assert entered.wait(WAIT), "the reaper never took the first one down"
+    reaper.close()
+    released.set()
+    reaper.join(WAIT)
+
+    assert reaper.is_alive() is False
+    assert [tunnel.shutdowns for tunnel in tunnels] == [1, 1], "the second one was not dropped"
+
+
+# --- the watchdog and the apply ---------------------------------------------
+
+
+class WatchedLock:
+    """A lock that records who asked for it, so exclusion can be asserted on.
+
+    `tick` runs on the main thread and `apply` on the link thread, so "they
+    cannot overlap" is a claim about a lock -- and a claim about a lock cannot be
+    proved by timing one thread against another. What can be proved is that the
+    tick *asks* for the one the apply holds, and that it has not got past the
+    asking while the apply still holds it.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.waiting = threading.Event()
+        self.acquisitions = 0
+
+    def acquire(self, *args: Any, **kwargs: Any) -> bool:
+        self.waiting.set()
+        taken = self._inner.acquire(*args, **kwargs)
+        self.acquisitions += 1
+        return taken
+
+    def release(self) -> None:
+        self._inner.release()
+
+    def __enter__(self) -> "WatchedLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *exception: Any) -> None:
+        self.release()
+
+
+def test_a_tick_takes_the_lock_an_apply_holds(tmp_path: Path) -> None:
+    """The watchdog restarts workers, and the apply opens panels; both walk `_slots`.
+
+    `tick` -> `_check` -> `_replace` starts a brand-new thread drawing on a
+    bus-mate while a fifty-command init sequence is on the wire, and it can fire
+    on a *retired* slot between the revoke loop and the join loop -- handing it a
+    fresh live panel on a backend about to be slept and closed. The same
+    unlocked read is what lets one status file describe a rack that is half of
+    each configuration: `tick` reads `_slots`, `_unavailable` and `_config` while
+    `apply` swaps them.
+    """
+    rack = Rack(tmp_path, screens=1)
+    rack.supervisor.start()
+    watched = WatchedLock(rack.supervisor._shutdown_lock)
+    rack.supervisor._shutdown_lock = watched  # type: ignore[assignment]
+    try:
+        rack.supervisor.tick()
+
+        assert watched.acquisitions == 1
+    finally:
+        rack.supervisor.stop()
+
+
+def test_the_watchdog_cannot_replace_a_worker_while_an_apply_is_running(tmp_path: Path) -> None:
+    """The stale heartbeat is not contrived: a worker wedged inside an SPI write
+    is precisely the one `pause` cannot hold off, so the wedged bus-mate and the
+    watchdog's restart of it arrive together."""
+    rack = Rack(tmp_path, screens=1)
+    rack.supervisor.start()
+    watched = WatchedLock(rack.supervisor._shutdown_lock)
+    rack.supervisor._shutdown_lock = watched  # type: ignore[assignment]
+    try:
+        worker = rack.supervisor.workers[0]
+        worker.heartbeat = LONG_AGO
+
+        with watched:  # stands in for an apply in flight, on the link thread
+            watched.waiting.clear()
+            ticking = threading.Thread(target=rack.supervisor.tick)
+            ticking.start()
+            assert watched.waiting.wait(WAIT), "the tick never asked for the lock"
+            assert rack.supervisor.workers[0] is worker, (
+                "the watchdog started a drawing worker inside the open window"
+            )
+
+        ticking.join(WAIT)
+        assert ticking.is_alive() is False
+        assert rack.supervisor.workers[0] is not worker, "and it is replaced once the apply is done"
+    finally:
+        rack.supervisor.stop()
+
+
+def test_the_event_the_supervisor_publishes_is_the_one_its_own_stop_sets(tmp_path: Path) -> None:
+    """A property handing out a *fresh* `Event` passes every test that asserts
+    against a double: the link thread would then never notice SIGTERM, never
+    refuse a push while stopping, and time out `link.join(3.0)` on every
+    shutdown. So it is pinned on the real supervisor, by identity and by effect.
+    """
+    supervisor, _, _ = make(tmp_path, screens=1)
+    published = supervisor.stop_event
+
+    assert supervisor.stop_event is published, "read twice, and it is the same event"
+    assert published.is_set() is False
+    supervisor.stop()
+    assert published.is_set(), "the one `stop` sets first, before it joins anything"

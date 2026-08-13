@@ -121,11 +121,33 @@ boots from the last snapshot the server pushed if it has a usable one, and from
 from darkening anything, and a rack that has never been paired runs exactly as
 it did before there was a server at all. A pushed configuration is applied to
 the running process: only the screens that actually changed are stopped and
-reopened, so a redundant push is not a rack-wide flicker.
+reopened, so a redundant push is not a rack-wide flicker. Integrations are
+diffed the same way — a source the push adds is polled from that moment, one it
+drops is taken down on a thread of its own so that a `kubectl port-forward`
+teardown does not hold up the panels, and one whose configuration moved is
+replaced. What a push cannot change without a restart is the rack's `timezone`.
 
 The pairing and the cached snapshot live in `/var/lib/openrackscreen`, which the
 shipped unit's `StateDirectory=` creates. `--link` moves them; the cache follows
-it unless `--cache` says otherwise.
+it unless `--cache` says otherwise. Every successful `connect` deletes the cache,
+`--force` or not: it holds a configuration from whichever server this rack
+answered to before, and a reboot before the first successful connect would boot
+from it *and claim its version* — which the new server can match, skip its push
+over, and leave the old rack on the glass for ever.
+
+**Run `connect` as the user the daemon runs as.** `sudo ors-daemon connect`
+writes the pairing root-owned and 0600, the unit runs the daemon as
+`User=openrackscreen`, and the daemon then gets `PermissionError` on every read
+of it — so the rack runs unpaired and says so in its log while the interface
+shows nothing at all. Either
+
+```bash
+sudo -u openrackscreen ors-daemon connect --server http://rack-server:8080 --token ...
+# or, after a sudo you have already done:
+sudo chown openrackscreen: /var/lib/openrackscreen/link.json
+```
+
+`connect` prints a note when it notices it is running as root.
 
 Two things `run` does *not* pick up from a push: the integrations (a poller and
 its `kubectl port-forward` cannot be replaced inside the apply's budget, and the
