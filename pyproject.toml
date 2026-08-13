@@ -29,7 +29,19 @@ ors-server = { workspace = true }
 # defaults this suite relies on. A range spanning it means `uv lock --upgrade`
 # can cross the removal without anything saying so; the lock file happens to
 # pin 1.4.0 today, which is what has been keeping CI honest by accident.
-dev = ["pytest>=8.0", "pytest-asyncio>=1.0,<2", "ruff>=0.6", "httpx2>=2.10"]
+# `pytest-timeout` is not a convenience. `starlette.testclient`'s `receive`
+# blocks on `concurrent.futures.Future.result()` with no timeout, so any change
+# that makes the server send one message where a `TestClient` test expects two
+# wedges the whole run rather than failing it -- and CI records that as a
+# stalled build, not a red one. Three unrelated one-line edits to
+# `ws_daemon.py` were each measured doing exactly that.
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=1.0,<2",
+    "pytest-timeout>=2.3",
+    "ruff>=0.6",
+    "httpx2>=2.10",
+]
 
 [tool.pytest.ini_options]
 testpaths = [
@@ -54,6 +66,14 @@ addopts = "-q --import-mode=importlib"
 # and this repo has no async test that wants a different loop. It changes
 # nothing for the synchronous suite, which pytest-asyncio does not touch.
 asyncio_mode = "auto"
+# Per test, and generous: the whole suite runs in under ten seconds, so no
+# passing test comes within an order of magnitude of this. It is a backstop
+# against a hang, not a performance budget -- picking a tight number would turn
+# a loaded CI runner into a flaky one, which is the failure mode that gets a
+# deadline deleted. The default `signal` method interrupts the test where it is
+# blocked and reports a normal failure with the traceback that shows the line,
+# which is the whole point: a wedged run tells you nothing.
+timeout = 60
 
 [tool.ruff]
 line-length = 100

@@ -28,6 +28,14 @@ DISPLAY = {"backend": "virtual", "out_dir": "/tmp/p"}
 # to notice something fails the test instead of hanging the suite -- the failure
 # this file cares most about, a socket left blocked in `receive`, is otherwise
 # indistinguishable from a test runner that stopped.
+#
+# It covers the `FakeSocket` half of this file only, because it is spelled with
+# `asyncio.wait_for` and the `TestClient` half has no event loop of its own to
+# hang one off. That half's deadline is `timeout = 60` in the root pytest
+# configuration, which is a signal and interrupts a blocked thread -- three
+# separate one-line edits to `ws_daemon.py` were each measured wedging a
+# `TestClient` test for as long as it was allowed to run, because
+# `starlette.testclient`'s `receive` blocks on a future with no timeout.
 PROMPTLY = 5.0
 
 
@@ -87,9 +95,10 @@ class FakeSocket:
     queued before the handler starts, and `None` in it is the daemon going away.
 
     `TestClient` covers the same route end to end below, but it cannot do this
-    much -- its `receive` blocks a thread with no deadline, so a handler that
-    should have closed a socket and did not hangs the suite instead of failing
-    it, and asserting that *nothing* was sent is not expressible at all.
+    much -- its `receive` blocks a thread on a future with no timeout of its
+    own, so a handler that should have sent something and did not stops that
+    test dead until the suite's own deadline cuts it short, and asserting that
+    *nothing* was sent is not expressible at all.
     """
 
     def __init__(self, app, *script: str, hang_up: bool = True) -> None:
