@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import base64
+import contextlib
+import hashlib
 import json
+import logging
 import os
+import socket as socket_module
 import threading
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -12,16 +18,24 @@ from zoneinfo import ZoneInfo
 import pytest
 from ors_daemon.clock import FakeClock
 from ors_daemon.link import (
+    BACKOFF_CAP_S,
+    CLOSE_PROTOCOL_SKEW,
+    CLOSE_UNAUTHORIZED,
+    MAX_MESSAGE_BYTES,
     RECV_TIMEOUT_S,
     LinkClient,
+    LinkClosed,
     LinkError,
     LinkSettings,
+    _default_connect,
+    _Socket,
     load_link_settings,
     websocket_url,
     write_link_settings,
 )
 from ors_schema.daemon import DaemonConfig
 from ors_schema.link import (
+    PROTOCOL_VERSION,
     Ack,
     Command,
     ConfigPush,
@@ -53,6 +67,9 @@ CONFIG = {
     ],
 }
 
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+"""RFC 6455's handshake constant, for the deaf peer below."""
+
 TIMEOUT = object()
 """Scripted into `inbound` for a `recv` that reaches its deadline saying nothing.
 
@@ -69,6 +86,20 @@ class FakeSocket:
     park in it indefinitely, or a SIGTERM on the rack waits for the server to
     say something -- and honouring that deadline here is what lets these tests
     drive the heartbeat and the stop event without a single `sleep`.
+
+    An `Exception` in `inbound` is raised rather than returned, which is how a
+    close arrives on this transport: the server's 4000-series code reaches the
+    client as a `LinkClosed` out of `recv`, not as a message.
+
+    `parks_after` models the one thing `websockets.sync` will not do for itself:
+    from that many sends onward, every send parks. Its `Connection.send` holds
+    the protocol mutex across a blocking `sendall` with no timeout on it, so a
+    server that is TCP-alive and has stopped reading parks the sending thread
+    until something else takes the socket away. Here that something else is
+    `abort`, and a `send` that is never rescued fails the test rather than
+    hanging the suite. It is a count and not a flag because the hello, the acks
+    and heartbeats, and task 11's cross-thread frames are three different
+    callers of three different code paths, and each has to be bounded on its own.
     """
 
     def __init__(
@@ -82,14 +113,21 @@ class FakeSocket:
         self.timeouts: list[float | None] = []
         self.recvs = 0
         self.closed = False
+        self.aborted = False
         self.url: str | None = None
         self.send_error: Exception | None = None
+        self.parks_after: int | None = None
+        self._released = threading.Event()
         self._clock = clock
         self._on_recv = on_recv
 
     def send(self, payload: str) -> None:
         if self.send_error is not None:
             raise self.send_error
+        if self.parks_after is not None and len(self.sent) >= self.parks_after:
+            if not self._released.wait(WAIT):
+                raise AssertionError("a parked send was never rescued")
+            raise ConnectionError("the socket was taken out from under this send")
         self.sent.append(payload)
 
     def recv(self, timeout: float | None = None) -> str:
@@ -104,10 +142,16 @@ class FakeSocket:
             if self._clock is not None and timeout:
                 self._clock.advance(timeout)
             raise TimeoutError("nothing yet")
+        if isinstance(item, Exception):
+            raise item
         return str(item)
 
     def close(self) -> None:
         self.closed = True
+
+    def abort(self) -> None:
+        self.aborted = True
+        self._released.set()
 
 
 def make(
@@ -203,6 +247,27 @@ def test_a_daemon_with_no_credential_at_all_does_not_dial(tmp_path: Path) -> Non
     assert socket.url is None
 
 
+def test_an_unpaired_daemon_backs_off_rather_than_saying_so_once_a_second(
+    tmp_path: Path,
+) -> None:
+    """`run` waits `retry_in` between attempts, and this branch has to set it.
+
+    Without the settle, the delay stays at the floor for as long as the daemon
+    is unpaired: `run` ticks once a second, and each tick logs at ERROR. That is
+    ~86,400 lines a day onto the SD card of a Pi whose only fault is that nobody
+    has paired it yet.
+    """
+    settings = LinkSettings(server_url="http://server:8080", cache_path=tmp_path / "cache.json")
+    client, _ = make(tmp_path, [], settings=settings)
+
+    delays = []
+    for _ in range(4):
+        client.tick_once()
+        delays.append(client.retry_in)
+
+    assert delays == [1.0, 2.0, 4.0, 8.0]
+
+
 def test_the_hello_says_it_is_running_nothing_when_it_has_no_config(tmp_path: Path) -> None:
     """None, never 0: 0 is a real version and the one an empty server counts from."""
     client, socket = make(tmp_path, [push()])
@@ -281,6 +346,27 @@ def test_an_applied_snapshot_is_written_to_the_cache(tmp_path: Path) -> None:
     assert DaemonConfig.model_validate(cached["snapshot"]).screens[0].name == "CPU"
 
 
+def test_a_cache_in_a_directory_that_does_not_exist_yet_is_still_written(
+    tmp_path: Path,
+) -> None:
+    """`/var/lib/ors/` on a freshly imaged Pi is a directory nothing has made yet.
+
+    Without the `mkdir`, the first push is never cached and the next boot has
+    nothing to boot from -- so the rack comes up on its local config file, or on
+    nothing, while the server believes it acked.
+    """
+    settings = LinkSettings(
+        server_url="http://server:8080",
+        cache_path=tmp_path / "var" / "lib" / "ors" / "cache.json",
+        token="tok",
+    )
+    client, _ = make(tmp_path, [push(7)], settings=settings)
+
+    client.tick_once()
+
+    assert json.loads(settings.cache_path.read_text())["version"] == 7
+
+
 def test_a_cache_that_cannot_be_written_still_leaves_the_push_acked(tmp_path: Path) -> None:
     """The config is running; the cache is only what the next boot starts from.
 
@@ -313,15 +399,21 @@ def test_a_push_of_the_version_already_running_is_not_applied(tmp_path: Path) ->
     Asserted on a list rather than by raising out of the handler: `_config`
     catches everything the apply path throws and turns it into a nack, so a
     handler that raised would report a re-apply as a passing test.
+
+    A second push follows the skipped one so that the assertion cannot pass
+    vacuously. `applied == []` is also what a client that received nothing at
+    all produces -- a `recv` never reached, a message never parsed -- so on its
+    own it says nothing about the skip. `applied == [8]` says the loop ran, read
+    both, and declined exactly one.
     """
     applied: list[int] = []
     client, socket = make(
-        tmp_path, [push(7)], applied=lambda s, v: applied.append(v), config_version=7
+        tmp_path, [push(7), push(8)], applied=lambda s, v: applied.append(v), config_version=7
     )
 
     client.tick_once()
 
-    assert applied == []
+    assert applied == [8]
     assert not only(socket, Nack)
 
 
@@ -402,6 +494,115 @@ def test_a_key_that_cannot_be_written_still_pairs_this_session(tmp_path: Path) -
 
     assert client.settings.key == "k9"
     assert applied == [3], "a link that cannot save its key must still run the rack"
+
+
+def test_a_settings_path_with_no_filename_is_reported_rather_than_unwound(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`write_link_settings` derives its temporary with `Path.with_name`.
+
+    That raises `ValueError`, not `OSError`, for a path with no filename -- the
+    same reason `_write_cache` catches both. Caught only as `OSError`, the
+    failure unwinds past the one log line that says the daemon is a reboot away
+    from permanent lockout, takes the link down, and drops the `ConfigPush` that
+    follows `Paired` with nothing but an INFO line to show for it.
+    """
+    applied: list[int] = []
+    with caplog.at_level(logging.ERROR):
+        client, _ = make(
+            tmp_path,
+            [paired("k9"), push(3)],
+            applied=lambda s, v: applied.append(v),
+            settings_path=Path("/"),  # `Path("/").with_name(...)` raises ValueError
+        )
+
+        client.tick_once()
+
+    assert any("reconnects with" in record.message for record in caplog.records), (
+        "the one failure that locks a rack out of its server must say so"
+    )
+    assert applied == [3], "and the push that follows the pairing must still be applied"
+
+
+def test_a_failure_nobody_anticipated_when_saving_the_key_is_not_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The catch is two named exceptions, not `Exception`, and that is the point.
+
+    `OSError` and `ValueError` are everything this write is known to do, and
+    each has an answer: keep the session, say so loudly. Anything else is a bug
+    rather than a disk, and swallowing it would leave the link running on a
+    guess. It ends the connection instead, which costs one backoff and reconnects
+    on the key already in memory.
+    """
+    from ors_daemon import link as link_module
+
+    def die(path: Path, settings: LinkSettings) -> None:
+        raise RuntimeError("something nobody wrote a branch for")
+
+    monkeypatch.setattr(link_module, "write_link_settings", die)
+    applied: list[int] = []
+    client, socket = make(tmp_path, [paired("k9"), push(3)], applied=lambda s, v: applied.append(v))
+
+    client.tick_once()
+
+    assert applied == [], "an unexpected failure ends the connection rather than being logged"
+    assert socket.closed is True
+    assert client.connected is False
+
+
+def test_a_second_pairing_never_overwrites_a_key_this_daemon_already_has(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Nothing on this socket authenticates the server. The URL is what was typed.
+
+    A healthy server never sends `Paired` to a daemon it has already keyed, so
+    one arriving is either a wrong URL or somebody answering on that address --
+    and writing their key over the real one on *disk* locks the rack out of its
+    real server permanently, with no recovery short of minting a new token.
+    """
+    settings = LinkSettings(
+        server_url="http://server:8080",
+        cache_path=tmp_path / "cache.json",
+        key="real",
+        daemon_id=7,
+    )
+    written = tmp_path / "link.json"
+    write_link_settings(written, settings)
+    applied: list[int] = []
+    with caplog.at_level(logging.ERROR):
+        client, _ = make(
+            tmp_path,
+            [paired("stolen", 99), push(3)],
+            settings=settings,
+            applied=lambda s, v: applied.append(v),
+        )
+
+        client.tick_once()
+
+    assert client.settings.key == "real"
+    assert json.loads(written.read_text())["key"] == "real"
+    assert any("already" in record.message for record in caplog.records)
+    assert applied == [3], "and the session carries on, on the key it already had"
+
+
+def test_pairing_invalidates_the_cached_snapshot_on_disk(tmp_path: Path) -> None:
+    """Clearing the version claim in memory only is a clear that a power cut undoes.
+
+    Anything between `Paired` and the first successful apply -- a reboot, a
+    power cut, the link drop a failed key write can produce -- leaves the
+    previous server's snapshot in the cache with its version. The next boot
+    loads it, claims that version, and if the new server's counter collides the
+    push is skipped: the rack shows the previous server's configuration, the
+    server holds no ack, and nothing re-pushes.
+    """
+    cache = tmp_path / "cache.json"
+    cache.write_text(json.dumps({"version": 3, "snapshot": CONFIG}))
+    client, _ = make(tmp_path, [paired("k9")])
+
+    client.tick_once()
+
+    assert not cache.exists(), "a claim voided in memory has to be voided on disk too"
 
 
 # --- refusals ---------------------------------------------------------------
@@ -572,8 +773,18 @@ def test_a_message_can_be_sent_up_a_live_link(tmp_path: Path) -> None:
 # --- the heartbeat ----------------------------------------------------------
 
 
-def test_the_heartbeat_interval_is_not_below_the_servers_send_bound(tmp_path: Path) -> None:
-    """`ws_daemon.SEND_TIMEOUT` is 5.0s. Beating faster makes that bound decoration."""
+def test_the_heartbeat_interval_is_long_enough_to_be_evidence_a_session_ran(
+    tmp_path: Path,
+) -> None:
+    """`_settle` spends this number as the bar for "a connection that lasted".
+
+    Nothing on either end times out on daemon silence, so there is no liveness
+    deadline this has to sit under. What there is, is `_settle`: a session that
+    outlives one interval resets the backoff, so an interval short enough for a
+    refused connection to reach makes every refusal look like a working session
+    and restores the hammering the backoff exists to prevent. A connect and a
+    close take milliseconds; seconds are the margin.
+    """
     client, _ = make(tmp_path, [])
 
     assert client.heartbeat >= 5.0
@@ -647,6 +858,51 @@ def test_a_daylight_saving_jump_is_not_fifteen_seconds_of_link(tmp_path: Path) -
     client.tick_once()
 
     assert not only(socket, Heartbeat), "an hour passed, not an hour and a half"
+
+
+def test_an_autumn_fall_back_is_not_an_hour_of_silence(tmp_path: Path) -> None:
+    """The other night the offset moves, where the wall clock goes *backwards*.
+
+    01:30 CEST to 01:30 CET is a full hour of elapsed time that the wall clock
+    records as none at all -- two readings of one `system_clock` carry the same
+    `tzinfo` object, and subtracting those is documented to ignore it. So the
+    naive answer here is zero, and the heartbeat that is due does not go: the
+    guard `0.0 <= since < heartbeat` bounds the harm to one interval, but an
+    interval of silence is still an interval the server spends not hearing from
+    a rack that is fine. Spring is tested above; this is the other direction.
+    """
+    clock = FakeClock(datetime(2026, 10, 25, 2, 30, tzinfo=ZoneInfo("Europe/Amsterdam")))
+    # No clock on the socket, so the hour below is the whole of what elapses and
+    # `uptime_s` is a number this test can name rather than one it has to derive.
+    socket = FakeSocket([TIMEOUT])
+    socket._on_recv = lambda _: clock.advance(3600.0)
+    client, _ = make(tmp_path, sockets=[socket], clock=clock, heartbeat=1800.0)
+
+    client.tick_once()
+
+    beats = only(socket, Heartbeat)
+    assert beats, "an hour elapsed, whatever the clock on the wall says"
+    assert beats[0].uptime_s == 3600
+
+
+def test_the_heartbeat_is_measured_from_the_connect_and_not_from_construction(
+    tmp_path: Path,
+) -> None:
+    """A daemon that waited to be paired must not beat the moment it gets a socket.
+
+    `_last_beat` is stamped at construction and again on connect, and only the
+    second one is about this connection. Without it, every reconnect after a
+    long outage opens with a heartbeat it does not owe -- and after a thirty
+    second backoff, that is every reconnect there is.
+    """
+    clock = FakeClock(NOW)
+    socket = FakeSocket([TIMEOUT], clock)
+    client, _ = make(tmp_path, sockets=[socket], clock=clock, heartbeat=15.0)
+    clock.advance(600.0)  # ten minutes of backing off against a server that was down
+
+    client.tick_once()
+
+    assert not only(socket, Heartbeat), "the interval is measured from this connection"
 
 
 def test_a_clock_that_steps_backwards_does_not_stall_the_heartbeat(tmp_path: Path) -> None:
@@ -723,6 +979,307 @@ def test_a_socket_that_will_not_close_is_survivable(tmp_path: Path) -> None:
     assert client.connected is False
 
 
+def test_a_push_that_arrives_as_the_daemon_is_stopping_is_not_applied(tmp_path: Path) -> None:
+    """`on_snapshot` is a teardown and repaint of four panels, run on this thread.
+
+    `_serve` looks at the stop event between `recv` calls, so a push that was
+    already in flight when SIGTERM landed is read and applied anyway -- and the
+    apply then runs against a supervisor that is being torn down underneath it,
+    inside a `SHUTDOWN_BUDGET` it can overrun on its own. Either outcome is four
+    dark panels: an overrun is a SIGKILL before `Supervisor.stop` sleeps them,
+    an abandoned apply is a rack halfway through a repaint.
+
+    Nothing is sent in answer, and that is right. The server clears what it
+    believes a daemon has confirmed on every connect, so silence reads as "still
+    hasn't got it" -- which is exactly true.
+    """
+    stop = threading.Event()
+    applied: list[int] = []
+    socket = FakeSocket([push(7)], on_recv=lambda s: stop.set())
+    client, _ = make(tmp_path, sockets=[socket], stop=stop, applied=lambda s, v: applied.append(v))
+
+    client.tick_once()
+
+    assert applied == []
+    assert not only(socket, Ack) and not only(socket, Nack)
+
+
+# --- what the server closed with --------------------------------------------
+
+
+def test_the_transport_translates_a_close_code_into_this_modules_vocabulary() -> None:
+    """`websockets.exceptions` is not imported above `_default_connect`, on purpose.
+
+    The module has to stay importable on a machine with no `websockets`, so the
+    package's exception types cannot appear in an `except` clause anywhere the
+    receive loop can see. Translating at the boundary is what buys both: the
+    transport knows `websockets`, and everything above it knows `LinkClosed`.
+    """
+
+    class Closed(Exception):
+        def __init__(self) -> None:
+            self.rcvd = type("Close", (), {"code": 4426, "reason": "protocol 1"})()
+
+    class Raw:
+        def send(self, payload: str) -> None:
+            raise Closed()
+
+        def recv(self, timeout: float | None = None) -> str:
+            raise Closed()
+
+    transport = _Socket(Raw(), Closed)
+
+    for call in (lambda: transport.send("hi"), lambda: transport.recv(timeout=1.0)):
+        with pytest.raises(LinkClosed) as caught:
+            call()
+        assert caught.value.code == 4426
+        assert caught.value.reason == "protocol 1"
+
+
+def test_a_close_that_carried_no_code_at_all_is_still_a_link_closed() -> None:
+    """A dropped TCP connection closes with nothing received. `rcvd` is None."""
+
+    class Closed(Exception):
+        rcvd = None
+
+    class Raw:
+        def send(self, payload: str) -> None:
+            raise Closed()
+
+    with pytest.raises(LinkClosed) as caught:
+        _Socket(Raw(), Closed).send("hi")
+
+    assert caught.value.code is None
+
+
+def test_a_refused_credential_is_an_error_and_goes_straight_to_the_cap(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """4401 cannot self-heal. Dialling every second until it does is pure noise.
+
+    It is also the one refusal a person has to act on, and a daemon that answers
+    it with the same INFO line a wifi blip gets is a locked-out rack nobody can
+    find in a log.
+    """
+    clock = FakeClock(NOW)
+    closed = LinkClosed(CLOSE_UNAUTHORIZED, "unauthorized")
+    client, _ = make(tmp_path, sockets=[FakeSocket([closed], clock)], clock=clock)
+
+    with caplog.at_level(logging.ERROR):
+        client.tick_once()
+
+    assert client.retry_in == BACKOFF_CAP_S
+    assert [record.levelno for record in caplog.records] == [logging.ERROR]
+    assert "credential" in caplog.records[0].message
+
+
+def test_a_refused_credential_is_still_retried_forever(tmp_path: Path) -> None:
+    """A re-paired daemon has to come back on its own; nothing else will fetch it."""
+    clock = FakeClock(NOW)
+    sockets = [
+        FakeSocket([LinkClosed(CLOSE_UNAUTHORIZED, "unauthorized")], clock) for _ in range(3)
+    ]
+    client, _ = make(tmp_path, sockets=sockets, clock=clock)
+
+    for _ in range(3):
+        client.tick_once()
+
+    assert client.retry_in == BACKOFF_CAP_S
+    assert [socket.url for socket in sockets[:1]] != [None], "capped is not stopped"
+
+
+def test_a_protocol_skew_close_names_both_versions(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The server documents 4426 as the one a daemon must not retry blindly.
+
+    Reconnecting against a build that cannot understand you never gets anywhere,
+    so the log line has to carry what an operator needs to upgrade one end: the
+    version this build speaks and the one the server said it does.
+    """
+    clock = FakeClock(NOW)
+    closed = LinkClosed(CLOSE_PROTOCOL_SKEW, "protocol 9")
+    client, _ = make(tmp_path, sockets=[FakeSocket([closed], clock)], clock=clock)
+
+    with caplog.at_level(logging.ERROR):
+        client.tick_once()
+
+    assert client.retry_in == BACKOFF_CAP_S
+    assert [record.levelno for record in caplog.records] == [logging.ERROR]
+    assert caplog.records[0].protocol == PROTOCOL_VERSION
+    assert caplog.records[0].server_said == "protocol 9"
+
+
+def test_an_ordinary_close_is_not_treated_as_hopeless(tmp_path: Path) -> None:
+    """A superseded socket or a server restarting is exactly what backing off is for."""
+    clock = FakeClock(NOW)
+    sockets = [FakeSocket([LinkClosed(4409, "superseded")], clock) for _ in range(2)]
+    client, _ = make(tmp_path, sockets=sockets, clock=clock)
+
+    client.tick_once()
+    assert client.retry_in == 1.0
+
+    client.tick_once()
+    assert client.retry_in == 2.0
+
+
+# --- the send deadline ------------------------------------------------------
+
+
+def test_a_send_that_parks_is_taken_apart_within_its_deadline(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Measured, not argued: without this the link thread never comes back.
+
+    `websockets.sync.Connection.send` holds the protocol mutex across a blocking
+    `sendall` and only ever calls `settimeout` when a close deadline is set,
+    which is never during normal operation. Its own keepalive thread cannot
+    rescue it either -- on a ping timeout that thread needs `send_context()`,
+    which blocks on the mutex the wedged sender is holding. So a server that is
+    TCP-alive and has stopped reading leaves this thread parked forever with
+    `connected` still true, no heartbeat and no reconnect, and every cross-thread
+    caller of `send` parked behind it.
+    """
+    socket = FakeSocket([TIMEOUT] * 5)
+    socket.parks_after = 0  # the hello itself never lands
+    client, _ = make(tmp_path, sockets=[socket], send_deadline=0.2)
+
+    with caplog.at_level(logging.ERROR):
+        started = time.monotonic()
+        client.tick_once()
+        took = time.monotonic() - started
+
+    assert socket.aborted is True, "nothing else can free a thread parked in sendall"
+    assert took < WAIT, f"the send was bounded, not parked: {took:.2f}s"
+    assert any("stopped reading" in record.message for record in caplog.records)
+    assert client.connected is False
+
+
+def test_the_link_threads_own_ack_is_bounded_like_every_other_write(tmp_path: Path) -> None:
+    """The hello, an ack and a frame are three callers and three code paths.
+
+    This one is the worst of the three to leave unbounded: it is the thread that
+    reads the socket and the thread that consults the stop event, so an ack that
+    parks is a link that has stopped receiving, stopped beating, stopped
+    noticing SIGTERM and will never reconnect -- with `connected` still true.
+    """
+    socket = FakeSocket([push(7)])
+    socket.parks_after = 1  # the hello lands; the ack that follows the apply does not
+    client, _ = make(tmp_path, sockets=[socket], send_deadline=0.2)
+
+    started = time.monotonic()
+    client.tick_once()
+    took = time.monotonic() - started
+
+    assert socket.aborted is True
+    assert took < WAIT, f"the ack was bounded, not parked: {took:.2f}s"
+
+
+def test_a_link_that_is_not_parked_is_never_taken_apart(tmp_path: Path) -> None:
+    """The deadline is a deadline, not a session limit: a quiet link outlives it."""
+    clock = FakeClock(NOW)
+    socket = FakeSocket([TIMEOUT] * 4, clock)
+    client, _ = make(tmp_path, sockets=[socket], clock=clock, send_deadline=0.2, heartbeat=1.0)
+
+    client.tick_once()
+
+    assert socket.aborted is False
+    assert only(socket, Heartbeat), "and it kept beating throughout"
+
+
+@contextlib.contextmanager
+def deaf_peer() -> Iterator[int]:
+    """A real socket that completes the handshake and then never reads again.
+
+    Not a `websockets` server: one of those keeps draining the socket into its
+    own buffers long after the handler has stopped asking for messages, which is
+    a different failure. This is the one the module is about -- a peer that is
+    TCP-alive, that has said nothing wrong, and whose receive window has closed.
+    A four-kilobyte `SO_RCVBUF` on the listener is inherited by the accepted
+    socket and turns off autotuning, so the window closes after kilobytes rather
+    than after the megabytes a tuned loopback connection will take.
+    """
+    listener = socket_module.socket()
+    listener.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
+    listener.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_RCVBUF, 4096)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    held: list[Any] = []
+
+    def accept() -> None:
+        while True:
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                return  # the listener was closed; the test is over
+            held.append(connection)
+            request = b""
+            while b"\r\n\r\n" not in request:
+                request += connection.recv(4096)
+            key = ""
+            for line in request.decode().split("\r\n"):
+                if line.lower().startswith("sec-websocket-key:"):
+                    key = line.split(":", 1)[1].strip()
+            digest = hashlib.sha1((key + _WS_GUID).encode()).digest()  # noqa: S324
+            connection.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: " + base64.b64encode(digest) + b"\r\n\r\n"
+            )
+
+    threading.Thread(target=accept, daemon=True).start()
+    try:
+        yield int(listener.getsockname()[1])
+    finally:
+        listener.close()
+        for connection in held:
+            connection.close()
+
+
+def test_a_real_peer_that_stops_reading_does_not_park_the_link_thread(tmp_path: Path) -> None:
+    """The same measurement again, over a real socket and the real transport.
+
+    With the deadline removed this run does not finish: `client.send` parks in
+    `sendall` and stays there, `connected` stays true, no heartbeat goes out and
+    no reconnect is ever attempted -- measured at forty-five seconds and killed,
+    not observed to recover. With it, the socket is taken apart and `send`
+    answers False, which is what task 11's frame path is written to expect.
+    """
+    with deaf_peer() as port:
+        stop = threading.Event()
+        client = LinkClient(
+            settings=LinkSettings(
+                server_url=f"http://127.0.0.1:{port}",
+                cache_path=tmp_path / "cache.json",
+                token="tok",
+            ),
+            settings_path=tmp_path / "link.json",
+            on_snapshot=lambda snapshot, version: None,
+            stop=stop,
+            clock=lambda: datetime.now(UTC),
+            connect_factory=_default_connect,
+            send_deadline=0.5,
+        )
+        client.start()
+        try:
+            started = time.monotonic()
+            while not client.connected and time.monotonic() - started < WAIT:
+                time.sleep(0.01)
+            assert client.connected, "the hello never reached the peer"
+
+            filler = LogLine(level="INFO", message="x" * 60_000)
+            started = time.monotonic()
+            while client.send(filler) and time.monotonic() - started < WAIT:
+                pass
+            wedged = time.monotonic() - started
+        finally:
+            stop.set()
+            client.join(WAIT)
+
+    assert wedged < WAIT, f"the send parked rather than raising: {wedged:.2f}s"
+    assert client.is_alive() is False, "and the link thread came back to be joined"
+
+
 # --- the backoff ------------------------------------------------------------
 
 
@@ -764,8 +1321,10 @@ def test_a_link_that_is_accepted_and_dropped_at_once_still_backs_off(tmp_path: P
     """A rejected credential closes the socket the moment it is opened.
 
     Resetting the delay on `connect` rather than on a session that lasted turns
-    that into a reconnect every two seconds, forever, against a server that has
-    already said no.
+    that into a reconnect every second, forever, against a server that has
+    already said no: the reset clears `_backing_off` too, so the close that
+    follows takes the plain-floor branch rather than the doubling one and the
+    delay never leaves the floor. Measured on the reconstructed draft.
     """
     clock = FakeClock(NOW)
     sockets = [FakeSocket([], clock) for _ in range(4)]
@@ -919,6 +1478,33 @@ def test_an_unreadable_settings_file_means_an_unpaired_daemon(tmp_path: Path) ->
     assert load_link_settings(path) is None
 
 
+def test_settings_whose_fields_are_the_wrong_shape_are_no_pairing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The docstring promises None for every kind of wrong. Three kinds raised.
+
+    A hand-edited file, a half-written one, or one from a build that spelled a
+    field differently, and the caller's answer to all of them is the same: run
+    the rack from the local config file and do not dial. Raising instead takes
+    the daemon down at startup over a file it does not need to boot -- which is
+    four dark panels for a corrupt *pairing*.
+    """
+    path = tmp_path / "link.json"
+    corrupt = [
+        {"server_url": "http://s", "token": "t", "daemon_id": "abc"},  # ValueError
+        {"server_url": "http://s", "token": "t", "daemon_id": [1]},  # TypeError
+        {"server_url": "http://s", "token": "t", "cache_path": ["a"]},  # TypeError
+    ]
+    for raw in corrupt:
+        path.write_text(json.dumps(raw))
+        path.chmod(0o600)
+        with caplog.at_level(logging.WARNING):
+            assert load_link_settings(path) is None, raw
+
+    assert len(caplog.records) == len(corrupt), "and each one says what was wrong with it"
+    assert all("TypeError" in r.error or "ValueError" in r.error for r in caplog.records)
+
+
 def test_settings_with_no_credential_are_no_pairing(tmp_path: Path) -> None:
     path = tmp_path / "link.json"
     path.write_text(json.dumps({"server_url": "http://s", "token": None, "key": None}))
@@ -973,3 +1559,37 @@ def test_writing_settings_creates_the_directory_they_go_in(tmp_path: Path) -> No
     write_link_settings(path, LinkSettings(server_url="http://s", cache_path=path, token="t"))
 
     assert load_link_settings(path) is not None
+
+
+# --- the transport ----------------------------------------------------------
+
+
+def test_every_number_the_real_transport_runs_on_is_one_this_module_chose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inherited defaults are decisions nobody made, in a module full of made ones.
+
+    Each of these has a rack-visible consequence -- `max_size` caps how large a
+    `ConfigPush` this daemon can accept at all, `open_timeout` and `close_timeout`
+    are both time a SIGTERM waits out -- so a `websockets` release that moves one
+    must move something here, not something on the rack.
+    """
+    import websockets.sync.client
+
+    seen: dict[str, Any] = {}
+
+    def record(url: str, **kwargs: Any) -> str:
+        seen.update(kwargs, url=url)
+        return "connection"
+
+    monkeypatch.setattr(websockets.sync.client, "connect", record)
+
+    transport = _default_connect("ws://rack:8080/ws/daemon")
+
+    assert isinstance(transport, _Socket)
+    assert seen["url"] == "ws://rack:8080/ws/daemon"
+    assert seen["max_size"] == MAX_MESSAGE_BYTES
+    assert seen["open_timeout"] is not None
+    assert seen["close_timeout"] is not None
+    assert seen["ping_interval"] is not None
+    assert seen["ping_timeout"] is not None

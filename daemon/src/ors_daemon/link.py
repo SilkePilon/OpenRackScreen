@@ -6,9 +6,9 @@ configuration, not a dependency: a server that is down, unreachable, speaking a
 protocol this build has never heard of, or refusing this daemon's credential
 outright, is answered here with a log line and a retry, while four panels keep
 drawing from the snapshot they already have. Nothing in this module raises into
-the daemon, and the one thread it owns cannot end on its own.
+the daemon, and the link thread cannot end on its own.
 
-Three things about the protocol are worth having in front of you before reading
+Four things about the protocol are worth having in front of you before reading
 the code, because each one is a place a plausible implementation goes wrong.
 
 *One credential, two lifetimes.* `Hello.token` carries either the one-time
@@ -30,15 +30,28 @@ getting that wrong in the optimistic direction is a blank rack.
 has confirmed on every connect, so a push this daemon already runs must still be
 answered -- otherwise the server learns nothing and pushes the same
 configuration again on the next connect, forever.
+
+*A send can park forever, and nothing in `websockets` will free it.* Its sync
+`Connection.send` holds the protocol mutex across a blocking `sendall` and only
+applies a socket timeout when a close deadline is set, which never happens
+during normal operation; its own keepalive thread cannot rescue a wedged sender
+either, because a ping timeout needs `send_context()` and that blocks on the
+same mutex. So a server that is TCP-alive and has stopped reading is the one
+failure reconnecting does *not* answer -- there is no reconnect, the thread
+never returns. `SEND_DEADLINE_S` and the watchdog that enforces it are the
+whole reason this module owns a second thread while a socket is open.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import socket as socket_module
 import threading
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,6 +61,7 @@ from urllib.parse import urlsplit, urlunsplit
 from ors_schema.daemon import DaemonConfig
 from ors_schema.errors import first_error
 from ors_schema.link import (
+    PROTOCOL_VERSION,
     Ack,
     Command,
     ConfigPush,
@@ -67,6 +81,27 @@ from ors_daemon.clock import Clock
 log = logging.getLogger(__name__)
 
 SnapshotHandler = Callable[[DaemonConfig, int], None]
+"""What to do with a pushed configuration. Called as `handler(snapshot, version)`.
+
+Two obligations, and neither is enforceable from here.
+
+*It must bound how long it takes, and the bound is seconds rather than tens of
+them.* It runs synchronously on the link thread, which is the thread that reads
+this socket and the thread that consults the stop event, so its duration is
+added directly to how long a SIGTERM takes to be noticed. That is spent out of
+`ors_daemon.supervisor.SHUTDOWN_BUDGET` -- ten seconds for the whole daemon --
+alongside `RECV_TIMEOUT_S` and `CLOSE_TIMEOUT_S`. Overrun it and systemd sends
+SIGKILL before `Supervisor.stop` runs, which leaves four panels lit until
+somebody pulls the power; the alternative, abandoning the apply where it stands,
+is four panels halfway through a repaint. The link refuses to *start* an apply
+once the stop event is set (see `_config`), which is as much as it can do: it
+cannot interrupt one that is already running.
+
+*It must raise on a configuration it cannot serve, rather than partially
+applying it.* A raise is a nack, which is how the person who saved the edit
+finds out; a half-applied snapshot is a rack that disagrees with the interface
+and an ack that says it does not.
+"""
 CommandHandler = Callable[[Command], None]
 FramesHandler = Callable[[FramesRequest], None]
 
@@ -76,22 +111,62 @@ DAEMON_PATH = "/ws/daemon"
 HEARTBEAT_INTERVAL_S = 15.0
 """How often a daemon says it is still there, in seconds.
 
-Three times the server's `SEND_TIMEOUT = 5.0`, and the floor is the interesting
-half of that. The server bounds how long one send to a daemon may take before it
-gives up on the socket; a daemon beating faster than that bound makes it
-decoration, because the server would then be dropping peers that are merely
-between heartbeats. At or above it, a late heartbeat is evidence of something.
+Nothing on either end times out on daemon silence, so this is not a deadline
+anyone has set: the hub knows a rack is online because it is holding its socket,
+uvicorn's ping/pong notices a peer that has gone away, and the server's
+`SEND_TIMEOUT` bounds an *outbound* send rather than a wait for one. It is the
+coarse "when did we last hear anything" the interface shows, and both bounds on
+it are local.
+
+The floor is `_settle`, which spends this number as the bar for "a connection
+that lasted" -- the only evidence this end can get, without a reply, that the
+server did not refuse it. A short interval makes a connection that was accepted
+and immediately closed count as a working session, which resets the backoff and
+restores exactly the hammering `_settle` exists to prevent. A connect and a
+refusal take milliseconds; seconds are the margin, and `_settle` reads the
+attribute rather than a constant so the relationship cannot drift.
 
 The ceiling is what the message costs. Every non-frame message makes the server
 write `daemon.last_seen`, which is one SQLite write per rack per beat -- four a
-minute here, against a link that is otherwise silent for hours at a time. It is
-not a liveness *detector*: the hub knows a rack is online because it is holding
-its socket, and uvicorn's ping/pong notices a peer that has gone away. This is
-the coarse "when did we last hear anything" the interface shows, so a beat every
-fifteen seconds is as fine-grained as anything can read.
+minute here, against a link that is otherwise silent for hours at a time -- and
+the freshness a person reads off the interface, which nobody can perceive below
+a few seconds.
 
 Deliberately unrelated to `RECV_TIMEOUT_S`, which is about shutdown latency.
 """
+
+SEND_DEADLINE_S = 5.0
+"""How long one write to the socket may take before the socket is taken apart.
+
+The module docstring says why there has to be one at all: `websockets.sync` puts
+no bound on a send during normal operation, and the failure it leaves open --
+a server that is TCP-alive and has stopped reading -- is the only one that
+reconnecting cannot answer, because the thread that would reconnect is the thread
+that is parked. The server bounds this exact failure in the other direction with
+its own `SEND_TIMEOUT`; this is the daemon's half.
+
+The floor is the largest thing this end legitimately writes, which is task 11's
+frame: a WebP of one 240x240 panel, base64'd, is tens of kilobytes, and even a
+Pi 3B+ on congested wifi puts that on the wire in well under a second.
+
+The ceiling is shutdown. A parked send is time a SIGTERM waits out -- the link
+thread reaches it at the next beat, and any other thread that called `send`
+waits behind it -- against `Supervisor.SHUTDOWN_BUDGET` of ten seconds for the
+whole daemon. Five leaves room for the rest of the teardown; the alternative to
+picking a number is forever.
+"""
+
+# The 4000-4999 codes `ors_server.link.ws_daemon` closes with. Only the two this
+# end acts on differently are named here, because a copy of a vocabulary is a
+# copy that goes stale: the server owns the list, and everything not named below
+# is deliberately handled as "try again". They are duplicated rather than
+# imported because the daemon does not depend on the server package -- if a
+# third code ever needs acting on, they belong in `ors_schema.link` where both
+# ends can read one definition.
+CLOSE_UNAUTHORIZED = 4401
+"""No credential, or one that matches nothing. Needs a person; cannot self-heal."""
+CLOSE_PROTOCOL_SKEW = 4426
+"""The two ends do not speak the same version of this protocol. Needs an upgrade."""
 
 RECV_TIMEOUT_S = 1.0
 """How long the receive loop may sit in `recv` before it looks at the stop event.
@@ -111,9 +186,92 @@ notices.
 BACKOFF_FLOOR_S = 1.0
 BACKOFF_CAP_S = 30.0
 
+# `websockets` ships a default for each of the four numbers below, and inherited
+# defaults are decisions nobody made -- in a module where `RECV_TIMEOUT_S` gets
+# fourteen lines of argument. Each has a consequence on the rack, so each is
+# stated here: a release that moves one has to move something in this file
+# rather than something on a Pi.
+
+MAX_MESSAGE_BYTES = 4 * 1024 * 1024
+"""The largest message this daemon will read. `websockets` defaults to 1 MiB.
+
+It is a cap on how large a `ConfigPush` this rack can accept at all, and
+exceeding it is not a soft failure: `websockets` closes the socket, so an
+oversized snapshot is a reconnect loop in which the server pushes the same thing
+every time and never learns why. Four mebibytes because a snapshot is JSON text
+-- screen parameters, template names and integration URLs -- and a rack's worth
+is kilobytes; four is three orders of magnitude of headroom while still being a
+number a Pi 3B+ can hold several of without swapping.
+
+Residual risk, recorded rather than solved: nothing on the server bounds what it
+assembles, so the two ends can disagree about what is servable and only this one
+finds out. `DaemonConfig.screens` has no cardinality bound either -- see the
+note in `ors_schema.daemon` -- so the honest description of this number is a
+memory bound on the daemon, not an agreement between the ends.
+"""
+
+OPEN_TIMEOUT_S = 5.0
+"""How long a connect attempt may take before it is abandoned. Default is 10.
+
+Two things are being traded. A connect that has not completed in five seconds
+against a server on the same LAN -- DNS, TCP, TLS and one HTTP upgrade -- is one
+that is not going to, and abandoning it costs a single backoff. Against that,
+this is time a SIGTERM waits out: the stop event is not looked at again until
+the attempt returns, so a shutdown landing mid-connect pays it in full out of
+`Supervisor.SHUTDOWN_BUDGET`.
+
+Kept above the server's `HELLO_TIMEOUT_S` reasoning rather than below it: the
+same congested LAN and half-booted Pi have to fit in both.
+"""
+
+CLOSE_TIMEOUT_S = 2.0
+"""How long `close()` may spend on the closing handshake. Default is 10.
+
+Ten seconds is the entire `SHUTDOWN_BUDGET`, spent on a courtesy. The handshake
+is worth attempting -- it is what lets the server drop the connection promptly
+rather than waiting for a ping timeout -- but not worth a rack that systemd
+SIGKILLs before `Supervisor.stop` can sleep the panels, which is four panels
+left lit until someone pulls the power.
+"""
+
+PING_INTERVAL_S = 20.0
+PING_TIMEOUT_S = 20.0
+"""`websockets`' own keepalive, at its defaults, stated so they are a choice.
+
+It answers a peer that has *gone away* -- a Pi whose wifi dropped without a FIN
+-- and it is worth having for that: without it a half-open socket is a link that
+looks up forever. It answers nothing about a peer that is present and not
+reading, because the keepalive thread needs `send_context()` to send its ping
+and that blocks on the mutex a parked sender holds. `SEND_DEADLINE_S` is what
+covers that case, and these two do not overlap with it.
+
+Twenty and twenty because a dead peer is then noticed inside forty seconds,
+which is well under the backoff cap and far above any pause a Pi's wifi takes in
+normal service.
+"""
+
 
 class LinkError(Exception):
     """The link cannot be attempted at all -- a server URL nothing can dial."""
+
+
+class LinkClosed(Exception):
+    """The server closed the socket, and said why with a code.
+
+    This module's own, deliberately: `websockets.exceptions` may not be imported
+    anywhere above `_default_connect`, because everything else here has to stay
+    importable and testable on a machine with no `websockets` at all. `_Socket`
+    translates at the boundary so that the receive loop can act on a close
+    without either end of that constraint being compromised.
+
+    `code` is None for a close that carried none -- a TCP connection that simply
+    dropped -- which is the common case and the one that means nothing.
+    """
+
+    def __init__(self, code: int | None, reason: str = "") -> None:
+        super().__init__(f"the server closed this link: {code} {reason}".strip())
+        self.code = code
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -182,13 +340,32 @@ def load_link_settings(path: Path) -> LinkSettings | None:
             extra={"path": str(path), "mode": oct(mode)},
         )
 
-    settings = LinkSettings(
-        server_url=str(raw["server_url"]),
-        cache_path=Path(raw.get("cache_path") or path.with_name("snapshot.json")),
-        token=raw.get("token") or None,
-        key=raw.get("key") or None,
-        daemon_id=int(raw["daemon_id"]) if raw.get("daemon_id") is not None else None,
-    )
+    try:
+        settings = LinkSettings(
+            server_url=str(raw["server_url"]),
+            cache_path=Path(raw.get("cache_path") or path.with_name("snapshot.json")),
+            token=raw.get("token") or None,
+            key=raw.get("key") or None,
+            daemon_id=int(raw["daemon_id"]) if raw.get("daemon_id") is not None else None,
+        )
+    except (TypeError, ValueError) as exc:
+        # Everything above reads a value out of a JSON document, and JSON can
+        # only hand back a dict, a list, a string, a number, a bool or null --
+        # so `TypeError` and `ValueError` between them are exhaustive over what
+        # the *content* of this file can do, whatever shape it is in. Measured
+        # examples, each of which raised straight through before: a `daemon_id`
+        # of "abc" (ValueError from `int`), a `daemon_id` of [1] (TypeError from
+        # `int`), a `cache_path` of ["a"] (TypeError from `Path`).
+        #
+        # Returned as None rather than raised because the docstring promises it
+        # and the promise is load-bearing: this is called at startup, and a
+        # daemon that refuses to boot over a corrupt pairing file is four dark
+        # panels for the sake of a file it does not need in order to draw.
+        log.warning(
+            "link settings that cannot be read; ignoring them",
+            extra={"path": str(path), "error": f"{type(exc).__name__}: {exc}"},
+        )
+        return None
     if settings.credential is None:
         log.warning("link settings carry no credential; ignoring them", extra={"path": str(path)})
         return None
@@ -281,10 +458,16 @@ class LinkClient(threading.Thread):
 
     `heartbeat` is the *interval* between heartbeat messages, in seconds -- not
     the monotonic liveness stamp that `Poller.heartbeat` and
-    `ScreenWorker.heartbeat` carry for the supervisor's watchdog. Nothing
-    watches this thread (there is nothing useful to do about a wedged link that
-    reconnecting does not already do), so publishing a stamp nobody reads would
-    be the mistake `Tunnel` records having made with its `ready` event.
+    `ScreenWorker.heartbeat` carry for the supervisor's watchdog. The supervisor
+    does not watch this thread, and publishing a stamp nobody reads would be the
+    mistake `Tunnel` records having made with its `ready` event: for every way a
+    link can fail *except one*, reconnecting already does everything a restart
+    would.
+
+    The exception is a send that never returns, which is why `_SendWatchdog`
+    exists. It is not a liveness watchdog on this thread -- it watches one
+    socket for one specific thing, for as long as that socket is open, and its
+    answer is to take the socket apart so that reconnecting can happen at all.
 
     Everything public here is read from other threads: `connected` and
     `retry_in` for a status report, and `send` by task 11's frame path.
@@ -304,6 +487,7 @@ class LinkClient(threading.Thread):
         heartbeat: float = HEARTBEAT_INTERVAL_S,
         backoff_floor: float = BACKOFF_FLOOR_S,
         backoff_cap: float = BACKOFF_CAP_S,
+        send_deadline: float = SEND_DEADLINE_S,
         sleeper: Callable[[float], None] | None = None,
     ) -> None:
         """`settings_path` has no default on purpose.
@@ -350,6 +534,17 @@ class LinkClient(threading.Thread):
         # serialised with this end's own acks and heartbeats.
         self._send_lock = threading.Lock()
         self._connection: Any | None = None
+        self._send_deadline = send_deadline
+        # `time.monotonic()` by which the write now in flight must have finished,
+        # or None when none is. Written by whichever thread is sending and read
+        # by the watchdog, which is why it is one float and not a structure:
+        # a single attribute read cannot see half of an update.
+        self._send_expiry: float | None = None
+        # Monotonic and not the injected clock, because this is a deadline on a
+        # thread that is stuck rather than a question about the time of day. An
+        # NTP step must not turn a healthy send into a force-close, or a wedged
+        # one into a wait that never ends.
+        self._now = time.monotonic
 
     def tick_once(self) -> None:
         """One connection attempt, run to its end. The unit the tests drive."""
@@ -362,34 +557,51 @@ class LinkClient(threading.Thread):
             return
 
         connection = None
+        watchdog = None
+        hopeless = False
         opened = self._clock()
         try:
             url = websocket_url(self.settings.server_url)
             connection = self._connect(url)
             with self._send_lock:
                 self._connection = connection
-            connection.send(
-                Hello(
-                    token=credential,
-                    hostname=os.uname().nodename,
-                    daemon_version=__version__,
-                    config_version=self.config_version,
-                ).model_dump_json()
-            )
+            # Before the first byte goes out, because the hello is a send like
+            # any other and a server that accepts a socket and reads nothing
+            # parks on it exactly as one that stops reading later does.
+            watchdog = _SendWatchdog(self, connection)
+            watchdog.start()
+            # Under the lock like every other write, even though this one is
+            # the first: `_connection` is published above, so task 11's frame
+            # path can already be in `send` by the time this runs, and two
+            # writes in flight at once would be two deadlines in one attribute.
+            with self._send_lock, self._deadline():
+                connection.send(
+                    Hello(
+                        token=credential,
+                        hostname=os.uname().nodename,
+                        daemon_version=__version__,
+                        config_version=self.config_version,
+                    ).model_dump_json()
+                )
             self.connected = True
             self._last_beat = self._clock()
             log.info("link up", extra={"server": url, "config_version": self.config_version})
             self._serve(connection)
+        except LinkClosed as closed:
+            # The server said why, and two of the reasons are not "try again".
+            hopeless = self._refused(closed)
         except Exception as exc:
-            # Every way this can end arrives here, and none of them is worth a
-            # traceback: a server that is down, a credential it refused, a
-            # protocol it does not share and a wifi blip are all "try again".
+            # Every other way this can end arrives here, and none of them is
+            # worth a traceback: a server that is down, a socket that dropped
+            # mid-message and a wifi blip are all "try again".
             log.info("link down", extra={"error": f"{type(exc).__name__}: {exc}"})
         finally:
             self.connected = False
             with self._send_lock:
                 self._connection = None
-            self._settle(_elapsed(opened, self._clock()))
+            if watchdog is not None:
+                watchdog.stop()
+            self._settle(_elapsed(opened, self._clock()), hopeless=hopeless)
             if connection is not None:
                 try:
                     connection.close()
@@ -424,13 +636,59 @@ class LinkClient(threading.Thread):
             if connection is None:
                 return False
             try:
-                connection.send(message.model_dump_json())
+                with self._deadline():
+                    connection.send(message.model_dump_json())
             except Exception as exc:
                 # The receive loop is about to find the same thing out and end
                 # the connection; there is nothing useful to do from here.
                 log.debug("could not send", extra={"error": str(exc), "said": message.type})
                 return False
             return True
+
+    @contextlib.contextmanager
+    def _deadline(self) -> Iterator[None]:
+        """Bound one write to the socket. `SEND_DEADLINE_S` says why there is one.
+
+        Only the deadline is published here; the enforcing is `_SendWatchdog`'s,
+        because there is no way to interrupt a thread parked in `sendall` from
+        inside that thread. The lock is already held by every caller, so at most
+        one write is ever in flight and one expiry describes it.
+        """
+        self._send_expiry = self._now() + self._send_deadline
+        try:
+            yield
+        finally:
+            self._send_expiry = None
+
+    def _overran(self) -> bool:
+        """Whether the write in flight has passed its deadline. The watchdog asks.
+
+        One read of one attribute, deliberately. A send that finishes between
+        this read and the force-close that follows it is a send that had already
+        overrun, so the worst the race can do is drop a link that had just
+        recovered from being parked for a whole `SEND_DEADLINE_S` -- which
+        reconnects, and which is not a state worth keeping anyway.
+        """
+        expiry = self._send_expiry
+        return expiry is not None and self._now() >= expiry
+
+    def _wedged(self, connection: Any) -> None:
+        """Take the socket out from under a parked send. Called on the watchdog.
+
+        An error, and not a quiet one. It is the only symptom of a server that
+        accepted this link and stopped reading it, and without a line here that
+        state is indistinguishable in a log from a link that is simply idle.
+        """
+        log.error(
+            "the server accepted this link and stopped reading it; taking the socket apart",
+            extra={"deadline_s": self._send_deadline},
+        )
+        try:
+            connection.abort()
+        except Exception as exc:
+            # There is nothing left to try. Logged rather than raised because
+            # this is a bare thread and an exception out of it goes nowhere.
+            log.error("could not take apart a wedged socket", extra={"error": str(exc)})
 
     def _serve(self, connection: Any) -> None:
         """Read this socket until the server goes away or the daemon is stopped.
@@ -498,6 +756,23 @@ class LinkClient(threading.Thread):
             self._send(connection, Ack(config_version=push.version))
             return
 
+        if self._stop_event.is_set():
+            # `_serve` only looks at the stop event between `recv` calls, so a
+            # push already in flight when SIGTERM landed is read anyway -- and
+            # `on_snapshot` is a teardown and repaint of four panels, run right
+            # here on this thread, against a supervisor that is being torn down
+            # underneath it. Both endings are dark panels: overrun
+            # `SHUTDOWN_BUDGET` and systemd SIGKILLs before `Supervisor.stop`
+            # can sleep them, or abandon the apply and leave the rack halfway
+            # through a repaint.
+            #
+            # Answered with silence on purpose. The server clears what it
+            # believes a daemon has confirmed on every connect, so saying
+            # nothing reads as "still hasn't got it", which is exactly true, and
+            # the next connect gets the push again.
+            log.info("not applying a push while stopping", extra={"version": push.version})
+            return
+
         try:
             self._on_snapshot(push.snapshot, push.version)
         except Exception as exc:
@@ -526,15 +801,52 @@ class LinkClient(threading.Thread):
         holding an ack that says it is up to date. The server always pushes on
         the connect that spends a token for exactly this reason; this is the
         other half of that agreement.
+
+        The clear is made durable, and that is the same decision rather than an
+        extra one. Clearing the attribute alone leaves the previous server's
+        snapshot in the cache, and anything at all between here and the first
+        successful apply -- a power cut, a reboot, a link that drops -- means the
+        next boot loads it, claims its version, and gets the push skipped if the
+        new server's counter collides. There is no "push now" anywhere in M3a to
+        recover with, so the file goes now.
         """
+        if self.settings.key is not None:
+            # Nothing on this socket authenticates the server: the URL is
+            # whatever was typed on the command line, over a scheme that may not
+            # even be TLS. A healthy server never sends `Paired` to a daemon it
+            # has already keyed, so one arriving is a wrong address or somebody
+            # answering on it -- and taking it would write their key over the
+            # real one *on disk*, locking the rack out of its real server with
+            # no recovery short of minting a new token. Refused, loudly, and the
+            # session carries on on the credential that got it here.
+            log.error(
+                "the server sent a pairing to a daemon that already has a key; ignoring it",
+                extra={"daemon": message.daemon_id, "server": self.settings.server_url},
+            )
+            return
+
         log.info("paired with the server", extra={"daemon": message.daemon_id})
         self.settings = replace(
             self.settings, key=message.key, token=None, daemon_id=message.daemon_id
         )
         self.config_version = None
+        self._forget_cache()
         try:
             write_link_settings(self._settings_path, self.settings)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # `ValueError` for the same reason `_write_cache` catches it, and it
+            # is the same line of code in both: `write_link_settings` derives its
+            # temporary with `Path.with_name`, which raises `ValueError` and not
+            # `OSError` for a path with no filename. Caught only as `OSError`,
+            # that failure unwinds past this line into `tick_once`'s blanket
+            # handler as one INFO line -- so the loudest thing that can happen
+            # here says nothing, and the `ConfigPush` that follows `Paired` is
+            # dropped with it.
+            #
+            # Nothing wider than these two. Anything else is a bug rather than a
+            # disk or a configuration error, and it ends the connection instead
+            # of being logged as something this handler survives.
+            #
             # The key is good for this session either way, so the link stays up
             # and the rack keeps running -- but the next boot has nothing, and
             # recovering means minting a new token in the interface. It is the
@@ -543,6 +855,25 @@ class LinkClient(threading.Thread):
                 "could not save the key this daemon reconnects with; "
                 "it will need pairing again after a restart",
                 extra={"path": str(self._settings_path), "error": str(exc)},
+            )
+
+    def _forget_cache(self) -> None:
+        """Delete the snapshot this daemon booted from. Raises nothing.
+
+        Deleting rather than rewriting: there is nothing true to put in the file
+        at this moment, and an absent cache is a boot from the local config
+        file, which is the fallback the rest of the daemon is built around.
+        """
+        path = Path(self.settings.cache_path)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            # Logged and stepped over. The claim is still cleared in memory, so
+            # this session pushes and applies normally; what is lost is only the
+            # protection against being interrupted before that happens.
+            log.error(
+                "could not clear the previous server's cached snapshot",
+                extra={"path": str(path), "error": str(exc)},
             )
 
     def _dispatch(self, what: str, handler: Callable[[Any], None] | None, message: Any) -> None:
@@ -581,9 +912,15 @@ class LinkClient(threading.Thread):
         self._send(connection, Nack(config_version=version, reason=reason[:500]))
 
     def _send(self, connection: Any, message: DaemonMessage) -> None:
-        """Send on the socket this loop is serving, under the shared lock."""
+        """Send on the socket this loop is serving, under the shared lock.
+
+        Bounded like every other write here. This one is the link thread's own,
+        so a parked ack or heartbeat is the receive loop stopping, the stop event
+        going unread and the reconnect never happening.
+        """
         with self._send_lock:
-            connection.send(message.model_dump_json())
+            with self._deadline():
+                connection.send(message.model_dump_json())
 
     def _write_cache(self, push: ConfigPush) -> None:
         """Save what to boot from when the server is unreachable. Raises nothing.
@@ -617,16 +954,54 @@ class LinkClient(threading.Thread):
                 extra={"path": str(path), "error": str(exc)},
             )
 
-    def _settle(self, lasted: float) -> None:
+    def _refused(self, closed: LinkClosed) -> bool:
+        """Log a close the server put a code on, and say whether to stop trying hard.
+
+        The server defines the whole 4000-series vocabulary and states the reason
+        it bothered: a client that cannot tell "your credential is wrong" from
+        "your configuration is unservable" retries the first forever and gives up
+        on the second. Answering all of them with one INFO line makes a
+        locked-out rack log exactly what a wifi blip logs.
+
+        True means "go straight to the cap". Not "stop": neither of these can
+        self-heal, but both are fixed by a person -- a token minted in the
+        interface, a package upgraded on one end -- and nothing else will fetch
+        the daemon back afterwards. So it keeps dialling, once every
+        `BACKOFF_CAP_S`, which is the least noise that still recovers on its own.
+        Everything else is a server that is restarting, a socket that was
+        superseded or a snapshot it could not build, all of which the ordinary
+        backoff is exactly right for.
+        """
+        if closed.code == CLOSE_UNAUTHORIZED:
+            log.error(
+                "the server refused this daemon's credential; it needs pairing again",
+                extra={"code": closed.code, "reason": closed.reason},
+            )
+            return True
+        if closed.code == CLOSE_PROTOCOL_SKEW:
+            # Both versions, because neither on its own tells anyone what to
+            # upgrade: the server puts what it speaks in the close reason, and
+            # what this build speaks is only knowable from here.
+            log.error(
+                "the server speaks a version of this protocol that this build does not; "
+                "one end needs upgrading",
+                extra={"protocol": PROTOCOL_VERSION, "server_said": closed.reason},
+            )
+            return True
+        log.info("link down", extra={"code": closed.code, "reason": closed.reason})
+        return False
+
+    def _settle(self, lasted: float, *, hopeless: bool = False) -> None:
         """Decide how long to wait before dialling again.
 
         Judged on how long the connection *lasted*, not on whether it opened.
         Resetting the delay the moment a socket connects reads a refusal as a
         success: a server that closes on an unknown credential, on a protocol it
         does not share, or because another connection superseded this one,
-        accepts the socket first -- so the delay would be reset and then doubled
-        once per attempt, settling at a constant two seconds and hammering a
-        server that has already said no.
+        accepts the socket first -- and the reset clears `_backing_off` with it,
+        so the close that follows takes the plain-floor branch rather than the
+        doubling one. The delay never leaves the floor: a reconnect every second,
+        forever, against a server that has already said no.
 
         A session that outlived one heartbeat interval is the evidence this end
         can get without a reply: it sent one and the server did not close on it.
@@ -637,7 +1012,15 @@ class LinkClient(threading.Thread):
         working session is one plain floor, and only a failure that follows a
         failure doubles. Doubling the already-capped delay rather than raising a
         base to a power keeps it finite over a server that is down all weekend.
+
+        `hopeless` short-circuits all of it -- see `_refused`. Checked first,
+        because the point of it is that no amount of evidence from this
+        connection is worth anything against a "no" the server has spelled out.
         """
+        if hopeless:
+            self._backing_off = True
+            self.retry_in = self._backoff_cap
+            return
         if lasted >= self.heartbeat:
             self._backing_off = False
             self.retry_in = self._backoff_floor
@@ -645,6 +1028,128 @@ class LinkClient(threading.Thread):
         delay = self.retry_in * 2 if self._backing_off else self._backoff_floor
         self._backing_off = True
         self.retry_in = min(self._backoff_cap, delay)
+
+
+class _SendWatchdog(threading.Thread):
+    """Watches one socket for a write that has stopped making progress.
+
+    It exists because there is nothing else that can. A thread parked in
+    `socket.sendall` cannot time itself out, `websockets`' keepalive thread
+    cannot reach it -- a ping needs `send_context()`, which blocks on the mutex
+    the parked sender holds -- and no other thread can get past that mutex
+    either. What is left is taking the file descriptor away, which is what
+    `Connection.abort` does, and doing it from a thread that is not involved.
+
+    One per connection rather than one per client, so it exists exactly while
+    there is a socket to watch and `tick_once` cannot leave one behind. It waits
+    on an event rather than sleeping, so stopping it is immediate and a shutdown
+    does not pay the poll interval.
+
+    Nothing watches *this* thread, and nothing needs to: it holds no lock, calls
+    nothing that blocks, and if it died the failure it guards against is the one
+    the link had before this class existed.
+    """
+
+    def __init__(self, client: LinkClient, connection: Any) -> None:
+        super().__init__(name="link-send-watchdog", daemon=True)
+        self._client = client
+        self._connection = connection
+        self._done = threading.Event()
+        # Half the deadline, so a parked send is noticed between one and one and
+        # a half of them -- close enough that the bound means something, coarse
+        # enough that an idle link wakes this thread twice a heartbeat rather
+        # than continuously. Floored so that a test's short deadline cannot ask
+        # for a spin.
+        self._poll = max(0.01, min(1.0, client._send_deadline / 2))
+
+    def run(self) -> None:
+        while not self._done.wait(self._poll):
+            if self._client._overran():
+                self._client._wedged(self._connection)
+                return
+
+    def stop(self) -> None:
+        self._done.set()
+        self.join()
+
+
+class _Socket:
+    """The real transport, with `websockets`' vocabulary translated into this one.
+
+    Two things live here and nowhere else. The first is the close code: the
+    server distinguishes "your credential is wrong" from "we do not speak the
+    same protocol", and a daemon that cannot read the difference retries the one
+    that will never work and treats the one that needs a person as a wifi blip.
+    Reading it means catching `websockets.exceptions.ConnectionClosed`, and that
+    type may not appear anywhere above this line, because everything above stays
+    importable and testable on a machine with no `websockets` installed. So the
+    exception class is handed in and the code comes back out as `LinkClosed`.
+
+    The second is `abort`. `close()` performs a closing handshake, which needs
+    the protocol mutex, which is precisely what a parked send is holding -- so
+    the one method that could rescue a wedged link is the one method that cannot
+    run. Taking the socket down directly is what actually frees it, and
+    `Connection.socket` is documented for exactly this kind of thing.
+    """
+
+    def __init__(self, connection: Any, closed: type[BaseException]) -> None:
+        self._connection = connection
+        self._closed = closed
+
+    def send(self, payload: str) -> None:
+        try:
+            self._connection.send(payload)
+        except self._closed as exc:
+            raise _closure(exc) from exc
+
+    def recv(self, timeout: float | None = None) -> str:
+        try:
+            return str(self._connection.recv(timeout=timeout))
+        except self._closed as exc:
+            raise _closure(exc) from exc
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def abort(self) -> None:
+        """Take the file descriptor away, from a thread that is not parked on it.
+
+        `shutdown` before `close` because on Linux it is the shutdown that
+        interrupts a peer thread already blocked in the kernel -- closing a
+        descriptor another thread is sitting in does not wake it. It frees the
+        reader as well as the writer, which is what is wanted: `websockets`'
+        own receive thread ends, the protocol goes to closed, and the `recv`
+        this module is serving raises instead of waiting for a server that is
+        never going to be read from again.
+
+        Both calls are guarded because both race an ordinary close: by the time
+        this runs the socket may already be gone, and that is a success.
+        """
+        raw = self._connection.socket
+        try:
+            raw.shutdown(socket_module.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            raw.close()
+        except OSError:
+            pass
+
+
+def _closure(error: BaseException) -> LinkClosed:
+    """A `websockets` close as this module's own.
+
+    `rcvd` is the close frame the *server* sent, which is the one that carries
+    the reason this daemon was turned away. It is None whenever no close frame
+    arrived -- a TCP connection that dropped, or one this end closed first --
+    and a missing code is the common case rather than an error, so it is carried
+    through as None rather than guessed at.
+    """
+    received = getattr(error, "rcvd", None)
+    return LinkClosed(
+        code=getattr(received, "code", None),
+        reason=str(getattr(received, "reason", "") or ""),
+    )
 
 
 def _elapsed(start: datetime, end: datetime) -> float:
@@ -696,15 +1201,31 @@ def _mode_of(path: Path) -> int | None:
         return None
 
 
-def _default_connect(url: str) -> Any:  # pragma: no cover - exercised on the rack
-    """The real transport: one blocking WebSocket connection.
+def _default_connect(url: str) -> _Socket:
+    """The real transport: one blocking WebSocket connection, wrapped.
 
     `websockets.sync.client`, not the asyncio one, because this is a thread and
     the whole daemon is threads -- an event loop here would need its own thread
     to run in and a queue to talk to the rest through, for a socket that carries
-    a message a minute. It is imported inside the function so that everything
-    above stays importable and testable on a machine with no `websockets`.
+    a message a minute. Both imports are inside the function so that everything
+    above stays importable and testable on a machine with no `websockets`, and
+    `ConnectionClosed` is handed to `_Socket` rather than named in an `except`
+    clause up there for the same reason.
+
+    Every keyword is passed explicitly. Their values, and what each one costs a
+    rack, are on the constants above.
     """
+    from websockets.exceptions import ConnectionClosed
     from websockets.sync.client import connect
 
-    return connect(url)
+    return _Socket(
+        connect(
+            url,
+            open_timeout=OPEN_TIMEOUT_S,
+            close_timeout=CLOSE_TIMEOUT_S,
+            ping_interval=PING_INTERVAL_S,
+            ping_timeout=PING_TIMEOUT_S,
+            max_size=MAX_MESSAGE_BYTES,
+        ),
+        ConnectionClosed,
+    )
