@@ -73,6 +73,47 @@ def test_a_daemon_with_no_config_says_so_rather_than_claiming_a_version():
     assert parse_daemon_message(fresh.model_dump_json()).config_version is None
 
 
+def test_a_hello_is_bounded_because_it_arrives_before_anything_is_authenticated():
+    """Every field here is attacker-controlled and none of it has been checked.
+
+    A socket reaches `hello` by connecting, and `hello` is the whole of what the
+    server reads before it knows who -- if anyone -- is on the other end. Two of
+    these fields are then stored, and `hostname` is written to a log line the
+    server emits for a credential that matched nothing, so an unbounded one is
+    an unbounded write per refused connect.
+
+    Every limit is far past anything a real daemon sends: 253 is the longest a
+    DNS name can be, and the credentials this server mints are 43 and 64
+    characters.
+    """
+    plenty = {"token": "t", "hostname": "pi-rack", "daemon_version": "0.1.0"}
+
+    for field, size in (("token", 257), ("hostname", 254), ("daemon_version", 65)):
+        with pytest.raises(ValidationError) as refused:
+            Hello(**{**plenty, field: "x" * size})
+        assert refused.value.errors()[0]["type"] == "string_too_long"
+        assert Hello(**{**plenty, field: "x" * (size - 1)}), "and the limit itself is allowed"
+
+
+def test_a_capabilities_dict_is_bounded_by_what_it_weighs_not_by_how_many_keys():
+    """One key is enough to carry four megabytes, so counting keys bounds nothing.
+
+    `capabilities` is `dict[str, Any]`, which is what lets a daemon describe
+    hardware this build has never heard of -- and what stops any per-field limit
+    from applying to the values. The bound has to be on the serialised whole,
+    because that is the thing that gets stored: this column is written verbatim
+    into `daemon.capabilities` by a server that has just finished deciding the
+    credential was good, and from there into every export of the database.
+    """
+    plenty = {"token": "t", "hostname": "pi-rack", "daemon_version": "0.1.0"}
+
+    with pytest.raises(ValidationError) as refused:
+        Hello(**plenty, capabilities={"spi": "x" * 5000})
+
+    assert "capabilities" in str(refused.value)
+    assert Hello(**plenty, capabilities={"spi": [0, 1], "displays": ["gc9a01"] * 20})
+
+
 def test_a_config_push_carries_a_whole_validated_snapshot():
     push = ConfigPush(version=7, snapshot=DaemonConfig.model_validate(CONFIG))
 

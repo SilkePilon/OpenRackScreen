@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
 from ors_schema.daemon import DaemonConfig
 
@@ -10,7 +11,32 @@ PROTOCOL_VERSION = 1
 """Bumped when a message shape changes incompatibly.
 
 Carried in `hello` so a server meeting an older daemon can say so, rather than
-failing on a field neither end can explain.
+failing on a field neither end can explain. The server checks it before it
+authenticates and closes the socket on a mismatch, so bumping this is a
+deliberate break of every daemon in the field and not a soft one.
+"""
+
+# `hello` is the only message either end reads from a peer it has not
+# authenticated, so it is the only one whose bounds are a security property
+# rather than tidiness. Every number here is far past anything a real daemon
+# sends: 253 is the longest a DNS name may be, the credentials the server mints
+# are 43 and 64 characters, and a version string is a handful.
+MAX_CREDENTIAL = 256
+MAX_HOSTNAME = 253
+MAX_VERSION = 64
+MAX_CAPABILITIES_BYTES = 4096
+"""How much serialised `capabilities` a server will read from a stranger.
+
+A bound on the serialised whole rather than `max_length` on the dict, which
+counts keys and would let one key carry a four-megabyte value -- measured, at
+4,000,011 bytes. The values are `Any` by design, because the point of the field
+is to describe hardware this build has never heard of, so there is no per-value
+constraint to hang a limit on and the weight is the only thing left to measure.
+
+Four kilobytes because this is stored: it lands verbatim in
+`daemon.capabilities` and from there in every export of the database. A dict
+naming the SPI buses, the display backends and a kernel version is a few
+hundred bytes.
 """
 
 
@@ -38,7 +64,7 @@ class _Message(BaseModel):
 
 class Hello(_Message):
     type: Literal["hello"] = "hello"
-    token: str = Field(repr=False)
+    token: str = Field(repr=False, max_length=MAX_CREDENTIAL)
     """The credential: the one-time pairing token, or the key `Paired` handed back.
 
     One field for both, which is what the design calls `token_or_key`. They are
@@ -55,8 +81,16 @@ class Hello(_Message):
     still serialises normally, because it has to travel; it just does not travel
     into a log by accident.
     """
-    hostname: str
-    daemon_version: str
+    hostname: str = Field(max_length=MAX_HOSTNAME)
+    """What the daemon calls itself. Bounded because it identifies nobody.
+
+    It is not a credential and is never treated as one, so the only thing it
+    does is get logged -- including on the path where the credential matched
+    nothing, which is a log line an unauthenticated peer can ask for as many
+    times as it can open sockets. Unbounded, that is an unbounded write per
+    refused connect.
+    """
+    daemon_version: str = Field(max_length=MAX_VERSION)
     config_version: int | None = None
     """The `ConfigPush.version` this daemon is running, or None for none at all.
 
@@ -80,6 +114,20 @@ class Hello(_Message):
     """
     protocol_version: int = PROTOCOL_VERSION
     capabilities: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("capabilities")
+    @classmethod
+    def _small_enough_to_store(cls, capabilities: dict[str, Any]) -> dict[str, Any]:
+        # `default=str` so that a dict assembled in Python rather than parsed
+        # from the wire cannot turn a length check into a `TypeError` escaping
+        # as something other than a validation failure. Nothing off the wire
+        # reaches it; everything there is JSON already.
+        weight = len(json.dumps(capabilities, default=str))
+        if weight > MAX_CAPABILITIES_BYTES:
+            raise ValueError(
+                f"capabilities is {weight} bytes, over the {MAX_CAPABILITIES_BYTES} allowed"
+            )
+        return capabilities
 
 
 class Heartbeat(_Message):
