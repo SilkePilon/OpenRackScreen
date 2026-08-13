@@ -1,6 +1,7 @@
 import json
 import sqlite3
 
+import pytest
 from ors_server.db import SCHEMA_VERSION, Database
 
 TABLES = {"daemon", "screen", "template", "integration", "secret", "setting", "daemon_event"}
@@ -121,6 +122,42 @@ def test_foreign_keys_are_enforced(tmp_path):
     raise AssertionError("a screen may not belong to a daemon that does not exist")
 
 
+def test_a_daemon_row_may_hold_a_token_or_a_key_but_never_both(tmp_path):
+    """The two credentials are unambiguous by convention. The schema now says so.
+
+    `pairing.py` reasons that one string can match at most one of the two
+    columns, because a token's hash is deleted the moment it is spent -- and
+    everything downstream rests on that, including which of the two the daemon
+    socket tries first. Nothing enforced it. A row hand-written with both, or
+    written by a future re-pair endpoint that sets a token without clearing the
+    key, authenticates by key today and has its live key silently revoked by the
+    next token claim.
+    """
+    database = Database(tmp_path / "ors.db")
+    database.initialise()
+
+    with database.connect() as connection:
+        connection.execute(
+            "INSERT INTO daemon (name, key_hash, created_at) VALUES ('pi-rack', 'k', 'now')"
+        )
+        for statement in (
+            "INSERT INTO daemon (name, token_hash, key_hash, created_at)"
+            " VALUES ('pi-two', 't', 'k', 'now')",
+            "UPDATE daemon SET token_hash = 't' WHERE name = 'pi-rack'",
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(statement)
+
+        # And the states the pairing really does move through are all still
+        # writable: unpaired, paired, and the re-pair task 13 owes.
+        connection.execute(
+            "UPDATE daemon SET key_hash = NULL, token_hash = 't2' WHERE name = 'pi-rack'"
+        )
+        connection.execute(
+            "UPDATE daemon SET token_hash = NULL, key_hash = 'k2' WHERE name = 'pi-rack'"
+        )
+
+
 def test_rows_come_back_as_mappings(tmp_path):
     database = Database(tmp_path / "ors.db")
     database.initialise()
@@ -142,6 +179,27 @@ def test_the_export_says_which_schema_produced_it(tmp_path):
     database.initialise()
 
     assert database.export()["_schema_version"] == SCHEMA_VERSION
+
+
+def test_the_export_dates_the_rows_in_it_and_not_the_code_that_wrote_it(tmp_path):
+    """The number a restorer reads has to describe the columns beside it.
+
+    Found by running the rebuild for real rather than by simulating it. The
+    export is written *before* the file is dropped, so its rows are the old
+    schema's -- and stamping them with the constant compiled into the running
+    build says the opposite: it dates a version-2 dump as version 3, and the
+    restorer decides which columns exist from that number.
+    """
+    path = tmp_path / "ors.db"
+    Database(path).initialise()
+    with Database(path).connect() as connection:
+        connection.execute("INSERT INTO setting (key, value) VALUES ('timezone', 'UTC')")
+        connection.execute("PRAGMA user_version = 2")
+
+    export = Database(path).initialise()
+
+    assert export is not None
+    assert json.loads(export.read_text())["_schema_version"] == 2
 
 
 def test_redaction_does_not_invent_a_column_the_old_schema_lacked(tmp_path):

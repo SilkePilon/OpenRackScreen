@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 """Bumped whenever the schema below changes.
 
 There are no migrations: a bump exports the database and rebuilds it empty.
@@ -34,7 +34,21 @@ CREATE TABLE IF NOT EXISTS daemon (
     last_seen      TEXT,
     status         TEXT NOT NULL DEFAULT 'unpaired',
     config_version INTEGER NOT NULL DEFAULT 0,
-    created_at     TEXT NOT NULL
+    created_at     TEXT NOT NULL,
+    -- Which of the two a credential is, decided by the schema rather than by
+    -- convention. `pairing.py` reasons that one string can match at most one of
+    -- those columns, because a token's hash is deleted the moment it is spent,
+    -- and everything downstream leans on that -- including the order the daemon
+    -- socket tries them in. Nothing enforced it: a row holding both
+    -- authenticates by its key, and the next claim of its token silently
+    -- revokes that live key out from under a connected daemon. Harmless while
+    -- `claim_token` is the only thing that writes here, and load-bearing the
+    -- moment there is a re-pair endpoint -- which is precisely the code most
+    -- likely to write a new token without clearing the old key.
+    --
+    -- A table constraint rather than a column one only because SQLite will not
+    -- take a CHECK naming two columns in the middle of a column list.
+    CHECK (token_hash IS NULL OR key_hash IS NULL)
 );
 
 CREATE TABLE IF NOT EXISTS template (
@@ -169,8 +183,14 @@ class Database:
 
     def export(self) -> dict[str, list[dict[str, Any]]]:
         """Every row of every table, with the credential-bearing columns redacted."""
-        dumped: dict[str, Any] = {"_schema_version": SCHEMA_VERSION}
+        dumped: dict[str, Any] = {}
         with closing(self.connect()) as connection:
+            # Read off the file, not from the constant compiled into this build.
+            # An export is written before the stale database is dropped, so its
+            # rows are the *old* schema's -- and this number is how a restorer
+            # decides which columns they have. `SCHEMA_VERSION` here would date
+            # a version-2 dump as whatever the code doing the rebuilding is.
+            dumped["_schema_version"] = connection.execute("PRAGMA user_version").fetchone()[0]
             tables = [
                 row[0]
                 for row in connection.execute(

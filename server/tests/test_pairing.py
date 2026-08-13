@@ -120,10 +120,16 @@ def test_no_credential_is_never_a_credential_whatever_the_row_holds(tmp_path):
     and one that cannot be entered because of what is currently in a table.
     """
     made = database(tmp_path)
+    # Two rows, because one holding both hashes is a state the schema now
+    # refuses -- see `test_a_daemon_row_may_hold_a_token_or_a_key_but_never_both`.
     with closing(made.connect()) as connection:
         connection.execute(
-            "INSERT INTO daemon (name, token_hash, key_hash, created_at) VALUES (?, ?, ?, ?)",
-            ("pi-rack", _fingerprint(""), _fingerprint(""), "2026-01-01"),
+            "INSERT INTO daemon (name, token_hash, created_at) VALUES (?, ?, ?)",
+            ("pi-unpaired", _fingerprint(""), "2026-01-01"),
+        )
+        connection.execute(
+            "INSERT INTO daemon (name, key_hash, created_at) VALUES (?, ?, ?)",
+            ("pi-paired", _fingerprint(""), "2026-01-01"),
         )
 
     assert claim_token(made, "") is None
