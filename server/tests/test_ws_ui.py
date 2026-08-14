@@ -798,6 +798,29 @@ def _explode(database, screen_id: int) -> int | None:
     raise RuntimeError("something this module does not expect")
 
 
+async def test_a_screen_deleted_while_a_tab_had_it_open_still_stops_its_rack(tmp_path):
+    """Which rack a closing tab has to tell used to be a row lookup, and the row
+    can be gone: a screen deleted from the interface while somebody had its
+    panel open answered nothing, so that rack was never told to stop and went on
+    encoding WebP for a tab that had closed.
+
+    The rack each screen belonged to is remembered when it is subscribed to
+    instead, which is what makes the whole release synchronous as well.
+    """
+    app = build(tmp_path)
+    daemon_id, screens = rack(app)
+    pi = Rack(app, daemon_id)
+    browser, handler = await browsing(app)
+    browser.say(action="subscribe", screen_id=screens[0])
+    await pi.told(True, screens)
+
+    with closing(app.state.database.connect()) as connection:
+        connection.execute("DELETE FROM screen WHERE id = ?", (screens[0],))
+    await finish(browser, handler)
+
+    assert pi.asked_for == (False, [])
+
+
 async def test_a_disconnect_mid_stream_does_not_take_another_tab_with_it(tmp_path):
     app = build(tmp_path)
     daemon_id, screens = rack(app)
