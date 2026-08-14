@@ -15,6 +15,7 @@ from ors_server.auth import Sessions, require_session
 from ors_server.db import Database
 from ors_server.link.hub import Hub
 from ors_server.link.ws_daemon import router as daemon_socket_router
+from ors_server.link.ws_ui import router as ui_socket_router
 from ors_server.secrets import SecretStore, load_or_create_key
 from ors_server.snapshot import seed_builtin_templates
 
@@ -109,4 +110,11 @@ def create_app(settings: AppSettings) -> FastAPI:
     # a daemon key rather than with the admin's session, so the guard `api`
     # carries would refuse every rack in the building.
     app.include_router(daemon_socket_router)
+    # And a fourth, also at the root and for the same half of the reason: the
+    # design puts the browser socket at `/ws/ui`, which `api` would turn into
+    # `/api/ws/ui`. The other half is the opposite of the daemon socket's --
+    # this one carries the session dependency on its own router, because there
+    # is no credential in a first message to fall back on and everything it
+    # streams belongs to the admin.
+    app.include_router(ui_socket_router)
     return app
