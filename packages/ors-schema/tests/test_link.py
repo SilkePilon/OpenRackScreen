@@ -6,6 +6,7 @@ from ors_schema.daemon import DaemonConfig
 from ors_schema.link import (
     MAX_FRAME_BYTES,
     MAX_REQUESTED_FPS,
+    MAX_WATCHED_SCREENS,
     PROTOCOL_VERSION,
     Ack,
     Command,
@@ -195,6 +196,52 @@ def test_a_rate_outside_what_a_screen_could_ever_show_does_not_parse(fps: float)
 def test_the_fastest_rate_a_server_may_ask_for_still_parses():
     assert FramesRequest(enabled=True, fps=MAX_REQUESTED_FPS).fps == MAX_REQUESTED_FPS
     assert FramesRequest(enabled=True, fps=0.0).fps == 0.0
+
+
+def test_a_request_may_not_name_more_screens_than_a_rack_could_have():
+    """The third hole of the `fps: NaN` family, and the one left for task 12.
+
+    `screen_ids` sizes the daemon's `_enabled` set and everything keyed off it,
+    and the daemon replaces that set wholesale on every request. Unbounded, one
+    message decides how much of a Pi's memory a subscription costs.
+    """
+    with pytest.raises(ValidationError):
+        FramesRequest(enabled=True, screen_ids=list(range(MAX_WATCHED_SCREENS + 1)))
+
+
+def test_a_request_naming_exactly_as_many_screens_as_are_allowed_still_parses():
+    request = FramesRequest(enabled=True, screen_ids=list(range(MAX_WATCHED_SCREENS)))
+
+    assert len(request.screen_ids) == MAX_WATCHED_SCREENS
+
+
+def test_an_over_long_screen_list_does_not_parse_off_the_wire_either():
+    """The bound has to hold where the list is chosen by the far end, not only
+    where a server assembles one in Python."""
+    over = json.dumps(
+        {
+            "type": "frames",
+            "enabled": True,
+            "screen_ids": list(range(MAX_WATCHED_SCREENS + 1)),
+            "fps": 2.0,
+        }
+    )
+
+    with pytest.raises(ValidationError):
+        parse_server_message(over)
+
+
+def test_the_bound_on_watched_screens_is_an_order_of_magnitude_past_a_rack():
+    """The one absolute assertion about this number, for the reason the frame
+    bound has one: every other test here uses the constant relatively, so
+    nothing else would notice it drifting.
+
+    Sixty-four is far past the four panels a Pi drives over SPI and well under
+    `ors_daemon.frames._MAX_TRACKED_SCREENS`, which is the table this list
+    resizes. The two are pinned against each other in the daemon's own suite,
+    which is the end that owns the smaller number.
+    """
+    assert MAX_WATCHED_SCREENS == 64
 
 
 def test_a_frame_carries_bytes_and_a_sequence_number():

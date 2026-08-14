@@ -309,10 +309,40 @@ request never meets it.
 """
 
 
+MAX_WATCHED_SCREENS = 64
+"""How many screens one `frames` request may name.
+
+The third hole of the family the `fps` bound closed two of, and the last one
+left open. `screen_ids` is not a filter the daemon applies to work it was doing
+anyway: `FrameStream.enable` does `self._enabled = set(screen_ids)`, so this
+list *is* the daemon's streaming state, and `_MAX_TRACKED_SCREENS` prunes the
+rate limiter's memory and the per-screen sequence counters down to it. An
+unbounded list is therefore one message deciding how much of a Pi's memory a
+subscription costs, and -- because the prune can only shrink those tables to
+what is enabled -- one that also decides whether the prune can do anything at
+all.
+
+Sixty-four because of what the number has to accommodate, which is not "how many
+screens exist" but "how many screens of *one* daemon are being watched at once".
+A rack is the four panels a Pi drives over SPI; a large one is a handful more.
+An order of magnitude past that leaves room for a rack nobody has built yet
+without ever meeting a legitimate request, and it sits well under the daemon's
+own `_MAX_TRACKED_SCREENS` of 256, which is the table this list resizes -- the
+two are pinned against each other in the daemon's suite, at the end that owns
+the smaller number.
+
+The server bounds what it *sends* as well, rather than letting a rack with more
+watched screens than this raise inside a subscription handler: see
+`ors_server.link.ws_ui`, which truncates and logs. A bound that turns a large
+rack into an exception would freeze every panel on it, which is worse than
+streaming the first sixty-four.
+"""
+
+
 class FramesRequest(_Message):
     type: Literal["frames"] = "frames"
     enabled: bool
-    screen_ids: list[int] = Field(default_factory=list)
+    screen_ids: list[int] = Field(default_factory=list, max_length=MAX_WATCHED_SCREENS)
     # `allow_inf_nan=False` as well as the two bounds, although either would
     # refuse a NaN on its own -- every comparison against one is False, so
     # `ge` rejects it. Said explicitly because the *reason* it must be rejected

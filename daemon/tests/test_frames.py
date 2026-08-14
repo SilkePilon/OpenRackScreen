@@ -12,7 +12,13 @@ from ors_daemon.frames import (
 from ors_render import load_builtin_templates, render_scene, select_scene
 from ors_render.context import RenderContext
 from ors_render.render import expand_params
-from ors_schema.link import MAX_FRAME_BYTES, MAX_REQUESTED_FPS, Frame, FramesRequest
+from ors_schema.link import (
+    MAX_FRAME_BYTES,
+    MAX_REQUESTED_FPS,
+    MAX_WATCHED_SCREENS,
+    Frame,
+    FramesRequest,
+)
 from PIL import Image
 
 WAIT = 5.0
@@ -580,6 +586,25 @@ def test_neither_of_the_tables_kept_per_screen_grows_without_bound():
 
     assert len(frames._seq) <= _MAX_TRACKED_SCREENS
     assert len(frames._last) <= _MAX_TRACKED_SCREENS
+
+
+def test_one_request_can_never_name_more_screens_than_this_daemon_tracks():
+    """The wire bound and this table have to be in the right order, or pruning
+    is the thing a subscription can defeat.
+
+    `_MAX_TRACKED_SCREENS` prunes `_last` and `_seq` down to what is *enabled*,
+    so a request naming more ids than the table holds would arrive as an enabled
+    set the prune cannot shrink -- the rate limiter's memory and the sequence
+    counters both sized by the far end after all, which is the failure both
+    bounds exist to close. This end owns the smaller number, so the assertion
+    lives here.
+    """
+    assert MAX_WATCHED_SCREENS <= _MAX_TRACKED_SCREENS
+
+    frames = FrameStream()
+    frames.request(FramesRequest(enabled=True, screen_ids=list(range(MAX_WATCHED_SCREENS))))
+
+    assert len(frames._enabled) == MAX_WATCHED_SCREENS
 
 
 # --- screens that stop existing ---------------------------------------------
