@@ -4,7 +4,7 @@ import asyncio
 
 from ors_schema.daemon import DaemonConfig
 from ors_schema.link import Command, ConfigPush, Frame, FramesRequest
-from ors_server.link.hub import Connection, Hub
+from ors_server.link.hub import Connection, DaemonsOnline, Hub
 
 
 class FakeSocket:
@@ -526,3 +526,119 @@ async def test_a_connection_carries_the_daemon_it_belongs_to():
 
     assert isinstance(connection, Connection)
     assert connection.daemon_id == 4
+
+
+# --- who is online, for whoever is looking at the interface ------------------
+
+
+async def test_a_browser_watching_for_racks_is_told_when_one_connects():
+    hub = Hub()
+    watching: asyncio.Queue[object] = asyncio.Queue()
+    hub.watch_daemons(watching)
+
+    hub.register(1, FakeSocket().send)
+
+    assert (await asyncio.wait_for(watching.get(), 1)) == DaemonsOnline(online=frozenset({1}))
+
+
+async def test_an_announcement_names_everyone_online_and_not_just_who_changed():
+    """The interface paints a list of racks from this, so a message carrying
+    only the daemon that moved would leave it having to remember the rest --
+    and a tab that connected in between would never learn about the others."""
+    hub = Hub()
+    hub.register(1, FakeSocket().send)
+    watching: asyncio.Queue[object] = asyncio.Queue()
+    hub.watch_daemons(watching)
+
+    hub.register(2, FakeSocket().send)
+
+    assert (await asyncio.wait_for(watching.get(), 1)).online == frozenset({1, 2})
+
+
+async def test_a_daemon_going_offline_is_announced_too():
+    hub = Hub()
+    connection = hub.register(1, FakeSocket().send)
+    watching: asyncio.Queue[object] = asyncio.Queue()
+    hub.watch_daemons(watching)
+
+    hub.drop(connection)
+
+    assert (await asyncio.wait_for(watching.get(), 1)).online == frozenset()
+
+
+async def test_a_reconnect_of_a_rack_that_is_already_online_announces_nothing():
+    """Nothing about the list changed, and a wifi blip is several of these a
+    minute against every open tab. The announcement is about the set, not about
+    the socket."""
+    hub = Hub()
+    hub.register(1, FakeSocket().send)
+    watching: asyncio.Queue[object] = asyncio.Queue()
+    hub.watch_daemons(watching)
+
+    hub.register(1, FakeSocket().send)
+
+    assert watching.empty()
+
+
+async def test_a_late_drop_from_a_replaced_connection_announces_nothing():
+    """The identity guard's failure, seen from the interface: a superseded
+    handler arriving at `drop` seconds after its daemon reconnected would
+    otherwise paint the rack as unplugged while it is streaming frames."""
+    hub = Hub()
+    superseded = hub.register(1, FakeSocket().send)
+    hub.register(1, FakeSocket().send)
+    watching: asyncio.Queue[object] = asyncio.Queue()
+    hub.watch_daemons(watching)
+
+    hub.drop(superseded)
+
+    assert watching.empty()
+    assert hub.online_ids() == {1}
+
+
+async def test_a_tab_that_stopped_watching_is_not_announced_to():
+    hub = Hub()
+    watching: asyncio.Queue[object] = asyncio.Queue()
+    hub.watch_daemons(watching)
+    hub.unwatch_daemons(watching)
+
+    hub.register(1, FakeSocket().send)
+
+    assert watching.empty()
+
+
+async def test_unwatching_something_that_was_never_watching_is_not_an_error():
+    # A browser socket whose `finally` runs after an accept that never got
+    # as far as registering.
+    Hub().unwatch_daemons(asyncio.Queue())
+
+
+async def test_a_full_announcement_queue_drops_the_oldest_rather_than_blocking():
+    """The same bargain frames get, and for a stronger reason: `register` is
+    called from inside the daemon socket's hello, so a put that blocked here
+    would hold a rack's whole connect on a browser that stopped reading."""
+    hub = Hub()
+    watching: asyncio.Queue[object] = asyncio.Queue(maxsize=1)
+    hub.watch_daemons(watching)
+
+    hub.register(1, FakeSocket().send)
+    hub.register(2, FakeSocket().send)
+
+    assert watching.qsize() == 1
+    assert watching.get_nowait().online == frozenset({1, 2}), "the newest list wins"
+
+
+async def test_one_stalled_tab_does_not_cost_another_one_its_announcement():
+    hub = Hub()
+    stalled: asyncio.Queue[object] = asyncio.Queue(maxsize=1)
+    reading: asyncio.Queue[object] = asyncio.Queue()
+    hub.watch_daemons(stalled)
+    hub.watch_daemons(reading)
+    hub.register(1, FakeSocket().send)
+
+    hub.register(2, FakeSocket().send)
+
+    assert [event.online for event in (reading.get_nowait(), reading.get_nowait())] == [
+        frozenset({1}),
+        frozenset({1, 2}),
+    ]

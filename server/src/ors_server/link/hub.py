@@ -38,6 +38,34 @@ against today -- so that constraint belongs to whoever writes it.
 """
 
 
+@dataclass(frozen=True)
+class DaemonsOnline:
+    """Which racks the hub is holding a socket for, at the moment that changed.
+
+    The whole set and not the daemon that moved, because the interface paints a
+    list from it: a message naming only the change would leave every browser
+    reconstructing the list from a stream it may have joined halfway through,
+    and a tab that connected a second ago would be missing every rack that
+    connected before it. The set is at most a few dozen integers.
+
+    Frozen, and a `frozenset` inside it, because one of these is handed to every
+    watching browser at once and the hub goes on mutating `_connections`
+    afterwards. A live view of that dict would be a message whose contents
+    changed between being queued and being sent.
+    """
+
+    online: frozenset[int]
+
+
+Watched = Frame | DaemonsOnline
+"""What a browser's queue carries. One queue, because the browser has one socket.
+
+The alternative -- a queue per kind -- makes the reader race two `get()`s and
+gains nothing: both of these are things to write to the same socket, in the
+order they happened.
+"""
+
+
 @dataclass
 class Connection:
     """One daemon socket, as much of it as the hub is allowed to know.
@@ -87,7 +115,8 @@ class Hub:
     def __init__(self, send_timeout: float = SEND_TIMEOUT) -> None:
         self._connections: dict[int, Connection] = {}
         self._acked: dict[int, int] = {}
-        self._watchers: dict[int, set[asyncio.Queue[Frame]]] = {}
+        self._watchers: dict[int, set[asyncio.Queue[Watched]]] = {}
+        self._daemon_watchers: set[asyncio.Queue[Watched]] = set()
         self._send_timeout = send_timeout
 
     def register(self, daemon_id: int, send: Sender) -> Connection:
@@ -107,6 +136,13 @@ class Hub:
         # reconnect that overtakes the old handler's exit never reaches `drop`
         # with a connection that is still current.
         self._acked.pop(daemon_id, None)
+        # Only when this daemon was not already online. A reconnect replaces a
+        # socket without changing the set of racks anyone can see, and
+        # announcing it anyway would make a flapping link several identical
+        # messages a minute against every open tab. `superseded` is that
+        # question already answered, read before the write above.
+        if superseded is None:
+            self._announce()
         return connection
 
     def drop(self, connection: Connection) -> None:
@@ -124,6 +160,12 @@ class Hub:
         # confirmed is not evidence about the one it will be running when it
         # comes back. Also what stops `_acked` outliving the daemon rows.
         self._acked.pop(connection.daemon_id, None)
+        # After the delete, and only past the identity guard above: a superseded
+        # handler reaching here seconds after its daemon reconnected would
+        # otherwise paint the rack as unplugged in every open tab while it is
+        # streaming frames -- the same failure the guard exists for, arriving at
+        # the interface instead of at a push.
+        self._announce()
 
     def is_online(self, daemon_id: int) -> bool:
         return daemon_id in self._connections
@@ -168,14 +210,34 @@ class Hub:
     async def request_frames(self, daemon_id: int, request: FramesRequest) -> None:
         await self._send(daemon_id, request.model_dump_json())
 
-    def subscribe_frames(self, screen_id: int, queue: asyncio.Queue[Frame]) -> bool:
+    def watch_daemons(self, queue: asyncio.Queue[Watched]) -> None:
+        """Send this queue the online set whenever it changes, until it unwatches.
+
+        Pushed rather than polled, and the cost decides it. A poll is a timer in
+        every open tab forever, and it buys a list that is wrong for up to one
+        interval -- which is precisely the window in which a rack that has just
+        gone offline still looks like it is about to send a frame. A push is one
+        `frozenset` and one `put_nowait` per tab per *connect or disconnect*,
+        which is a Pi rebooting, not a rate.
+
+        A queue and not a callback, although a callback is fewer lines: the
+        callers are `register` and `drop`, and `register` runs inside the daemon
+        socket's hello. A callback that raised, or that awaited anything, would
+        put a browser's problem on the path a rack uses to come online.
+        """
+        self._daemon_watchers.add(queue)
+
+    def unwatch_daemons(self, queue: asyncio.Queue[Watched]) -> None:
+        self._daemon_watchers.discard(queue)
+
+    def subscribe_frames(self, screen_id: int, queue: asyncio.Queue[Watched]) -> bool:
         """Returns True when this is the first watcher, which starts the daemon."""
         watchers = self._watchers.setdefault(screen_id, set())
         first = not watchers
         watchers.add(queue)
         return first
 
-    def unsubscribe_frames(self, screen_id: int, queue: asyncio.Queue[Frame]) -> bool:
+    def unsubscribe_frames(self, screen_id: int, queue: asyncio.Queue[Watched]) -> bool:
         """Returns True when the last watcher left, which stops the daemon."""
         watchers = self._watchers.get(screen_id, set())
         watchers.discard(queue)
@@ -209,22 +271,29 @@ class Hub:
         # nothing like the copy, which is at most four queues at 2 fps. A
         # watcher that arrives mid-frame catches the next one.
         for queue in list(self._watchers.get(frame.screen_id, ())):
-            try:
-                queue.put_nowait(frame)
-            except asyncio.QueueFull:
-                # The newest frame wins, which the design says in as many words:
-                # a stale panel image is worse than a skipped one. So the oldest
-                # goes and this one takes its place -- discarding *this* one
-                # instead would serve a browser that stalled for a second and
-                # recovered its backlog, frame by stale frame, while every fresh
-                # one was thrown away.
-                #
-                # There is no await between the two calls, so nothing else on
-                # this loop -- a watcher parked in `queue.get()`, above all --
-                # runs in between: the space made is the space used.
-                queue.get_nowait()
-                queue.put_nowait(frame)
+            # The newest frame wins, which the design says in as many words: a
+            # stale panel image is worse than a skipped one. Discarding *this*
+            # one instead would serve a browser that stalled for a second and
+            # then recovered its backlog, frame by stale frame, while every
+            # fresh one was thrown away.
+            if _offer(queue, frame):
                 log.debug("dropped a frame for a slow watcher", extra={"screen": frame.screen_id})
+
+    def _announce(self) -> None:
+        """Tell every watching browser who is online now. Called on a change only.
+
+        A copy of the watcher set for the reason `relay_frame` copies: this runs
+        from inside the daemon socket's hello and from its `finally`, and a
+        browser socket registering from anywhere that is not this loop would
+        otherwise raise `RuntimeError: Set changed size during iteration` on a
+        path that takes a whole rack offline.
+        """
+        if not self._daemon_watchers:
+            return
+        online = DaemonsOnline(online=frozenset(self._connections))
+        for queue in list(self._daemon_watchers):
+            if _offer(queue, online):
+                log.debug("dropped a stale online list for a slow watcher")
 
     async def _send(self, daemon_id: int, payload: str) -> None:
         connection = self._connections.get(daemon_id)
@@ -249,3 +318,26 @@ class Hub:
         except Exception as exc:
             log.info("daemon send failed; dropping", extra={"daemon": daemon_id, "error": str(exc)})
             self.drop(connection)
+
+
+def _offer(queue: asyncio.Queue[Watched], item: Watched) -> bool:
+    """Hand a browser something to send, without ever waiting for it. True if
+    something older had to be thrown away to make room.
+
+    The one place either fan-out above puts anything, because the property that
+    makes it safe is a property of these three lines and not of either caller:
+    there is no await between the `get_nowait` and the `put_nowait`, so nothing
+    else on this loop -- a watcher parked in `queue.get()`, above all -- runs in
+    between, and the space made is the space used.
+
+    Never blocking is the whole point. The callers are a daemon's frame relay
+    and a daemon's connect, and a browser that has stopped reading its socket
+    must not be able to hold either of them up.
+    """
+    try:
+        queue.put_nowait(item)
+        return False
+    except asyncio.QueueFull:
+        queue.get_nowait()
+        queue.put_nowait(item)
+        return True
