@@ -201,8 +201,15 @@ class Hub:
         """
         return self._acked.get(daemon_id)
 
-    async def push_config(self, daemon_id: int, push: ConfigPush) -> None:
-        await self._send(daemon_id, push.model_dump_json())
+    async def push_config(self, daemon_id: int, push: ConfigPush) -> bool:
+        """Send a snapshot. True if it reached a socket, False if there was none.
+
+        The return exists for `POST /api/daemons/{id}/push`, whose whole job is
+        to report whether a configuration got out of the server -- and which
+        cannot ask `is_online` instead, because that is true of a rack that was
+        sent nothing and true of one whose send timed out and was dropped.
+        """
+        return await self._send(daemon_id, push.model_dump_json())
 
     async def send_command(self, daemon_id: int, command: Command) -> None:
         await self._send(daemon_id, command.model_dump_json())
@@ -344,12 +351,20 @@ class Hub:
             if _offer(queue, online):
                 log.debug("dropped a stale online list for a slow watcher")
 
-    async def _send(self, daemon_id: int, payload: str) -> None:
+    async def _send(self, daemon_id: int, payload: str) -> bool:
+        """True if the payload was handed to a live socket, False if it was not.
+
+        False rather than an exception for every one of the three ways that
+        happens -- no socket, a send that timed out, a socket that failed --
+        because none of them is an error here: the edit is already committed and
+        the snapshot is pushed again on the next connect. What the boolean is for
+        is a caller that has to *say* whether anything left.
+        """
         connection = self._connections.get(daemon_id)
         if connection is None:
             # Offline is a normal state, not an error: the edit is already
             # saved, and the snapshot is pushed again when it reconnects.
-            return
+            return False
         try:
             await asyncio.wait_for(connection.send(payload), self._send_timeout)
         except TimeoutError:
@@ -364,9 +379,12 @@ class Hub:
                 extra={"daemon": daemon_id, "timeout_s": self._send_timeout},
             )
             self.drop(connection)
+            return False
         except Exception as exc:
             log.info("daemon send failed; dropping", extra={"daemon": daemon_id, "error": str(exc)})
             self.drop(connection)
+            return False
+        return True
 
 
 def _offer(queue: asyncio.Queue[Watched], item: Watched) -> bool:

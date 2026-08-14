@@ -11,9 +11,18 @@ this module is that no route has to remember any of them:
 A rule that must be remembered at eleven call sites will be broken at the
 twelfth, and the way it breaks is silent: the row saves, the request answers
 200, and the rack goes on showing what it showed before. So the rule is not
-written down for routes to follow -- it is the context manager they have to use
-in order to write anything at all. `Change.connection` is the only writable
-connection a router is given.
+written down for routes to follow -- it is the context manager a route uses in
+order to write.
+
+**Nothing in the code enforces that, and it is worth being exact about why.**
+`Change.connection` is not the only writable connection a router holds: every
+one of them opens `request.app.state.database.connect()` to read, that
+connection is writable, and a route could commit through it with no version, no
+snapshot and no push. SQLite has no read-only handle here to hand out instead.
+What enforces the rule is `test_api_routes.unmanaged_mutations`, which parses
+every mutating route -- and everything it hangs off `Depends(...)` -- and fails
+the build for one that writes outside a `change`. Any claim stronger than that
+would be a claim the next router could quietly falsify.
 
 **The affected set defaults to every daemon.** A route that forgets to say what
 it touched therefore pushes too much, which costs an unnecessary repaint of an
@@ -58,13 +67,41 @@ other rack's history out of the window while it does it.
 """
 
 SAVED_BUT_NOT_PUSHED = 202
-"""The answer when an edit landed and no rack could be given the result.
+"""The answer when an edit landed and **not one** of the racks it names got it.
 
 Not 200, which would say the change is on the glass, and not an error, which
 would say it was refused -- it is neither. The only case that reaches it is a
 configuration that was *already* unservable before this edit (see `_assemble`),
 so the honest statement is "accepted, not applied", which is what 202 is for.
-`GET /api/daemons` carries the reason per rack in `config_error`.
+
+Per edit and not per server, which it was not: the status was set if *any*
+affected rack was unservable, and the rack-wide routes -- `PATCH /api/settings`
+and every template edit -- affect every rack there is and so never call
+`affects`. One rack with a hand-edited column therefore turned every rack-wide
+edit into a 202 forever, while each of them went on pushing successfully to
+every healthy rack. At that point 202 stops meaning "your edit was not applied"
+and starts meaning "something somewhere is wrong", which is not something a
+client can act on.
+
+It is also only ever narrowed from the *default*. A route that declares its own
+status keeps it: `201 Created` is a stronger and still-true claim -- the row
+exists and its representation is in the body, which is what the interface routes
+on -- and overwriting it would lose that to say something `UNSERVABLE_HEADER`
+already says more precisely.
+"""
+
+UNSERVABLE_HEADER = "X-Unservable-Daemons"
+"""Which racks an edit could not be given to, on every response that has any.
+
+The status code cannot carry this. A 202 body is byte-identical to a 200 body
+and names no rack, so a client reading one had to re-list every daemon and diff
+`config_error` to find out which; and on a 201, or on an edit that reached three
+racks out of four, there is no status code left to say it with at all.
+
+Comma-separated daemon ids, ascending, and absent when every affected rack was
+reached. The reason per rack stays in `config_error` on `GET /api/daemons`: it
+is a sentence, it changes without any edit happening, and a header is not where
+a paragraph belongs.
 """
 
 
@@ -95,6 +132,20 @@ class Change:
     Filled in on the way out, so a route reads it after its `async with` block.
     Nothing here is a reason to refuse the edit; it is what makes the response
     honest about what did not happen.
+    """
+    delivered: dict[int, bool] = field(default_factory=dict)
+    """Whether each pushed snapshot really left the server, per rack.
+
+    Not "is there a socket": a rack with no servable configuration has no
+    snapshot to send at all, so nothing is attempted and this holds no entry for
+    it, and a send that timed out against a wedged Pi is dropped by the hub and
+    holds False. Both of those are open sockets. `POST /api/daemons/{id}/push`
+    is the one button that exists to dig a blank rack out of a stuck state, and
+    it answered `delivered: true` with zero messages on the wire for the first of
+    them -- so the question it asks has to be about the send.
+
+    Filled in on the way out, like `versions`, and for the same reason: the
+    pushes happen after the commit, which is after the route's block has run.
     """
 
     def affects(self, *daemon_ids: int) -> None:
@@ -197,9 +248,32 @@ async def change(request: Request, response: Response) -> AsyncIterator[Change]:
         connection.close()
 
     if edit.unservable:
+        response.headers[UNSERVABLE_HEADER] = ",".join(str(one) for one in sorted(edit.unservable))
+    if edit.unservable and not pushes and _declares_no_status(request):
         response.status_code = SAVED_BUT_NOT_PUSHED
     for daemon_id, push in pushes:
-        await state.hub.push_config(daemon_id, push)
+        edit.delivered[daemon_id] = await state.hub.push_config(daemon_id, push)
+
+
+def _declares_no_status(request: Request) -> bool:
+    """Whether this route left its status code to the default, so 202 may take it.
+
+    Asked of the route rather than of the injected `Response`, because the
+    injected one is `None` on every route: FastAPI applies a declared
+    `status_code=201` only *after* the handler returns, and lets anything written
+    on the sub-response win over it. So "did the route declare one" is not
+    readable from the response at all, and reading it from the response is how
+    `POST /api/screens` answered 202 for a row it had just created.
+
+    `scope["route"]` is set by FastAPI's own `APIRoute`, and a route reached by
+    some other means is one whose declared status is not knowable here -- so it
+    is left alone, `UNSERVABLE_HEADER` being the part of this contract that does
+    not depend on a status code at all. Both directions are pinned by tests, so a
+    framework that stopped setting `route` is a failure rather than a 202 that
+    quietly stopped happening.
+    """
+    route = request.scope.get("route")
+    return route is not None and getattr(route, "status_code", None) is None
 
 
 def _assemble(edit: Change) -> list[tuple[int, ConfigPush]]:
@@ -250,10 +324,17 @@ def _servable(state: State, daemon_id: int) -> bool:
     that: in WAL a second connection reads the last committed state, so it sees
     the rows as they were when the transaction above began, however much that
     transaction has written since.
+
+    `RecursionError` is caught here as well as at `_json_column`, where it is
+    turned into a message. This is the outer net: anything in the assembly that
+    recurses over a document a hand-edited database can make arbitrarily deep
+    lands here, and the honest answer to "could this rack have been given a
+    configuration" is then no. Escaping instead makes the *edit* a 500, which
+    would refuse the repair along with everything else.
     """
     try:
         build_snapshot(state.database, state.secrets, daemon_id)
-    except (SnapshotError, KeyError):
+    except (SnapshotError, KeyError, RecursionError):
         return False
     return True
 
@@ -265,6 +346,13 @@ def config_error(state: State, daemon_id: int) -> str | None:
     which it could be written: the reasons are spread across the screen,
     integration, template and setting tables, and an edit to any of them can
     make a rack servable again without naming it.
+
+    This is `GET /api/daemons`, per rack, and it is the only place a rack that
+    cannot be given a configuration says so -- so it is the last route that may
+    fail because one is broken. An exception escaping here answers 500 for every
+    rack in the list, the healthy ones included, and takes away the page the
+    reason would have been read on. `RecursionError` is the outer net; see
+    `_servable`.
     """
     try:
         build_snapshot(state.database, state.secrets, daemon_id)
@@ -272,6 +360,8 @@ def config_error(state: State, daemon_id: int) -> str | None:
         return str(error)
     except KeyError:
         return None
+    except RecursionError:
+        return "this rack's configuration is nested too deeply to read"
     return None
 
 

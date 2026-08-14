@@ -110,6 +110,35 @@ async def test_a_config_push_and_a_frames_request_reach_the_daemon():
     assert '"screen_ids":[7]' in socket.sent[1].replace(" ", "")
 
 
+async def test_a_config_push_reports_whether_it_reached_a_socket():
+    """`POST /api/daemons/{id}/push` has to say whether anything left the server,
+    and `is_online` cannot answer it: a rack with no servable configuration is
+    online and is sent nothing, and a rack whose send timed out is dropped only
+    after the fact. So the send is what reports."""
+    hub, socket = Hub(), FakeSocket()
+    hub.register(1, socket.send)
+
+    reached = await hub.push_config(1, ConfigPush(version=3, snapshot=DaemonConfig()))
+    missed = await hub.push_config(99, ConfigPush(version=3, snapshot=DaemonConfig()))
+
+    assert reached is True
+    assert missed is False
+    assert len(socket.sent) == 1
+
+
+async def test_a_config_push_that_wedges_reports_that_it_did_not_arrive():
+    """Dropped rather than raised -- the edit is committed and the next connect
+    pushes again -- so the return is the only thing that says so."""
+    hub = Hub(send_timeout=0.01)
+    hub.register(1, GatedSocket().send)
+
+    reached = await asyncio.wait_for(
+        hub.push_config(1, ConfigPush(version=3, snapshot=DaemonConfig())), 1
+    )
+
+    assert reached is False
+
+
 async def test_sending_to_an_offline_daemon_is_not_an_error():
     # An edit made while the Pi is unplugged must save; the daemon picks it up
     # when it reconnects. Raising here would make the API 500 on a normal state.
