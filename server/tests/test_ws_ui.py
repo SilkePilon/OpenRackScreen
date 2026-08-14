@@ -5,6 +5,7 @@ import base64
 import binascii
 import json
 import logging
+import time
 from contextlib import closing
 
 import pytest
@@ -74,10 +75,12 @@ class Rack:
 
     def __init__(self, app, daemon_id: int) -> None:
         self.sent: list[str] = []
+        self.arrived = asyncio.Event()
         self.connection = app.state.hub.register(daemon_id, self.send)
 
     async def send(self, payload: str | bytes) -> None:
         self.sent.append(payload if isinstance(payload, str) else payload.decode())
+        self.arrived.set()
 
     @property
     def requests(self) -> list[dict]:
@@ -88,6 +91,51 @@ class Rack:
         """The last thing this rack was told to stream, as (enabled, screen ids)."""
         last = self.requests[-1]
         return last["enabled"], last["screen_ids"]
+
+    async def told(self, enabled: bool, screen_ids: list[int]) -> None:
+        """Wait until the last thing this rack was told is this.
+
+        A browser's subscribe is no longer one request each: a burst of them is
+        coalesced into one send an interval later, so `browser.handled()` --
+        which says the reader has acted on everything -- no longer says the rack
+        has been told. This is the other half of that barrier, and it is an
+        event rather than a sleep, so a passing run waits exactly as long as the
+        coalescing window and no longer.
+
+        Safe against the send it is waiting for landing between the check and
+        the clear: both are synchronous and the sends are on this loop, so
+        nothing can run in between.
+        """
+        while True:
+            if self.requests and self.asked_for == (enabled, screen_ids):
+                return
+            self.arrived.clear()
+            await asyncio.wait_for(self.arrived.wait(), PROMPTLY)
+
+
+class StalledRack(Rack):
+    """A rack whose send really suspends, and finishes when the test says so.
+
+    `Rack.send` reaches no await, so nothing else on the loop can run while a
+    request is being written to it -- and that window is where a subscribe that
+    lands *during* a send has to be accounted for. A suite built only on `Rack`
+    never opens it.
+    """
+
+    def __init__(self, app, daemon_id: int) -> None:
+        super().__init__(app, daemon_id)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.release.set()
+
+    async def send(self, payload: str | bytes) -> None:
+        self.started.set()
+        await self.release.wait()
+        await super().send(payload)
+
+    def stall(self) -> None:
+        self.started.clear()
+        self.release.clear()
 
 
 class Browser:
@@ -329,6 +377,40 @@ async def test_a_rack_going_offline_is_pushed_too(tmp_path):
     await finish(browser, handler)
 
 
+async def test_the_online_list_is_in_order_when_the_ids_are_not_contiguous(tmp_path):
+    """Sorted, and the ids are chosen so that set order and sorted order differ.
+
+    `list({1, 8})` is `[8, 1]` in CPython, and every fixture here that numbers
+    its racks from one contiguously hides that: set iteration happens to be
+    ascending for those, so `sorted(online)` and `list(online)` agree and the
+    sort is unpinned. The order is load-bearing -- it is what lets the interface
+    skip a repaint without comparing sets -- so unpinned means a status strip
+    that flickers on every connect and disconnect.
+    """
+    app = build(tmp_path)
+    Rack(app, 8)
+    Rack(app, 1)
+
+    browser, handler = await browsing(app)
+
+    assert list({1, 8}) != [1, 8], "a fixture that cannot tell the two apart proves nothing"
+    assert browser.messages[0] == {"type": "daemons", "online": [1, 8]}
+    await finish(browser, handler)
+
+
+async def test_a_pushed_online_list_is_in_order_too(tmp_path):
+    """The first message and every later one go through the same function, and
+    a test of only the first would leave the pushed ones to a mutant."""
+    app = build(tmp_path)
+    Rack(app, 8)
+    browser, handler = await browsing(app)
+
+    Rack(app, 1)
+
+    assert (await browser.next_message()) == {"type": "daemons", "online": [1, 8]}
+    await finish(browser, handler)
+
+
 async def test_a_closed_tab_stops_being_told_about_racks(tmp_path):
     """Asserted against the hub's own set, because nothing else can see it.
 
@@ -381,12 +463,12 @@ async def test_a_second_panel_is_added_to_the_request_and_not_swapped_for_it(tmp
 
     for screen_id in screens:
         browser.say(action="subscribe", screen_id=screen_id)
-    await browser.handled()
+    await pi.told(True, sorted(screens))
 
     assert pi.asked_for == (True, sorted(screens))
-    assert [request["screen_ids"] for request in pi.requests] == [
-        sorted(screens[:count]) for count in (1, 2, 3, 4)
-    ]
+    assert all(screens[0] in request["screen_ids"] for request in pi.requests), (
+        "no request ever named only the panel that was just opened"
+    )
     await finish(browser, handler)
 
 
@@ -401,7 +483,7 @@ async def test_closing_one_panel_leaves_the_others_streaming(tmp_path):
         browser.say(action="subscribe", screen_id=screen_id)
 
     browser.say(action="unsubscribe", screen_id=screens[1])
-    await browser.handled()
+    await pi.told(True, [screens[0], screens[2], screens[3]])
 
     assert pi.asked_for == (True, [screens[0], screens[2], screens[3]])
     await finish(browser, handler)
@@ -529,7 +611,7 @@ async def test_the_last_watcher_leaving_turns_the_rack_off(tmp_path):
     await browser.handled()
 
     browser.say(action="unsubscribe", screen_id=screens[0])
-    await browser.handled()
+    await pi.told(False, [])
 
     assert pi.asked_for == (False, []), "a rack nobody watches must stop encoding"
     assert app.state.hub.watched_screens() == set()
@@ -564,7 +646,8 @@ async def test_each_rack_is_armed_with_its_own_screens_only(tmp_path):
 
     for screen_id in first_screens + second_screens:
         browser.say(action="subscribe", screen_id=screen_id)
-    await browser.handled()
+    await first_pi.told(True, sorted(first_screens))
+    await second_pi.told(True, sorted(second_screens))
 
     assert first_pi.asked_for == (True, sorted(first_screens))
     assert second_pi.asked_for == (True, sorted(second_screens))
@@ -597,6 +680,7 @@ async def test_unsubscribing_from_something_never_subscribed_to_changes_nothing(
     await browser.handled()
 
     assert pi.asked_for == (True, [screens[0]])
+    assert len(pi.requests) == 1, "nothing changed, so there was nothing to say"
     await finish(browser, handler)
 
 
@@ -893,7 +977,29 @@ async def test_a_message_this_socket_does_not_understand_is_skipped(tmp_path, me
 
     assert app.state.hub.watched_screens() == set()
     assert pi.requests == []
-    assert screens
+    assert screens == [1], "the ids these messages name are real, so it is the message refused"
+    await finish(browser, handler)
+
+
+async def test_a_boolean_is_not_a_screen_id(tmp_path):
+    """`bool` is an `int` in Python, so `{"screen_id": true}` validates as 1 and
+    subscribes to whatever screen has row id 1.
+
+    A buggy build of the SPA sending a flag where an id belongs then opens panel
+    A and is shown panel B's image, with nothing anywhere saying so.
+    `ws_daemon._about` guards exactly this on the other socket.
+    """
+    app = build(tmp_path)
+    daemon_id, screens = rack(app)
+    pi = Rack(app, daemon_id)
+    browser, handler = await browsing(app)
+
+    browser.says('{"action": "subscribe", "screen_id": true}')
+    await browser.handled()
+
+    assert screens == [1], "a boolean that validated would land on this row"
+    assert app.state.hub.watched_screens() == set()
+    assert pi.requests == []
     await finish(browser, handler)
 
 
@@ -944,7 +1050,7 @@ async def test_a_rack_with_more_watched_screens_than_one_request_may_name(tmp_pa
     """Truncated and logged rather than raised. `FramesRequest` refuses a list
     over the bound, so building one unchecked turns a large rack into a
     `ValidationError` inside a subscribe -- which freezes every panel on it.
-    Streaming the first sixty-four is the lesser failure, and it is loud.
+    Streaming sixty-four of them is the lesser failure, and it is loud.
     """
     app = build(tmp_path)
     daemon_id, screens = rack(app, screens=MAX_WATCHED_SCREENS + 2)
@@ -953,27 +1059,55 @@ async def test_a_rack_with_more_watched_screens_than_one_request_may_name(tmp_pa
 
     for screen_id in screens:
         browser.say(action="subscribe", screen_id=screen_id)
-    await browser.handled()
+    await pi.told(True, sorted(screens[-MAX_WATCHED_SCREENS:]))
 
     enabled, asked = pi.asked_for
     assert enabled is True
-    assert asked == sorted(screens)[:MAX_WATCHED_SCREENS]
+    assert asked == sorted(screens[-MAX_WATCHED_SCREENS:]), "the newest subscriptions survive"
     assert len(asked) == MAX_WATCHED_SCREENS
     await finish(browser, handler)
 
 
-async def test_the_rack_that_is_too_big_is_named_in_the_log(tmp_path, caplog):
+async def test_the_panel_a_tab_just_opened_is_not_the_one_that_is_dropped(tmp_path):
+    """Truncating the lowest ids keeps the oldest-created panels, so the screen
+    somebody has just opened is exactly the one left out -- a panel frozen from
+    the moment it appears, with no `daemons` change and no stall event to say
+    so, on a rack the interface still shows as online.
+
+    Opened here in an order that has nothing to do with the ids, which is the
+    only way to tell "the newest subscription survives" from "the highest id
+    survives".
+    """
     app = build(tmp_path)
     daemon_id, screens = rack(app, screens=MAX_WATCHED_SCREENS + 1)
-    Rack(app, daemon_id)
+    pi = Rack(app, daemon_id)
+    browser, handler = await browsing(app)
+    opened_last, opened_first = screens[0], screens[1]
+
+    for screen_id in screens[1:] + screens[:1]:
+        browser.say(action="subscribe", screen_id=screen_id)
+    await pi.told(True, sorted(set(screens) - {opened_first}))
+
+    assert opened_last in pi.asked_for[1], "the panel the tab just opened went quiet"
+    assert opened_first not in pi.asked_for[1], "the oldest subscription is the casualty"
+    await finish(browser, handler)
+
+
+async def test_the_rack_that_is_too_big_says_which_panels_went_quiet(tmp_path, caplog):
+    """A count and a limit describe every rack over the bound identically.
+    Whoever is reading this is trying to find out why one panel is blank."""
+    app = build(tmp_path)
+    daemon_id, screens = rack(app, screens=MAX_WATCHED_SCREENS + 2)
+    pi = Rack(app, daemon_id)
     browser, handler = await browsing(app)
 
-    with caplog.at_level(logging.ERROR, logger="ors_server.link.ws_ui"):
+    with caplog.at_level(logging.ERROR, logger="ors_server.link.hub"):
         for screen_id in screens:
             browser.say(action="subscribe", screen_id=screen_id)
-        await browser.handled()
+        await pi.told(True, sorted(screens[-MAX_WATCHED_SCREENS:]))
 
     assert [record.daemon for record in caplog.records] == [daemon_id]
+    assert caplog.records[0].dropped == screens[:2]
     await finish(browser, handler)
 
 
@@ -986,14 +1120,189 @@ async def test_a_rack_with_exactly_as_many_screens_as_are_allowed_is_left_alone(
     pi = Rack(app, daemon_id)
     browser, handler = await browsing(app)
 
-    with caplog.at_level(logging.ERROR, logger="ors_server.link.ws_ui"):
+    with caplog.at_level(logging.ERROR, logger="ors_server.link.hub"):
         for screen_id in screens:
             browser.say(action="subscribe", screen_id=screen_id)
-        await browser.handled()
+        await pi.told(True, sorted(screens))
 
     assert pi.asked_for == (True, sorted(screens))
     assert caplog.records == [], "a rack at the bound is not a rack over it"
     await finish(browser, handler)
+
+
+# --- what one tab may make the server write to a rack -----------------------
+
+
+async def test_a_tab_churning_its_subscriptions_does_not_churn_the_rack(tmp_path):
+    """One message decided what a subscription cost the Pi, and nothing bounded
+    how many of them a tab could send.
+
+    Four hundred subscribe/unsubscribe messages from one connection produced
+    four hundred `frames` requests -- each replacing the daemon's whole
+    streaming state under `FrameStream._condition`, and each costing two
+    synchronous SQLite reads on the event loop. The interface legitimately
+    churns subscriptions as tabs open and close, so the answer is to coalesce
+    the recomputation rather than to refuse the messages: what the rack is owed
+    is the *last* of these, not all of them.
+    """
+    app = build(tmp_path)
+    daemon_id, screens = rack(app)
+    pi = Rack(app, daemon_id)
+    browser, handler = await browsing(app)
+
+    for _ in range(200):
+        browser.say(action="subscribe", screen_id=screens[0])
+        browser.say(action="unsubscribe", screen_id=screens[0])
+    await browser.handled()
+    await pi.told(False, [])
+
+    assert len(pi.requests) <= 4, "400 messages, and the rack hears about them a few times"
+    assert pi.asked_for == (False, []), "coalescing may not lose the last word"
+    await finish(browser, handler)
+
+
+async def test_two_requests_to_one_rack_are_an_interval_apart(tmp_path):
+    """What bounds the rate, measured rather than asserted about.
+
+    The first request goes immediately -- opening a panel must not wait -- and
+    everything the same tab asks for within the window after it is coalesced
+    into one send at the end of it.
+    """
+    app = build(tmp_path)
+    daemon_id, screens = rack(app, screens=2)
+    pi = Rack(app, daemon_id)
+    browser, handler = await browsing(app)
+
+    started = time.monotonic()
+    browser.say(action="subscribe", screen_id=screens[0])
+    browser.say(action="subscribe", screen_id=screens[1])
+    await pi.told(True, sorted(screens))
+    elapsed = time.monotonic() - started
+
+    assert len(pi.requests) == 2
+    assert elapsed >= ws_ui.ARM_INTERVAL_S, "the second request was not held at all"
+    await finish(browser, handler)
+
+
+async def test_a_tab_subscribing_twice_to_one_panel_says_so_once(tmp_path):
+    """A repeat from the *same* connection changes nothing -- the hub holds one
+    queue per connection, so the second `subscribe_frames` is a no-op -- and a
+    request restating a set nobody moved is a write to a rack for nothing.
+
+    Not the same question as two tabs on one screen, which still restates the
+    whole set: there the connection really did acquire a subscription.
+    """
+    app = build(tmp_path)
+    daemon_id, screens = rack(app)
+    pi = Rack(app, daemon_id)
+    browser, handler = await browsing(app)
+
+    for _ in range(3):
+        browser.say(action="subscribe", screen_id=screens[0])
+    await browser.handled()
+
+    assert len(pi.requests) == 1
+    assert pi.asked_for == (True, screens)
+    await finish(browser, handler)
+
+
+async def test_a_panel_opened_while_a_request_is_being_written_is_not_lost(tmp_path):
+    """The window a send holds open, which is where a coalesced set can vanish.
+
+    The bookkeeping that says "this rack has been told" has to come *before* the
+    write and not after it: done afterwards, a subscribe arriving while the
+    coalesced request is on the wire is recorded as owed and then immediately
+    un-owed by a send that never carried it, and that panel stays blank until
+    something unrelated moves the set again.
+
+    The reader is free during that write and only during that write -- when it
+    is the reader doing the arming it is not reading -- so the window belongs to
+    the coalescing task, and it is the second request here rather than the first.
+    """
+    app = build(tmp_path)
+    daemon_id, screens = rack(app, screens=3)
+    pi = StalledRack(app, daemon_id)
+    browser, handler = await browsing(app)
+    browser.say(action="subscribe", screen_id=screens[0])
+    await pi.told(True, [screens[0]])
+
+    pi.stall()
+    browser.say(action="subscribe", screen_id=screens[1])
+    await asyncio.wait_for(pi.started.wait(), PROMPTLY)
+    browser.say(action="subscribe", screen_id=screens[2])
+    await browser.handled()
+    pi.release.set()
+
+    await pi.told(True, sorted(screens))
+    await finish(browser, handler)
+
+
+async def test_a_rack_owed_a_request_by_a_tab_that_closes_is_still_told(tmp_path):
+    """The panel opened and closed again inside one window, which is the whole
+    of what a tab does when somebody clicks the wrong thing.
+
+    The rack was told to stream it and the coalescing window swallowed the
+    correction, so on the way out `_let_go` has to name the racks this tab
+    *owes* a request as well as the ones it still holds a screen of -- and it no
+    longer holds any.
+    """
+    app = build(tmp_path)
+    daemon_id, screens = rack(app)
+    pi = Rack(app, daemon_id)
+    browser, handler = await browsing(app)
+
+    browser.say(action="subscribe", screen_id=screens[0])
+    browser.say(action="unsubscribe", screen_id=screens[0])
+    await browser.handled()
+    await finish(browser, handler)
+
+    assert pi.asked_for == (False, []), "a rack left streaming a panel nobody has open"
+
+
+async def test_the_window_is_per_rack_and_not_one_clock_for_all_of_them(tmp_path):
+    """Two racks armed at different moments owe their coalesced request at
+    different moments. One clock for the connection would write to whichever
+    rack was armed most recently before its own window was out."""
+    app = build(tmp_path)
+    first, first_screens = rack(app, "one", screens=2)
+    second, second_screens = rack(app, "two", screens=2)
+    first_pi, second_pi = Rack(app, first), Rack(app, second)
+    browser, handler = await browsing(app)
+
+    browser.say(action="subscribe", screen_id=first_screens[0])
+    await first_pi.told(True, [first_screens[0]])
+    await asyncio.sleep(ws_ui.ARM_INTERVAL_S * 0.6)
+    browser.say(action="subscribe", screen_id=second_screens[0])
+    await second_pi.told(True, [second_screens[0]])
+    armed = time.monotonic()
+
+    browser.say(action="subscribe", screen_id=first_screens[1])
+    browser.say(action="subscribe", screen_id=second_screens[1])
+    await second_pi.told(True, sorted(second_screens))
+
+    assert time.monotonic() - armed >= ws_ui.ARM_INTERVAL_S, (
+        "the second rack's window was cut short by the first rack's"
+    )
+    await finish(browser, handler)
+
+
+async def test_a_tab_that_closes_before_the_window_is_out_still_stops_the_rack(tmp_path):
+    """The coalescing window must not outlive the socket. A rack owed a request
+    by a tab that has gone is a rack encoding WebP for nobody, and the delay is
+    exactly the moment the tab is most likely to leave -- a panel opened and
+    closed again."""
+    app = build(tmp_path)
+    daemon_id, screens = rack(app, screens=2)
+    pi = Rack(app, daemon_id)
+    browser, handler = await browsing(app)
+
+    browser.say(action="subscribe", screen_id=screens[0])
+    browser.say(action="subscribe", screen_id=screens[1])
+    await browser.handled()
+    await finish(browser, handler)
+
+    assert pi.asked_for == (False, [])
+    assert app.state.hub.watched_screens() == set()
 
 
 # --- the same route, through a real socket ----------------------------------

@@ -5,7 +5,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-from ors_schema.link import Command, ConfigPush, Frame, FramesRequest
+from ors_schema.link import MAX_WATCHED_SCREENS, Command, ConfigPush, Frame, FramesRequest
 
 log = logging.getLogger(__name__)
 
@@ -252,6 +252,55 @@ class Hub:
 
     def watched_screens(self) -> set[int]:
         return set(self._watchers)
+
+    def frames_for(self, daemon_id: int, owned: set[int]) -> FramesRequest:
+        """The whole `frames` request for one rack: every screen it owns that
+        anybody is watching, bounded to what one request may name.
+
+        **One mechanism, because there is one rule.** Both callers assemble this
+        list -- the browser socket on every subscribe and unsubscribe, the daemon
+        socket on every reconnect -- and the two had it separately: one truncated
+        and logged, the other did not. On a rack with more watched screens than
+        the bound, that asymmetry was a hello that raised `ValidationError` after
+        `hub.register`, so the rack reconnected in a loop while every open tab
+        showed it online. A bound implemented twice is a bound implemented once
+        and forgotten once.
+
+        `owned` is passed in rather than read here, which is the hub's standing
+        rule: ownership is a row and this class reads none. What the hub does
+        know, and the caller cannot, is the *order* the screens were subscribed
+        in -- `_watchers` is a dict, so it is insertion order -- and that is what
+        decides which survive.
+
+        The most recently opened win. Sorting and keeping the lowest ids keeps
+        the oldest-created panels, so the screen a tab has just opened is the one
+        dropped: a panel frozen from the moment it appears, with no `daemons`
+        change and no stall event to say so, on a rack the interface still shows
+        as online. Newest-first is also what a person means by "the panels I am
+        looking at".
+
+        Sorted for the wire, so that two requests naming the same screens look
+        the same, and because a daemon's log is easier to read in order. The
+        order the ids are *kept* in and the order they are *sent* in are two
+        different decisions and this is the second one.
+        """
+        watched = [screen_id for screen_id in self._watchers if screen_id in owned]
+        if len(watched) > MAX_WATCHED_SCREENS:
+            dropped = watched[:-MAX_WATCHED_SCREENS]
+            watched = watched[-MAX_WATCHED_SCREENS:]
+            # The ids and not just a count. Without them nobody reading this can
+            # tell which panel went quiet, and a count plus a limit describes
+            # every rack over the bound identically.
+            log.error(
+                "more screens of one rack are watched than a single request may name",
+                extra={
+                    "daemon": daemon_id,
+                    "watched": len(dropped) + len(watched),
+                    "allowed": MAX_WATCHED_SCREENS,
+                    "dropped": sorted(dropped),
+                },
+            )
+        return FramesRequest(enabled=bool(watched), screen_ids=sorted(watched))
 
     async def relay_frame(self, frame: Frame) -> None:
         """Fan one frame out to whoever is watching that screen.

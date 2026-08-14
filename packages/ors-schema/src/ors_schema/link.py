@@ -332,10 +332,13 @@ two are pinned against each other in the daemon's suite, at the end that owns
 the smaller number.
 
 The server bounds what it *sends* as well, rather than letting a rack with more
-watched screens than this raise inside a subscription handler: see
-`ors_server.link.ws_ui`, which truncates and logs. A bound that turns a large
-rack into an exception would freeze every panel on it, which is worse than
-streaming the first sixty-four.
+watched screens than this raise inside the handler that assembles a request:
+`ors_server.link.hub.Hub.frames_for` truncates and logs, and is the only place
+either socket builds one. A bound that turns a large rack into an exception
+would freeze every panel on it, which is worse than streaming sixty-four of
+them -- and it did worse than that at the daemon's end, where the exception
+landed after the connection was registered and left the rack reconnecting in a
+loop while every browser showed it online.
 """
 
 

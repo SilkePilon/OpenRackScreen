@@ -11,6 +11,7 @@ from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 from ors_schema.link import (
     MAX_FRAME_BYTES,
+    MAX_WATCHED_SCREENS,
     PROTOCOL_VERSION,
     Ack,
     Frame,
@@ -178,6 +179,24 @@ class FakeSocket:
     @property
     def messages(self) -> list[dict]:
         return [json.loads(payload) for payload in self.sent]
+
+
+class GatedSocket(FakeSocket):
+    """A socket whose first send suspends and never finishes.
+
+    The window between `hub.register` and `_hello` returning a session is
+    otherwise not reachable from a test: everything in it is either synchronous
+    or a send that completes at once. The config push is the await that holds it
+    open, which is also the one a real wedged Pi holds open.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.started = asyncio.Event()
+
+    async def send_text(self, payload: str) -> None:
+        self.started.set()
+        await asyncio.Event().wait()
 
 
 class VanishingSocket(FakeSocket):
@@ -914,6 +933,125 @@ async def test_a_daemon_nobody_is_watching_is_not_asked_for_frames(tmp_path):
     await run(socket)
 
     assert [message["type"] for message in socket.messages] == ["config"]
+
+
+async def test_a_rack_with_more_watched_screens_than_a_request_may_name_reconnects(tmp_path):
+    """The bound is one rule, and a reconnect is the other place it applies.
+
+    `ws_ui` truncates a set this large and logs; this end built the request
+    straight from the watched set, so the same list that a browser survives
+    killed a hello. The `ValidationError` is neither `SnapshotError` nor
+    `WebSocketDisconnect`, so nothing caught it -- and it was raised *after*
+    `hub.register`, with `session` still unassigned, so the `finally` never
+    dropped the registration either.
+    """
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    screens = [
+        add_screen(app, daemon_id, name=f"panel {position}", position=position)
+        for position in range(1, MAX_WATCHED_SCREENS + 2)
+    ]
+    for screen_id in screens:
+        app.state.hub.subscribe_frames(screen_id, asyncio.Queue())
+
+    socket = FakeSocket(app, hello(key))
+    await run(socket)
+
+    requests = [message for message in socket.messages if message["type"] == "frames"]
+    assert [len(request["screen_ids"]) for request in requests] == [MAX_WATCHED_SCREENS]
+    assert requests[0]["screen_ids"] == sorted(screens[-MAX_WATCHED_SCREENS:])
+
+
+async def test_a_rack_too_big_to_resume_is_not_left_online_for_ever(tmp_path):
+    """What the loop above cost every open tab, which is the worse half.
+
+    The hello dies after `register` on every attempt, so the rack reconnects,
+    is killed, and reconnects again -- while `register`/`drop` never see a set
+    change and every browser goes on showing a green dot over four panels
+    frozen on their last image.
+    """
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    screens = [
+        add_screen(app, daemon_id, name=f"panel {position}", position=position)
+        for position in range(1, MAX_WATCHED_SCREENS + 2)
+    ]
+    for screen_id in screens:
+        app.state.hub.subscribe_frames(screen_id, asyncio.Queue())
+
+    socket = FakeSocket(app, hello(key), hang_up=False)
+    handler = asyncio.create_task(daemon_socket(socket))
+    await socket.next_message()
+    await socket.handled()
+
+    assert app.state.hub.is_online(daemon_id) is True
+    await finish(socket, handler)
+    assert app.state.hub.is_online(daemon_id) is False
+
+
+@pytest.mark.parametrize(
+    "stage", ["_record_hello", "_push_for", "_owned_screens", "_resume_frames"]
+)
+async def test_a_hello_that_fails_leaves_no_rack_online(tmp_path, monkeypatch, stage):
+    """Whatever goes wrong, and wherever, a rack that never became a session
+    must not be left online.
+
+    `session = await _hello(...)` never completes when `_hello` raises, so the
+    handler's `finally` has no connection to drop -- and past `hub.register`
+    there is one. The stages before it are here to say that the registration is
+    the thing being tested rather than the assertion being vacuous: a hello that
+    dies before registering leaves nothing behind either.
+    """
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    monkeypatch.setattr(ws_daemon, stage, _explode)
+
+    with pytest.raises(RuntimeError):
+        await run(FakeSocket(app, hello(key)))
+
+    assert app.state.hub.is_online(daemon_id) is False, (
+        "a registration nothing will ever drop is a rack the interface shows"
+        " online for the life of the process"
+    )
+
+
+async def test_a_hello_whose_push_fails_leaves_no_rack_online_either(tmp_path, monkeypatch):
+    """The one stage between `register` and the session that is not this
+    module's own function: the hub send the whole rest of the hello is behind."""
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    monkeypatch.setattr(app.state.hub, "push_config", _explode)
+
+    with pytest.raises(RuntimeError):
+        await run(FakeSocket(app, hello(key)))
+
+    assert app.state.hub.is_online(daemon_id) is False
+
+
+async def test_a_hello_cancelled_after_registering_leaves_no_rack_online(tmp_path):
+    """A shutdown, or any outer deadline ever put around this handler.
+
+    A cancel is one of the ways out of the window between `hub.register` and the
+    session existing, and it leaves exactly the same wreckage as an exception:
+    the caller's `finally` holds None and drops nothing, so the rack is online
+    for the life of the process with no socket behind it.
+    """
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+
+    socket = GatedSocket(app, hello(key), hang_up=False)
+    handler = asyncio.create_task(daemon_socket(socket))
+    await asyncio.wait_for(socket.started.wait(), PROMPTLY)
+    assert app.state.hub.is_online(daemon_id) is True
+
+    handler.cancel()
+    await asyncio.gather(handler, return_exceptions=True)
+
+    assert app.state.hub.is_online(daemon_id) is False
+
+
+def _explode(*args, **kwargs):
+    raise RuntimeError("something this handler does not expect")
 
 
 # --- the connection this one replaced --------------------------------------

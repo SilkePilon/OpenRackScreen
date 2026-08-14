@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from ors_schema.daemon import DaemonConfig
-from ors_schema.link import Command, ConfigPush, Frame, FramesRequest
+from ors_schema.link import (
+    MAX_WATCHED_SCREENS,
+    Command,
+    ConfigPush,
+    Frame,
+    FramesRequest,
+)
 from ors_server.link.hub import Connection, DaemonsOnline, Hub
 
 
@@ -642,3 +649,115 @@ async def test_one_stalled_tab_does_not_cost_another_one_its_announcement():
         frozenset({1}),
         frozenset({1, 2}),
     ]
+
+
+# --- what one rack is asked to stream ---------------------------------------
+
+
+def watching(hub: Hub, *screen_ids: int) -> None:
+    for screen_id in screen_ids:
+        hub.subscribe_frames(screen_id, asyncio.Queue())
+
+
+async def test_a_rack_is_asked_for_every_screen_of_its_that_anybody_watches():
+    hub = Hub()
+    watching(hub, 1, 2, 3)
+
+    request = hub.frames_for(7, owned={1, 3})
+
+    assert request.enabled is True
+    assert request.screen_ids == [1, 3], "screen 2 belongs to another rack"
+
+
+async def test_a_rack_nobody_is_watching_is_asked_to_stop():
+    """`enabled=False` and nothing else: `FrameStream.disable()` clears the lot,
+    and there is no per-screen off switch to send instead."""
+    hub = Hub()
+
+    request = hub.frames_for(7, owned={1, 2})
+
+    assert (request.enabled, request.screen_ids) == (False, [])
+
+
+async def test_the_screens_are_named_in_ascending_order_however_they_were_opened():
+    """Ascending, not set order, and the ids are chosen so the two differ.
+
+    `list({1, 8})` is `[8, 1]` in CPython, and every fixture that numbers its
+    screens from one contiguously hides that -- set iteration happens to be
+    ascending for those. This is the same identity-fixture trap the base64
+    alphabet fell into.
+    """
+    hub = Hub()
+    watching(hub, 8, 1)
+
+    request = hub.frames_for(7, owned={1, 8})
+
+    assert request.screen_ids == [1, 8]
+    assert list({1, 8}) != [1, 8], "a fixture that cannot tell the two apart proves nothing"
+
+
+async def test_more_watched_screens_than_one_request_may_name_keeps_the_newest():
+    """Bounded here, once, for both callers.
+
+    `FramesRequest` refuses a longer list, so building one unchecked raises --
+    inside a browser's subscribe, which tears down a tab, and inside a
+    reconnecting daemon's hello, which leaves the rack looping and online.
+    Truncating is the lesser failure; *which* sixty-four survive is the
+    question this answers, and the answer is the most recently opened, because
+    the panel somebody just opened is the one they are looking at.
+    """
+    hub = Hub()
+    screens = list(range(1, MAX_WATCHED_SCREENS + 3))
+    watching(hub, *screens)
+
+    request = hub.frames_for(7, owned=set(screens))
+
+    assert request.screen_ids == sorted(screens[-MAX_WATCHED_SCREENS:])
+    assert len(request.screen_ids) == MAX_WATCHED_SCREENS
+
+
+async def test_the_screen_that_was_opened_last_survives_the_bound():
+    """The failure the ordering exists for: truncating the *lowest* ids drops
+    the panel a tab just opened, which is a panel frozen from the moment it
+    appears -- with no `daemons` change and no stall event to say so."""
+    hub = Hub()
+    screens = list(range(1, MAX_WATCHED_SCREENS + 2))
+    watching(hub, *screens[1:], screens[0])
+
+    request = hub.frames_for(7, owned=set(screens))
+
+    assert screens[0] in request.screen_ids
+    assert screens[1] not in request.screen_ids, "the oldest subscription is the casualty"
+
+
+async def test_the_screens_that_lost_the_bound_are_named_in_the_log(caplog):
+    """A count and a limit say a panel went quiet; they do not say which one.
+
+    Opened here oldest-last-but-one, so that the order they were subscribed in
+    and the order they are logged in differ: a line whose ids are in whatever
+    order they happened to be dropped in is a line somebody has to sort by hand.
+    """
+    hub = Hub()
+    screens = list(range(1, MAX_WATCHED_SCREENS + 3))
+    watching(hub, screens[1], screens[0], *screens[2:])
+
+    with caplog.at_level(logging.ERROR, logger="ors_server.link.hub"):
+        hub.frames_for(7, owned=set(screens))
+
+    assert [record.daemon for record in caplog.records] == [7]
+    assert caplog.records[0].dropped == screens[:2]
+    assert caplog.records[0].watched == len(screens)
+    assert caplog.records[0].allowed == MAX_WATCHED_SCREENS
+
+
+async def test_the_bound_counts_one_rack_s_screens_and_not_every_rack_s(caplog):
+    hub = Hub()
+    mine = list(range(1, MAX_WATCHED_SCREENS + 1))
+    theirs = list(range(1000, 1000 + MAX_WATCHED_SCREENS))
+    watching(hub, *mine, *theirs)
+
+    with caplog.at_level(logging.ERROR, logger="ors_server.link.hub"):
+        request = hub.frames_for(7, owned=set(mine))
+
+    assert request.screen_ids == mine
+    assert caplog.records == [], "a rack at the bound is not a rack over it"

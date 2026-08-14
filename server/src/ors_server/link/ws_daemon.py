@@ -15,7 +15,6 @@ from ors_schema.link import (
     ConfigPush,
     DaemonMessage,
     Frame,
-    FramesRequest,
     Hello,
     Nack,
     Paired,
@@ -235,9 +234,24 @@ async def _hello(state: State, socket: WebSocket) -> _Session | None:
         connection=state.hub.register(daemon_id, socket.send_text),
         owned=owned,
     )
-    if push is not None:
-        await state.hub.push_config(daemon_id, push)
-    await _resume_frames(state, session)
+    try:
+        if push is not None:
+            await state.hub.push_config(daemon_id, push)
+        await _resume_frames(state, session)
+    except BaseException:
+        # From here to `return`, this function owns the registration, and the
+        # caller's `finally` cannot: `session = await _hello(...)` never
+        # completes when this raises, so `daemon_socket` is left holding None
+        # and drops nothing. A rack registered and then abandoned is one every
+        # open tab shows as online -- `register` and `drop` announce set
+        # *changes*, so its reconnect changes nothing anybody can see -- and
+        # nothing will ever take it offline again.
+        #
+        # `BaseException` because a cancel is one of the ways out: a shutdown
+        # landing between `register` and the return would otherwise leave the
+        # same wreckage, and re-raising keeps it a cancel.
+        state.hub.drop(session.connection)
+        raise
     return session
 
 
@@ -312,17 +326,23 @@ async def _resume_frames(state: State, session: _Session) -> None:
 
     Nothing else will: the interface subscribes when someone opens a screen, and
     if the Pi reboots after that, the watcher is left holding a queue nobody
-    fills. Intersected with what this daemon owns, because `watched_screens` is
-    global -- every screen anyone is watching across every rack -- and asking a
-    Pi to render screen ids belonging to another one is at best noise in its log
-    and at worst four workers it cannot start.
+    fills.
+
+    `Hub.frames_for` is what assembles it, which is the same call the browser
+    socket makes on every subscribe -- the intersection with what this daemon
+    owns, and the bound on how many screens one request may name, are one rule
+    and had been implemented here and there separately. This end had no bound at
+    all, so a rack with more watched screens than the limit died in its own hello
+    on a `ValidationError`, having already registered.
+
+    Nothing is sent when the set is empty, unlike the browser socket's `_arm`: a
+    daemon that has just connected is streaming nothing, so `enabled=False` here
+    would be a message telling it to stop doing what it is not doing.
     """
-    resumed = state.hub.watched_screens() & session.owned
-    if not resumed:
+    request = state.hub.frames_for(session.daemon_id, session.owned)
+    if not request.enabled:
         return
-    await state.hub.request_frames(
-        session.daemon_id, FramesRequest(enabled=True, screen_ids=sorted(resumed))
-    )
+    await state.hub.request_frames(session.daemon_id, request)
 
 
 async def _serve(state: State, socket: WebSocket, session: _Session) -> None:
