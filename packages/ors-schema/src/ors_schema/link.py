@@ -201,7 +201,7 @@ inheriting a default that has nothing to do with a panel.
 """
 
 
-def _not_a_flag(screen_id: object) -> object:
+def not_a_flag(screen_id: object) -> object:
     """Refuse a JSON `true` where a row id belongs, on every message that carries one.
 
     `bool` is an `int` in Python and pydantic's lax mode takes it as one, so
@@ -215,6 +215,13 @@ def _not_a_flag(screen_id: object) -> object:
     `ws_daemon._about` in a log field. A rule about what a field may hold belongs
     to the field, and a third copy at a third caller is a fourth caller waiting
     to forget it.
+
+    Public, and that is the point of it. A request body upstream of one of these
+    messages is a field of the same kind: `daemons.CommandBody.screen_id` widened
+    `true` to `1` before `Command` was ever constructed, so the validator below
+    saw an integer and passed it, and `sleep` darkened whichever panel holds row
+    id 1. The fix for a field that has to obey this rule is to call this, not to
+    write it again.
 
     A validator and not `StrictInt`, because strictness would also refuse the
     `"7"` a JSON producer may legitimately send for an integer; what is wrong
@@ -253,7 +260,7 @@ class Frame(_Message):
     @field_validator("screen_id", mode="before")
     @classmethod
     def _screen_id_is_a_row_id(cls, screen_id: object) -> object:
-        return _not_a_flag(screen_id)
+        return not_a_flag(screen_id)
 
 
 class LogLine(_Message):
@@ -325,7 +332,7 @@ class Command(_Message):
     @field_validator("screen_id", mode="before")
     @classmethod
     def _screen_id_is_a_row_id(cls, screen_id: object) -> object:
-        return _not_a_flag(screen_id)
+        return not_a_flag(screen_id)
 
 
 MAX_REQUESTED_FPS = 60.0
