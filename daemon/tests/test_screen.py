@@ -430,6 +430,22 @@ def test_an_unbounded_identify_still_waits_for_the_panel() -> None:
     assert len(display.images) == 1
 
 
+def test_identify_answers_false_when_the_panel_refused_the_digit() -> None:
+    """A backend that refuses one frame is not a faulted one -- three in a row
+    are -- so the answer cannot be read off `faulted`. `_show` absorbs a refusal
+    by design, because a render loop has to survive one, which is exactly why
+    the counter and not the call is what says whether the digit landed. Without
+    it, `Supervisor.identify` counts a dark panel as painted and the button
+    reports a rack it did not number.
+    """
+    display = RecordingDisplay(fail_times=1)
+    worker, _, _ = make(display=display)
+
+    assert worker.identify("2") is False
+    assert worker.faulted is False, "one refusal is not a fault"
+    assert display.images == []
+
+
 def test_identify_leaves_a_faulted_backend_alone() -> None:
     display = RecordingDisplay(fail_times=99)
     worker, store, _ = make(display=display)

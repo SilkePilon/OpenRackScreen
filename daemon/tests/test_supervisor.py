@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 from ors_daemon.clock import FakeClock
-from ors_daemon.config import ConfigError, resolve_screens
+from ors_daemon.config import ConfigError, resolve_screens, system_scenes
 from ors_daemon.displays import DisplayError
 from ors_daemon.frames import MAX_FPS, FrameStream
 from ors_daemon.screen import _NIGHT_PARK_CHUNK as NIGHT_PARK_CHUNK
@@ -28,6 +28,7 @@ from ors_daemon.supervisor import (
     _Slot,
     _Source,
 )
+from ors_render import RenderContext, render_scene
 from ors_schema.daemon import (
     DaemonConfig,
     IntegrationConfig,
@@ -3042,4 +3043,43 @@ def test_one_wedged_panel_does_not_cost_the_link_thread_or_the_other_panels(
         assert elapsed < IDENTIFY_BUDGET
     finally:
         wedged._lock.release()
+        supervisor.stop()
+
+
+def test_the_digit_on_the_glass_is_the_screens_position(tmp_path: Path) -> None:
+    """Which number a panel shows is the whole of what the command is for.
+
+    The printed map `ors-daemon identify` produces is keyed by `position`, and
+    two ways of numbering the same rack make that map useless -- so this asserts
+    the pixels rather than the call. The row id is the tempting thing to reach
+    for here, because it is what addressed the screen; it is not what anybody at
+    the rack is reading off the front of the config.
+    """
+    supervisor, displays = running_rack(tmp_path, screens=2)
+    try:
+        supervisor.identify(None)
+    finally:
+        supervisor.stop()
+
+    system = system_scenes()["identify"]
+    for name, position in (("S1", 1), ("S2", 2)):
+        expected = render_scene(system, RenderContext(data={"params": {"ordinal": str(position)}}))
+        assert displays[name].images[-1].tobytes() == expected.tobytes(), name
+
+
+def test_identify_steps_over_a_panel_that_has_no_worker_yet(tmp_path: Path) -> None:
+    """A slot with an open panel and nothing started on it is a real state: a
+    stop that landed between `start`'s two phases leaves one, and so does a
+    worker that would not fork. There is no thread to draw the digit and no lock
+    to take, and an `AttributeError` out of here reaches the link thread."""
+    supervisor, displays = running_rack(tmp_path, screens=2)
+    try:
+        supervisor._slots[0].worker = None
+        before = digits(displays["S1"])
+
+        assert supervisor.identify(None) == 1
+
+        assert digits(displays["S1"]) == before
+        assert displays["S2"].images
+    finally:
         supervisor.stop()
