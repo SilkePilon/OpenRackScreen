@@ -7,7 +7,15 @@ Two of them, and both are rules the *next* route someone writes has to obey:
   the version and pushes the snapshot.
 
 Each sweep is followed by a test that plants a violation and watches the sweep
-find it, so a sweep that stopped looking fails rather than passing quietly.
+find it, so a sweep that stopped looking fails rather than passing quietly. A
+planted violation has to be a real one: a route containing no write at all
+proves the sweep is live and nothing more, and "live" was never the question.
+
+Every sweep here parses. None of them greps, and the two are not
+interchangeable: all five router files *discuss* these rules in their prose, so
+a substring search over their source is a check each of them passes by talking
+about it. A route was planted with `async with change(` in its docstring and a
+bare `INSERT` in its body, and the substring form returned `set()`.
 """
 
 from __future__ import annotations
@@ -15,14 +23,17 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import textwrap
 import threading
+from contextlib import closing
 from pathlib import Path
 
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 from ors_server import api
+from ors_server.api.changes import change
 from ors_server.app import AppSettings, create_app
 from starlette.routing import WebSocketRoute
 
@@ -68,8 +79,30 @@ def threadpool_routes(app: FastAPI) -> set[str]:
     }
 
 
+WRITING_STATEMENTS = ("insert", "update", "delete", "replace", "create", "drop", "alter")
+"""The SQL verbs that change a row. `BEGIN`, `COMMIT` and `ROLLBACK` are not
+here: they are `changes.change`'s own, and it is the thing being enforced."""
+
+
 def unmanaged_mutations(app: FastAPI) -> set[str]:
-    """`METHOD /path` for every writing route that does not open a `change`."""
+    """`METHOD /path` for every writing route that does not open a `change`.
+
+    Two questions per route, because there are two places the rule can be broken.
+    The endpoint has to open a `change` -- unless it is on `MUTATES_NOTHING`,
+    which is then held to writing nothing at all, so an exemption cannot quietly
+    become a licence. And nothing the route hangs off `Depends(...)` may write,
+    because a dependency runs *before* the endpoint's transaction is open and on
+    a connection of its own: the row would be committed, unbumped and unpushed,
+    and rolling the endpoint back would not take it with it.
+
+    **What this still cannot see**, stated so nobody reads it as more than it is.
+    `writes` reads one function's own source, so a `MUTATES_NOTHING` route or a
+    dependency that wrote through a helper it *called* would pass -- the primary
+    rule does not depend on that, because "the endpoint must open a `change`" is
+    unconditional and needs no notion of writing at all. Nor does it follow a
+    route into a background task, or into a thread it hands work to. Neither is
+    a shape anything here takes; both would need a call graph rather than a file.
+    """
     found = set()
     for path, route in routes(app):
         if not path.startswith("/api") or isinstance(route, WebSocketRoute):
@@ -79,11 +112,103 @@ def unmanaged_mutations(app: FastAPI) -> set[str]:
         for method in sorted(getattr(route, "methods", None) or ()):
             if method in ("GET", "HEAD", "OPTIONS"):
                 continue
-            if f"{method} {path}" in MUTATES_NOTHING:
-                continue
-            if "async with change(" not in inspect.getsource(route.endpoint):
-                found.add(f"{method} {path}")
+            name = f"{method} {path}"
+            if name in MUTATES_NOTHING:
+                if writes(route.endpoint):
+                    found.add(name)
+            elif not opens_a_change(route.endpoint):
+                found.add(name)
+            if any(writes(call) for call in dependency_calls(route)):
+                found.add(name)
     return found
+
+
+def opens_a_change(function: object) -> bool:
+    """Whether this function really opens `async with change(...)`.
+
+    Parsed rather than grepped, for the reason the name sweep below is: every
+    one of these files *discusses* the rule in its docstrings, and a substring
+    search over the source is a test that passes for any route that mentions it.
+    A route planted with `async with change(` in its docstring and a bare
+    `connection.execute("INSERT ...")` in its body was swept clean, measured.
+    """
+    for node in ast.walk(_tree(function)):
+        if not isinstance(node, ast.AsyncWith):
+            continue
+        for item in node.items:
+            call = item.context_expr
+            if isinstance(call, ast.Call) and _called(call.func) == "change":
+                return True
+    return False
+
+
+def writes(function: object) -> bool:
+    """Whether this function executes a statement that changes a row.
+
+    Read off the statement rather than off the method name, because `execute` is
+    how everything reaches SQLite here, reads included. A statement this cannot
+    read statically -- one built by concatenation, or passed in from elsewhere --
+    counts as a write: the point of the sweep is that a route cannot arrange to
+    be believed.
+    """
+    for node in ast.walk(_tree(function)):
+        if not isinstance(node, ast.Call):
+            continue
+        if _called(node.func) not in ("execute", "executemany", "executescript"):
+            continue
+        if not node.args:
+            return True
+        statement = _leading_text(node.args[0])
+        if statement is None:
+            return True
+        head = statement.strip().split(None, 1)
+        if head and head[0].lower() in WRITING_STATEMENTS:
+            return True
+    return False
+
+
+def dependency_calls(route: object) -> list[object]:
+    """Every callable the route hangs off `Depends(...)`, at any depth."""
+    dependant = getattr(route, "dependant", None)
+    if dependant is None:
+        return []
+    found: list[object] = []
+    pending = list(dependant.dependencies)
+    while pending:
+        dependency = pending.pop()
+        if dependency.call is not None:
+            found.append(dependency.call)
+        pending.extend(dependency.dependencies)
+    return found
+
+
+def _tree(function: object) -> ast.AST:
+    """The function's source as an AST. A source that cannot be read is a
+    failure rather than a pass, because a sweep that quietly skips what it
+    cannot see is a sweep that reports `set()` forever."""
+    return ast.parse(textwrap.dedent(inspect.getsource(function)))
+
+
+def _called(func: ast.expr) -> str | None:
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
+
+
+def _leading_text(node: ast.expr) -> str | None:
+    """The statically known start of a string expression, or None.
+
+    An f-string counts -- `f"UPDATE screen SET {assignments} WHERE id = ?"` is a
+    write whoever reads it can see -- and its leading literal is what names the
+    verb. Anything else is unreadable, and unreadable is not innocent.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr) and node.values:
+        return _leading_text(node.values[0])
+    return None
 
 
 def test_every_api_route_is_async_because_the_hub_is_event_loop_affine(tmp_path):
@@ -165,32 +290,166 @@ def test_every_mutating_route_goes_through_the_bump_and_push(tmp_path):
 
 
 def test_the_mutation_sweep_sees_a_route_that_writes_on_its_own(tmp_path):
+    """The planted violation really writes a row.
+
+    It has to: a route containing no `execute` at all proves the sweep is live
+    and nothing more, and "live" was never the question -- the question is
+    whether it catches a route that saves an edit no rack is told about.
+    `request.app.state.database.connect()` is writable and every router holds
+    one, which is exactly why this rule cannot be enforced by a type.
+    """
     app = create_app(AppSettings(data_dir=tmp_path))
 
     @app.state.api.post("/rogue")
-    async def rogue() -> dict[str, bool]:
+    async def rogue(request: Request) -> dict[str, bool]:
+        with closing(request.app.state.database.connect()) as connection:
+            connection.execute("INSERT INTO setting (key, value) VALUES ('rogue', '1')")
         return {"ok": True}
 
     assert unmanaged_mutations(app) == {"POST /api/rogue"}
 
 
-@pytest.mark.parametrize("module", sorted(path.name for path in API_PACKAGE.glob("*.py")))
+def test_the_mutation_sweep_is_not_fooled_by_a_route_that_explains_the_rule(tmp_path):
+    """The five router files all discuss `async with change(` in their prose, so
+    a substring search over the source is a sweep every one of them satisfies by
+    talking. This route mentions it and does not do it, and was swept clean by
+    the substring form -- measured, `set()`."""
+    app = create_app(AppSettings(data_dir=tmp_path))
+
+    @app.state.api.post("/sneaky")
+    async def sneaky(request: Request) -> dict[str, bool]:
+        """Every write in this module goes through `async with change(` -- except
+        this one, which is the point."""
+        with closing(request.app.state.database.connect()) as connection:
+            connection.execute("UPDATE setting SET value = '1' WHERE key = 'sneaky'")
+        return {"ok": True}
+
+    assert unmanaged_mutations(app) == {"POST /api/sneaky"}
+
+
+def test_the_mutation_sweep_sees_a_write_hidden_in_a_dependency(tmp_path):
+    """A `Depends(...)` runs before the endpoint's transaction is open and on a
+    connection of its own, so a write there is committed, unbumped and unpushed
+    -- and rolling the endpoint back does not take it with it. Only
+    `route.endpoint` was inspected, so it was invisible."""
+    app = create_app(AppSettings(data_dir=tmp_path))
+
+    def stamp(request: Request) -> None:
+        with closing(request.app.state.database.connect()) as connection:
+            connection.execute("UPDATE setting SET value = '1' WHERE key = 'stamped'")
+
+    @app.state.api.post("/stamped")
+    async def stamped(
+        # `= Depends(stamp)` rather than `Annotated[..., Depends(stamp)]`,
+        # because this module has `from __future__ import annotations` and
+        # FastAPI resolves an annotation against the *module* namespace -- a
+        # dependency named by a local would silently not be one, and the sweep
+        # would be watched finding nothing rather than finding this.
+        request: Request,
+        response: Response,
+        _: None = Depends(stamp),
+    ) -> dict[str, bool]:
+        async with change(request, response) as edit:
+            edit.affects_nobody()
+        return {"ok": True}
+
+    assert unmanaged_mutations(app) == {"POST /api/stamped"}
+
+
+def test_the_routes_exempted_from_the_change_rule_really_write_nothing(tmp_path):
+    """`MUTATES_NOTHING` is a list, and a list is a thing that rots. An exemption
+    is from opening a `change`, not a licence to write outside one -- so the
+    routes on it are held to the stronger half of the rule instead."""
+    app = create_app(AppSettings(data_dir=tmp_path))
+    exempted = [
+        route
+        for path, route in routes(app)
+        if any(f"{method} {path}" in MUTATES_NOTHING for method in getattr(route, "methods", ()))
+    ]
+
+    assert len(exempted) == len(MUTATES_NOTHING), "an exemption naming a route nobody has written"
+    assert [route for route in exempted if writes(route.endpoint)] == []
+
+
+def test_the_write_check_reads_the_statement_rather_than_the_method(tmp_path):
+    """`execute` is how every read reaches SQLite too, so the verb is what
+    decides -- and a statement it cannot read statically is not given the benefit
+    of the doubt."""
+
+    def reads(connection) -> None:  # noqa: ANN001 - a stand-in
+        connection.execute("SELECT * FROM daemon ORDER BY id")
+
+    def writes_a_row(connection) -> None:  # noqa: ANN001
+        connection.execute("DELETE FROM screen WHERE id = ?", (1,))
+
+    def writes_through_an_f_string(connection, columns) -> None:  # noqa: ANN001
+        connection.execute(f"UPDATE screen SET {columns} WHERE id = ?", (1,))
+
+    def writes_through_a_name(connection, statement) -> None:  # noqa: ANN001
+        connection.execute(statement, (1,))
+
+    assert writes(reads) is False
+    assert writes(writes_a_row) is True
+    assert writes(writes_through_an_f_string) is True
+    assert writes(writes_through_a_name) is True, "unreadable is not innocent"
+
+
+def test_the_change_check_reads_code_rather_than_prose():
+    """The other half of the substring problem, at the function it is asked of."""
+
+    async def opens(request, response) -> None:  # noqa: ANN001
+        async with change(request, response) as edit:
+            edit.affects_nobody()
+
+    async def only_talks_about_it(request, response) -> None:  # noqa: ANN001
+        """Writes are made under `async with change(request, response)`."""
+        return None
+
+    assert opens_a_change(opens) is True
+    assert opens_a_change(only_talks_about_it) is False
+
+
+ROUTER_MODULES = sorted(
+    # `rglob`, because `glob("*.py")` was the top level only: an `api/`
+    # subpackage -- which is the obvious shape the moment one of these files
+    # needs splitting -- would have been swept by nothing at all.
+    str(path.relative_to(API_PACKAGE))
+    for path in API_PACKAGE.rglob("*.py")
+)
+
+NOT_A_ROUTER = ("changes.py", "__init__.py")
+"""`changes.py` is the mechanism being enforced, and `__init__.py` is empty."""
+
+
+@pytest.mark.parametrize("module", ROUTER_MODULES)
 def test_no_router_bumps_or_pushes_on_its_own(module):
     """One mechanism, in one file. A router that reached for `push_config` or
     `bump_config_version` directly would be a second implementation of the
     ordering `changes` exists to own -- assemble before commit, commit before
     push -- and the two would disagree the first time one of them was edited."""
-    if module in ("changes.py", "__init__.py"):
+    if Path(module).name in NOT_A_ROUTER:
         return
 
     # Parsed rather than grepped: every one of these files *discusses* the rule
     # in its docstrings, and a substring search would be a test that passes
     # only while nobody explains anything.
-    reached_for = _names_used((API_PACKAGE / module).read_text())
+    source = (API_PACKAGE / module).read_text()
+    reached_for = _names_used(source)
 
     assert "push_config" not in reached_for
     assert "bump_config_version" not in reached_for
     assert "bump_config_version_on" not in reached_for
+    # And the one thing a name sweep cannot see through. `getattr(hub, "push_" +
+    # "config")` refers to no name this reads, so the sweep above is only worth
+    # anything while nothing in these files looks an attribute up dynamically.
+    # No router has a reason to, so the tool is what is forbidden rather than
+    # the strings it might be handed.
+    assert "getattr" not in reached_for, "a dynamic attribute lookup makes the sweep above blind"
+
+
+def test_the_routers_swept_are_the_routers_there_are():
+    """A parametrised sweep over an empty list is a green test that ran nothing."""
+    assert set(ROUTER_MODULES) >= {"daemons.py", "screens.py", "templates.py", "settings.py"}
 
 
 def _names_used(source: str) -> set[str]:
@@ -210,6 +469,13 @@ def test_the_name_sweep_reads_code_rather_than_prose():
     """It has to see a call and ignore a docstring, or it is asserting nothing."""
     assert "push_config" in _names_used("hub.push_config(1, push)")
     assert "push_config" not in _names_used('"""Never calls hub.push_config."""')
+
+
+def test_the_name_sweep_is_blind_to_a_dynamic_lookup_which_is_why_getattr_is_banned():
+    """Stated as a test rather than as a comment, because it is the reason the
+    assertion above exists and the thing that makes it load-bearing."""
+    assert "push_config" not in _names_used('getattr(hub, "push_" + "config")(1, push)')
+    assert "getattr" in _names_used('getattr(hub, "push_" + "config")(1, push)')
 
 
 class _WatchfulHub:
