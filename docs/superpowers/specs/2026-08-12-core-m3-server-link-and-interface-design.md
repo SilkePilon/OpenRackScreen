@@ -181,7 +181,24 @@ GET/PATCH /api/settings                          GET /api/events
 WS     /ws/daemon                                WS  /ws/ui
 ```
 
-Every route and both sockets require the session cookie. A `/ws/ui` that skipped the check would be a live view of the rack for anyone on the LAN.
+Every route and both sockets require the session cookie. A `/ws/ui` that skipped the check would be a live view of the rack for anyone on the LAN. `/ws/ui` is refused at the handshake rather than after a first message: unlike `/ws/daemon`, there is no credential on the wire to fall back on.
+
+#### `/ws/ui`, the browser protocol
+
+Not the link protocol. `ors-schema` is the contract between the server and a daemon, and both ends of that one are pydantic; this one is between the server and a browser, so it is written for what a browser has.
+
+**Browser → server:** `{"action": "subscribe"|"unsubscribe", "screen_id": int}`. Anything else is skipped and logged; the socket stays open. Unknown fields are refused rather than ignored, so an SPA older than the server is told which field it invented.
+
+**Server → browser:**
+
+- `{"type": "daemons", "online": [int, ...]}` — every rack the server is holding a socket for, sorted. Sent once on connect and **pushed again on every change**, so the interface never polls for it. It is also the signal that a panel has stopped for a reason: a rebooted Pi, a pulled cable or a wifi blip all arrive here, and no per-frame event covers those.
+- `{"type": "frame", "screen_id": int, "seq": int, "webp": "<base64>"}`.
+
+**The base64 is the standard alphabet, with padding — decode with `atob(message.webp)` and no substitution.** This is deliberately *not* what pydantic emits. `Frame` on the link serialises `bytes` with the **URL-safe** alphabet (`-` and `_`), and `atob` throws `InvalidCharacterError` on both of those characters, so `model_dump_json()` onto this socket produces a payload the interface cannot read. The failure is silent at the Python end — `base64.b64decode` accepts either alphabet unless asked not to — so `ws_ui.py` assembles the message rather than dumping the model, and pins it with a payload whose two encodings differ. If that ever changes back, the SPA needs `.replace(/-/g, '+').replace(/_/g, '/')` first.
+
+**A stalled stream has no event of its own, by decision.** A frame a rack encoded too large is refused by the schema and skipped by `/ws/daemon`; the watcher's queue simply stops and the page keeps its last image. M3a does not add a `stalled` event for it, because an oversized frame is the rarest of the ways a panel goes quiet and an event covering only it would teach the interface that silence otherwise means healthy. The panel component owns staleness: time since the last `frame` for that screen, combined with `daemons`, which covers every case where the rack itself has gone.
+
+**A subscription is not a per-screen toggle at the far end.** `frames{enabled, screen_ids[]}` is whole-daemon state — the daemon *replaces* its streaming set from it — so the server recomputes that daemon's complete watched set, across every open tab, on every subscribe and unsubscribe, and sends it whole. `enabled: false` only when the set is empty. Four tabs on four panels of one rack is the case this exists for.
 
 ### 7.2 Pages
 
