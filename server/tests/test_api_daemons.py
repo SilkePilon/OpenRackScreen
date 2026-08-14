@@ -5,7 +5,7 @@ from contextlib import closing
 
 import pytest
 from fastapi.testclient import TestClient
-from ors_server.api.changes import MAX_EVENTS_PER_DAEMON
+from ors_server.api.changes import MAX_EVENTS_PER_DAEMON, UNSERVABLE_HEADER, Change
 from ors_server.app import AppSettings, create_app
 from ors_server.pairing import authenticate_key, claim_token
 
@@ -73,6 +73,35 @@ def add_screen(client: TestClient, daemon_id: int, *, name: str = "CPU", positio
         "params": {},
     }
     return client.post("/api/screens", json=body).json()["id"]
+
+
+def add_integration(client: TestClient, daemon_id: int, *, name: str = "prom", credential: str):
+    """A disabled integration holding a credential, which is the only kind M3a
+    allows one on -- see `_credential_has_somewhere_to_go`."""
+    body = {
+        "daemon_id": daemon_id,
+        "name": name,
+        "config": {"url": "http://prom.local:9090", "fields": {"cpu": {"query": "up"}}},
+        "credential": credential,
+        "enabled": False,
+    }
+    return client.post("/api/integrations", json=body).json()["id"]
+
+
+def secrets_in(client: TestClient) -> list[str]:
+    with closing(client.app.state.database.connect()) as connection:
+        return [row["ciphertext"] for row in connection.execute("SELECT ciphertext FROM secret")]
+
+
+def make_unservable(client: TestClient, daemon_id: int) -> None:
+    """An enabled integration holding a credential -- see `test_api_screens`."""
+    with closing(client.app.state.database.connect()) as connection:
+        secret_id = connection.execute("INSERT INTO secret (ciphertext) VALUES ('x')").lastrowid
+        connection.execute(
+            "INSERT INTO integration (daemon_id, type, name, config, secret_id, enabled)"
+            " VALUES (?, 'prometheus', 'prom', '{}', ?, 1)",
+            (daemon_id, secret_id),
+        )
 
 
 # --- the guard --------------------------------------------------------------
@@ -169,6 +198,38 @@ def test_a_daemon_the_hub_holds_a_socket_for_reports_online(client, daemon_id):
     assert listed(client, 1)["online"] is False, "and one rack being up is not another's"
 
 
+def test_a_creation_that_then_fails_leaves_no_rack_holding_an_unclaimable_token(
+    client, monkeypatch
+):
+    """The row is written on the edit's own transaction, so a `change` that then
+    raises undoes it.
+
+    Written outside it, the failure leaves a `daemon` row holding a token nobody
+    was ever shown -- and `daemon.name` is UNIQUE, so that name is occupied
+    forever and every retry answers 409, with no event anywhere saying why. The
+    injected failure stands for anything that can go wrong between the INSERT
+    and the COMMIT; what is being asserted is the ordering, not the cause.
+    """
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("the transaction failed after the row was written")
+
+    monkeypatch.setattr(Change, "record", boom)
+
+    with pytest.raises(RuntimeError):
+        client.post("/api/daemons", json={"name": "half-made"})
+
+    monkeypatch.undo()
+    with closing(client.app.state.database.connect()) as connection:
+        held = connection.execute(
+            "SELECT COUNT(*) FROM daemon WHERE name = 'half-made'"
+        ).fetchone()[0]
+    assert held == 0
+    assert client.post("/api/daemons", json={"name": "half-made"}).status_code == 201, (
+        "and the name it would have occupied is free, so the retry is not a 409 forever"
+    )
+
+
 def test_a_second_daemon_by_the_same_name_is_a_conflict_not_a_traceback(client):
     client.post("/api/daemons", json={"name": "pi-rack"})
 
@@ -224,6 +285,51 @@ def test_deleting_a_daemon_does_not_repaint_the_racks_that_are_left(client, daem
 
     assert other_rack.of_type("config") == []
     assert listed(client, other)["config_version"] == 0
+
+
+def test_deleting_a_daemon_forgets_the_credentials_of_its_integrations(client, daemon_id):
+    """`secret` has no `daemon_id`, so no cascade reaches it.
+
+    `screen`, `integration` and `daemon_event` all reference `daemon(id) ON
+    DELETE CASCADE` and go; `integration.secret_id` is `ON DELETE SET NULL`,
+    which protects the integration from a deleted secret and does nothing in
+    this direction. Without this the ciphertext outlives the only row that ever
+    referenced it -- unreachable through any route, undeletable, and in every
+    export of the database from then on. `delete_integration` handles it; this
+    is the same leak reached one level up.
+    """
+    add_integration(client, daemon_id, credential="hunter2-the-only-copy")
+    assert secrets_in(client), "the fixture proves nothing without a ciphertext to orphan"
+
+    client.delete(f"/api/daemons/{daemon_id}")
+
+    assert secrets_in(client) == []
+
+
+def test_deleting_a_daemon_keeps_another_racks_credentials(client, daemon_id):
+    """A delete that emptied the whole `secret` table would pass the test above."""
+    other = client.post("/api/daemons", json={"name": "other-rack"}).json()["id"]
+    add_integration(client, daemon_id, credential="hunter2-the-only-copy")
+    add_integration(client, other, name="theirs", credential="a-different-one")
+
+    client.delete(f"/api/daemons/{daemon_id}")
+
+    assert len(secrets_in(client)) == 1
+    assert client.get("/api/integrations").json()[0]["has_credential"] is True
+
+
+def test_deleting_a_daemon_is_recorded_against_no_rack_rather_than_not_at_all(client, daemon_id):
+    """The most destructive action in the API is the one the status panel could
+    not show. `daemon_event.daemon_id` is nullable and cascades, so the event has
+    to be written against no rack -- against this one it would be deleted by the
+    same statement that deletes the rack."""
+    client.delete(f"/api/daemons/{daemon_id}")
+
+    events = client.get("/api/events").json()
+    deleted = [event for event in events if event["kind"] == "deleted"]
+    assert len(deleted) == 1
+    assert deleted[0]["daemon_id"] is None
+    assert "pi-rack" in deleted[0]["message"]
 
 
 def test_deleting_a_daemon_that_is_already_gone_is_a_404(client, daemon_id):
@@ -373,6 +479,36 @@ def test_a_command_for_a_rack_that_is_not_connected_says_so(client, daemon_id):
     assert refused.status_code == 409
 
 
+def test_a_command_naming_a_screen_that_is_a_flag_is_refused(client, daemon_id):
+    """`bool` is an `int` in Python and pydantic's lax mode takes it as one.
+
+    `Command` refuses `{"screen_id": true}` -- that is what `_not_a_flag` on the
+    field is for -- but the request body is a model of its own, and it widened
+    `true` to `1` before the message was ever built. So the validator saw an
+    integer and passed it, and `sleep` put a dark circle on whichever panel holds
+    row id 1: someone else's rack.
+    """
+    rack = Rack(client, daemon_id)
+
+    refused = client.post(
+        f"/api/daemons/{daemon_id}/command", json={"command": "identify", "screen_id": True}
+    )
+
+    assert refused.status_code == 422
+    assert rack.of_type("command") == [], "and nothing reached the rack on the way to refusing"
+
+
+def test_a_command_for_the_whole_rack_still_names_no_screen(client, daemon_id):
+    """The other half: `None` is an absence, not a flag, and `sleep` with no
+    screen is the commonest command there is."""
+    rack = Rack(client, daemon_id)
+
+    sent = client.post(f"/api/daemons/{daemon_id}/command", json={"command": "sleep"})
+
+    assert sent.status_code == 200
+    assert rack.of_type("command")[-1]["screen_id"] is None
+
+
 def test_a_command_nobody_defined_is_refused(client, daemon_id):
     Rack(client, daemon_id)
 
@@ -453,6 +589,39 @@ def test_pushing_to_an_offline_rack_is_saved_for_its_next_connect(client, daemon
     assert pushed.status_code == 200
     assert pushed.json()["delivered"] is False
     assert listed(client, daemon_id)["config_version"] == 1
+
+
+def test_pushing_now_to_a_rack_that_cannot_be_given_a_configuration_admits_it(client, daemon_id):
+    """The one button that exists to dig a blank rack out of a stuck state must
+    not claim success when nothing left the server.
+
+    A rack whose committed configuration is unservable has no snapshot to send,
+    so `_assemble` records it and appends no push. `delivered` asked the hub
+    whether a socket was open -- which it is, and which is not the question --
+    and answered `{"version": 2, "delivered": true}` with zero messages on that
+    socket. Measured.
+    """
+    rack = Rack(client, daemon_id)
+    make_unservable(client, daemon_id)
+    rack.sent.clear()
+
+    pushed = client.post(f"/api/daemons/{daemon_id}/push")
+
+    assert pushed.json()["delivered"] is False
+    assert rack.of_type("config") == [], "and nothing was sent, which is what it now says"
+    assert pushed.status_code == 202
+    assert pushed.headers[UNSERVABLE_HEADER] == str(daemon_id)
+
+
+def test_pushing_now_to_a_connected_rack_reports_the_send_that_happened(client, daemon_id):
+    """The other half: `delivered` is still true when a snapshot really went."""
+    rack = Rack(client, daemon_id)
+
+    pushed = client.post(f"/api/daemons/{daemon_id}/push")
+
+    assert pushed.status_code == 200
+    assert pushed.json()["delivered"] is True
+    assert len(rack.of_type("config")) == 1
 
 
 def test_pushing_to_a_daemon_that_does_not_exist_is_a_404(client):

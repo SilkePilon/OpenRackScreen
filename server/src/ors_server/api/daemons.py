@@ -24,12 +24,12 @@ from contextlib import closing
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
-from ors_schema.link import Command
-from pydantic import BaseModel, ConfigDict, Field
+from ors_schema.link import Command, not_a_flag
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.datastructures import State
 
 from ors_server.api.changes import change, config_error, one_row
-from ors_server.pairing import mint_token, rotate_key
+from ors_server.pairing import mint_token_on, rotate_key
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["daemons"])
@@ -94,6 +94,20 @@ class CommandBody(BaseModel):
 
     command: Literal["identify", "sleep", "wake", "reload"]
     screen_id: int | None = None
+    """Which panel, or None for the whole rack. Not a flag -- see `not_a_flag`.
+
+    The schema's own rule, called rather than copied, and it has to be here as
+    well as on `Command`: this model is *upstream* of that one. `bool` is an
+    `int` and pydantic's lax mode takes it as one, so `{"screen_id": true}`
+    arrived here as `1`, and by the time `Command`'s validator saw the value it
+    was an ordinary integer -- 200 on the wire, `screen_id: 1`, and `sleep`
+    darkening whichever panel holds row id 1 on somebody else's rack.
+    """
+
+    @field_validator("screen_id", mode="before")
+    @classmethod
+    def _screen_id_is_a_row_id(cls, screen_id: object) -> object:
+        return not_a_flag(screen_id)
 
 
 class Delivered(BaseModel):
@@ -130,26 +144,32 @@ async def list_daemons(request: Request) -> list[DaemonView]:
 @router.post("/daemons", status_code=201)
 async def create_daemon(request: Request, response: Response, body: NewDaemon) -> DaemonCreated:
     """Mint a rack and the one-time token that pairs it. The token is shown here
-    and never again, from this or any other route."""
-    state = request.app.state
+    and never again, from this or any other route.
+
+    The row is written **inside** the transaction, on the edit's own connection.
+    Minted outside it, a `change` that then raised would leave a `daemon` row
+    holding a token nobody was ever shown -- and `daemon.name` is UNIQUE, so that
+    name would be occupied forever and every retry would answer 409, with no
+    event, because the event is the thing that was rolled back.
+    """
     try:
-        daemon_id, token = mint_token(state.database, body.name)
+        async with change(request, response) as edit:
+            daemon_id, token = mint_token_on(edit.connection, body.name)
+            # Nothing to push, and no version to mint: a rack that has just been
+            # created has no screens, no socket and no configuration that has
+            # changed. The counter is the generation of a *configuration*, and
+            # moving it here would start every rack at 1 for an edit that touched
+            # nothing.
+            edit.affects_nobody()
+            edit.record(daemon_id, "info", "created", f"minted a pairing token for {body.name!r}")
     except sqlite3.IntegrityError as error:
         # `daemon.name` is UNIQUE. A 409 rather than a 500, because two racks
         # called "pi-rack" is a thing a person does, not a thing that goes wrong.
+        # Caught around the whole block rather than around the INSERT: `change`
+        # rolls back and re-raises, so this is where the error arrives.
         raise HTTPException(
             status_code=409, detail=f"a daemon named {body.name!r} exists"
         ) from error
-
-    async with change(request, response) as edit:
-        # Nothing to push, and no version to mint: a rack that has just been
-        # created has no screens, no socket and no configuration that has
-        # changed. The counter is the generation of a *configuration*, and
-        # moving it here would start every rack at 1 for an edit that touched
-        # nothing. The event is still the transaction's, so a creation that then
-        # failed leaves no history of a rack that does not exist.
-        edit.affects_nobody()
-        edit.record(daemon_id, "info", "created", f"minted a pairing token for {body.name!r}")
     return DaemonCreated(id=daemon_id, name=body.name, token=token)
 
 
@@ -201,20 +221,50 @@ async def delete_daemon(request: Request, response: Response, daemon_id: int) ->
     DELETE CASCADE`, which SQLite honours only because `Database.connect` turns
     `PRAGMA foreign_keys` on -- it is per-connection and off by default, and
     without it this leaves orphaned screens rather than an error.
+
+    **`secret` is the one table the cascade does not reach**, and it holds the
+    ciphertext. It has no `daemon_id` -- it is referenced the other way, by
+    `integration.secret_id`, which is `ON DELETE SET NULL` and so protects the
+    integration from a deleted secret and does nothing in this direction. So the
+    integration rows go and their credentials stay: unreachable through any
+    route, undeletable, and in every export of the database from then on.
+    `delete_integration` says the same thing about the same column; this is that
+    leak reached one level up, and it has to be forgotten *before* the delete,
+    while there is still a row naming which secrets were this rack's.
     """
+    state = request.app.state
     async with change(request, response) as edit:
-        one_row(
+        row = one_row(
             edit.connection,
-            "SELECT id FROM daemon WHERE id = ?",
+            "SELECT name FROM daemon WHERE id = ?",
             (daemon_id,),
             missing=f"no daemon {daemon_id}",
         )
+        for secret_id in _credentials_of(edit.connection, daemon_id):
+            state.secrets.delete_on(edit.connection, secret_id)
         edit.connection.execute("DELETE FROM daemon WHERE id = ?", (daemon_id,))
         # The one edit with nothing to push: the rack it changed is gone, and
         # minting a version for a row that no longer exists is a `KeyError`.
         edit.affects_nobody()
+        # Against no rack, which is not the same as against none: the row this
+        # names has just been deleted, and `daemon_event.daemon_id` cascades, so
+        # an event recorded against it would be removed by the statement above.
+        # `daemon_id` is nullable for exactly this. The most destructive action
+        # in the API was the one action the status panel could not show.
+        edit.record(None, "warning", "deleted", f"the rack {row['name']!r} was deleted")
     log.info("a daemon was deleted", extra={"daemon": daemon_id})
     return Deleted(deleted=daemon_id)
+
+
+def _credentials_of(connection: sqlite3.Connection, daemon_id: int) -> list[int]:
+    """The `secret` rows this rack's integrations are the only reference to."""
+    return [
+        int(row["secret_id"])
+        for row in connection.execute(
+            "SELECT secret_id FROM integration WHERE daemon_id = ? AND secret_id IS NOT NULL",
+            (daemon_id,),
+        )
+    ]
 
 
 @router.post("/daemons/{daemon_id}/command")
@@ -260,6 +310,14 @@ async def push_now(request: Request, response: Response, daemon_id: int) -> Push
     version equals the one it believes it is running with an ack and no apply,
     so re-sending the number the daemon is lying about would be answered exactly
     as the skip was. A number it has never seen cannot be deduped.
+
+    `delivered` is about the send and not about the socket. A rack whose
+    committed configuration is unservable has no snapshot to send, so nothing is
+    attempted -- and `hub.is_online` is true of it anyway, which is how this
+    answered `{"version": 2, "delivered": true}` with nothing on the wire. This
+    is the one button that exists to dig a blank rack out of a stuck state, so it
+    is the last place that may claim a success that did not happen; the 202 and
+    `UNSERVABLE_HEADER` beside it say why.
     """
     async with change(request, response) as edit:
         one_row(
@@ -272,7 +330,7 @@ async def push_now(request: Request, response: Response, daemon_id: int) -> Push
         edit.record(daemon_id, "info", "push", "the configuration was pushed by hand")
     return Pushed(
         version=edit.versions[daemon_id],
-        delivered=request.app.state.hub.is_online(daemon_id),
+        delivered=edit.delivered.get(daemon_id, False),
     )
 
 

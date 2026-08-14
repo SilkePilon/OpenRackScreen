@@ -53,6 +53,17 @@ _KEY_CANDIDATES = "SELECT id, key_hash AS fingerprint FROM daemon WHERE key_hash
 
 
 def mint_token(database: Database, name: str) -> tuple[int, str]:
+    """Create a daemon record and a one-time token, on a connection of its own.
+
+    See `mint_token_on` for what it writes. This wrapper is for the callers with
+    no transaction to join, and it is the only difference between the two -- the
+    same pair, for the same reason, as `bump_config_version`.
+    """
+    with closing(database.connect()) as connection:
+        return mint_token_on(connection, name)
+
+
+def mint_token_on(connection: sqlite3.Connection, name: str) -> tuple[int, str]:
     """Create a daemon record and a one-time token. Only its hash is stored.
 
     Both halves of the return are needed by the one caller there will ever be:
@@ -64,14 +75,19 @@ def mint_token(database: Database, name: str) -> tuple[int, str]:
     `name` is unique in the schema, so a second daemon by the same name raises
     `sqlite3.IntegrityError` here. That is the API's to turn into a 409; it is
     not this function's business to decide what a name collision means.
+
+    On the caller's connection because the route that mints a rack records an
+    event for it in the same breath, and the two have to land or not land
+    together. Written on a connection of its own, a request that then failed
+    would leave a row holding a token nobody was ever shown, permanently
+    occupying the UNIQUE name so that every retry answered 409 -- with no event,
+    because the event was the thing that was rolled back.
     """
     token = secrets.token_urlsafe(TOKEN_BYTES)
-    with closing(database.connect()) as connection:
-        cursor = connection.execute(
-            "INSERT INTO daemon (name, token_hash, status, created_at)"
-            " VALUES (?, ?, 'unpaired', ?)",
-            (name, _fingerprint(token), datetime.now(UTC).isoformat()),
-        )
+    cursor = connection.execute(
+        "INSERT INTO daemon (name, token_hash, status, created_at) VALUES (?, ?, 'unpaired', ?)",
+        (name, _fingerprint(token), datetime.now(UTC).isoformat()),
+    )
     return int(cursor.lastrowid), token
 
 
