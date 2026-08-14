@@ -75,6 +75,42 @@ def mint_token(database: Database, name: str) -> tuple[int, str]:
     return int(cursor.lastrowid), token
 
 
+def rotate_key(connection: sqlite3.Connection, daemon_id: int) -> str:
+    """Revoke a daemon's key and mint it a fresh pairing token. Returns the token.
+
+    The answer to a key read off a Pi. `mint_token` only INSERTs and
+    `daemon.name` is UNIQUE, so before this the only way to invalidate a key was
+    to delete the row -- which cascades the rack's screens away, making the
+    recovery from a leak indistinguishable from starting again.
+
+    **One statement, and it clears the key rather than merely overwriting it.**
+    The schema's `CHECK (token_hash IS NULL OR key_hash IS NULL)` refuses a row
+    holding both, so an UPDATE that wrote only `token_hash` would raise
+    `IntegrityError` -- which is exactly what that constraint is for, since this
+    is the code most likely to leave a live key beside a new token. The daemon
+    socket tries the key before the token, so such a row would have gone on
+    authenticating the leaked credential while the interface showed a fresh one.
+
+    `status` goes back to `unpaired` and `paired_at` with it: the row is now in
+    the state a rack that has never been paired is in, which is true, and the
+    interface reads that column to decide what to offer.
+
+    On the caller's connection because rotating is an edit like any other and
+    belongs in the same transaction as the event that records it -- and because
+    a rotation that committed while the request went on to fail would be a key
+    revoked for a change nobody made.
+    """
+    token = secrets.token_urlsafe(TOKEN_BYTES)
+    row = connection.execute(
+        "UPDATE daemon SET key_hash = NULL, token_hash = ?, status = 'unpaired', paired_at = NULL"
+        " WHERE id = ? RETURNING id",
+        (_fingerprint(token), daemon_id),
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"no daemon {daemon_id}")
+    return token
+
+
 def claim_token(database: Database, token: str) -> tuple[int, str] | None:
     """Spend a pairing token; return whose it was and the key that replaces it.
 

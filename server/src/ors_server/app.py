@@ -11,6 +11,12 @@ from fastapi.responses import JSONResponse
 
 from ors_server import __version__
 from ors_server.api.auth import router as auth_router
+from ors_server.api.daemons import router as daemons_router
+from ors_server.api.integrations import query_prometheus
+from ors_server.api.integrations import router as integrations_router
+from ors_server.api.screens import router as screens_router
+from ors_server.api.settings import router as settings_router
+from ors_server.api.templates import router as templates_router
 from ors_server.auth import Sessions, require_session
 from ors_server.db import Database
 from ors_server.link.hub import Hub
@@ -82,6 +88,10 @@ def create_app(settings: AppSettings) -> FastAPI:
         database, load_or_create_key(settings.data_dir, settings.secret_key)
     )
     app.state.hub = Hub()
+    # The one piece of outbound HTTP this server makes, held here rather than
+    # imported at its call site so a test can replace it with a function --
+    # which is the only way to exercise the Test button without binding a port.
+    app.state.probe = query_prometheus
 
     # Two routers under one prefix, and the difference is the whole access
     # control model: `api` carries the session dependency, so a route added to
@@ -100,6 +110,20 @@ def create_app(settings: AppSettings) -> FastAPI:
         return {"status": "ok", "version": __version__}
 
     public.include_router(auth_router)
+
+    # The configuration API, all of it on the guarded router. Nothing here says
+    # `Depends(require_session)`: `api` carries it, so a route added to any of
+    # these five files is guarded without anybody remembering to say so, and
+    # `test_auth.py`'s sweep is what fails if one is ever hung off `public`
+    # instead.
+    for configuration in (
+        daemons_router,
+        screens_router,
+        templates_router,
+        integrations_router,
+        settings_router,
+    ):
+        api.include_router(configuration)
 
     app.include_router(public)
     app.include_router(api)

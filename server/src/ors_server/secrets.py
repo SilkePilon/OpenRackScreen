@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import stat
 from contextlib import closing
 from pathlib import Path
@@ -98,10 +99,23 @@ class SecretStore:
         self._fernet = Fernet(key)
 
     def put(self, plaintext: str) -> int:
-        token = self._fernet.encrypt(plaintext.encode()).decode()
         with closing(self.database.connect()) as connection:
-            cursor = connection.execute("INSERT INTO secret (ciphertext) VALUES (?)", (token,))
-            return int(cursor.lastrowid)
+            return self.put_on(connection, plaintext)
+
+    def put_on(self, connection: sqlite3.Connection, plaintext: str) -> int:
+        """Store a credential on the caller's connection, and return its row id.
+
+        The configuration API writes a secret in the same transaction as the
+        integration row that references it, which is the only ordering that is
+        correct in both directions: a `put` on a connection of its own would be
+        a second writer against a database the edit has already locked, and if
+        it somehow got past that it would leave a ciphertext behind whenever the
+        edit that wanted it was rolled back -- unreachable through any route,
+        undeletable, and in every export of the database from then on.
+        """
+        token = self._fernet.encrypt(plaintext.encode()).decode()
+        cursor = connection.execute("INSERT INTO secret (ciphertext) VALUES (?)", (token,))
+        return int(cursor.lastrowid)
 
     def get(self, secret_id: int) -> str:
         """The plaintext. `KeyError` if the row is gone, `InvalidToken` if the key is wrong.
@@ -119,4 +133,8 @@ class SecretStore:
 
     def delete(self, secret_id: int) -> None:
         with closing(self.database.connect()) as connection:
-            connection.execute("DELETE FROM secret WHERE id = ?", (secret_id,))
+            self.delete_on(connection, secret_id)
+
+    def delete_on(self, connection: sqlite3.Connection, secret_id: int) -> None:
+        """Forget a credential on the caller's connection. See `put_on`."""
+        connection.execute("DELETE FROM secret WHERE id = ?", (secret_id,))
