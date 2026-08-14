@@ -28,7 +28,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from ors_schema.errors import first_error
 from ors_schema.link import MAX_WATCHED_SCREENS, Frame, FramesRequest
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.datastructures import State
 
 from ors_server.auth import require_session
@@ -66,6 +66,20 @@ starts evicting a four-panel refresh that arrived in one tick.
 """
 
 
+MAX_ROW_ID = 2**63 - 1
+"""The largest integer SQLite will take as a bind parameter.
+
+A bound on `screen_id` and not decoration. `int` is unbounded in Python and
+bounded in SQLite, and the two meet inside `sqlite3.execute`, which answers a
+larger one with `OverflowError: Python int too large to convert to SQLite
+INTEGER`. Measured. That is not a `ValidationError`, so it is not skipped the
+way an unreadable message is -- it leaves `_read`, leaves the handler, and takes
+the socket down with a traceback, on a message a browser chose. Refused as a
+malformed request instead, which is what it is: a screen id is a row id, and no
+row has ever had this one.
+"""
+
+
 class _Request(BaseModel):
     """What a browser is allowed to say. Everything else is skipped.
 
@@ -79,7 +93,7 @@ class _Request(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: Literal["subscribe", "unsubscribe"]
-    screen_id: int
+    screen_id: int = Field(ge=1, le=MAX_ROW_ID)
 
 
 @dataclass
@@ -131,6 +145,18 @@ async def ui_socket(socket: WebSocket) -> None:
         # The ordinary ending: the tab was closed, or the laptop was shut.
         log.debug("a browser socket closed")
     finally:
+        # The hub first, and before anything at all is awaited. A `finally`
+        # entered by cancellation raises again at every await inside it that a
+        # further cancel lands on -- a shutdown with a grace period is exactly
+        # two of those -- so an await above this line is a dead queue left
+        # subscribed for the life of the process. Even the `gather` below is
+        # such an await, which is why the release is not merely first among the
+        # awaits but before all of them.
+        #
+        # Safe despite the reader still being alive: there is no await between
+        # `_let_go` and the `cancel` below, so the reader cannot run in between
+        # and put a subscription back after this took them away.
+        released = _let_go(state, watcher)
         for task in tasks:
             task.cancel()
         if tasks:
@@ -138,7 +164,7 @@ async def ui_socket(socket: WebSocket) -> None:
             # without this a handler that ends for any reason leaves the other
             # half of itself parked on the loop -- one per tab ever opened.
             await asyncio.gather(*tasks, return_exceptions=True)
-        await _release(state, watcher)
+        await _tell_the_racks(state, released)
 
 
 async def _read(state: State, socket: WebSocket, watcher: _Watcher) -> None:
@@ -249,28 +275,40 @@ async def _arm(state: State, daemon_id: int) -> None:
     )
 
 
-async def _release(state: State, watcher: _Watcher) -> None:
-    """Give up everything this connection held, and re-arm the racks it had open.
+def _let_go(state: State, watcher: _Watcher) -> set[int]:
+    """Take this connection out of the hub. Returns the screens it was watching.
 
     The `finally` the hub cannot do for itself: it holds a queue, not a socket,
     so a closed tab is invisible to it and the rack goes on encoding WebP --
     burning a Pi's CPU on a browser that no longer exists -- until something
     says otherwise. Nothing else ever would.
 
-    Every line that touches the hub is synchronous and comes first, deliberately.
-    A cancelled handler -- server shutdown, or any outer deadline ever put around
-    this -- resumes its `finally` and raises at the first await, so an `await`
-    above these would leave a dead queue subscribed for the life of the process.
-    The sends afterwards are best-effort by comparison: a rack that misses one
-    is re-armed by `_resume_frames` on its next connect, and one that never
-    reconnects is not encoding anything anyway.
+    Deliberately synchronous, and the whole of what the handler must do before
+    it awaits anything on the way out. Cancellation is why: a `finally` entered
+    by a cancel raises again at any await a further cancel lands on, and this
+    running late is not a late release, it is no release.
+
+    Both halves matter and only one of them is visible from outside. The
+    subscriptions keep a rack encoding; the daemon watch is a queue the hub
+    holds forever, one per tab ever opened, and nothing downstream would ever
+    notice because the socket that would have read it is gone.
     """
     state.hub.unwatch_daemons(watcher.queue)
     screens = set(watcher.screens)
     for screen_id in screens:
         state.hub.unsubscribe_frames(screen_id, watcher.queue)
     watcher.screens.clear()
+    return screens
 
+
+async def _tell_the_racks(state: State, screens: set[int]) -> None:
+    """Re-state what is left to watch, to every rack this connection had open.
+
+    Best-effort by comparison with `_let_go`, and it is the ordering rather than
+    the sends that carries the guarantee: a rack that misses one of these is
+    re-armed by the daemon socket's `_resume_frames` on its next connect, and a
+    rack that never reconnects is not encoding anything to miss.
+    """
     for daemon_id in sorted(_daemons_of(state.database, screens)):
         await _arm(state, daemon_id)
 

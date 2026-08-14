@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from ors_schema.link import MAX_WATCHED_SCREENS, Frame
 from ors_server.app import AppSettings, create_app
+from ors_server.link import ws_ui
 from ors_server.link.ws_ui import WATCHER_QUEUE, ui_socket
 from ors_server.pairing import mint_token
 from starlette.testclient import WebSocketDenialResponse
@@ -329,6 +330,14 @@ async def test_a_rack_going_offline_is_pushed_too(tmp_path):
 
 
 async def test_a_closed_tab_stops_being_told_about_racks(tmp_path):
+    """Asserted against the hub's own set, because nothing else can see it.
+
+    Removing the `unwatch_daemons` changes nothing a browser could observe --
+    the writer is cancelled with the handler, so the queue that goes on being
+    filled is one nobody reads. What is left behind is a leak of one queue per
+    tab ever opened, for the life of the server, and this is the only assertion
+    that fails on it.
+    """
     app = build(tmp_path)
     daemon_id, _ = rack(app)
     browser, handler = await browsing(app)
@@ -336,7 +345,8 @@ async def test_a_closed_tab_stops_being_told_about_racks(tmp_path):
 
     Rack(app, daemon_id)
 
-    assert len(browser.messages) == 1, "a hub that keeps a dead queue leaks one per tab"
+    assert app.state.hub._daemon_watchers == set(), "one dead queue held per tab ever opened"
+    assert len(browser.messages) == 1
 
 
 # --- subscribing, and the rule that makes a rack canvas work ----------------
@@ -460,6 +470,31 @@ async def test_two_tabs_watching_one_screen_both_see_it(tmp_path):
 
     assert (await first.next_frame())["seq"] == 4
     assert (await second.next_frame())["seq"] == 4
+    await finish(first, first_handler)
+    await finish(second, second_handler)
+
+
+async def test_a_second_tab_on_the_same_screen_still_re_states_the_whole_set(tmp_path):
+    """The hub answers "were you the first?" and this module deliberately does
+    not ask, which is a decision no other test here can tell apart -- a second
+    watcher of an already-watched screen changes the set not at all, so skipping
+    the request sends a rack exactly what it already had.
+
+    Pinned because the alternative is a memory of what each rack was last told,
+    and that is state which goes wrong precisely when a daemon reconnects having
+    forgotten everything. Restating costs a few dozen bytes and cannot.
+    """
+    app = build(tmp_path)
+    daemon_id, screens = rack(app)
+    pi = Rack(app, daemon_id)
+    first, first_handler = await browsing(app)
+    second, second_handler = await browsing(app)
+
+    for browser in (first, second):
+        browser.say(action="subscribe", screen_id=screens[0])
+        await browser.handled()
+
+    assert [request["screen_ids"] for request in pi.requests] == [screens, screens]
     await finish(first, first_handler)
     await finish(second, second_handler)
 
@@ -622,6 +657,63 @@ async def test_a_cancelled_handler_still_releases_its_subscriptions(tmp_path):
     assert app.state.hub.watched_screens() == set()
 
 
+async def test_a_handler_cancelled_at_every_turn_still_releases_its_subscriptions(tmp_path):
+    """One cancel is not the case the ordering exists for, and it took a mutant
+    to say so: a `CancelledError` is delivered at the await the task is parked
+    on, and the `finally` then runs to completion undisturbed, so an extra
+    `await` inside it changes nothing. It is the *second* cancel -- a shutdown
+    with a grace period, an `asyncio.wait_for` around this handler -- that
+    raises again at the first await in the unwind.
+
+    Cancelling until the task is done delivers one at every await point there
+    is, which is the strongest form of the question: does anything survive
+    being interrupted wherever it can be? The hub bookkeeping must, because a
+    subscription that outlives its socket is a Pi encoding WebP forever.
+    """
+    app = build(tmp_path)
+    daemon_id, screens = rack(app, screens=3)
+    Rack(app, daemon_id)
+    browser, handler = await browsing(app)
+    for screen_id in screens:
+        browser.say(action="subscribe", screen_id=screen_id)
+    await browser.handled()
+
+    while not handler.done():
+        handler.cancel()
+        await asyncio.sleep(0)
+
+    assert app.state.hub.watched_screens() == set()
+    assert app.state.hub._daemon_watchers == set()
+
+
+async def test_a_handler_that_fails_outright_still_stops_the_rack(tmp_path, monkeypatch):
+    """A bug in this module must not cost a Pi its CPU for the rest of the day.
+
+    Every other test here ends the socket the way a browser does. This one ends
+    it the way a defect does -- an exception that is not a `WebSocketDisconnect`,
+    escaping the reader -- and the obligation is the same: the hub lets go, and
+    the rack is told, before the failure goes anywhere.
+    """
+    app = build(tmp_path)
+    daemon_id, screens = rack(app, screens=2)
+    pi = Rack(app, daemon_id)
+    browser, handler = await browsing(app)
+    browser.say(action="subscribe", screen_id=screens[0])
+    await browser.handled()
+
+    monkeypatch.setattr(ws_ui, "_daemon_of", _explode)
+    browser.say(action="subscribe", screen_id=screens[1])
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(handler, PROMPTLY)
+
+    assert app.state.hub.watched_screens() == set()
+    assert pi.asked_for == (False, []), "a rack must not go on encoding for a handler that died"
+
+
+def _explode(database, screen_id: int) -> int | None:
+    raise RuntimeError("something this module does not expect")
+
+
 async def test_a_disconnect_mid_stream_does_not_take_another_tab_with_it(tmp_path):
     app = build(tmp_path)
     daemon_id, screens = rack(app)
@@ -709,6 +801,25 @@ def test_pydantic_s_own_serialisation_is_the_thing_this_socket_must_not_send():
         base64.b64decode(emitted, validate=True)
 
 
+async def test_a_frame_whose_length_needs_padding_keeps_it(tmp_path):
+    """`WEBP` is six bytes, so it encodes to a multiple of four and no test
+    above says anything about padding at all. A real WebP is any length."""
+    app = build(tmp_path)
+    daemon_id, screens = rack(app)
+    Rack(app, daemon_id)
+    browser, handler = await browsing(app)
+    browser.say(action="subscribe", screen_id=screens[0])
+    await browser.handled()
+    odd = WEBP + b"\xfe"
+
+    await relay(app, screens[0], seq=1, webp=odd)
+
+    payload = (await browser.next_frame())["webp"]
+    assert payload.endswith("=="), "an unpadded payload is not what this claims to send"
+    assert base64.b64decode(payload, validate=True) == odd
+    await finish(browser, handler)
+
+
 # --- a slow or broken tab ---------------------------------------------------
 
 
@@ -786,6 +897,33 @@ async def test_a_message_this_socket_does_not_understand_is_skipped(tmp_path, me
     await finish(browser, handler)
 
 
+@pytest.mark.parametrize("screen_id", [2**63, 10**30, -(2**63) - 1, -(10**30), 0, -1])
+async def test_a_screen_id_no_row_could_have_is_refused_rather_than_looked_up(tmp_path, screen_id):
+    """An id past SQLite's range is not an unknown screen, it is an
+    `OverflowError` from inside `sqlite3.execute` -- measured, `Python int too
+    large to convert to SQLite INTEGER`. That is not a `ValidationError`, so
+    nothing skips it: it leaves the reader, leaves the handler, and takes the
+    socket down over a message a browser chose.
+
+    Both ends of the range, because the overflow is about magnitude and not
+    about sign: a bound written as `le` alone lets `-10**30` through to exactly
+    the same crash. The two ordinary refusals -- `0` and `-1` -- are here to say
+    the bound is on what a row id can be rather than on what SQLite can hold.
+    """
+    app = build(tmp_path)
+    daemon_id, screens = rack(app)
+    pi = Rack(app, daemon_id)
+    browser, handler = await browsing(app)
+
+    browser.say(action="subscribe", screen_id=screen_id)
+    browser.say(action="subscribe", screen_id=screens[0])
+    await browser.handled()
+
+    assert pi.asked_for == (True, screens), "the socket has to survive it, not just refuse it"
+    assert app.state.hub.watched_screens() == set(screens)
+    await finish(browser, handler)
+
+
 async def test_an_unreadable_message_says_which_field_in_the_log(tmp_path, caplog):
     app = build(tmp_path)
     rack(app)
@@ -836,6 +974,25 @@ async def test_the_rack_that_is_too_big_is_named_in_the_log(tmp_path, caplog):
         await browser.handled()
 
     assert [record.daemon for record in caplog.records] == [daemon_id]
+    await finish(browser, handler)
+
+
+async def test_a_rack_with_exactly_as_many_screens_as_are_allowed_is_left_alone(tmp_path, caplog):
+    """The case that says which side of the bound the truncation sits on, and
+    the only one that can: at `MAX + 1` an off-by-one truncates to the same list
+    and logs an error nobody reads, so it passes either way."""
+    app = build(tmp_path)
+    daemon_id, screens = rack(app, screens=MAX_WATCHED_SCREENS)
+    pi = Rack(app, daemon_id)
+    browser, handler = await browsing(app)
+
+    with caplog.at_level(logging.ERROR, logger="ors_server.link.ws_ui"):
+        for screen_id in screens:
+            browser.say(action="subscribe", screen_id=screen_id)
+        await browser.handled()
+
+    assert pi.asked_for == (True, sorted(screens))
+    assert caplog.records == [], "a rack at the bound is not a rack over it"
     await finish(browser, handler)
 
 
