@@ -75,16 +75,19 @@ def add_screen(client: TestClient, daemon_id: int, *, name: str = "CPU", positio
     return client.post("/api/screens", json=body).json()["id"]
 
 
-def add_integration(client: TestClient, daemon_id: int, *, name: str = "prom", credential: str):
-    """A disabled integration holding a credential, which is the only kind M3a
-    allows one on -- see `_credential_has_somewhere_to_go`."""
+def add_integration(
+    client: TestClient, daemon_id: int, *, name: str = "prom", credential: str | None = None
+):
+    """An integration, disabled when it holds a credential -- which is the only
+    kind M3a allows one on, see `_credential_has_somewhere_to_go`."""
     body = {
         "daemon_id": daemon_id,
         "name": name,
         "config": {"url": "http://prom.local:9090", "fields": {"cpu": {"query": "up"}}},
-        "credential": credential,
-        "enabled": False,
+        "enabled": credential is None,
     }
+    if credential is not None:
+        body["credential"] = credential
     return client.post("/api/integrations", json=body).json()["id"]
 
 
@@ -304,6 +307,22 @@ def test_deleting_a_daemon_forgets_the_credentials_of_its_integrations(client, d
     client.delete(f"/api/daemons/{daemon_id}")
 
     assert secrets_in(client) == []
+
+
+def test_deleting_a_daemon_whose_integration_holds_no_credential_is_not_an_error(client, daemon_id):
+    """The commonest rack there is, and the one the credential sweep can break.
+
+    `integration.secret_id` is nullable and most rows leave it null, so a sweep
+    that collected every integration's `secret_id` rather than only the ones
+    that are set hands `None` where a row id belongs -- and deleting an ordinary
+    rack becomes a 500.
+    """
+    add_integration(client, daemon_id)
+
+    deleted = client.delete(f"/api/daemons/{daemon_id}")
+
+    assert deleted.status_code == 200
+    assert client.get("/api/integrations").json() == []
 
 
 def test_deleting_a_daemon_keeps_another_racks_credentials(client, daemon_id):
