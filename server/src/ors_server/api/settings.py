@@ -107,6 +107,24 @@ def _write(connection: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
+def _stored(connection: sqlite3.Connection) -> dict[str, str]:
+    """The readable settings, and nothing else the table happens to hold.
+
+    A function of its own so the allow-list has something a test can look at.
+    `SettingsView` is what keeps a foreign key out of a *response* today, and no
+    assertion about a response can tell the two lines apart -- so asserted at
+    this one, which is what stops the leak the day somebody builds a response
+    from this dict, one obvious refactor away.
+    """
+    return {
+        row["key"]: row["value"]
+        for row in connection.execute(
+            f"SELECT key, value FROM setting WHERE key IN ({','.join('?' * len(READABLE))})",  # noqa: S608 - names from READABLE
+            READABLE,
+        )
+    }
+
+
 def _view(connection: sqlite3.Connection) -> SettingsView:
     """What is stored, with the defaults `DaemonConfig` would have used.
 
@@ -115,13 +133,7 @@ def _view(connection: sqlite3.Connection) -> SettingsView:
     one place writes a default, and a second copy would be an interface showing
     a night window the rack is not keeping.
     """
-    stored = {
-        row["key"]: row["value"]
-        for row in connection.execute(
-            f"SELECT key, value FROM setting WHERE key IN ({','.join('?' * len(READABLE))})",  # noqa: S608 - names from READABLE
-            READABLE,
-        )
-    }
+    stored = _stored(connection)
     night = NightWindow.model_validate(json.loads(stored["night"])) if "night" in stored else None
     return SettingsView(
         # The schema's default, read off the field rather than repeated: an
