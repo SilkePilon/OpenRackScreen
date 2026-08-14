@@ -512,6 +512,47 @@ def test_one_unreadable_column_does_not_make_the_screen_list_unloadable(client_a
     assert next(s for s in listed.json() if s["id"] == kept)["params"] == {"title": "CPU"}
 
 
+def test_the_daemon_list_survives_an_assembly_that_recurses(client_and_daemon, monkeypatch):
+    """`_json_column` turns the reachable case into a `SnapshotError`, so this
+    drives the guard behind it: anything *else* in the assembly that recurses
+    over a document a hand-edited database can make arbitrarily deep. It is the
+    outer net, and a net is only there for what got past the first one -- so it
+    is asserted by injection rather than left to a path that happens not to
+    exist today."""
+    client, daemon_id = client_and_daemon
+
+    def too_deep(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr("ors_server.api.changes.build_snapshot", too_deep)
+
+    listed = client.get("/api/daemons")
+
+    assert listed.status_code == 200
+    stuck = next(daemon for daemon in listed.json() if daemon["id"] == daemon_id)
+    assert stuck["config_error"] and "deep" in stuck["config_error"]
+
+
+def test_an_edit_survives_an_assembly_that_recurses_anywhere(client_and_daemon, monkeypatch):
+    """The same net at `_servable`, which is the question "was this rack already
+    broken". Escaping there makes the *edit* a 500 -- so the repair would be
+    refused along with everything else, which is the trap the whole branch
+    exists to avoid."""
+    client, daemon_id = client_and_daemon
+    screen_id = create(client, daemon_id)["id"]
+    make_unservable(client, daemon_id)
+
+    def too_deep(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr("ors_server.api.changes.build_snapshot", too_deep)
+
+    saved = client.patch(f"/api/screens/{screen_id}", json={"rotation": 90})
+
+    assert saved.status_code == 202, "already broken, so saved and not pushed rather than refused"
+    assert saved.headers[UNSERVABLE_HEADER] == str(daemon_id)
+
+
 def test_an_edit_to_a_rack_with_an_unreadable_column_is_still_saved(client_and_daemon):
     """The trap this closes from the other side: the rack is unservable, so the
     edit is saved and not pushed rather than refused -- which is what makes the
@@ -595,6 +636,29 @@ def test_one_broken_rack_does_not_make_every_racks_edit_read_as_unapplied(client
     assert reordered.status_code == 200, "the healthy rack was pushed, so this was applied"
     assert reordered.headers[UNSERVABLE_HEADER] == str(broken)
     assert rack.pushes, "and the rack that could be reached really was"
+
+
+def test_the_racks_are_named_in_a_settled_order(client):
+    """One edit may name screens on several racks, so the header may name
+    several -- and it is read by an interface, not by a person. Ascending row id,
+    which is the contract M3b is given, rather than whatever order the racks
+    were reached in.
+
+    The screens are named in the reorder highest rack first, so the request's
+    own order is the opposite of the answer's.
+    """
+    lower = client.post("/api/daemons", json={"name": "one-rack"}).json()["id"]
+    higher = client.post("/api/daemons", json={"name": "two-rack"}).json()["id"]
+    assert lower < higher, "the fixture proves nothing if these are the same way round"
+    on_higher = create(client, higher, name="A", position=3)["id"]
+    on_lower = create(client, lower, name="B", position=4)["id"]
+    make_unservable(client, higher)
+    make_unservable(client, lower)
+
+    reordered = client.post("/api/screens/reorder", json={"ids": [on_higher, on_lower]})
+
+    assert reordered.status_code == 202
+    assert reordered.headers[UNSERVABLE_HEADER] == f"{lower},{higher}"
 
 
 def test_an_edit_no_rack_at_all_received_is_the_one_that_is_a_202(client):

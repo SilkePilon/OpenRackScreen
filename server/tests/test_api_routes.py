@@ -409,13 +409,18 @@ def test_the_change_check_reads_code_rather_than_prose():
     assert opens_a_change(only_talks_about_it) is False
 
 
-ROUTER_MODULES = sorted(
-    # `rglob`, because `glob("*.py")` was the top level only: an `api/`
-    # subpackage -- which is the obvious shape the moment one of these files
-    # needs splitting -- would have been swept by nothing at all.
-    str(path.relative_to(API_PACKAGE))
-    for path in API_PACKAGE.rglob("*.py")
-)
+def router_modules(package: Path) -> list[str]:
+    """Every module in the router package, subpackages included.
+
+    A function so the recursion is testable. It was `glob("*.py")`, the top
+    level only, so an `api/` subpackage -- the obvious shape the moment one of
+    these files needs splitting -- would have been swept by nothing at all, with
+    the sweep below still green because it iterated the files that were left.
+    """
+    return sorted(str(path.relative_to(package)) for path in package.rglob("*.py"))
+
+
+ROUTER_MODULES = router_modules(API_PACKAGE)
 
 NOT_A_ROUTER = ("changes.py", "__init__.py")
 """`changes.py` is the mechanism being enforced, and `__init__.py` is empty."""
@@ -450,6 +455,17 @@ def test_no_router_bumps_or_pushes_on_its_own(module):
 def test_the_routers_swept_are_the_routers_there_are():
     """A parametrised sweep over an empty list is a green test that ran nothing."""
     assert set(ROUTER_MODULES) >= {"daemons.py", "screens.py", "templates.py", "settings.py"}
+
+
+def test_a_router_in_a_subpackage_is_swept_too(tmp_path):
+    """The sweep above is over the files that exist today, so it stays green
+    whether or not it recurses. This is the half that says it does -- and the
+    subpackage is the shape the day one of these files is split in two."""
+    (tmp_path / "extra").mkdir()
+    (tmp_path / "top.py").write_text("")
+    (tmp_path / "extra" / "nested.py").write_text("")
+
+    assert router_modules(tmp_path) == ["extra/nested.py", "top.py"]
 
 
 def _names_used(source: str) -> set[str]:
