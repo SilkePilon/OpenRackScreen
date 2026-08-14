@@ -145,7 +145,16 @@ class Hub:
             self._announce()
         return connection
 
-    def drop(self, connection: Connection) -> None:
+    def drop(self, connection: Connection) -> bool:
+        """Take this connection out of the hub. True if it was the live one.
+
+        The return is what lets a caller tell "the rack has gone" from "this
+        handler's socket was superseded and the rack is fine". Both arrive here,
+        and they are the same call from the handler's point of view -- it cannot
+        know which it is, because the guard below is the only thing that does.
+        `ws_daemon` needs the difference in order not to write "the link closed"
+        into the history of a rack that is online and streaming.
+        """
         connection.closed.set()
         # Identity, not the id: a handler whose socket was replaced still runs
         # its own cleanup, and it arrives here holding a connection the hub
@@ -154,7 +163,7 @@ class Hub:
         # unplugged, and every push would be dropped as unsendable, seconds
         # after it reconnected.
         if self._connections.get(connection.daemon_id) is not connection:
-            return
+            return False
         del self._connections[connection.daemon_id]
         # Nothing is left to answer for this daemon, and the last version it
         # confirmed is not evidence about the one it will be running when it
@@ -166,6 +175,7 @@ class Hub:
         # streaming frames -- the same failure the guard exists for, arriving at
         # the interface instead of at a push.
         self._announce()
+        return True
 
     def is_online(self, daemon_id: int) -> bool:
         return daemon_id in self._connections

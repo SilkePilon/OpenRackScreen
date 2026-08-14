@@ -807,3 +807,88 @@ def test_the_newest_events_are_the_ones_kept(client, daemon_id):
 
 def mint(client: TestClient, name: str) -> str:
     return client.post("/api/daemons", json={"name": name}).json()["token"]
+
+
+# --- what the rack says it is running, beside what the server minted ---------
+
+
+def test_a_rack_that_has_confirmed_nothing_reports_no_applied_version(client, daemon_id):
+    """None is "no rack has told me", which is honest and is not "old".
+
+    It is what an offline rack, a rack that has not answered its first push, and
+    a rack that has just reconnected all report -- and the interface has to be
+    able to say "unknown" rather than painting a version the server invented as
+    though the glass agreed with it.
+    """
+    listing = listed(client, daemon_id)
+
+    assert listing["applied_version"] is None
+    assert listing["config_version"] == 0
+
+
+def test_the_version_a_rack_acked_is_reported_apart_from_the_one_the_server_minted(
+    client, daemon_id
+):
+    """The whole point of the field, and the failure it closes.
+
+    `Hub.acked_version` had no production caller at all: task 7 built the
+    identity guard, the clear-on-register and the "None means ask again"
+    contract, and the answer terminated in a dictionary nobody read. So a rack
+    that refused an edit showed a green dot and the new version in every open
+    tab while its panels went on drawing the old one -- a stale image the
+    interface reported as current, with the person who saved the edit told
+    nothing.
+    """
+    rack = Rack(client, daemon_id)
+    add_screen(client, daemon_id)
+    pushed = listed(client, daemon_id)["config_version"]
+    client.app.state.hub.record_ack(rack.connection, pushed)
+
+    assert listed(client, daemon_id)["applied_version"] == pushed
+
+    add_screen(client, daemon_id, name="MEM", position=5)
+    listing = listed(client, daemon_id)
+
+    assert listing["config_version"] > pushed, "the server minted a new one"
+    assert listing["applied_version"] == pushed, "and the rack is still running the old one"
+
+
+def test_an_ack_from_a_socket_the_hub_has_replaced_is_not_reported(client, daemon_id):
+    """The identity guard, seen from the route. A superseded handler is still a
+    reader, and the ack it is holding was read from a socket the daemon has
+    already left -- reported, it would describe the previous boot of a Pi that
+    has just rebooted with no configuration at all."""
+    superseded = Rack(client, daemon_id)
+    Rack(client, daemon_id)
+
+    client.app.state.hub.record_ack(superseded.connection, 7)
+
+    assert listed(client, daemon_id)["applied_version"] is None
+
+
+def test_a_reconnect_forgets_what_the_previous_socket_confirmed(client, daemon_id):
+    """`register` clears it, and this is that decision made visible.
+
+    Which is also why the ack stays in the hub rather than being written to the
+    row: a persisted one is a claim about a rack the server is no longer holding
+    a socket for, and the case it is wrong in -- a re-imaged Pi coming back with
+    nothing -- is exactly the case a person is looking at the page to diagnose.
+    A daemon that reconnects re-acks, so the field refills from the rack itself.
+    """
+    first = Rack(client, daemon_id)
+    client.app.state.hub.record_ack(first.connection, 3)
+    assert listed(client, daemon_id)["applied_version"] == 3
+
+    Rack(client, daemon_id)
+
+    assert listed(client, daemon_id)["applied_version"] is None
+
+
+def test_an_offline_rack_reports_no_applied_version(client, daemon_id):
+    rack = Rack(client, daemon_id)
+    client.app.state.hub.record_ack(rack.connection, 3)
+    client.app.state.hub.drop(rack.connection)
+
+    listing = listed(client, daemon_id)
+    assert listing["online"] is False
+    assert listing["applied_version"] is None

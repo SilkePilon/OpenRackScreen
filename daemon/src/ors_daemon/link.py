@@ -607,6 +607,7 @@ class LinkClient(threading.Thread):
             self.connected = True
             self._last_beat = self._clock()
             log.info("link up", extra={"server": url, "config_version": self.config_version})
+            self._reack(connection)
             self._serve(connection)
         except LinkClosed as closed:
             # The server said why, and two of the reasons are not "try again".
@@ -638,6 +639,46 @@ class LinkClient(threading.Thread):
                     connection.close()
                 except Exception:
                     log.debug("closing a dead socket failed")
+
+    def _reack(self, connection: Any) -> None:
+        """Say what this rack is actually running, on every connect. Second, after hello.
+
+        The other half of spec section 8's "daemons reconnect and re-ack their
+        version. Nothing is re-pushed if the versions already match." Only the
+        second sentence was built: the server compares `Hello.config_version`,
+        skips the push on a match, and is then holding no evidence at all --
+        `Hub.register` cleared what this daemon had last confirmed, and a
+        skipped push is a push there is nothing to ack. So after every
+        reconnect, and a wifi blip is a reconnect, the server could report what
+        it had minted and nothing about what was on the glass.
+
+        The claim in the hello is not that evidence and is not being promoted to
+        it: it may still only ever *skip* a push, which is what stops a daemon
+        talking its way out of a configuration. This is the same fact said in
+        the message the server treats as an answer, so that the interface can
+        tell "pushed" from "applied".
+
+        *After the hello and never before it.* The server authenticates and
+        registers on the hello, and `register` is what clears the previous ack --
+        one arriving first would be read on an unidentified socket and then
+        cleared by the connect it belongs to.
+
+        *Not on the connect that spends a pairing token.* `ws_daemon._push_for`
+        refuses to believe the claim there and says why: at the moment a token is
+        spent, the server knows outright that it has given this daemon nothing,
+        so there is nothing for an ack to be about. Judged on holding a key
+        rather than on anything the server says, because this end has to decide
+        before it has heard back.
+
+        *Nothing at all when the daemon is running nothing.* None is "I have no
+        configuration", and acking 0 would be the mistake `Hello.config_version`
+        documents in the other direction -- 0 is a real version and the one an
+        empty server counts from.
+        """
+        version = self.config_version
+        if version is None or self.settings.key is None:
+            return
+        self._send(connection, Ack(config_version=version))
 
     def run(self) -> None:
         """Connect, serve, wait, repeat, until stopped. Nothing gets out of here.
@@ -775,12 +816,26 @@ class LinkClient(threading.Thread):
     def _config(self, connection: Any, push: ConfigPush) -> None:
         """Apply a pushed configuration, or say why not. Always answers.
 
-        The skip is what stops a reconnect from repainting a rack that is
-        already showing the right thing, and it is safe because the server never
-        mints one version for two configurations: `bump_config_version` moves the
-        counter on every edit. The ack is sent either way -- the server clears
+        **The skip below is defence, not a handshake.** It used to be described
+        as the thing that stops a reconnect repainting a rack that is already
+        showing the right thing, and that is not where the skipping happens: the
+        server decides it, at hello, in `ws_daemon._push_for`, which answers None
+        when the claimed version matches the row. No production path reaches
+        here with a version this daemon already runs. Every push out of
+        `changes.change` carries a number `bump_config_version_on` has just
+        minted, which is by construction one this rack has never seen;
+        `POST /api/daemons/{id}/push` bumps deliberately, precisely so that its
+        push *cannot* be deduped away here; and the pairing connect -- the one
+        connect on which the server pushes without believing the claim -- is
+        preceded by a `Paired` that sets `config_version` to None, which matches
+        no integer.
+
+        So it is kept for what it costs nothing to keep: a version the server
+        repeated by accident would otherwise be a full teardown and repaint of
+        four panels. The ack still goes out either way, because the answer to a
+        push is an ack whether or not there was work in it -- the server clears
         what it believes a daemon has confirmed on every connect, so silence
-        here reads as "still hasn't got it" and buys another push next time.
+        here would read as "still hasn't got it" and buy another push next time.
         """
         if push.version == self.config_version:
             log.info("already running this configuration", extra={"version": push.version})

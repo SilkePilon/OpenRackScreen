@@ -1736,3 +1736,96 @@ def test_a_command_off_the_wire_paints_a_real_racks_panels(tmp_path: Path) -> No
         assert [worker.current_scene for worker in supervisor.workers] == ["identify"]
     finally:
         supervisor.stop()
+
+
+# --- the re-ack on reconnect ------------------------------------------------
+
+
+def keyed(tmp_path: Path) -> LinkSettings:
+    """A daemon that has already been paired, which is every connect but the first."""
+    return LinkSettings(
+        server_url="http://server:8080", cache_path=tmp_path / "cache.json", key="k9"
+    )
+
+
+def test_a_paired_daemon_re_acks_the_version_it_is_running_on_every_connect(
+    tmp_path: Path,
+) -> None:
+    """Spec section 8: "daemons reconnect and re-ack their version. Nothing is
+    re-pushed if the versions already match."
+
+    Only half of that was built. The server compares `Hello.config_version` and
+    skips the push on a match, which is the second sentence -- but a skipped
+    push is a push there is nothing to ack, and `Hub.register` has just cleared
+    what this daemon had confirmed. So after any reconnect, and a wifi blip is a
+    reconnect, the server knew nothing at all about what the rack was running:
+    `GET /api/daemons` reported the version it had minted, beside a green dot,
+    over a rack that might be showing something else entirely.
+
+    The claim in the hello may only ever *skip* a push, which is deliberate and
+    stays that way. This is the separate statement -- "and this is what I am
+    running" -- said in the one message the server treats as evidence.
+    """
+    client, socket = make(tmp_path, [], settings=keyed(tmp_path), config_version=5)
+
+    client.tick_once()
+
+    assert [type(message) for message in said(socket)] == [Hello, Ack]
+    assert only(socket, Ack)[0].config_version == 5
+
+
+def test_a_daemon_running_nothing_re_acks_nothing(tmp_path: Path) -> None:
+    """None is "I have no configuration", which is not a version to confirm.
+
+    Acking 0 instead would be the mistake `Hello.config_version` documents at
+    length in the other direction: 0 is a real version and the one an empty
+    server counts from.
+    """
+    client, socket = make(tmp_path, [], settings=keyed(tmp_path), config_version=None)
+
+    client.tick_once()
+
+    assert only(socket, Ack) == []
+
+
+def test_the_connect_that_spends_a_pairing_token_re_acks_nothing(tmp_path: Path) -> None:
+    """The one connect on which the claim is not admissible at all.
+
+    `ws_daemon._push_for` refuses to believe `Hello.config_version` on a pairing
+    for the same reason, and spells it out: at the moment a token is spent the
+    server knows outright that it has given this daemon nothing. An ack arriving
+    there would be recorded as evidence about a configuration this server never
+    sent, and only corrected a round trip later when the pairing push landed.
+    """
+    settings = LinkSettings(
+        server_url="http://server:8080", cache_path=tmp_path / "cache.json", token="tok"
+    )
+    client, socket = make(tmp_path, [], settings=settings, config_version=5)
+
+    client.tick_once()
+
+    assert [type(message) for message in said(socket)] == [Hello]
+
+
+def test_the_re_ack_follows_the_hello_and_never_precedes_it(tmp_path: Path) -> None:
+    """The server authenticates on the hello and registers on it, and `register`
+    is what clears the previous ack. One arriving first would be read on an
+    unidentified socket and then cleared by the connect it belongs to."""
+    client, socket = make(tmp_path, [push(7)], settings=keyed(tmp_path), config_version=5)
+
+    client.tick_once()
+
+    kinds = [type(message) for message in said(socket)]
+    assert kinds.index(Hello) == 0
+    assert kinds[1] is Ack
+
+
+def test_a_re_ack_is_not_a_second_ack_for_a_push_that_follows_it(tmp_path: Path) -> None:
+    """A push that really arrives is applied and acked on its own number, which
+    is what tells the server the edit landed. The re-ack said what was running
+    before it."""
+    client, socket = make(tmp_path, [push(7)], settings=keyed(tmp_path), config_version=5)
+
+    client.tick_once()
+
+    assert [message.config_version for message in only(socket, Ack)] == [5, 7]

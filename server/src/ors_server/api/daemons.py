@@ -62,6 +62,43 @@ class DaemonView(BaseModel):
     status: str
     online: bool
     config_version: int
+    """The generation counter this server has minted for this rack's configuration.
+
+    What was *sent*, or would be. Read beside `applied_version`, never instead of
+    it: on its own it is a number the server invented, and reporting it as though
+    the glass agreed with it is exactly the stale image this pair exists to make
+    visible.
+    """
+    applied_version: int | None
+    """The `config_version` this rack has confirmed applying, or None if unknown.
+
+    The other half of the only question a person asks about an edit they just
+    saved: did the Pi apply what I sent? `config_version` alone cannot answer it
+    -- a rack that nacked a snapshot, or that never received one, reports the
+    version the server minted and goes on drawing the previous configuration,
+    which is a stale image the interface reports as current.
+
+    **None is "no rack has told me", not "old".** It is what an offline rack, a
+    rack that has not yet answered its first push, and a rack that has just
+    reconnected all report, and the honest rendering of it is "unknown".
+
+    **Read from the hub and deliberately not stored on the row.** An ack is
+    evidence about a socket the server is holding *now*, and `Hub.register`
+    clears it on every connect precisely because a Pi that reboots comes back
+    with nothing while the server still remembers it confirming version 7.
+    Writing it to the row would put that stale claim back, and would do it in
+    the one case somebody is reading this page to diagnose. It would also need
+    invalidating from `rotate-key`, from `delete`, and from anything else that
+    changes what a rack is -- a second source of truth for a question only the
+    socket can answer.
+
+    What that costs is a server restart: the hub starts empty, so every rack
+    reads unknown until it says otherwise. It says otherwise within one backoff,
+    because a daemon re-acks the version it is running on every connect (see
+    `ors_daemon.link.LinkClient._reack`, and spec section 8's "daemons reconnect
+    and re-ack their version"). Refilled from the racks is a better answer than
+    remembered from before the restart, because it is true.
+    """
     config_error: str | None
     """Why this rack cannot be given a configuration, or None because it can.
 
@@ -461,6 +498,7 @@ def _view(state: State, row: sqlite3.Row) -> DaemonView:
         status=row["status"],
         online=state.hub.is_online(int(row["id"])),
         config_version=int(row["config_version"]),
+        applied_version=state.hub.acked_version(int(row["id"])),
         config_error=config_error(state, int(row["id"])),
         version=row["version"],
         capabilities=_capabilities(row),

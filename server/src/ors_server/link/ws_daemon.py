@@ -23,6 +23,7 @@ from ors_schema.link import (
 from pydantic import ValidationError
 from starlette.datastructures import State
 
+from ors_server.api.changes import write_event
 from ors_server.db import Database
 from ors_server.link.hub import Connection
 from ors_server.pairing import authenticate_key, claim_token
@@ -137,8 +138,20 @@ async def daemon_socket(socket: WebSocket) -> None:
         # The ordinary ending, not an error: a Pi rebooted, or the wifi went.
         log.info("a daemon socket closed", extra={"daemon": getattr(session, "daemon_id", None)})
     finally:
-        if session is not None:
-            state.hub.drop(session.connection)
+        # Only when this socket was still the live one, which is what `drop`
+        # answers. A superseded handler runs its own cleanup seconds after the
+        # rack reconnected, and a disconnect recorded there would put "the link
+        # closed" into the history of a rack that is online and streaming --
+        # the same wrong answer the hub's identity guard exists to keep out of
+        # the interface, arriving by another road.
+        if session is not None and state.hub.drop(session.connection):
+            _record(
+                state.database,
+                session.daemon_id,
+                "info",
+                "disconnected",
+                "the link to this rack closed",
+            )
 
 
 async def _hello(state: State, socket: WebSocket) -> _Session | None:
@@ -252,6 +265,20 @@ async def _hello(state: State, socket: WebSocket) -> _Session | None:
         # same wreckage, and re-raising keeps it a cancel.
         state.hub.drop(session.connection)
         raise
+    # Last, so that a connect this function then abandoned records nothing --
+    # and so a `disconnected` never appears without the `connected` it belongs
+    # to. What the rack *claims* to be running goes in it because that is the
+    # fact that decided whether it was pushed to at all, and it is otherwise
+    # only in a log line.
+    _record(
+        database,
+        daemon_id,
+        "info",
+        "connected",
+        f"the rack connected, running configuration version {first.config_version}"
+        if first.config_version is not None
+        else "the rack connected, running no configuration",
+    )
     return session
 
 
@@ -421,6 +448,19 @@ async def _handle(state: State, session: _Session, message: DaemonMessage) -> No
                 "reason": message.reason,
             },
         )
+        # And in the rack's own history, which is the difference between the
+        # person who saved the edit finding out and a line in a container's log
+        # nobody is tailing. The reason travels because it is the only part of
+        # this anyone can act on -- it names the field or the row that would not
+        # validate -- and the version because a nack for a push two edits ago
+        # says something quite different from one for the edit just saved.
+        _record(
+            state.database,
+            session.daemon_id,
+            "error",
+            "nack",
+            f"the rack refused configuration version {message.config_version}: {message.reason}",
+        )
     elif isinstance(message, Frame):
         # The refusal is logged inside `_owns`, which is the only thing that
         # knows how many frames a single line is standing for.
@@ -535,6 +575,34 @@ def _record_hello(database: Database, daemon_id: int, hello: Hello) -> None:
                 daemon_id,
             ),
         )
+
+
+def _record(database: Database, daemon_id: int, level: str, kind: str, message: str) -> None:
+    """One line of this rack's history, on a connection of this socket's own.
+
+    The ring buffer is `changes.write_event`'s, shared rather than copied: a
+    rack in a reconnect loop writes two of these a lap, which is precisely the
+    traffic `MAX_EVENTS_PER_DAEMON` exists to bound, and a second implementation
+    of that bound is the one that gets forgotten.
+
+    **What gets one, and what deliberately does not.** A nack, a connect and a
+    disconnect: between them they are the whole of what happens to a rack that
+    the API's own events cannot describe, and each of them is a thing a person
+    looking at a stale panel needs in order to tell "the edit never left" from
+    "the rack refused it" from "the rack was not there". `SourceStatus` gets
+    none, and the reason is that no daemon sends one -- the message type exists
+    in the schema with no producer anywhere in `ors_daemon`, so an event for it
+    would put a category into the status panel that can never appear. It belongs
+    with whatever first sends one.
+
+    A synchronous SQLite write on the event loop, like `_touch` and
+    `_record_hello` beside it, and bounded by the same argument: these are per
+    connect, per disconnect and per refused snapshot, which is a Pi rebooting
+    rather than a rate. Frames, which are a rate, are excluded from `_touch` for
+    exactly that reason and get nothing here either.
+    """
+    with closing(database.connect()) as connection:
+        write_event(connection, daemon_id, level, kind, message)
 
 
 def _touch(database: Database, daemon_id: int) -> None:

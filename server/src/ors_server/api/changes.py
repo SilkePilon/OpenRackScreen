@@ -105,6 +105,44 @@ a paragraph belongs.
 """
 
 
+def write_event(
+    connection: sqlite3.Connection, daemon_id: int | None, level: str, kind: str, message: str
+) -> None:
+    """Append one line of a rack's history and prune the ring, on this connection.
+
+    A function rather than a method, because there are two callers with nothing
+    else in common and only one of them is an edit. `Change.record` writes on the
+    transaction it is rolling back or committing; `ors_server.link.ws_daemon`
+    writes on a connection of its own, for things that happen to a rack rather
+    than to a row -- a connect, a disconnect, a snapshot the rack refused. None
+    of those is a mutation, none of them may be rolled back by one, and all of
+    them belong in the same list a person reads.
+
+    The ring is what makes it one function rather than two similar ones. It is
+    the same bound (`MAX_EVENTS_PER_DAEMON`), per rack, and a second copy of it
+    is the copy that is forgotten -- a rack in a reconnect loop writes two of
+    these a lap, which is exactly the traffic the ring exists for.
+
+    `daemon_id` may be None for an event about a rack that has just been
+    deleted. Nothing is pruned in that case: the rows share no rack, so there is
+    no per-rack window to hold them to.
+    """
+    connection.execute(
+        "INSERT INTO daemon_event (daemon_id, at, level, kind, message) VALUES (?, ?, ?, ?, ?)",
+        (daemon_id, datetime.now(UTC).isoformat(), level, kind, message),
+    )
+    if daemon_id is None:
+        return
+    # The oldest go, and "oldest" is by row id rather than by `at`: the
+    # timestamp is a string a clock change can move backwards, and the id is
+    # the order they were really written in.
+    connection.execute(
+        "DELETE FROM daemon_event WHERE daemon_id = ? AND id NOT IN"
+        " (SELECT id FROM daemon_event WHERE daemon_id = ? ORDER BY id DESC LIMIT ?)",
+        (daemon_id, daemon_id, MAX_EVENTS_PER_DAEMON),
+    )
+
+
 @dataclass
 class Change:
     """One edit in flight: a connection to write on, and who has to hear about it."""
@@ -171,20 +209,7 @@ class Change:
         On the transaction deliberately: an event describing an edit that was
         then refused is a history of something that never happened.
         """
-        self.connection.execute(
-            "INSERT INTO daemon_event (daemon_id, at, level, kind, message) VALUES (?, ?, ?, ?, ?)",
-            (daemon_id, datetime.now(UTC).isoformat(), level, kind, message),
-        )
-        if daemon_id is None:
-            return
-        # The oldest go, and "oldest" is by row id rather than by `at`: the
-        # timestamp is a string a clock change can move backwards, and the id is
-        # the order they were really written in.
-        self.connection.execute(
-            "DELETE FROM daemon_event WHERE daemon_id = ? AND id NOT IN"
-            " (SELECT id FROM daemon_event WHERE daemon_id = ? ORDER BY id DESC LIMIT ?)",
-            (daemon_id, daemon_id, MAX_EVENTS_PER_DAEMON),
-        )
+        write_event(self.connection, daemon_id, level, kind, message)
 
     def daemons(self) -> list[int]:
         if self._daemons is not None:

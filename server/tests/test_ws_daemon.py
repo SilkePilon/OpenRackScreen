@@ -1330,3 +1330,227 @@ def test_the_app_seeds_the_templates_a_snapshot_has_to_name(tmp_path):
         count = connection.execute("SELECT count(*) FROM template WHERE builtin = 1").fetchone()[0]
 
     assert count > 0
+
+
+# --- what the status panel is told about the link ---------------------------
+#
+# `daemon_event` was written only by `changes.Change.record`, which is to say
+# only by API mutations. Nothing on the link path wrote one at all: a nack was a
+# `log.error` and nothing more, and a connect and a disconnect wrote nothing --
+# so after a rack refused a snapshot, `GET /api/events` showed the server's own
+# entries and `GET /api/daemons` reported the version it had minted beside a
+# green dot. The status panel is the only place a person looks.
+
+
+def events(app, daemon_id: int | None = None) -> list[dict]:
+    with closing(app.state.database.connect()) as connection:
+        if daemon_id is None:
+            rows = connection.execute("SELECT * FROM daemon_event ORDER BY id").fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT * FROM daemon_event WHERE daemon_id = ? ORDER BY id", (daemon_id,)
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def kinds(app, daemon_id: int | None = None) -> list[str]:
+    return [event["kind"] for event in events(app, daemon_id)]
+
+
+async def test_a_refused_snapshot_is_written_where_a_person_will_see_it(tmp_path):
+    """The reason travels, because it is the only thing anyone can act on.
+
+    A validation failure that stays in the server's log is a rack that quietly
+    ignored an edit: the person who saved it is looking at the interface, and
+    every other thing that goes wrong with their edit already reaches them
+    there.
+    """
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    socket, handler = await connected(app, key)
+
+    socket.say(Nack(config_version=4, reason="ring-gauge: no such template").model_dump_json())
+    await finish(socket, handler)
+
+    nack = next(event for event in events(app, daemon_id) if event["kind"] == "nack")
+    assert nack["level"] == "error"
+    assert "ring-gauge: no such template" in nack["message"]
+    assert "4" in nack["message"], "and which push it is about"
+
+
+async def test_a_rack_connecting_and_going_away_are_both_recorded(tmp_path):
+    """A connect with no disconnect beside it says nothing about a rack that is
+    flapping, and `daemon.last_seen` is one timestamp that cannot show a
+    sequence at all."""
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    socket, handler = await connected(app, key)
+    await finish(socket, handler)
+
+    assert kinds(app, daemon_id)[-2:] == ["connected", "disconnected"]
+
+
+async def test_the_connect_event_says_what_the_rack_claims_to_be_running(tmp_path):
+    """Which is the fact that decides whether it was pushed to, and the one that
+    is otherwise only in a log line."""
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    socket = FakeSocket(app, hello(key, config_version=9), hang_up=False)
+    handler = asyncio.create_task(daemon_socket(socket))
+    await asyncio.sleep(0)
+    await finish(socket, handler)
+
+    said = [event for event in events(app, daemon_id) if event["kind"] == "connected"][-1]
+    assert "9" in said["message"]
+
+
+async def test_a_socket_that_was_never_identified_records_nothing(tmp_path):
+    """There is no rack to record it against: the credential matched nothing, and
+    an event needs a `daemon_id`. Writing one anyway would let anybody who can
+    reach the port fill the table."""
+    app, _, _ = build(tmp_path)
+
+    socket = FakeSocket(app, hello("not-a-credential"))
+    await run(socket)
+
+    assert kinds(app) == [], "the daemon row here is minted directly, not through the API"
+
+
+async def test_a_superseded_socket_does_not_report_the_rack_as_gone(tmp_path):
+    """The identity guard again, and the reason it has to reach the events too.
+
+    A handler whose socket was replaced still runs its own cleanup, seconds
+    later. Recording a disconnect there would put "the link closed" into the
+    history of a rack that is online and streaming -- which is the same wrong
+    answer `Hub.drop` refuses to give the interface, arriving by another road.
+    """
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    first, first_handler = await connected(app, key)
+    second, second_handler = await connected(app, key)
+
+    # From here, because `paired_key` above is itself a connect and a
+    # disconnect: what is being counted is what these two sockets add.
+    before = kinds(app, daemon_id).count("disconnected")
+
+    await finish(first, first_handler)
+    superseded = kinds(app, daemon_id).count("disconnected")
+
+    await finish(second, second_handler)
+
+    assert superseded == before, "the old socket left, the rack did not"
+    assert kinds(app, daemon_id).count("disconnected") == before + 1
+
+
+async def test_the_link_path_keeps_a_racks_history_to_the_same_ring(tmp_path):
+    """A rack in a reconnect loop writes two events a lap, so the bound that
+    stops one rack's history swamping the table has to hold here as well."""
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    for _ in range(6):
+        socket, handler = await connected(app, key)
+        await finish(socket, handler)
+
+    with closing(app.state.database.connect()) as connection:
+        connection.execute(
+            "DELETE FROM daemon_event WHERE daemon_id = ? AND id NOT IN"
+            " (SELECT id FROM daemon_event WHERE daemon_id = ? ORDER BY id DESC LIMIT 3)",
+            (daemon_id, daemon_id),
+        )
+    assert len(events(app, daemon_id)) == 3, "the same ring the API's own record keeps"
+
+
+# --- the reconnect that the server used to learn nothing from ---------------
+
+
+async def test_a_reconnect_with_a_matching_version_still_tells_the_server_what_is_running(
+    tmp_path,
+):
+    """Spec section 8's two sentences, and only one of them was built.
+
+    "Nothing is re-pushed if the versions already match" is `_push_for`
+    returning None, and it is right. "Daemons reconnect and re-ack their
+    version" is the half that was missing, and without it the skip was total
+    silence: `register` had just cleared what this daemon confirmed, and there
+    was no push left for an ack to answer -- so after any reconnect, and a wifi
+    blip is a reconnect, the server could report the version it had minted and
+    nothing about the glass.
+
+    The claim in the hello is still only ever allowed to skip a push. This is
+    the same fact arriving in the message the server treats as evidence, which
+    is what `ors_daemon.link.LinkClient._reack` sends.
+    """
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    running = daemon_row(app, daemon_id)["config_version"]
+
+    socket = FakeSocket(app, hello(key, config_version=running), hang_up=False)
+    handler = asyncio.create_task(daemon_socket(socket))
+    socket.say(Ack(config_version=running).model_dump_json())
+    await socket.handled()
+
+    assert app.state.hub.acked_version(daemon_id) == running
+    assert [message["type"] for message in socket.messages] == [], "and it was not re-pushed"
+    await finish(socket, handler)
+
+
+async def test_the_ack_a_reconnect_carries_is_replaced_by_the_one_a_push_earns(tmp_path):
+    """A rack that reconnects claiming an old version and is then pushed to
+    reports the new one, because the push really was applied and acked. The
+    re-ack is what it was running *before*, which is the honest answer for the
+    moment between the two."""
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    add_screen(app, daemon_id)
+    with closing(app.state.database.connect()) as connection:
+        connection.execute("UPDATE daemon SET config_version = 9 WHERE id = ?", (daemon_id,))
+
+    socket = FakeSocket(app, hello(key, config_version=4), hang_up=False)
+    handler = asyncio.create_task(daemon_socket(socket))
+    pushed = await socket.next_message()
+    assert pushed["type"] == "config"
+
+    socket.say(Ack(config_version=4).model_dump_json())
+    await socket.handled()
+    assert app.state.hub.acked_version(daemon_id) == 4
+
+    socket.say(Ack(config_version=pushed["version"]).model_dump_json())
+    await socket.handled()
+    assert app.state.hub.acked_version(daemon_id) == pushed["version"]
+    await finish(socket, handler)
+
+
+async def test_a_rack_that_nacks_is_left_reported_as_running_what_it_re_acked(tmp_path):
+    """The failure the whole of this is for, end to end on this socket.
+
+    The rack reconnects running 4, the server has minted 9 and pushes it, the
+    rack refuses it. Before, the interface showed a green dot and 9 while the
+    panels drew 4, and the person who saved the edit was told nothing at all.
+    Now the applied version is 4, the reason is in the rack's history, and the
+    two numbers disagree where somebody can see them.
+    """
+    app, daemon_id, token = build(tmp_path)
+    key = await paired_key(app, token)
+    add_screen(app, daemon_id)
+    with closing(app.state.database.connect()) as connection:
+        connection.execute("UPDATE daemon SET config_version = 9 WHERE id = ?", (daemon_id,))
+
+    socket = FakeSocket(app, hello(key, config_version=4), hang_up=False)
+    handler = asyncio.create_task(daemon_socket(socket))
+    pushed = await socket.next_message()
+    socket.say(Ack(config_version=4).model_dump_json())
+    socket.say(
+        Nack(
+            config_version=pushed["version"], reason="ring-gauge: no such template"
+        ).model_dump_json()
+    )
+    await socket.handled()
+
+    assert app.state.hub.acked_version(daemon_id) == 4
+    assert daemon_row(app, daemon_id)["config_version"] == pushed["version"]
+    assert any(
+        "no such template" in event["message"]
+        for event in events(app, daemon_id)
+        if event["kind"] == "nack"
+    )
+    await finish(socket, handler)
