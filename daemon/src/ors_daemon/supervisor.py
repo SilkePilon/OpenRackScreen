@@ -205,6 +205,44 @@ this is built for -- four panels, so at most three kept -- fits inside the budge
 with room, and large enough that the guard is a real one rather than a formality.
 """
 
+IDENTIFY_BUDGET = 1.0
+"""How long an identify may spend getting hold of the panels, in seconds -- in total.
+
+One deadline for the rack, taken once, for the reason every other deadline here
+is shared: how many screens there are is the server's decision, so a timeout each
+is multiplied by a number this module does not choose.
+
+It needs one at all because of where it runs. `Supervisor.identify` answers a
+`Command` off the link, on the link's own thread -- the thread that reads the
+socket, sends the heartbeat and consults the stop event -- and a worker wedged
+inside an SPI write never gives its tick lock up. An unbounded identify is
+therefore a rack that can never be reconfigured again, in exchange for a digit.
+
+A second rather than three, because unlike `APPLY_BUDGET` nothing about the rack
+depends on this finishing: an identify that misses a panel has painted no digit
+on it, which is a press of the button that did not take and is retried by
+pressing it again. It is deliberately well under `APPLY_BUDGET`, so an identify
+arriving in the middle of nothing at all can never be the reason a SIGTERM is
+late.
+"""
+
+_IDENTIFY_PER_SCREEN = 0.25
+"""What one panel is promised out of `IDENTIFY_BUDGET`, in seconds.
+
+`_BUS_GUARD_PER_SCREEN`'s measurement, for the same reason and against the same
+lock: a whole tick -- read, render, and clock ~115 KiB out at 40 MHz -- is tens
+of milliseconds on a Pi 3B+, so a worker that is merely busy always hands its
+panel over inside a quarter of a second and one that does not is wedged and
+never will. A separate constant rather than the same one because the two answer
+to different budgets and a rack that grew a fifth panel would want them to move
+apart.
+
+Per screen rather than "whatever is left", which is exactly the defect
+`BUS_GUARD_BUDGET` was split out to fix: one wedged worker spending the lot
+means every panel after it is offered nothing and the last screens of a rack are
+never numbered.
+"""
+
 SOURCE_TEARDOWN_BUDGET = 12.0
 """How long the reaper may spend taking one retired integration down, in seconds.
 
@@ -853,6 +891,63 @@ class Supervisor:
             except BaseException:
                 self._config, self._config_fingerprint, self._screens = previous
                 raise
+
+    def identify(self, screen_id: int | None = None) -> int:
+        """Paint each panel's ordinal on it, now. Returns how many took the digit.
+
+        The running rack's answer to `Command(command="identify")`, and the one
+        command of the four that means something against a supervisor that is
+        already driving panels: `sleep` and `wake` are what the night window and
+        `ScreenConfig.sleep_override` are, and a rack whose configuration comes
+        from the server has nothing to `reload` that `POST /api/daemons/{id}/push`
+        does not already do.
+
+        *`screen_id` is the server's row id, and None is the whole rack.* Nothing
+        else identifies a screen -- `name` and `position` are unique over nothing
+        in the schema -- and a screen carrying no id is one no server has ever
+        named, so it is not addressable and is skipped rather than guessed at. A
+        `screen_id` this rack does not have paints nothing and says so; painting
+        the whole rack instead would be `identify` lighting up panels nobody
+        asked about.
+
+        *The ordinal is the screen's `position`*, which is what
+        `__main__._identify` paints and what the printed map is keyed by. Two
+        commands numbering the same panel differently would make the map useless.
+
+        *It is bounded, and per panel.* See `IDENTIFY_BUDGET`: this runs on the
+        link thread, and a worker wedged inside an SPI write never gives its tick
+        lock up. A panel that will not come free is counted as not painted, which
+        is what the caller reports.
+
+        Under `_shutdown_lock` like `tick` and `apply`, because it walks
+        `_slots` -- an apply is swapping that list and the panels behind it, and
+        a digit painted into the middle of one lands on a backend that is about
+        to be slept and closed. The lock ordering is the one `_off_the_bus`
+        already establishes: this lock first, then a worker's tick lock, never
+        the other way.
+        """
+        with self._shutdown_lock:
+            if self._stopped:
+                # The panels are slept and their serial devices closed by now,
+                # and on a GC9A01 a command written to one that has been torn
+                # down is a write to nothing. The same check `apply` makes.
+                return 0
+            remaining = _deadline(IDENTIFY_BUDGET, self._shutdown_clock)
+            painted = 0
+            for slot in self._slots:
+                if screen_id is not None and slot.screen.config.id != screen_id:
+                    continue
+                worker = slot.worker
+                if worker is None:
+                    # An open panel nothing was ever started on. There is no
+                    # thread to draw the digit and no lock to take.
+                    continue
+                if worker.identify(
+                    str(slot.screen.config.position),
+                    timeout=min(_IDENTIFY_PER_SCREEN, remaining()),
+                ):
+                    painted += 1
+            return painted
 
     def _skip_open(self, screen: ResolvedScreen) -> None:
         """Record a panel that was not opened because its bus was not guarded.

@@ -20,11 +20,14 @@ from typing import Any
 
 import pytest
 import yaml
-from ors_daemon.__main__ import DEFAULT_LINK_PATH, _frame_pump, main
-from ors_daemon.config import load_cached_snapshot
+from ors_daemon.__main__ import DEFAULT_LINK_PATH, _command_handler, _frame_pump, main
+from ors_daemon.clock import system_clock
+from ors_daemon.config import load_cached_snapshot, resolve_screens
 from ors_daemon.frames import FramePump, FrameStream
+from ors_daemon.snapshot import SnapshotStore
+from ors_daemon.supervisor import Supervisor
 from ors_schema.daemon import DaemonConfig
-from ors_schema.link import FramesRequest
+from ors_schema.link import Command, FramesRequest
 from PIL import Image
 
 SNAPSHOT: dict[str, Any] = {
@@ -80,6 +83,7 @@ class RecordingSupervisor:
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
         self.applied: list[DaemonConfig] = []
+        self.identified: list[int | None] = []
         self.ran = 0
         self.stops = 0
         # A real `Supervisor` publishes this so that everything it does not own
@@ -95,6 +99,10 @@ class RecordingSupervisor:
 
     def apply(self, config: DaemonConfig) -> None:
         self.applied.append(config)
+
+    def identify(self, screen_id: int | None = None) -> int:
+        self.identified.append(screen_id)
+        return 0
 
 
 class _Flag:
@@ -796,3 +804,132 @@ def test_a_pump_that_will_not_start_leaves_the_rack_drawing(
 
 def _raises(*args: Any, **kwargs: Any) -> None:
     raise RuntimeError("can't start new thread")
+
+
+# --- commands ---------------------------------------------------------------
+
+
+def test_a_command_from_the_server_reaches_the_running_supervisor(tmp_path: Path) -> None:
+    """The wire that was never joined. `LinkClient` was built with `on_snapshot`,
+    `on_frames_request` and `on_link_down` and no `on_command` at all, so
+    `_dispatch` logged "nothing is listening for this" and the API's
+    `POST /api/daemons/{id}/command` answered `{"delivered": true}` for a message
+    that reached no supervisor -- a button that lies by a different road from the
+    one its own docstring reasons about.
+    """
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+
+    handler = FakeLink.instances[0].kwargs["on_command"]
+    assert handler is not None
+    handler(Command(command="identify", screen_id=None))
+    assert RecordingSupervisor.instances[-1].identified == [None]
+
+
+class _RealRack:
+    """A real `Supervisor` over virtual panels, for the handler's own tests.
+
+    A double that only recorded the call would prove the handler was called and
+    nothing about what each command *means* against a rack that is driving
+    panels -- which is the whole question, since three of the four turn out to
+    mean nothing here at all.
+    """
+
+    def __init__(self, tmp_path: Path, screens: int = 2) -> None:
+        raw = {
+            "version": 1,
+            "timezone": "UTC",
+            "night": {"enabled": False},
+            "integrations": [],
+            "screens": [
+                {
+                    "id": position * 10,
+                    "name": f"S{position}",
+                    "position": position,
+                    "display": {"backend": "virtual", "out_dir": str(tmp_path / "panels")},
+                    "template": "text-only",
+                    "params": {"line1": "x"},
+                }
+                for position in range(1, screens + 1)
+            ],
+        }
+        config = DaemonConfig.model_validate(raw)
+        self.supervisor = Supervisor(
+            config=config,
+            screens=resolve_screens(config),
+            store=SnapshotStore(),
+            clock=system_clock("UTC"),
+            status_path=tmp_path / "status.json",
+        )
+        self.supervisor.start()
+        self.handler = _command_handler(self.supervisor)
+
+    def scenes(self) -> list[str | None]:
+        return [worker.current_scene for worker in self.supervisor.workers]
+
+
+def test_identify_off_the_link_paints_the_ordinals_on_a_real_rack(tmp_path: Path) -> None:
+    rack = _RealRack(tmp_path)
+    try:
+        rack.handler(Command(command="identify"))
+
+        assert rack.scenes() == ["identify", "identify"]
+    finally:
+        rack.supervisor.stop()
+
+
+def test_identify_off_the_link_can_name_one_panel(tmp_path: Path) -> None:
+    rack = _RealRack(tmp_path)
+    try:
+        rack.handler(Command(command="identify", screen_id=20))
+
+        assert rack.scenes()[1] == "identify"
+        assert rack.scenes()[0] != "identify"
+    finally:
+        rack.supervisor.stop()
+
+
+@pytest.mark.parametrize("command", ["sleep", "wake", "reload"])
+def test_a_command_this_build_cannot_honour_says_so_and_touches_nothing(
+    tmp_path: Path, command: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The three that have no honest meaning against a running supervisor.
+
+    `sleep` and `wake` are what the night window and `ScreenConfig.sleep_override`
+    already are, and deciding which of a transient command and a persistent
+    configuration field wins is a design question rather than a wiring one;
+    `reload` has nothing to reload, because a paired rack's configuration comes
+    from the server and `POST /api/daemons/{id}/push` is how it is re-sent. The
+    server refuses all three, so nothing this daemon is talking to can send one
+    -- but a newer server or a replayed message can, and the answer is a line
+    somebody can act on rather than silence.
+    """
+    rack = _RealRack(tmp_path)
+    try:
+        before = rack.scenes()
+        with caplog.at_level("WARNING"):
+            rack.handler(Command(command=command))
+
+        assert rack.scenes() == before
+        assert [record.command for record in caplog.records if hasattr(record, "command")] == [
+            command
+        ]
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_command_arriving_while_the_daemon_stops_touches_no_panel(tmp_path: Path) -> None:
+    """The panels are slept and their serial devices closed by then, and on a
+    GC9A01 a command written to one that has been torn down is a write to
+    nothing. `_dispatch` runs on the thread the stop event is consulted on, so
+    the message really can arrive here."""
+    rack = _RealRack(tmp_path)
+    rack.supervisor.stop()
+    before = rack.scenes()
+
+    rack.handler(Command(command="identify"))
+
+    assert rack.scenes() == before
+    assert "identify" not in before

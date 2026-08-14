@@ -45,6 +45,7 @@ from typing import Any
 
 from ors_render import RenderContext, render_screen
 from ors_schema.daemon import DaemonConfig, DisplayConfig
+from ors_schema.link import Command
 
 from ors_daemon.clock import Clock, ClockError, system_clock
 from ors_daemon.config import (
@@ -503,6 +504,14 @@ def _link(
             stop=supervisor.stop_event,
             clock=clock,
             config_version=version,
+            # Without this `_dispatch` logs "nothing is listening for this" and
+            # the server's `POST /api/daemons/{id}/command` answers
+            # `{"delivered": true}` for a message no supervisor ever sees --
+            # which is the button that lies its own route reasons at length
+            # about not being. See `_command_handler` for what each of the four
+            # commands means against a rack that is already driving panels, and
+            # for which three of them mean nothing.
+            on_command=_command_handler(supervisor),
             # Handled on the link's own thread, which is what it is for: it
             # replaces a set and clamps a number, and nothing behind it encodes
             # or draws. See `FrameStream.request` on why the message is
@@ -520,6 +529,61 @@ def _link(
         log.exception("could not start the link; this rack runs from what it already has")
         return None
     return client
+
+
+def _command_handler(supervisor: Supervisor) -> Callable[[Command], None]:
+    """What the running rack does with a `Command`. Raises nothing worth catching.
+
+    A named function taking the supervisor rather than a closure written at the
+    call site, so that what each command means is testable against a real rack
+    instead of only through a `run` that stands both ends in for.
+
+    **Only `identify` means anything here, and the other three are refused
+    rather than approximated.** That is the honest shape of M3a, and the reason
+    per command is worth having in one place:
+
+    - `identify` paints each panel's ordinal on it, which is exactly what
+      somebody standing at the rack needs in order to map a physical panel to a
+      line of the configuration -- and it is the one command the milestone's
+      definition of done names. `Supervisor.identify` is the whole of it.
+
+    - `sleep` and `wake` already exist, as configuration. A panel sleeps because
+      it is inside `DaemonConfig.night` or a screen's own
+      `ScreenConfig.sleep_override`, and `ScreenWorker.tick` decides that on
+      every lap from the clock. A transient command would need new state on the
+      render loop that the night check consults, and then a rule for which of
+      the two wins, whether a push clears it, and whether it survives the
+      watchdog replacing a worker. Those are design questions, not wiring, and
+      the spec puts sleep in the inspector's Sleep tab -- which is the
+      configuration field, not this.
+
+    - `reload` has nothing to reload. A paired rack's configuration comes from
+      the server, and re-sending it is `POST /api/daemons/{id}/push`, which
+      exists and mints a fresh version precisely so a rack cannot dedupe it
+      away. Re-reading the local YAML would put the rack back on a document the
+      server is no longer the source of truth for.
+
+    The server refuses all three, so nothing this daemon is paired with can send
+    one. This still answers, because the protocol carries four values and a
+    newer server, an older cache or a replayed message can produce any of them:
+    a warning naming the command is something an operator can act on, where
+    silence is the state this function was written to end.
+    """
+
+    def handle(command: Command) -> None:
+        if command.command == "identify":
+            painted = supervisor.identify(command.screen_id)
+            log.info(
+                "identified this rack's panels",
+                extra={"screen": command.screen_id, "panels": painted},
+            )
+            return
+        log.warning(
+            "the server sent a command this daemon does not implement; nothing was done",
+            extra={"command": command.command, "screen": command.screen_id},
+        )
+
+    return handle
 
 
 def _boot(

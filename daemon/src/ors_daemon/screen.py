@@ -219,26 +219,51 @@ class ScreenWorker(threading.Thread):
             self._seen_version = snapshot.version
             self._render_and_show(scene, name, context)
 
-    def identify(self, ordinal: str) -> None:
+    def identify(self, ordinal: str, timeout: float | None = None) -> bool:
         """Paint the panel's ordinal, now, from whatever thread asked for it.
 
-        `__main__._identify` is the only caller, and it calls this on a worker it
-        never starts -- there is no identify path through the supervisor, and a
-        running rack redraws over the digit within a tick. The lock is still
-        taken, because "from whatever thread" is the contract this offers and a
-        method that is only safe from one thread should say so instead.
+        True if the digit reached the glass. Returned rather than left to be
+        inferred from `renders`, because both callers have to *report*: the
+        setup wizard's `__main__._identify` prints a map of ordinal to panel and
+        a dark panel beside a printed line is a wrong answer, and
+        `Supervisor.identify` answers a command that came off the link, where
+        the person who pressed the button is looking at the server.
+
+        Two callers, two lock disciplines, and the difference is not cosmetic.
+        `__main__._identify` calls this on a worker it never starts -- there is
+        no loop to interleave with, so it waits for the lock and `None` means
+        exactly that. `Supervisor.identify` calls it on a *running* worker from
+        the link thread, which is the thread that reads the socket and consults
+        the stop event: an unbounded acquire there is a link parked for ever
+        behind a worker wedged inside an SPI write, which is the one failure
+        this whole module is arranged to prevent. So the wait is bounded and the
+        answer is returned rather than raised, exactly as `pause` does it.
 
         Deliberately not sticky: the next tick draws the screen's real scene
         again, because `_selected_scene` now reads `identify` and the change
         alone is a reason to render. The digit therefore stands for at most one
         loop wait, which is what someone counting panels in a rack needs.
         """
-        with self._lock:
+        if timeout is None:
+            self._lock.acquire()
+        elif not self._lock.acquire(timeout=max(0.0, timeout)):
+            return False
+        try:
             if self.faulted:
-                return
+                # A faulted panel is usually an unplugged one, and `_show`
+                # reaches the bus through the same `_command` that has already
+                # failed three times. `tick` refuses it for the same reason.
+                return False
             scene = self._system["identify"]
             context = RenderContext(data={"params": {"ordinal": ordinal}})
+            drawn = self.renders
             self._show(render_scene(scene, context), "identify")
+            # `_show` absorbs a backend that refuses the frame -- a render loop
+            # has to survive one -- so the counter is what says whether it
+            # landed, which is the same thing `__main__._identify` reads.
+            return self.renders > drawn
+        finally:
+            self._lock.release()
 
     def pause(self, timeout: float) -> bool:
         """Keep this worker off its panel until `resume`. True if it took.

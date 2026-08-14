@@ -470,11 +470,13 @@ def test_rotating_a_key_for_a_daemon_that_does_not_exist_is_a_404(client):
 def test_a_command_reaches_the_rack(client, daemon_id):
     rack = Rack(client, daemon_id)
 
-    sent = client.post(f"/api/daemons/{daemon_id}/command", json={"command": "wake"})
+    sent = client.post(f"/api/daemons/{daemon_id}/command", json={"command": "identify"})
 
     assert sent.status_code == 200
-
-    assert rack.of_type("command") == [{"type": "command", "command": "wake", "screen_id": None}]
+    assert sent.json() == {"delivered": True}
+    assert rack.of_type("command") == [
+        {"type": "command", "command": "identify", "screen_id": None}
+    ]
 
 
 def test_identify_carries_the_screen_it_is_meant_to_light_up(client, daemon_id):
@@ -518,11 +520,11 @@ def test_a_command_naming_a_screen_that_is_a_flag_is_refused(client, daemon_id):
 
 
 def test_a_command_for_the_whole_rack_still_names_no_screen(client, daemon_id):
-    """The other half: `None` is an absence, not a flag, and `sleep` with no
-    screen is the commonest command there is."""
+    """The other half: `None` is an absence, not a flag, and numbering every
+    panel at once is what `identify` is usually for."""
     rack = Rack(client, daemon_id)
 
-    sent = client.post(f"/api/daemons/{daemon_id}/command", json={"command": "sleep"})
+    sent = client.post(f"/api/daemons/{daemon_id}/command", json={"command": "identify"})
 
     assert sent.status_code == 200
     assert rack.of_type("command")[-1]["screen_id"] is None
@@ -537,7 +539,103 @@ def test_a_command_nobody_defined_is_refused(client, daemon_id):
 
 
 def test_a_command_for_a_daemon_that_does_not_exist_is_a_404(client):
-    assert client.post("/api/daemons/4242/command", json={"command": "wake"}).status_code == 404
+    assert client.post("/api/daemons/4242/command", json={"command": "identify"}).status_code == 404
+
+
+@pytest.mark.parametrize("command", ["sleep", "wake", "reload"])
+def test_a_command_this_build_cannot_carry_out_says_so_instead_of_claiming_delivery(
+    client, daemon_id, command
+):
+    """The route's own docstring reasons that answering 200 would be a button
+    that lies, and then did -- by a different road.
+
+    `identify`, `sleep`, `wake` and `reload` were all sent down a socket whose
+    daemon had no handler for any of them, and all four were answered
+    `{"delivered": true}`. `identify` is now wired. The other three have no
+    mechanism behind them in M3a at all, and a 200 for one is the same lie the
+    409 for an offline rack exists to avoid: 501 is what "this server does not
+    implement that" is for, where 422 would blame the caller for a request that
+    is perfectly well formed.
+    """
+    rack = Rack(client, daemon_id)
+
+    refused = client.post(f"/api/daemons/{daemon_id}/command", json={"command": command})
+
+    assert refused.status_code == 501
+    assert rack.of_type("command") == [], "and nothing was put on the wire on the way to refusing"
+
+
+@pytest.mark.parametrize(
+    ("command", "instead"),
+    [("sleep", "sleep_override"), ("wake", "sleep_override"), ("reload", "/push")],
+)
+def test_the_refusal_names_the_thing_that_does_work(client, daemon_id, command, instead):
+    """A 501 that only says no leaves the reader looking for a button that is
+    never coming. Each of the three has a real mechanism beside it."""
+    refused = client.post(f"/api/daemons/{daemon_id}/command", json={"command": command})
+
+    assert instead in refused.json()["detail"]
+
+
+@pytest.mark.parametrize("command", ["sleep", "wake", "reload"])
+def test_a_command_this_build_cannot_carry_out_is_refused_before_anything_is_read(client, command):
+    """Whether this build implements `reload` has nothing to do with which rack
+    it was aimed at, so the answer may not depend on one existing. Otherwise the
+    same request answers 404 or 501 for reasons that are not about the command,
+    and a client cannot tell which of the two facts it has learned."""
+    assert client.post("/api/daemons/4242/command", json={"command": command}).status_code == 501
+
+
+def test_identify_for_a_screen_on_another_rack_is_refused(client, daemon_id):
+    """`Command.screen_id` is a row id in a table this rack does not own all of.
+
+    `not_a_flag` stops `true` addressing row 1; nothing stopped an honest
+    integer naming a screen that belongs to somebody else. The daemon ignores
+    one it does not have -- which is the second lie in the same answer, because
+    the route reported it delivered.
+    """
+    rack = Rack(client, daemon_id)
+    other = client.post("/api/daemons", json={"name": "other-rack"}).json()["id"]
+    theirs = add_screen(client, other)
+
+    refused = client.post(
+        f"/api/daemons/{daemon_id}/command",
+        json={"command": "identify", "screen_id": theirs},
+    )
+
+    assert refused.status_code == 404
+    assert rack.of_type("command") == []
+
+
+def test_identify_for_a_screen_that_does_not_exist_at_all_is_refused(client, daemon_id):
+    rack = Rack(client, daemon_id)
+
+    refused = client.post(
+        f"/api/daemons/{daemon_id}/command",
+        json={"command": "identify", "screen_id": 4242},
+    )
+
+    assert refused.status_code == 404
+    assert rack.of_type("command") == []
+
+
+def test_a_command_that_did_not_get_out_is_not_reported_as_delivered(client, daemon_id):
+    """`is_online` is about the socket, not the send -- which is exactly how
+    `POST /api/daemons/{id}/push` came to answer `delivered: true` with nothing
+    on the wire. A rack that is TCP-alive and no longer reading has its send
+    timed out and its socket dropped by the hub, and the button has to say so.
+    """
+
+    class Wedged(Rack):
+        async def send(self, payload: str | bytes) -> None:
+            raise ConnectionResetError("the Pi stopped reading")
+
+    Wedged(client, daemon_id)
+
+    sent = client.post(f"/api/daemons/{daemon_id}/command", json={"command": "identify"})
+
+    assert sent.status_code == 200
+    assert sent.json() == {"delivered": False}
 
 
 def test_a_command_does_not_bump_the_configuration(client, daemon_id):

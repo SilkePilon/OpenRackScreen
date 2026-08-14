@@ -16,7 +16,9 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
-from ors_daemon.clock import FakeClock
+from ors_daemon.__main__ import _command_handler
+from ors_daemon.clock import FakeClock, system_clock
+from ors_daemon.config import resolve_screens
 from ors_daemon.link import (
     BACKOFF_CAP_S,
     CLOSE_PROTOCOL_SKEW,
@@ -33,6 +35,8 @@ from ors_daemon.link import (
     websocket_url,
     write_link_settings,
 )
+from ors_daemon.snapshot import SnapshotStore
+from ors_daemon.supervisor import Supervisor
 from ors_schema.daemon import DaemonConfig
 from ors_schema.link import (
     PROTOCOL_VERSION,
@@ -66,6 +70,16 @@ CONFIG = {
         }
     ],
 }
+
+
+def DISPLAY(tmp_path: Path) -> dict[str, str]:
+    """A virtual panel writing under the test's own directory rather than /tmp/p.
+
+    `CONFIG` names a fixed path because nothing in these tests ever opens one;
+    the seam test at the bottom of this file really does.
+    """
+    return {"backend": "virtual", "out_dir": str(tmp_path / "panels")}
+
 
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 """RFC 6455's handshake constant, for the deaf peer below."""
@@ -1683,3 +1697,42 @@ def test_every_number_the_real_transport_runs_on_is_one_this_module_chose(
     assert seen["close_timeout"] is not None
     assert seen["ping_interval"] is not None
     assert seen["ping_timeout"] is not None
+
+
+def test_a_command_off_the_wire_paints_a_real_racks_panels(tmp_path: Path) -> None:
+    """The seam this milestone left unjoined, end to end and with nothing faked
+    between the socket and the glass.
+
+    `LinkClient` was built without `on_command` at all, so an `identify` read off
+    this socket reached `_dispatch`, found no handler, and logged "nothing is
+    listening for this" -- while the server's route answered `{"delivered":
+    true}`. Every link in the chain was tested and the chain was not, which is
+    the shape of defect a seam test exists for. A recording double in place of
+    the supervisor would have passed against the broken build too, because the
+    thing that was missing was the argument, not the handler.
+    """
+    raw = {
+        **CONFIG,
+        "screens": [{**CONFIG["screens"][0], "id": 10, "display": DISPLAY(tmp_path)}],  # type: ignore[dict-item]
+    }
+    config = DaemonConfig.model_validate(raw)
+    supervisor = Supervisor(
+        config=config,
+        screens=resolve_screens(config),
+        store=SnapshotStore(),
+        clock=system_clock("UTC"),
+        status_path=tmp_path / "status.json",
+    )
+    supervisor.start()
+    try:
+        client, _ = make(
+            tmp_path,
+            [Command(command="identify", screen_id=10).model_dump_json()],
+            on_command=_command_handler(supervisor),
+        )
+
+        client.tick_once()
+
+        assert [worker.current_scene for worker in supervisor.workers] == ["identify"]
+    finally:
+        supervisor.stop()

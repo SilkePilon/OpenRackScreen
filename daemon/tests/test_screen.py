@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -374,6 +375,61 @@ def test_the_next_tick_takes_the_panel_back_off_the_identify_digit() -> None:
     assert len(display.images) == 3
 
 
+def test_identify_says_whether_the_digit_reached_the_glass() -> None:
+    """Read by a caller that has to report, rather than inferred from `renders`.
+
+    `Supervisor.identify` answers a command that came off the link, and the
+    server is where the person who pressed the button is looking -- so "how many
+    panels took it" has to be an answer this method gives rather than a
+    subtraction a caller does around it.
+    """
+    worker, _, display = make()
+
+    assert worker.identify("2") is True
+    assert len(display.images) == 1
+
+
+def test_identify_can_be_bounded_and_answers_false_when_it_could_not_get_the_panel() -> None:
+    """Because the only caller that passes a timeout is on the link thread.
+
+    An unbounded acquire there is the failure the whole link module is written
+    around: a worker wedged inside an SPI write never gives its tick lock up, so
+    an identify that waited for one would park the thread that reads the socket
+    and consults the stop event -- for ever. The same bargain `pause` makes, and
+    the answer is returned rather than raised for the same reason.
+    """
+    worker, _, display = make()
+    worker._lock.acquire()
+    try:
+        assert worker.identify("2", timeout=0.01) is False
+    finally:
+        worker._lock.release()
+
+    assert display.images == []
+
+
+def test_an_unbounded_identify_still_waits_for_the_panel() -> None:
+    """`__main__._identify` calls this on a worker it never starts, where the
+    lock is free and there is no thread to protect -- so `None` is a real wait
+    and not a zero-length one."""
+    worker, _, display = make()
+    handed_over = threading.Event()
+
+    def hold() -> None:
+        worker._lock.acquire()
+        handed_over.set()
+        time.sleep(0.05)
+        worker._lock.release()
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert handed_over.wait(WAIT)
+
+    assert worker.identify("2") is True
+    holder.join(WAIT)
+    assert len(display.images) == 1
+
+
 def test_identify_leaves_a_faulted_backend_alone() -> None:
     display = RecordingDisplay(fail_times=99)
     worker, store, _ = make(display=display)
@@ -382,7 +438,7 @@ def test_identify_leaves_a_faulted_backend_alone() -> None:
         worker.tick()
     before = display.fail_times
 
-    worker.identify("2")
+    assert worker.identify("2") is False
 
     assert display.fail_times == before
 

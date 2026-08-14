@@ -19,6 +19,7 @@ from ors_daemon.supervisor import _MAX_RESTARTS as MAX_RESTARTS
 from ors_daemon.supervisor import (
     APPLY_BUDGET,
     BUS_GUARD_BUDGET,
+    IDENTIFY_BUDGET,
     SHUTDOWN_BUDGET,
     SOURCE_TEARDOWN_BUDGET,
     Supervisor,
@@ -2927,3 +2928,118 @@ def test_an_apply_that_retires_nothing_does_not_wake_the_rack(tmp_path: Path) ->
         assert len(rack.supervisor.workers) == 2
     finally:
         rack.supervisor.stop()
+
+
+# --- identify, as a command off the link rather than as a CLI subcommand -----
+
+
+def running_rack(
+    tmp_path: Path, screens: int = 2
+) -> tuple[Supervisor, dict[str, RecordingDisplay]]:
+    """A real rack with real workers on virtual panels, and server row ids on its
+    screens -- which is what a `Command` addresses one by.
+
+    Settled before it is handed over: every worker has drawn its first frame and
+    is parked on the store for a whole heartbeat floor afterwards, so a test
+    that counts frames is counting its own doing. Without this the first
+    `connecting` frame lands *after* the count is taken, and "the other panel
+    was left alone" fails on a rack that was merely still starting.
+    """
+    supervisor, _, displays = build(with_ids(tmp_path, screens), tmp_path)
+    supervisor.start()
+    for worker in supervisor.workers:
+        deadline = time.monotonic() + WAIT
+        while not worker.renders and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert worker.renders, f"{worker.screen_name} never drew its first frame"
+    return supervisor, displays
+
+
+def digits(display: RecordingDisplay) -> int:
+    """How many frames this panel has taken. The identify scene is one of them."""
+    return len(display.images)
+
+
+def test_identify_paints_every_panel_with_its_own_ordinal(tmp_path: Path) -> None:
+    """The whole point of the command: somebody standing at the rack maps a
+    physical panel to a line of the configuration. `screen_id` of None is the
+    ordinary case -- one press, every panel numbered."""
+    supervisor, displays = running_rack(tmp_path, screens=2)
+    try:
+        before = {name: digits(display) for name, display in displays.items()}
+
+        painted = supervisor.identify(None)
+
+        assert painted == 2
+        assert [worker.current_scene for worker in supervisor.workers] == ["identify"] * 2
+        assert all(digits(displays[name]) > count for name, count in before.items())
+    finally:
+        supervisor.stop()
+
+
+def test_identify_addresses_one_panel_by_its_server_row_id(tmp_path: Path) -> None:
+    """`Command.screen_id` is the server's row id and nothing else identifies a
+    screen: `name` and `position` are unique over nothing in the schema."""
+    supervisor, displays = running_rack(tmp_path, screens=2)
+    try:
+        before = {name: digits(display) for name, display in displays.items()}
+
+        painted = supervisor.identify(20)
+
+        assert painted == 1
+        assert [worker.current_scene for worker in supervisor.workers] == ["connecting", "identify"]
+        assert digits(displays["S1"]) == before["S1"], "the other panel was left alone"
+    finally:
+        supervisor.stop()
+
+
+def test_identify_for_a_screen_this_rack_does_not_have_paints_nothing(tmp_path: Path) -> None:
+    """Nought is the honest answer and the caller reports it. Painting the whole
+    rack instead would be `identify` on somebody else's glass, which is the
+    failure `not_a_flag` exists for reached by a different road."""
+    supervisor, displays = running_rack(tmp_path, screens=2)
+    try:
+        before = {name: digits(display) for name, display in displays.items()}
+
+        assert supervisor.identify(999) == 0
+        assert all(digits(displays[name]) == count for name, count in before.items())
+    finally:
+        supervisor.stop()
+
+
+def test_identify_on_a_stopping_daemon_touches_nothing(tmp_path: Path) -> None:
+    """The panels are slept and their serial devices closed by then, and on a
+    GC9A01 a write to one that has been torn down is a write to nothing. The
+    same check `apply` makes on the other side of the same handover."""
+    supervisor, displays = running_rack(tmp_path, screens=2)
+    supervisor.stop()
+    before = {name: digits(display) for name, display in displays.items()}
+
+    assert supervisor.identify(None) == 0
+    assert all(digits(displays[name]) == count for name, count in before.items())
+
+
+def test_one_wedged_panel_does_not_cost_the_link_thread_or_the_other_panels(
+    tmp_path: Path,
+) -> None:
+    """It runs on the thread that reads the socket and consults the stop event.
+
+    A worker wedged inside an SPI write never gives its tick lock up, so an
+    unbounded acquire here parks the link for ever -- and a deadline shared with
+    whoever went first would leave the last panel nothing, which is the defect
+    `BUS_GUARD_BUDGET` exists for, met again.
+    """
+    supervisor, displays = running_rack(tmp_path, screens=2)
+    wedged = supervisor.workers[0]
+    wedged._lock.acquire()
+    try:
+        started = time.monotonic()
+        painted = supervisor.identify(None)
+        elapsed = time.monotonic() - started
+
+        assert painted == 1, "the panel that was free still took its digit"
+        assert displays["S2"].images, "the second panel was given no time at all"
+        assert elapsed < IDENTIFY_BUDGET
+    finally:
+        wedged._lock.release()
+        supervisor.stop()

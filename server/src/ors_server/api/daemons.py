@@ -112,7 +112,48 @@ class CommandBody(BaseModel):
 
 class Delivered(BaseModel):
     delivered: bool
-    """Whether a rack was there to receive it."""
+    """Whether the message really left the server, which is not the same question
+    as whether a socket was open.
+
+    `Pushed.delivered` learned this the hard way: `hub.is_online` is true of a
+    rack whose send then times out and is dropped, so a route answering that
+    question reported `true` with nothing on the wire. This is about the send.
+    """
+
+
+NO_MECHANISM = {
+    "sleep": "a screen sleeps because it is inside this rack's night window or its own "
+    "sleep_override, and nothing else puts one to sleep. Set one with "
+    "PATCH /api/screens/{id} or PATCH /api/settings",
+    "wake": "a screen wakes when it leaves this rack's night window or its own "
+    "sleep_override, and nothing else wakes one. Set one with "
+    "PATCH /api/screens/{id} or PATCH /api/settings",
+    "reload": "a paired rack's configuration comes from this server rather than from a file "
+    "on the Pi, so there is nothing local for it to re-read. "
+    "POST /api/daemons/{id}/push sends it again",
+}
+"""The commands the protocol carries that this build cannot make a rack do.
+
+`ors_schema.link.Command` names four, and one of them is implemented: the daemon
+answers `identify` by painting each panel's ordinal on it, which is what the
+setup wizard needs and what the milestone's definition of done names. The other
+three are refused here rather than sent, because there is no mechanism behind
+them on the Pi -- `ors_daemon.__main__._command_handler` carries the long form of
+why each one is a design question rather than a wiring one.
+
+Refused with 501 rather than 422. It is not the caller's mistake: the request is
+well formed, the command is one the protocol defines, and what is missing is on
+this side. 422 would say "you typed it wrong" about a message a newer build will
+accept unchanged.
+
+Each reason names the thing that *does* work, because a refusal that only says
+no leaves the reader waiting for a button that is not coming.
+
+Kept as a denial list rather than narrowing `CommandBody.command` to `identify`,
+so that this file and `Command` hold one vocabulary between them rather than two
+that can drift -- and so that the reason travels with the answer, which a
+validation error on a `Literal` cannot carry.
+"""
 
 
 class Pushed(BaseModel):
@@ -267,7 +308,13 @@ def _credentials_of(connection: sqlite3.Connection, daemon_id: int) -> list[int]
     ]
 
 
-@router.post("/daemons/{daemon_id}/command")
+@router.post(
+    "/daemons/{daemon_id}/command",
+    responses={
+        409: {"description": "the rack is not connected, and a command cannot be deferred"},
+        501: {"description": "this build has no mechanism behind that command; see NO_MECHANISM"},
+    },
+)
 async def send_command(request: Request, daemon_id: int, body: CommandBody) -> Delivered:
     """Say something to a rack that is listening. Changes nothing on the server.
 
@@ -275,12 +322,38 @@ async def send_command(request: Request, daemon_id: int, body: CommandBody) -> D
     snapshot. Bumping here would mean pressing identify tore down and repainted
     every panel on the rack.
 
-    Refused when the rack is not connected, which is the opposite of what an
+    **Every way this route can fail to do what it was asked is an answer that
+    says so**, because the one thing it may not be is a button that lies, and it
+    was one three times over.
+
+    *A command with nothing behind it* is a 501 and is not sent. Three of the
+    four the protocol carries have no mechanism on the Pi; `NO_MECHANISM` names
+    them and what to use instead. Answered first, before anything is read: what
+    this build implements is not a fact about which rack was named, and a
+    request that answers 404 for one id and 501 for another has told the caller
+    nothing it can act on.
+
+    *A screen this rack does not own* is a 404 and is not sent. `screen_id` is a
+    row id in a table that holds every rack's screens, and `not_a_flag` only
+    stops `true` from becoming row 1 -- an honest integer naming somebody else's
+    panel went out unchallenged, was ignored by a daemon that does not have it,
+    and was reported delivered.
+
+    *A rack that is not connected* is a 409, which is the opposite of what an
     edit does. `Hub.push_config` drops a send to an offline daemon in silence
     because the edit is saved and pushed on reconnect -- there is nothing about
-    `identify` that survives being deferred by an hour, so answering 200 would
-    be a button that lies.
+    `identify` that survives being deferred by an hour.
+
+    *A send that did not get out* is `delivered: false`. `is_online` is true of a
+    rack that is TCP-alive and has stopped reading, whose send the hub then times
+    out and drops; asking the socket rather than the send is how
+    `POST /api/daemons/{id}/push` came to report a success with zero bytes on the
+    wire.
     """
+    reason = NO_MECHANISM.get(body.command)
+    if reason is not None:
+        raise HTTPException(status_code=501, detail=f"{body.command}: {reason}")
+
     state = request.app.state
     with closing(state.database.connect()) as connection:
         one_row(
@@ -289,10 +362,19 @@ async def send_command(request: Request, daemon_id: int, body: CommandBody) -> D
             (daemon_id,),
             missing=f"no daemon {daemon_id}",
         )
+        if body.screen_id is not None:
+            one_row(
+                connection,
+                "SELECT id FROM screen WHERE id = ? AND daemon_id = ?",
+                (body.screen_id, daemon_id),
+                missing=f"daemon {daemon_id} has no screen {body.screen_id}",
+            )
     if not state.hub.is_online(daemon_id):
         raise HTTPException(status_code=409, detail=f"daemon {daemon_id} is not connected")
-    await state.hub.send_command(daemon_id, Command(command=body.command, screen_id=body.screen_id))
-    return Delivered(delivered=True)
+    delivered = await state.hub.send_command(
+        daemon_id, Command(command=body.command, screen_id=body.screen_id)
+    )
+    return Delivered(delivered=delivered)
 
 
 @router.post("/daemons/{daemon_id}/push")

@@ -211,8 +211,16 @@ class Hub:
         """
         return await self._send(daemon_id, push.model_dump_json())
 
-    async def send_command(self, daemon_id: int, command: Command) -> None:
-        await self._send(daemon_id, command.model_dump_json())
+    async def send_command(self, daemon_id: int, command: Command) -> bool:
+        """Send a command. True if it reached a socket, False if it did not.
+
+        The return exists for the same reason `push_config`'s does, and for a
+        route with even less room to be wrong: a command is not saved anywhere
+        and is not retried on reconnect, so one that did not leave the server
+        never happens at all. `is_online` cannot answer it -- it is true of a
+        rack whose send this class has just timed out and dropped.
+        """
+        return await self._send(daemon_id, command.model_dump_json())
 
     async def request_frames(self, daemon_id: int, request: FramesRequest) -> None:
         await self._send(daemon_id, request.model_dump_json())
