@@ -3,25 +3,62 @@ name = "openrackscreen"
 version = "0.1.0"
 description = "Configurable monitoring displays for server racks"
 requires-python = ">=3.11"
-dependencies = ["ors-schema", "ors-render", "ors-daemon"]
+dependencies = ["ors-schema", "ors-render", "ors-daemon", "ors-server"]
 
 [tool.uv]
 package = false
 
 [tool.uv.workspace]
-# `daemon/` sits outside the `packages/*` glob, so it needs its own entry.
-members = ["packages/*", "daemon"]
+# `daemon/` and `server/` sit outside the `packages/*` glob, so they need their
+# own entries.
+members = ["packages/*", "daemon", "server"]
 
 [tool.uv.sources]
 ors-schema = { workspace = true }
 ors-render = { workspace = true }
 ors-daemon = { workspace = true }
+ors-server = { workspace = true }
 
 [dependency-groups]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+# `httpx2` is here for `fastapi.testclient.TestClient`, which wraps a client
+# around the app and raises at import without one. It is `httpx2`, not `httpx`:
+# starlette 1.6 imports `httpx2` first and only falls back to `httpx` with a
+# `StarletteDeprecationWarning`. FastAPI's testing tutorial still says `httpx`.
+# `pytest-asyncio` is floored at 1.0 rather than 0.24 because the 0.x -> 1.0
+# boundary removed the `event_loop` fixture and settled the `asyncio_mode`
+# defaults this suite relies on. A range spanning it means `uv lock --upgrade`
+# can cross the removal without anything saying so; the lock file happens to
+# pin 1.4.0 today, which is what has been keeping CI honest by accident.
+# `pytest-timeout` is not a convenience. `starlette.testclient`'s `receive`
+# blocks on `concurrent.futures.Future.result()` with no timeout, so any change
+# that makes the server send one message where a `TestClient` test expects two
+# wedges the whole run rather than failing it -- and CI records that as a
+# stalled build, not a red one. Three unrelated one-line edits to
+# `ws_daemon.py` were each measured doing exactly that.
+# `pyyaml` is here for `test_deploy.py`, which reads the compose files as
+# documents rather than as text -- asserting on the text is how a published port
+# ends up matched by a substring of a comment. It is *already* installed in this
+# workspace, because `ors-daemon` depends on it to read `rack.yaml`, and that is
+# exactly why it is named here: a server-side test that imports it by accident,
+# through a dependency of a package it does not depend on, breaks the day the
+# daemon stops parsing YAML. `ors-server` itself does not, and the image does
+# not ship it.
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=1.0,<2",
+    "pytest-timeout>=2.3",
+    "ruff>=0.6",
+    "httpx2>=2.10",
+    "pyyaml>=6",
+]
 
 [tool.pytest.ini_options]
-testpaths = ["packages/ors-schema/tests", "packages/ors-render/tests", "daemon/tests"]
+testpaths = [
+    "packages/ors-schema/tests",
+    "packages/ors-render/tests",
+    "daemon/tests",
+    "server/tests",
+]
 # Three test directories, none of them a package, all of them holding files
 # pytest has to import. Under the default `prepend` mode a module's name is its
 # basename, so the first `test_config.py` imported takes that name and any
@@ -32,6 +69,29 @@ testpaths = ["packages/ors-schema/tests", "packages/ors-render/tests", "daemon/t
 # make itself distinct. There is no ini key for it -- `--import-mode` is
 # command-line only.
 addopts = "-q --import-mode=importlib"
+# Without this every `async def test_` is collected, skipped and reported as a
+# warning -- a green run that ran none of them. `auto` rather than a
+# `@pytest.mark.asyncio` on each: a forgotten mark is exactly that silent skip,
+# and this repo has no async test that wants a different loop. It changes
+# nothing for the synchronous suite, which pytest-asyncio does not touch.
+asyncio_mode = "auto"
+# Per test. The default `signal` method interrupts the test where it is blocked
+# and reports a normal failure with the traceback that names the line, which is
+# the whole point: a wedged run tells you nothing at all.
+#
+# Ten seconds is seventeen times the slowest test in the suite -- 0.58s, and
+# argon2 by design -- so nothing reaches it by being slow on a loaded runner,
+# which is the failure mode that gets a deadline deleted. It is also twice the
+# in-test deadline `test_ws_daemon.py` sets for itself, which is the right
+# relationship: anything a test can put a `wait_for` around fails at five
+# seconds and this never sees it, so all this has to cover is the code that has
+# no deadline available to it at all.
+#
+# Not larger, because this is a *per test* budget and a change that wedges the
+# link wedges a dozen tests at once. At sixty seconds, two of the three one-line
+# edits measured against this route took the whole run past two minutes -- the
+# same useless wait as no deadline, arriving by a different road.
+timeout = 10
 
 [tool.ruff]
 line-length = 100

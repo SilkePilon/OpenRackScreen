@@ -51,6 +51,23 @@ class SnapshotStore:
         with self._condition:
             self._health.setdefault(name, IntegrationHealth())
 
+    def unregister(self, name: str) -> None:
+        """Forget an integration this rack no longer has. Idempotent.
+
+        For a reconfiguration that drops a source: the status file reports every
+        name the store knows, and a rack that reports readings from a Prometheus
+        nobody is polling any more is a rack describing a configuration it is not
+        running. The data goes with the health, so a screen that still names the
+        namespace renders nothing rather than the last value from before the push.
+
+        No `notify_all`: like `fail`, this does not move the version, and nothing
+        waits on anything else. The screens that depended on this source have
+        already been retired by the same apply.
+        """
+        with self._condition:
+            self._health.pop(name, None)
+            self._data.pop(name, None)
+
     def put(self, name: str, fields: dict[str, Any], latency_ms: float, now: datetime) -> None:
         with self._condition:
             # Copied on the way in as well as out: `fields` belongs to the
@@ -161,8 +178,50 @@ class SnapshotStore:
             self._closed = True
             self._condition.notify_all()
 
-    def wait_for_change(self, version: int, timeout: float) -> bool:
+    def wake(self) -> None:
+        """Have every waiter re-test its predicate, now. Publishes nothing.
+
+        The other half of `wait_for_change`'s `stop`. A `threading.Event` is a
+        flag, not a notification: setting one tells this condition variable
+        nothing, so a worker already parked here would only read it when its
+        wait timed out -- a whole heartbeat floor later, which is the delay this
+        pair exists to remove. `Supervisor._retire` calls this after it has set
+        every retiring slot's event, so the flag and the notification arrive
+        together, exactly as `close` arranges for its own.
+
+        Not news. Nothing about the data has moved, so every waiter that is not
+        stopping re-tests, finds the same version, and goes back to waiting for
+        what is left of its timeout -- `Condition.wait_for` keeps that
+        arithmetic. That is what makes waking the whole rack to retire one
+        screen cost the other three a predicate call rather than a render.
+
+        Deliberately not called by `fail` or `unregister`, which say why they
+        notify nothing: neither moves the version, and neither is a reason for a
+        worker to leave.
+        """
+        with self._condition:
+            self._condition.notify_all()
+
+    def wait_for_change(
+        self, version: int, timeout: float, stop: threading.Event | None = None
+    ) -> bool:
         """Block until the version leaves `version`. True if it did, False on timeout.
+
+        `stop` is an event this waiter should also be released by -- a screen
+        worker's slot event, which is what retires one screen without stopping
+        the rack. Without it, the ordinary branch of `ScreenWorker._wait` was
+        the one wait in the daemon a stop event could not cut short: `_retire`
+        set the flag and joined against a worker that was not watching it, so a
+        push to a rack whose integrations are quiet spent whatever was left of
+        the five-second floor and, often enough, the whole `APPLY_BUDGET` --
+        measured at 2.008s, 3.003s and 1.019s on three consecutive one-screen
+        applies. It is optional because `SnapshotStore` is not the screen
+        worker's alone, and a caller with nothing to be stopped by omits it.
+
+        True is "there may be something to do" and not "the version moved": a
+        closed store and a set stop event both answer it, and neither is a
+        change. The one caller reads its own flags on the way round rather than
+        this return, which is what `closed` says at length.
 
         `version` is the one the caller last read, and testing it is what closes
         the lost-wakeup window: a publish landing between a worker's `read` and
@@ -183,5 +242,8 @@ class SnapshotStore:
         """
         with self._condition:
             return self._condition.wait_for(
-                lambda: self._version != version or self._closed, timeout=timeout
+                lambda: (
+                    self._version != version or self._closed or (stop is not None and stop.is_set())
+                ),
+                timeout=timeout,
             )

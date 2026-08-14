@@ -8,6 +8,7 @@ from ors_schema.daemon import (
     ScreenConfig,
     TunnelConfig,
 )
+from ors_schema.errors import first_error
 from pydantic import ValidationError
 
 MINIMAL = {
@@ -316,3 +317,96 @@ def test_screen_rejects_an_empty_name_or_template(key):
 def test_config_round_trips_through_json():
     config = DaemonConfig.model_validate(MINIMAL)
     assert DaemonConfig.model_validate(config.model_dump(exclude_none=True)) == config
+
+
+def test_first_error_names_the_field_path_and_the_reason():
+    """What both ends put in front of a person: the daemon prefixes the file and
+    the server prefixes the daemon, and neither knows anything about the field
+    that the model did not already say."""
+    with pytest.raises(ValidationError) as error:
+        DaemonConfig.model_validate(
+            {**MINIMAL, "screens": [{**MINIMAL["screens"][0], "rotation": 45}]}
+        )
+
+    assert first_error(error.value).startswith("screens.0.rotation: ")
+
+
+def test_a_failure_about_the_whole_document_still_reads_as_a_message():
+    """`loc` is empty when nothing narrower than the document is at fault, and a
+    message opening with a bare colon reads as a bug in the formatting."""
+    with pytest.raises(ValidationError) as error:
+        DaemonConfig.model_validate([])
+
+    assert first_error(error.value).startswith("(root): ")
+
+
+def test_a_screen_carries_the_id_the_server_routes_frames_by():
+    """The daemon has no other way to learn it, and frames are addressed by it.
+
+    The server routes a frame to a browser by its own `screen.id` and refuses one
+    naming a screen the sending daemon does not own, so a snapshot that did not
+    carry the number would make the whole frame path unimplementable -- and
+    matching by name or position is not available, because the schema makes
+    neither unique.
+    """
+    screen = ScreenConfig.model_validate({**MINIMAL["screens"][0], "id": 42})
+
+    assert screen.id == 42
+
+
+def test_a_hand_written_screen_has_no_server_id():
+    """A YAML file has never been through a server, so there is no row to name."""
+    assert DaemonConfig.model_validate(MINIMAL).screens[0].id is None
+
+
+def test_a_screen_id_is_a_row_id_rather_than_a_position():
+    with pytest.raises(ValidationError):
+        ScreenConfig.model_validate({**MINIMAL["screens"][0], "id": 0})
+
+
+def test_two_screens_may_not_carry_the_same_server_id():
+    """Unlike `name` and `position`, which the schema deliberately leaves alone.
+
+    An id is what a frame is addressed by at both ends, so two screens sharing
+    one is not an untidy document but a rack that cannot be watched: they
+    compete for one entry in the daemon's rate-limiter table, the loser's offer
+    is refused inside the interval the winner just claimed, and it is not even
+    counted as a drop. The browser then shows two different panels alternating
+    under one screen, and nothing anywhere says why.
+
+    Checked here and not in the daemon because the daemon is not the only
+    producer -- a hand-written YAML can set the field, which is the whole reason
+    this is reachable -- and a rule about the *set* of screens has nowhere else
+    to live.
+    """
+    with pytest.raises(ValidationError) as error:
+        DaemonConfig.model_validate(
+            {
+                **MINIMAL,
+                "screens": [
+                    {**MINIMAL["screens"][0], "id": 5, "position": 1},
+                    {**MINIMAL["screens"][0], "id": 5, "position": 2},
+                ],
+            }
+        )
+
+    assert "5" in first_error(error.value)
+
+
+def test_screens_with_no_server_id_do_not_collide_with_each_other():
+    """None is "no server has ever named this screen", not a value to be unique.
+
+    Which is every screen of a hand-written rack, so reading the absence as a
+    duplicate would refuse the ordinary M2 config outright.
+    """
+    config = DaemonConfig.model_validate(
+        {
+            **MINIMAL,
+            "screens": [
+                {**MINIMAL["screens"][0], "position": 1},
+                {**MINIMAL["screens"][0], "position": 2},
+            ],
+        }
+    )
+
+    assert [screen.id for screen in config.screens] == [None, None]

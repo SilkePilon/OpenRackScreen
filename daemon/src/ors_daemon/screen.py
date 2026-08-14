@@ -96,6 +96,7 @@ class ScreenWorker(threading.Thread):
         stop: threading.Event,
         clock: Clock,
         floor: float = 5.0,
+        on_frame: Callable[[Image.Image], None] | None = None,
     ) -> None:
         super().__init__(name=f"screen-{screen.config.name}", daemon=True)
         self._screen = screen
@@ -108,13 +109,23 @@ class ScreenWorker(threading.Thread):
         self._stop_event = stop
         self._clock = clock
         self._floor = floor
+        # Where a frame goes when somebody is watching this panel in a browser,
+        # or None when nothing is. The contract is the whole reason this is a
+        # callback rather than a component: it is called with this worker's tick
+        # lock held, so it must not encode, must not send and must not block --
+        # `FrameStream.offer` stores one reference and returns. A panel is the
+        # product and a preview is not, so nothing behind this may cost the
+        # render loop anything it can measure.
+        self._on_frame = on_frame
+        self._logged_frame_error: str | None = None
         # Serialises everything that touches the backend, for any caller that
         # arrives while this loop is mid-tick: `show` is several sequential SPI
         # commands (address window, then the frame), so two interleaved writes do
-        # not merely race for the last frame -- they corrupt both. Nothing races
-        # it today -- `identify`'s only caller is `__main__._identify`, on a
-        # worker it never starts -- and the lock is kept anyway, because it is
-        # also what makes a tick atomic against itself. Held across the render, so
+        # not merely race for the last frame -- they corrupt both. Two callers
+        # arrive from outside: `identify`, from `__main__._identify` on a worker
+        # it never starts, and `pause`, which is the supervisor taking this
+        # worker off a bus it is about to open another panel on. It is also what
+        # makes a tick atomic against itself. Held across the render, so
         # the counters and `current_scene` a status report reads always describe
         # the frame that is actually on the glass. Not an `RLock`: nothing here
         # re-enters, and a plain lock keeps that provable.
@@ -143,6 +154,16 @@ class ScreenWorker(threading.Thread):
         Monotonic, unlike everything else here, because it answers "is this
         thread still turning" -- a question an NTP step must not be able to
         answer for it, in either direction.
+        """
+        self.held_off = False
+        """Whether something outside this worker is holding it off its panel.
+
+        Set by `pause` and cleared by `resume`, and published rather than kept
+        private because "who is holding this lock" is not a question a lock can
+        answer. The supervisor is the only caller and reads it back nowhere; it
+        exists so that the property *can* be observed, since the alternative --
+        a test that infers it from a wait that does not finish -- proves nothing
+        about a lock that was simply busy.
         """
 
     def tick(self) -> None:
@@ -198,26 +219,112 @@ class ScreenWorker(threading.Thread):
             self._seen_version = snapshot.version
             self._render_and_show(scene, name, context)
 
-    def identify(self, ordinal: str) -> None:
+    def identify(self, ordinal: str, timeout: float | None = None) -> bool:
         """Paint the panel's ordinal, now, from whatever thread asked for it.
 
-        `__main__._identify` is the only caller, and it calls this on a worker it
-        never starts -- there is no identify path through the supervisor, and a
-        running rack redraws over the digit within a tick. The lock is still
-        taken, because "from whatever thread" is the contract this offers and a
-        method that is only safe from one thread should say so instead.
+        True if the digit reached the glass. Returned rather than left to be
+        inferred from `renders`, because both callers have to *report*: the
+        setup wizard's `__main__._identify` prints a map of ordinal to panel and
+        a dark panel beside a printed line is a wrong answer, and
+        `Supervisor.identify` answers a command that came off the link, where
+        the person who pressed the button is looking at the server.
+
+        Two callers, two lock disciplines, and the difference is not cosmetic.
+        `__main__._identify` calls this on a worker it never starts -- there is
+        no loop to interleave with, so it waits for the lock and `None` means
+        exactly that. `Supervisor.identify` calls it on a *running* worker from
+        the link thread, which is the thread that reads the socket and consults
+        the stop event: an unbounded acquire there is a link parked for ever
+        behind a worker wedged inside an SPI write, which is the one failure
+        this whole module is arranged to prevent. So the wait is bounded and the
+        answer is returned rather than raised, exactly as `pause` does it.
 
         Deliberately not sticky: the next tick draws the screen's real scene
         again, because `_selected_scene` now reads `identify` and the change
         alone is a reason to render. The digit therefore stands for at most one
         loop wait, which is what someone counting panels in a rack needs.
         """
-        with self._lock:
+        if timeout is None:
+            self._lock.acquire()
+        elif not self._lock.acquire(timeout=max(0.0, timeout)):
+            return False
+        try:
             if self.faulted:
-                return
+                # A faulted panel is usually an unplugged one, and `_show`
+                # reaches the bus through the same `_command` that has already
+                # failed three times. `tick` refuses it for the same reason.
+                return False
             scene = self._system["identify"]
             context = RenderContext(data={"params": {"ordinal": ordinal}})
+            drawn = self.renders
             self._show(render_scene(scene, context), "identify")
+            # `_show` absorbs a backend that refuses the frame -- a render loop
+            # has to survive one -- so the counter is what says whether it
+            # landed, which is the same thing `__main__._identify` reads.
+            return self.renders > drawn
+        finally:
+            self._lock.release()
+
+    def pause(self, timeout: float) -> bool:
+        """Keep this worker off its panel until `resume`. True if it took.
+
+        For the supervisor, and for one situation: it is about to open a panel
+        that shares an SPI bus with this one. Opening a GC9A01 is a hardware
+        reset and a fifty-command init sequence over that shared wire, and a
+        worker drawing across it corrupts the init -- the other panel comes up
+        showing unconfigured RAM, non-deterministically, depending on which of
+        them the scheduler favoured. On a rack coming up, ordering all the opens
+        before all the starts is enough, because nothing is drawing yet; on a
+        rack being *reconfigured*, the panels that are staying are drawing
+        throughout, and this is the only thing that stops them.
+
+        It takes the tick lock, so it waits out a `show` that is already on the
+        wire rather than interrupting it -- which is the whole point: the window
+        it closes is the one where two threads are on the bus at once.
+
+        Bounded, and the answer is returned rather than raised, because it can
+        legitimately fail: a worker wedged inside an SPI write never gives its
+        panel up, and an apply that waited for one would spend its entire budget
+        on a screen that is already lost. The caller proceeds and logs.
+
+        Not re-entrant, deliberately: `self._lock` is a plain `Lock`, so a second
+        `pause` answers False rather than double-counting a hold that one
+        `resume` would then release.
+        """
+        taken = self._lock.acquire(timeout=max(0.0, timeout))
+        if taken:
+            self.held_off = True
+        return taken
+
+    def resume(self) -> None:
+        """Give the panel back. A no-op on a worker that was never held off.
+
+        Robust rather than paired by convention, and the cost of the convention
+        is measured. `Lock.release` on a lock this thread never took raises
+        `RuntimeError`, and the only caller makes these calls from a `finally`
+        that runs *after* the retired panels have been closed and the new ones
+        opened -- so the raise escapes `apply` and the link nacks a snapshot that
+        is in fact on the glass, while every kept worker that *did* pause is
+        never resumed and stays frozen on its last frame for the life of the
+        process. One panel's pairing bug must not cost the other three.
+
+        `held_off` is what makes that decidable, which is a second reason for it
+        to be a field: it is set only by a `pause` that took the lock, so it
+        answers "did this worker hand its panel over" without asking a lock a
+        question locks cannot answer. Not re-entrant either way -- a second
+        `pause` returns False and never sets it, so one `resume` releases one
+        hold.
+
+        Still a warning, because a caller resuming what it never held is a bug in
+        the caller and this is the only place it can be seen from.
+        """
+        if not self.held_off:
+            log.warning(
+                "a screen was resumed that was never held off", extra={"screen": self.screen_name}
+            )
+            return
+        self.held_off = False
+        self._lock.release()
 
     def run(self) -> None:
         """Draw until stopped. Nothing gets out of here.
@@ -293,7 +400,16 @@ class ScreenWorker(threading.Thread):
             # moving it, so that wait returns instantly, every lap, forever.
             self._stop_event.wait(timeout)
             return
-        self._store.wait_for_change(self._seen_version, timeout=timeout)
+        # The stop event goes in as well as the version, and it is the branch
+        # that runs on every lap of a healthy rack -- so it is the one where
+        # leaving it out cost the most. The other two above park on the event
+        # directly and end the instant a `Supervisor._retire` sets it; this one
+        # parks on the store, which a `threading.Event` does not notify, so
+        # without this a retirement was noticed only when the floor elapsed.
+        # `SnapshotStore.wake` is the notification behind the flag; between them
+        # they are what turns "the flag is only read between waits" into a wait
+        # that reads it.
+        self._store.wait_for_change(self._seen_version, timeout=timeout, stop=self._stop_event)
 
     def _select(self, snapshot: Snapshot) -> tuple[Scene, str, RenderContext]:
         """The scene to draw, its name, and the context both stages agreed on.
@@ -431,6 +547,15 @@ class ScreenWorker(threading.Thread):
         selection asked for; they differ only for the `error` scene, which is
         drawn in place of a scene that would not render.
         """
+        rendered = image
+        """The frame as the renderer drew it, before the mount is corrected for.
+
+        What a browser is shown, and deliberately not what goes down the SPI
+        bus. `rotation` and `hflip` below compensate for how the panel is bolted
+        into the rack, so the image the *glass* takes is transposed precisely so
+        that a person standing in front of it sees this one. Sending the
+        transposed copy would show the interface a panel lying on its side.
+        """
         rotation = self._screen.config.rotation
         if rotation:
             # Negative: the panel is bolted in rotated by `rotation`, and the
@@ -450,3 +575,38 @@ class ScreenWorker(threading.Thread):
         self._selected_scene = drawn if selected is None else selected
         self.last_render = self._clock()
         self.renders += 1
+        # Last, and only on the path where the backend took the frame. A browser
+        # showing something the glass refused would be describing a rack that
+        # does not exist -- and it is after the counters so that nothing on the
+        # way to a browser can change what a status report reads.
+        self._offer_frame(rendered)
+
+    def _offer_frame(self, image: Image.Image) -> None:
+        """Hand the frame to whoever is streaming this panel. Raises nothing.
+
+        Guarded because of where it runs. This is inside the tick lock on a
+        thread whose only job is the panel, and the code behind the callback
+        exists for a web page: an exception out of it would leave the screen
+        frozen on its last frame with a traceback in the journal blaming the
+        renderer, which is the one failure this whole module is built to prevent.
+
+        Once per distinct reason, the same bargain `_render_and_show` makes: a
+        frame path that is broken is broken every frame, and a line each fills a
+        Pi's journal overnight and buries the first one. Cleared on the next good
+        frame, so a fault that returns after a recovery is logged as the new
+        incident it is.
+        """
+        if self._on_frame is None:
+            return
+        try:
+            self._on_frame(image)
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            if message != self._logged_frame_error:
+                log.error(
+                    "could not offer a frame; the panel is unaffected",
+                    extra={"screen": self.screen_name, "error": message},
+                )
+                self._logged_frame_error = message
+            return
+        self._logged_frame_error = None

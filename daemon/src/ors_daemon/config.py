@@ -6,6 +6,10 @@ Three products, all decided once at startup rather than per frame:
 - each enabled screen's template scenes and bound parameters, in panel order;
 - each screen's *dependencies* -- which integrations it needs before it can show
   anything real, which is what drives the worker's two-stage scene selection.
+
+Plus one thing that is not from the YAML at all: `load_cached_snapshot` reads
+the last configuration the server pushed, which is what a rack boots from when
+the server is unreachable. Same model, same resolution, different source.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from typing import Any
 import yaml
 from ors_render import load_builtin_templates
 from ors_schema.daemon import DaemonConfig, ScreenConfig
+from ors_schema.errors import first_error
 from ors_schema.scene import Scene, Template
 from pydantic import ValidationError
 
@@ -90,11 +95,55 @@ def load_config(path: Path) -> DaemonConfig:
     try:
         return DaemonConfig.model_validate(parsed)
     except ValidationError as exc:
-        # The first error only: pydantic reports every branch of a discriminated
-        # union it tried, and a wall of them buries the one line that matters.
-        first = exc.errors()[0]
-        location = ".".join(str(part) for part in first["loc"]) or "(root)"
-        raise ConfigError(f"{path}: {location}: {first['msg']}") from exc
+        raise ConfigError(f"{path}: {first_error(exc)}") from exc
+
+
+def load_cached_snapshot(path: Path) -> tuple[DaemonConfig, int] | None:
+    """The last snapshot the server pushed, and its version. None if unusable.
+
+    A daemon boots from this when the server is unreachable, which is the whole
+    reason a server outage does not darken the rack. The version comes back
+    alongside the configuration because `Hello.config_version` reports it, and
+    reporting it is what lets the server skip a push that would otherwise be a
+    teardown and repaint of four panels on every reconnect.
+
+    *Anything unreadable is treated as absent rather than fatal, and the promise
+    is load-bearing.* This is read at startup, before a single panel is open, so
+    a loader that raised would turn a truncated file into four dark panels and a
+    traceback -- and under the shipped unit's `Restart=always` and
+    `StartLimitIntervalSec=0`, into a five-second restart loop that re-runs the
+    GC9A01 init sequence on four panels for as long as the file survives.
+
+    *So the guard is `Exception`, deliberately, and the breadth is the point.*
+    Three narrower ones have shipped in this milestone and each was found by
+    someone holding a file the list did not name. The first listed `OSError` and
+    `JSONDecodeError`; then `TypeError`, `ValueError`, `KeyError` and
+    `ValidationError` were added for a top-level array, a `version` of "abc", a
+    missing key and a snapshot the schema refuses. That list was written against
+    what a *file* can be rather than against what the schema can reject, which
+    was the right idea and still missed two shapes a real file takes:
+    `{"version": 1e400}` and `{"version": Infinity}` both parse to a float
+    `int()` answers with `OverflowError` (an `ArithmeticError`), and twenty
+    thousand nested arrays exhaust the parser's stack with `RecursionError` (a
+    `RuntimeError`). Neither is exotic and neither is in any list anyone would
+    write from memory -- which is the argument: this is untrusted input on the
+    boot path, and *nothing* it can do is worth the rack going dark. A narrower
+    guard buys a diagnosis nobody wants at the cost of the panels.
+
+    The warning is deliberate. An ignored cache is a rack that quietly falls
+    back to its local file and draws the configuration somebody edited months
+    ago, which from the front of the rack looks exactly like a working one.
+    """
+    path = Path(path)
+    try:
+        raw = json.loads(path.read_text())
+        return DaemonConfig.model_validate(raw["snapshot"]), int(raw["version"])
+    except Exception as exc:
+        log.warning(
+            "ignoring an unusable snapshot cache; this rack boots from its config file",
+            extra={"path": str(path), "error": f"{type(exc).__name__}: {exc}"},
+        )
+        return None
 
 
 _FINGERPRINT_CHARS = 12
@@ -134,19 +183,48 @@ def config_fingerprint(config: DaemonConfig) -> str:
 def _templates(config: DaemonConfig) -> dict[str, Template]:
     """The built-ins, overlaid with the config's own templates.
 
-    The config wins, which is what lets a rack owner amend a built-in without
-    forking it -- and is also silent, so a user-defined `ring-gauge` changes
-    *every* screen naming `ring-gauge`, not just theirs. That is worth a line in
-    the log: it is invisible in the YAML, and the symptom (a screen drawing
-    someone else's layout) points nowhere near the cause.
+    The config wins either way, which is what lets a rack owner amend a built-in
+    without forking it, and is what keeps a pushed snapshot honest: the server's
+    copy of a template is the one the browser drew its preview from, so agreeing
+    with it is the point.
+
+    What is worth logging is which of the two just happened, and they are told
+    apart by `Template.builtin`:
+
+    *A template the config declares as its own* (`builtin=False`) shadowing a
+    built-in is a user override, and a silent one -- a hand-written `ring-gauge`
+    changes *every* screen naming `ring-gauge`, not just theirs, which is
+    invisible in the YAML and whose symptom (a screen drawing someone else's
+    layout) points nowhere near the cause. That is a warning.
+
+    *A built-in arriving from the server* (`builtin=True`) is the normal case:
+    every snapshot carries all of them, so warning would be seven lines on every
+    config load and no signal at all. Only a *difference* from this build's own
+    copy says anything -- the two ends are on different wheels -- and that is one
+    INFO line, when it happens.
     """
     builtin = load_builtin_templates()
-    shadowed = sorted(set(builtin) & set(config.templates))
-    if shadowed:
+    overridden = sorted(
+        name
+        for name, template in config.templates.items()
+        if name in builtin and not template.builtin
+    )
+    if overridden:
         log.warning(
             "config templates shadow built-ins: %s",
-            ", ".join(shadowed),
-            extra={"templates": shadowed},
+            ", ".join(overridden),
+            extra={"templates": overridden},
+        )
+    differing = sorted(
+        name
+        for name, template in config.templates.items()
+        if name in builtin and template.builtin and template != builtin[name]
+    )
+    if differing:
+        log.info(
+            "the server's copy of these built-ins differs from this build's: %s",
+            ", ".join(differing),
+            extra={"templates": differing},
         )
     return {**builtin, **config.templates}
 

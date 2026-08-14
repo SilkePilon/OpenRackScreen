@@ -1,0 +1,49 @@
+# OpenRackScreen server, on the same Raspberry Pi that drives the panels.
+#
+#   docker compose -f deploy/compose.pi.yaml up -d
+#
+# The daemon is deliberately absent, and this is the one file where that looks
+# like an omission rather than a decision. It needs /dev/spidev0.0, /dev/spidev0.1,
+# /dev/spidev1.0, /dev/spidev1.1 and /dev/gpiochip*, plus membership of the `spi`
+# and `gpio` groups, plus a state directory that survives a reboot and holds the
+# pairing it cannot be given twice. Containerising that means --privileged, or a
+# device list that has to be corrected every time a rack is rewired, in exchange
+# for nothing: the daemon is one Python process that is already managed perfectly
+# well by systemd. It stays a host unit -- see daemon/examples/openrackscreen.service
+# -- and reaches this server on localhost.
+services:
+  server:
+    image: ghcr.io/silkepilon/openrackscreen:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # The bare name, and not `ORS_SECRET_KEY: ${ORS_SECRET_KEY:-}`, which is
+      # the obvious form and is wrong here: compose substitutes an unset
+      # variable to the *empty string*, and the server refuses an empty key on
+      # purpose -- treating `ORS_SECRET_KEY=` as "unset" would silently fall
+      # back to the generated key file and make every stored credential
+      # undecryptable with no signal at all. So the tidy-looking default turns
+      # "I did not set this" into a crash on first boot naming a variable the
+      # operator never touched. The list form passes the variable through when
+      # it is set and omits it entirely when it is not.
+      #
+      # Left unset, the server generates a key into the data volume on first
+      # boot and keeps it at 0600. Set it to keep the key with your other
+      # secrets instead. Changing it afterwards makes every stored integration
+      # credential undecryptable; there is no recovery.
+      - ORS_SECRET_KEY
+    volumes:
+      # A named volume, not a bind mount, and emphatically not a bind mount of
+      # the host's /var/lib/openrackscreen -- on this machine that path is the
+      # *daemon's* StateDirectory, created 0700 and owned by the openrackscreen
+      # user, holding the pairing. Mounting it here would drop the server's
+      # ors.db into a directory its own uid cannot enter, on top of the one file
+      # the rack cannot be given again.
+      - ors-data:/var/lib/openrackscreen
+
+volumes:
+  ors-data:

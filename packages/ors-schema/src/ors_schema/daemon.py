@@ -185,6 +185,23 @@ class ScreenConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    id: int | None = Field(default=None, ge=1)
+    """The server's row id for this screen, or None for a hand-written config.
+
+    The one field here that describes nothing about the panel. It exists because
+    frames are addressed by it: the server relays a frame to the browsers
+    watching `screen.id`, and refuses one naming a screen the sending daemon does
+    not own. Without it in the snapshot the daemon has no way to learn the
+    number at all -- it sees a configuration and nothing else -- and neither
+    `name` nor `position` can stand in, because this schema makes neither unique
+    and a rack that guessed would paint over another rack's panel.
+
+    None means "no server has ever named this screen", which is what a YAML file
+    on a Pi says. Such a screen draws exactly as any other and simply cannot be
+    streamed to a browser, which is the truth about it. Not 0: an id is a
+    SQLite rowid and those start at 1, so nought would be a real-looking number
+    that matches no row.
+    """
     name: str = Field(min_length=1)
     # Which physical panel in the rack, left to right, counted from 1: the rack
     # has a first panel, not a zeroth one, and every example config and every
@@ -233,3 +250,36 @@ class DaemonConfig(BaseModel):
     # dict's key*, not the `Template.name` inside the value, which may differ and
     # which nothing here reconciles.
     templates: dict[str, Template] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _screen_ids_are_unique(self) -> DaemonConfig:
+        """Two screens may not carry the same `id`. The one rule about the set.
+
+        Deliberately unlike `name` and `position`, which this schema leaves
+        un-unique on purpose -- assigning panels to hardware is somebody else's
+        rule, and a duplicate there costs a filename or a log line. A duplicate
+        `id` costs the rack: it is what a frame is addressed by at *both* ends,
+        so two screens sharing one compete for a single entry in the daemon's
+        rate-limiter and sequence tables. The loser's offer is refused inside
+        the interval the winner has just claimed and is not even counted as a
+        drop, and the browser watching that id shows two different panels
+        alternating under one screen with nothing anywhere saying why.
+
+        Enforced here rather than in the daemon because the daemon is not the
+        only producer: a server assembling a snapshot from its own rows cannot
+        emit a duplicate, but a hand-written YAML can set the field, and that is
+        the whole reason this is reachable at all.
+        """
+        seen: set[int] = set()
+        for screen in self.screens:
+            # None is "no server has ever named this screen", which is every
+            # screen of a hand-written rack -- an absence, not a value that
+            # could collide with another absence.
+            if screen.id is None:
+                continue
+            if screen.id in seen:
+                raise ValueError(
+                    f"two screens share the id {screen.id}; a frame is addressed by it"
+                )
+            seen.add(screen.id)
+        return self

@@ -154,6 +154,29 @@ def test_a_screen_that_has_never_rendered_says_so_rather_than_guessing() -> None
     }
 
 
+def test_the_status_file_reports_how_many_panels_the_link_could_not_keep_up_with() -> None:
+    """`FrameStream.dropped` is invisible everywhere else, which is why it is here.
+
+    A dropped frame is by design something nothing sends, nothing logs and
+    nothing else counts -- so on a real rack the one measure of how far behind
+    the link is running against what the panels are drawing had no reader at
+    all. One `cat` over SSH is what this file is for.
+    """
+    payload = build_status(
+        START, START, 1, FINGERPRINT, [], SnapshotStore().read(), frames_dropped=98
+    )
+
+    assert payload["frames_dropped"] == 98
+
+
+def test_a_rack_nobody_is_watching_reports_no_dropped_frames_rather_than_nothing() -> None:
+    """Present always, like every other field here: a key that appears only on a
+    paired rack is a key every reader has to guess about."""
+    payload = build_status(START, START, 1, FINGERPRINT, [], SnapshotStore().read())
+
+    assert payload["frames_dropped"] == 0
+
+
 def test_a_daemon_with_no_screens_and_no_integrations_reports_empty_lists() -> None:
     payload = build_status(START, START, 1, FINGERPRINT, [], SnapshotStore().read())
     assert payload["screens"] == []

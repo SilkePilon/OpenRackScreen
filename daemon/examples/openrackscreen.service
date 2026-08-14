@@ -57,15 +57,43 @@ RestartSec=5
 RuntimeDirectory=openrackscreen
 RuntimeDirectoryMode=0755
 
-# Derived, not guessed. The daemon spends at most `SHUTDOWN_BUDGET` seconds
-# (`ors_daemon.supervisor`, 10s today) on every thread join and tunnel teardown
-# together -- one deadline for all of them, so the cost does not grow with the
-# number of panels -- and only then blanks, sleeps and closes them. This is that
-# budget with room to spare for the blanking, which happens whether or not the
-# budget ran out. Past whatever this says, systemd sends SIGKILL, the panels are
-# never slept, and four GC9A01s stay lit until the rack is power-cycled -- the
-# one outcome the whole shutdown path exists to prevent. Raise it, never lower
-# it, and if `SHUTDOWN_BUDGET` ever goes up, raise this first.
+# Creates /var/lib/openrackscreen owned by User=, and unlike RuntimeDirectory it
+# survives a reboot -- which is the point. Two files live there and the daemon
+# writes both: the pairing (`ors-daemon connect --link`, default
+# /var/lib/openrackscreen/link.json) and, beside it, the last snapshot the server
+# pushed. Without this the directory does not exist, `Paired` cannot be saved,
+# and the rack has to be paired again by hand after every restart -- which needs
+# a new token minted in the interface, because the server keeps only a
+# fingerprint of the key it handed over.
+#
+# 0700 because the pairing is the right to reconfigure this rack and draw on its
+# panels. The daemon writes the file 0600 as well; this is the other half.
+#
+# Which is also why `ors-daemon connect` has to be run as the User= above:
+#   sudo -u openrackscreen ors-daemon connect --server ... --token ...
+# A `sudo ors-daemon connect` writes that file root-owned and 0600, this daemon
+# then gets PermissionError on every read of it, and the rack runs unpaired for
+# ever -- with the server showing a daemon that never connected. The daemon logs
+# that case as an error rather than as "never paired", and `connect` prints a
+# note when it sees it is running as root, but the fix is `chown`.
+StateDirectory=openrackscreen
+StateDirectoryMode=0700
+
+# Derived, not guessed, and derived from four numbers rather than one. The
+# daemon spends at most `SHUTDOWN_BUDGET` seconds (`ors_daemon.supervisor`, 10s
+# today) on every thread join and tunnel teardown together -- one deadline for
+# all of them, so the cost does not grow with the number of panels -- and only
+# then blanks, sleeps and closes the panels. A SIGTERM landing while the server
+# is pushing a configuration waits for that push first: `stop` blocks on the
+# lock `apply` holds and takes its own deadline afterwards, so the apply's
+# `APPLY_BUDGET` (3s) and `BUS_GUARD_BUDGET` (1s) are ADDED to the ten rather
+# than spent out of them. Then `LINK_JOIN_TIMEOUT` (3s) after the panels are
+# off. Sixteen seconds worst case, and this is that with room for the blanking,
+# which happens whether or not any budget ran out. Past whatever this says,
+# systemd sends SIGKILL, the panels are never slept, and four GC9A01s stay lit
+# until the rack is power-cycled -- the one outcome the whole shutdown path
+# exists to prevent. Raise it, never lower it, and if any of those four numbers
+# goes up, raise this first.
 TimeoutStopSec=30
 
 # The tunnel shells out to `kubectl`, which is usually in /usr/local/bin -- not

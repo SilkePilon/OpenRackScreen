@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -112,6 +113,7 @@ def make(
     template: str = "ring-gauge",
     depends: tuple[str, ...] = ("prom",),
     floor: float = 5.0,
+    on_frame: Callable[[Image.Image], None] | None = None,
 ) -> tuple[ScreenWorker, SnapshotStore, Any]:
     resolved = ResolvedScreen(
         config=ScreenConfig(
@@ -140,6 +142,7 @@ def make(
         stop=threading.Event(),
         clock=clock or FakeClock(NOW),
         floor=floor,
+        on_frame=on_frame,
     )
     return worker, store, worker._display
 
@@ -372,6 +375,77 @@ def test_the_next_tick_takes_the_panel_back_off_the_identify_digit() -> None:
     assert len(display.images) == 3
 
 
+def test_identify_says_whether_the_digit_reached_the_glass() -> None:
+    """Read by a caller that has to report, rather than inferred from `renders`.
+
+    `Supervisor.identify` answers a command that came off the link, and the
+    server is where the person who pressed the button is looking -- so "how many
+    panels took it" has to be an answer this method gives rather than a
+    subtraction a caller does around it.
+    """
+    worker, _, display = make()
+
+    assert worker.identify("2") is True
+    assert len(display.images) == 1
+
+
+def test_identify_can_be_bounded_and_answers_false_when_it_could_not_get_the_panel() -> None:
+    """Because the only caller that passes a timeout is on the link thread.
+
+    An unbounded acquire there is the failure the whole link module is written
+    around: a worker wedged inside an SPI write never gives its tick lock up, so
+    an identify that waited for one would park the thread that reads the socket
+    and consults the stop event -- for ever. The same bargain `pause` makes, and
+    the answer is returned rather than raised for the same reason.
+    """
+    worker, _, display = make()
+    worker._lock.acquire()
+    try:
+        assert worker.identify("2", timeout=0.01) is False
+    finally:
+        worker._lock.release()
+
+    assert display.images == []
+
+
+def test_an_unbounded_identify_still_waits_for_the_panel() -> None:
+    """`__main__._identify` calls this on a worker it never starts, where the
+    lock is free and there is no thread to protect -- so `None` is a real wait
+    and not a zero-length one."""
+    worker, _, display = make()
+    handed_over = threading.Event()
+
+    def hold() -> None:
+        worker._lock.acquire()
+        handed_over.set()
+        time.sleep(0.05)
+        worker._lock.release()
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert handed_over.wait(WAIT)
+
+    assert worker.identify("2") is True
+    holder.join(WAIT)
+    assert len(display.images) == 1
+
+
+def test_identify_answers_false_when_the_panel_refused_the_digit() -> None:
+    """A backend that refuses one frame is not a faulted one -- three in a row
+    are -- so the answer cannot be read off `faulted`. `_show` absorbs a refusal
+    by design, because a render loop has to survive one, which is exactly why
+    the counter and not the call is what says whether the digit landed. Without
+    it, `Supervisor.identify` counts a dark panel as painted and the button
+    reports a rack it did not number.
+    """
+    display = RecordingDisplay(fail_times=1)
+    worker, _, _ = make(display=display)
+
+    assert worker.identify("2") is False
+    assert worker.faulted is False, "one refusal is not a fault"
+    assert display.images == []
+
+
 def test_identify_leaves_a_faulted_backend_alone() -> None:
     display = RecordingDisplay(fail_times=99)
     worker, store, _ = make(display=display)
@@ -380,7 +454,7 @@ def test_identify_leaves_a_faulted_backend_alone() -> None:
         worker.tick()
     before = display.fail_times
 
-    worker.identify("2")
+    assert worker.identify("2") is False
 
     assert display.fail_times == before
 
@@ -595,7 +669,7 @@ def test_a_drawing_worker_waits_for_the_data_it_last_drew_to_change() -> None:
     worker, store, _ = make()
     calls: list[tuple[int, float]] = []
 
-    def record(version: int, timeout: float) -> bool:
+    def record(version: int, timeout: float, stop=None) -> bool:
         calls.append((version, timeout))
         return False
 
@@ -605,6 +679,36 @@ def test_a_drawing_worker_waits_for_the_data_it_last_drew_to_change() -> None:
     worker._wait()
 
     assert calls == [(worker._seen_version, 5.0)]
+
+
+def test_the_ordinary_wait_is_also_cut_short_by_this_worker_being_retired() -> None:
+    """The branch that runs 100% of the time on a healthy rack, and the one that
+    was left out when the flag-read-between-waits defect was fixed everywhere
+    else.
+
+    The other two branches of `_wait` park on the stop event itself, so they
+    already end the moment `Supervisor._retire` sets it. This one parks on the
+    store, which the event does not notify -- so an apply set the flag, joined
+    against a worker that was not watching it, and spent whatever was left of
+    the five-second floor. It is not a matter of shaving milliseconds off a
+    push: three of those seconds come out of the daemon's ten-second shutdown
+    budget, the link thread reads nothing and beats nothing while they pass, and
+    the overrun ERROR beside them fires on an ordinary healthy rack, which
+    retires it as a signal.
+    """
+    worker, store, _ = make()
+    handed: list[object] = []
+
+    def record(version: int, timeout: float, stop=None) -> bool:
+        handed.append(stop)
+        return False
+
+    store.wait_for_change = record  # type: ignore[method-assign]
+    publish(store)
+    worker.tick()
+    worker._wait()
+
+    assert handed == [worker._stop_event]
 
 
 def test_the_loop_closes_the_panel_on_the_way_out() -> None:
@@ -619,7 +723,7 @@ def test_the_loop_closes_the_panel_on_the_way_out() -> None:
 def test_a_wait_that_blows_up_does_not_take_the_thread_down() -> None:
     worker, store, display = make()
 
-    def boom(version: int, timeout: float) -> bool:
+    def boom(version: int, timeout: float, stop=None) -> bool:
         # Set from in here so the guard's own fallback wait returns at once:
         # the point is that the loop survives, not how long it pauses for.
         worker._stop_event.set()
@@ -681,9 +785,12 @@ def test_the_thread_draws_until_it_is_told_to_stop() -> None:
     display = RecordingDisplay()
     drawn = threading.Event()
     display.on_show = drawn.set
-    # A floor this short only bounds how long the loop sits in `wait_for_change`
-    # after the stop event is set; nothing in the test waits for it to elapse.
-    worker, store, _ = make(display=display, floor=0.05)
+    # The default floor, deliberately. This used to pass a floor of 0.05 so that
+    # the join below could not sit out a wait the stop event did not reach --
+    # which was the defect, worked around in a test rather than seen. The stop
+    # event now goes into `wait_for_change`, so a worker parked there leaves at
+    # once whatever the floor is, and this asserts it at the value a rack runs.
+    worker, store, _ = make(display=display)
 
     worker.start()
     try:
@@ -696,3 +803,78 @@ def test_the_thread_draws_until_it_is_told_to_stop() -> None:
     assert not worker.is_alive()
     assert worker.renders >= 1
     assert display.closed == 1
+
+
+def test_a_frame_is_offered_for_what_reached_the_glass() -> None:
+    offered: list[Image.Image] = []
+    worker, store, display = make(on_frame=offered.append)
+    publish(store)
+
+    worker.tick()
+
+    assert len(display.images) == 1
+    assert len(offered) == 1
+    assert offered[0].size == (240, 240)
+
+
+def test_nothing_is_offered_for_a_frame_the_panel_refused() -> None:
+    """A browser must not be shown something the glass never took."""
+    offered: list[Image.Image] = []
+    worker, store, _ = make(display=RecordingDisplay(fail_times=1), on_frame=offered.append)
+    publish(store)
+
+    worker.tick()
+
+    assert offered == []
+
+
+def test_the_frame_offered_is_the_image_before_the_mount_correction() -> None:
+    """`rotation` compensates for how the panel is bolted in, so what a person
+    standing at the rack sees is the *un*rotated render. Sending the transposed
+    image would show the browser a panel lying on its side."""
+    offered: list[Image.Image] = []
+    worker, store, display = make(on_frame=offered.append)
+    worker._screen.config.rotation = 90
+    publish(store)
+
+    worker.tick()
+
+    assert offered[0].tobytes() != display.images[0].tobytes()
+    assert offered[0].rotate(-90).tobytes() == display.images[0].tobytes()
+
+
+def test_a_frame_callback_that_raises_does_not_stop_the_panel() -> None:
+    """Nothing on the way to a browser may darken a panel."""
+
+    def explode(image: Image.Image) -> None:
+        raise RuntimeError("the frame path is broken")
+
+    worker, store, display = make(on_frame=explode)
+    publish(store)
+
+    worker.tick()
+    store.put("prom", {"cpu": 51.0}, latency_ms=1.0, now=NOW)
+    worker.tick()
+
+    assert len(display.images) == 2
+    assert worker.renders == 2
+    assert not worker.faulted
+
+
+def test_a_frame_callback_that_raises_is_logged_once_per_reason(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A line per frame overnight is a full journal and a buried first line."""
+
+    def explode(image: Image.Image) -> None:
+        raise RuntimeError("the frame path is broken")
+
+    worker, store, _ = make(on_frame=explode)
+    publish(store)
+
+    with caplog.at_level(logging.ERROR):
+        for reading in (1.0, 2.0, 3.0):
+            store.put("prom", {"cpu": reading}, latency_ms=1.0, now=NOW)
+            worker.tick()
+
+    assert len([record for record in caplog.records if record.levelno >= logging.ERROR]) == 1

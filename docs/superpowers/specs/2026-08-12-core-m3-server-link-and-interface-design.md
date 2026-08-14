@@ -151,7 +151,7 @@ SQLite, one file, written only by the server.
 | Table | Columns beyond id/timestamps |
 |---|---|
 | `daemon` | `name`, `token_hash`, `paired_at`, `version`, `capabilities` (json), `last_seen`, `status`, `config_version` |
-| `screen` | `daemon_id`, `position`, `name`, `display` (json), `rotation`, `hflip`, `enabled`, `template_id`, `params` (json), `sleep_override` (json) |
+| `screen` | `daemon_id`, `position`, `name`, `display` (json), `rotation`, `hflip`, `enabled`, `template` (its name), `params` (json), `sleep_override` (json) |
 | `template` | `name`, `builtin`, `category`, `scenes` (json), `params_schema` (json) |
 | `integration` | `daemon_id`, `type`, `name`, `config` (json), `secret_id`, `poll_interval`, `enabled` |
 | `secret` | `ciphertext` |
@@ -161,6 +161,8 @@ SQLite, one file, written only by the server.
 **Schema changes.** The database carries a schema version. On a bump the server writes `export-<timestamp>.json` beside it — every table's contents, secrets redacted — then rebuilds empty. You re-pair each daemon; the config you tuned is recoverable from the export rather than retyped. That export is also the beginning of the backup/restore the Core spec wants in M5.
 
 **Secrets** are encrypted at rest with a key from `ORS_SECRET_KEY` or generated on first boot into a `0600` file in the data volume. They are write-only over the API: responses redact them, and the SPA never receives a plaintext credential. They reach the daemon inside the snapshot, over a LAN link; TLS is a reverse proxy's job.
+
+`integration.config` is the one column that carries operator-authored JSON and is exported verbatim, so a credential inline in it — a URL of the form `https://user:pass@host` most plausibly — ends up in a plaintext file beside the database. The integrations API enforces the invariant: credentials become `secret` rows, and a URL carrying userinfo is refused.
 
 ## 7. HTTP API and the interface
 
@@ -179,14 +181,31 @@ GET/PATCH /api/settings                          GET /api/events
 WS     /ws/daemon                                WS  /ws/ui
 ```
 
-Every route and both sockets require the session cookie. A `/ws/ui` that skipped the check would be a live view of the rack for anyone on the LAN.
+Every route and both sockets require the session cookie. A `/ws/ui` that skipped the check would be a live view of the rack for anyone on the LAN. `/ws/ui` is refused at the handshake rather than after a first message: unlike `/ws/daemon`, there is no credential on the wire to fall back on.
+
+#### `/ws/ui`, the browser protocol
+
+Not the link protocol. `ors-schema` is the contract between the server and a daemon, and both ends of that one are pydantic; this one is between the server and a browser, so it is written for what a browser has.
+
+**Browser → server:** `{"action": "subscribe"|"unsubscribe", "screen_id": int}`. Anything else is skipped and logged; the socket stays open. Unknown fields are refused rather than ignored, so an SPA older than the server is told which field it invented.
+
+**Server → browser:**
+
+- `{"type": "daemons", "online": [int, ...]}` — every rack the server is holding a socket for, sorted. Sent once on connect and **pushed again on every change**, so the interface never polls for it. It is also the signal that a panel has stopped for a reason: a rebooted Pi, a pulled cable or a wifi blip all arrive here, and no per-frame event covers those.
+- `{"type": "frame", "screen_id": int, "seq": int, "webp": "<base64>"}`.
+
+**The base64 is the standard alphabet, with padding — decode with `atob(message.webp)` and no substitution.** This is deliberately *not* what pydantic emits. `Frame` on the link serialises `bytes` with the **URL-safe** alphabet (`-` and `_`), and `atob` throws `InvalidCharacterError` on both of those characters, so `model_dump_json()` onto this socket produces a payload the interface cannot read. The failure is silent at the Python end — `base64.b64decode` accepts either alphabet unless asked not to — so `ws_ui.py` assembles the message rather than dumping the model, and pins it with a payload whose two encodings differ. If that ever changes back, the SPA needs `.replace(/-/g, '+').replace(/_/g, '/')` first.
+
+**A stalled stream has no event of its own, by decision.** A frame a rack encoded too large is refused by the schema and skipped by `/ws/daemon`; the watcher's queue simply stops and the page keeps its last image. M3a does not add a `stalled` event for it, because an oversized frame is the rarest of the ways a panel goes quiet and an event covering only it would teach the interface that silence otherwise means healthy. The panel component owns staleness: time since the last `frame` for that screen, combined with `daemons`, which covers every case where the rack itself has gone.
+
+**A subscription is not a per-screen toggle at the far end.** `frames{enabled, screen_ids[]}` is whole-daemon state — the daemon *replaces* its streaming set from it — so the server recomputes that daemon's complete watched set, across every open tab, on every subscribe and unsubscribe, and sends it whole. `enabled: false` only when the set is empty. Four tabs on four panels of one rack is the case this exists for.
 
 ### 7.2 Pages
 
 Vite + React + TypeScript + Tailwind + shadcn/ui, installed and extended **only** through the official CLI. The shell is the `sidebar-04` block: floating sidebar, collapsible to icons. Types are generated from the server's OpenAPI schema, not hand-maintained. Data via TanStack Query; live updates over one `/ws/ui` connection.
 
 - **Daemons** — pair, status, per-daemon events, key rotation.
-- **Screens** — the approved layout: a horizontal rack of round live panels as the canvas, a tabbed inspector on the right (Config / Data / Sleep), and the add-screen wizard with **identify**, which paints an ordinal on the glass so a physical panel can be mapped to a config line.
+- **Screens** — the approved layout: a horizontal rack of round live panels as the canvas, a tabbed inspector on the right (Config / Data / Sleep), and the add-screen wizard with **identify**, which paints an ordinal on the glass so a physical panel can be mapped to a config line. Live panels arrive **before** the mount correction — the daemon streams the rendered frame, not the copy it transposes by `rotation` and `hflip` — so the browser shows a panel the same way up as a person standing at the rack sees it, and the interface must not rotate it again. `rotation` describes how a panel is bolted in (all four in `examples/rack.yaml` are `270`), which is a fact about the rack's carpentry and not about the picture.
 - **Templates** — list, assign, detach. Not the visual editor, which is phase 2.
 - **Integrations** — add and configure a Prometheus integration, edit its fields, and **Test**, which dry-runs every field and shows live values.
 - **Settings** — admin password, timezone, global night window.

@@ -1497,7 +1497,7 @@ git commit -m "feat(server): assemble a daemon snapshot from the database"
 - Produces:
   - `Hub()` with `register(daemon_id, sender) -> Connection`, `drop(connection)`, `is_online(daemon_id) -> bool`, `online_ids() -> set[int]`
   - `await push_config(daemon_id, ConfigPush) -> None`, `await send_command(daemon_id, Command) -> None`, `await request_frames(daemon_id, FramesRequest) -> None`
-  - `record_ack(daemon_id, version)`, `acked_version(daemon_id) -> int | None`
+  - `record_ack(connection, version)`, `acked_version(daemon_id) -> int | None` — the ack is recorded against the `Connection` that carried it and ignored if that connection has been superseded or dropped; it is read back by daemon id, because the caller deciding whether to push has a row rather than a socket
   - `subscribe_frames(screen_id, queue)`, `unsubscribe_frames(screen_id, queue)`, `await relay_frame(Frame)`
   - `Sender = Callable[[str | bytes], Awaitable[None]]`
 
@@ -1757,6 +1757,15 @@ git commit -m "feat(server): the link hub — connections, acks and frame fan-ou
 
 ### Task 8: `/ws/daemon` — pairing and the daemon socket
 
+**Carried from task 7 — four obligations this task now owes. Read these before the steps below; two of them are security or correctness holes, not polish.**
+
+1. **Race the read against `connection.closed`.** The hub is handed a `send` callable, not a socket, so it cannot close a superseded connection — it sets an `asyncio.Event` instead. A bare `while True: await socket.receive_text()` leaves the replaced handler blocked in `receive` until uvicorn's ping timeout (~40s at the defaults), still able to act on a message from a daemon that has already gone. Race the read against `connection.closed.wait()` with `asyncio.wait(..., return_when=FIRST_COMPLETED)`, cancel the loser, and close the socket when the event wins.
+2. **`record_ack` now takes the `Connection`, not the daemon id** — it carries the same identity guard `drop` has, so a superseded handler's ack is discarded rather than recorded under the live connection's id.
+3. **Frame ownership, which nothing else can check.** `relay_frame` trusts `frame.screen_id`, and the hub reads no rows by design. A daemon — or a stolen pairing key — can emit frames for a screen belonging to another rack and the hub will fan them out to whoever is watching it. Build a per-connection set of owned screen ids at hello, refresh it on every push, and check it before relaying. This is the only place in the system that can.
+4. **The version comparison the spec's definition of done requires.** `Hello` now carries `config_version: int | None`. Push only on a mismatch; `None` never matches (a fresh daemon says `None`, and `0` would collide with the version an empty server counts from). Still require the ack — the claim is what the daemon says it has, the ack is the only evidence it applied.
+
+Note also that `watched_screens()` is **global** — every screen anyone is watching across all daemons. Resuming that set wholesale on reconnect asks a daemon for screens it does not own; intersect it with the ownership map from (3).
+
 **Files:**
 - Create: `server/src/ors_server/link/ws_daemon.py`, `server/src/ors_server/pairing.py`
 - Modify: `server/src/ors_server/app.py`
@@ -1976,7 +1985,7 @@ async def daemon_socket(socket: WebSocket) -> None:
         await socket.send_text(ConfigPush(version=version, snapshot=snapshot).model_dump_json())
 
         while True:
-            await _handle(state, daemon_id, parse_daemon_message(await socket.receive_text()))
+            await _handle(state, connection, parse_daemon_message(await socket.receive_text()))
     except WebSocketDisconnect:
         pass
     except ValidationError as exc:
@@ -2006,9 +2015,13 @@ def _record_hello(database, daemon_id: int, hello: Hello) -> None:
         )
 
 
-async def _handle(state, daemon_id: int, message) -> None:
+async def _handle(state, connection: Connection, message) -> None:
+    # The `Connection`, not the id: this handler can still be reading a socket
+    # the hub has already replaced, and `record_ack` is what refuses the stale
+    # ack that would otherwise describe the daemon's previous boot.
+    daemon_id = connection.daemon_id
     if isinstance(message, Ack):
-        state.hub.record_ack(daemon_id, message.config_version)
+        state.hub.record_ack(connection, message.config_version)
     elif isinstance(message, Nack):
         log.error(
             "daemon refused a snapshot",
@@ -2049,6 +2062,11 @@ git commit -m "feat(server): pairing and the daemon websocket"
 ---
 
 ### Task 9: The daemon's link client
+
+**Carried from task 7:**
+- Send `config_version` in `Hello`, read from the cached snapshot.
+- `_receive` as drafted applies **every** `ConfigPush` unconditionally. Skip the apply when the version already matches what is running — **but still ack**, or the server never learns and pushes again on the next tick.
+- Pick the heartbeat interval, and keep it at or above the server's `SEND_TIMEOUT = 5.0`. Below it, the server's send bound is decoration: it would drop a daemon that is merely between heartbeats.
 
 **Files:**
 - Create: `daemon/src/ors_daemon/link.py`
@@ -2403,6 +2421,17 @@ git commit -m "feat(daemon): the link client"
 ---
 
 ### Task 10: Applying a snapshot in the daemon
+
+**Carried from task 9 — two obligations, the first with a measured deadline.**
+
+**`Supervisor.apply` must bound how long it takes, and the bound is seconds rather than tens of them.** It is called as `on_snapshot` synchronously on the link thread — the thread that reads the socket and the thread that consults the stop event — so its duration is added directly to how long a SIGTERM takes to be noticed, and it is spent out of `SHUTDOWN_BUDGET = 10.0` for the whole daemon, alongside `RECV_TIMEOUT_S = 1.0` and `CLOSE_TIMEOUT_S = 2.0`. Measured on the draft: a 3s apply delayed `join()` by the full 3s. Overrun the budget and systemd SIGKILLs before `Supervisor.stop` sleeps the panels — four panels lit until someone pulls the power; abandon the apply mid-teardown instead and it is four dark circles. The link refuses to *start* an apply once the stop event is set, which is as much as it can do; it cannot interrupt one already running. Task 10 owns the bound itself.
+
+**It must raise on a configuration it cannot serve rather than partially applying it.** A raise is a nack, which is how the person who saved the edit finds out.
+
+**Carried from task 7:**
+- **`Supervisor.apply` must be idempotent on a same-version or same-content push.** As drafted it revokes every panel, joins every worker and reopens — a full teardown and repaint of the rack. That is what turns a redundant push into a visible rack-wide flicker on every wifi blip. Belt and braces with task 9's version skip: the daemon should not apply it, and applying it should not be destructive either.
+- `load_cached_snapshot` must surface the version, because `Hello.config_version` reports it.
+- Fix `_templates` in `daemon/src/ors_daemon/config.py` while you are in that file — already done in `dd7bbf8`, so verify rather than redo.
 
 **Files:**
 - Modify: `daemon/src/ors_daemon/config.py`, `daemon/src/ors_daemon/supervisor.py`, `daemon/src/ors_daemon/__main__.py`
@@ -2798,6 +2827,25 @@ git commit -m "feat(daemon): encode frames on demand"
 
 ### Task 12: `/ws/ui` — status and frame subscriptions
 
+**The rule drafted in Step 3 below is WRONG. Do not implement it. Carried from task 7's review, which traced it against task 11's `FrameStream`.**
+
+`FramesRequest` is **whole-daemon state** — an `enabled` flag plus the complete `screen_ids` list — not a per-screen toggle. Task 11's `FrameStream.enable` does `self._enabled = set(screen_ids)`, a replace, and `disable()` clears everything. So the drafted rule breaks on the four-panel rack canvas, which is the primary screen of the whole interface:
+
+- opening a fifth panel's live view sends `enabled=True, screen_ids=[5]`, replacing the daemon's set — **the other four freeze**;
+- closing any one panel sends `enabled=False` — **all four freeze**;
+- a daemon that reconnects is never re-armed at all, so a wifi blip leaves a frozen canvas until the tab is reloaded.
+
+**Correct rule:** on every subscribe and unsubscribe, recompute that daemon's *full* watched set and send it whole. `enabled=False` only when the set is empty.
+
+That needs a per-daemon view the hub does not have — `watched_screens()` returns a global set. Either the caller maps screen → daemon, or `watched_screens` grows a daemon partition, which means an injected ownership lookup since the hub reads no rows by design. Decide which, and say why in your report.
+
+Also carried: the browser socket must `unsubscribe_frames` in a `finally`. The hub cannot notice a dead queue, so a closed tab otherwise leaves the daemon encoding WebP forever.
+
+**Carried from task 11:**
+- **A dropped frame is invisible to the browser.** An oversized frame is refused by the schema and skipped by `ws_daemon` (which now logs the screen id), but the watcher's queue simply stops and the page keeps its stale image with no indication. There is no channel to tell a watcher "this screen's stream stalled". Either add that event to `/ws/ui` or give the panel component a staleness indicator driven by frame arrival.
+- **`FramesRequest.screen_ids` is an unbounded `list[int]` chosen by the far end**, and the daemon's `_enabled` set is sized by it. Task 11 closed two holes of this family (`fps: NaN` parsed off the wire and defeated the rate cap; an enable/disable cycle reset the limiter's memory) and left this third one open deliberately, because this task decides how many screens one request may legitimately name. Bound it here.
+- The daemon sends frames **before** the mount correction, so the browser shows what a person standing at the rack sees. Do not rotate again. Now stated in the spec, §7.2.
+
 **Files:**
 - Create: `server/src/ors_server/link/ws_ui.py`
 - Modify: `server/src/ors_server/app.py`
@@ -2903,6 +2951,28 @@ git commit -m "feat(server): the browser websocket and frame subscriptions"
 ---
 
 ### Task 13: The configuration API
+
+**Carried from task 8 — two actions this task owes, both of which exist because of decisions made upstream.**
+
+**A re-pair endpoint.** A leaked daemon key is permanent. `mint_token` only INSERTs and `daemon.name` is UNIQUE, so re-pairing an existing daemon is impossible without hand-written SQL or deleting the row — which cascades its screens away. Until an endpoint exists, a key read off a Pi is full impersonation of that rack for as long as the rack exists, with no way to revoke it that does not also destroy the configuration. This task owes a re-pair action on an existing daemon: clear `key_hash`, write a fresh `token_hash`, set `status` back to `unpaired`, and show the new token exactly once, the way creation does. The schema now enforces `CHECK (token_hash IS NULL OR key_hash IS NULL)`, so clearing the key is not optional — writing a token onto a row that still holds a key raises `IntegrityError`, which is the point of the constraint. The connected daemon is dropped by the next connect it cannot authenticate, which is what a rotate button should mean.
+
+**A "push configuration now" action, per daemon.** `Hello.config_version` is a claim the server cannot verify, and the server only ever *skips* a push on a match — so a daemon that claims a version it does not really have gets nothing, and nothing re-pushes until an unrelated edit bumps the counter. M3a closed the worst case (the connect that pairs now always pushes, whatever it claims) but every later reconnect still trusts the claim by design, because distrusting it means repainting the whole rack on every wifi blip. A button that pushes the current snapshot regardless of the comparison is the only way out of a blank rack that does not involve editing a screen you did not want to change.
+
+**Carried from task 12's review:**
+- `Frame.screen_id` and `Command.screen_id` in `ors_schema.link` still accept a JSON `true` as `1`, the way `ws_ui._Request` did. Lower impact at both ends — `_owns` means a daemon can only paint a screen it already owns, and a command is minted by the server — but it is the same defect and the same one-line answer. Fix it in the schema rather than a third time at a caller.
+- **The stalled-panel signal is still owed, and truncation is now a second way to earn it.** A rack with more than `MAX_WATCHED_SCREENS` watched screens streams the sixty-four most recently opened; the rest go quiet with no `daemons` change and no per-frame event, exactly like an oversized frame. The honest answer remains time-since-last-frame in the panel component. The server-side log now names the dropped ids, which is the operator's half.
+- `ARM_INTERVAL_S` (0.25s) bounds how often one browser connection makes the server write to one rack. If this task ever lets a tab choose its own `fps`, that request travels the same path and inherits the same window — a slider dragged across the interface must not be a `frames` request per pixel.
+- The two `screen` reads in `ws_ui` stay on the event loop, measured at 0.075ms and 0.076ms and bounded per arm rather than per message. `_let_go` must stay synchronous, so an executor hop is not a free change. If one server ever drives enough racks for this to matter, the answer is a connection cache in `Database`, not `run_in_executor` at that call site.
+
+**Carried from task 11:**
+- **`FrameStream.dropped` reaches `status.json` as `frames_dropped`** (a running total, never reset) and nothing carries it further: `Heartbeat.status` is still sent empty and there is no Prometheus exporter in this repo — `integrations/prometheus.py` is the poller, not an exporter. Whichever of those two this task builds should read that key, because it is the only measure of how far behind the link is running.
+- `_MAX_TRACKED_SCREENS` prunes the rate limiter's memory as well as the sequence table, keeping only currently-enabled ids. A peer cycling more than 256 distinct ids could still evict a real screen's entry. Two orders of magnitude past a rack, so it is a note rather than a task — unless this task ever lets one server drive many racks through one daemon.
+
+**Carried from task 7 — `Hub` is event-loop-affine, and this task is where that gets broken.**
+
+Every route that touches the hub must be `async def`, the read-only-looking ones included. FastAPI runs a `def` route in a threadpool, and the natural shape of `GET /api/daemons` — blocking `sqlite3` plus `hub.online_ids()` — is exactly that. `online_ids()` builds a set from a dict a reconnect may be resizing, and a threadpool `subscribe_frames` can resize `_watchers` under `relay_frame`. The resulting `RuntimeError: Set changed size during iteration` is neither `WebSocketDisconnect` nor `ValidationError`, so it escapes the daemon socket handler and takes the whole rack offline in the UI rather than failing one request. Reproduced, not theorised.
+
+Also: `PATCH /api/screens/{id}` awaits `hub.push_config` inside the handler. That now returns within `SEND_TIMEOUT` (5s) against a wedged daemon rather than never, but decide whether the push should be fire-and-forget once there is a retry path — the row is already committed and the version already bumped by the time the push is attempted, so the request does not need its result.
 
 **Files:**
 - Create: `server/src/ors_server/api/daemons.py`, `screens.py`, `templates.py`, `integrations.py`, `settings.py`
@@ -3080,6 +3150,8 @@ Expected: FAIL — the routes do not exist.
 
 - [ ] **Step 3: Write minimal implementation**
 
+**A credential must never reach `integration.config`.** That column is exported verbatim on a schema bump — deliberately, because an export exists so a rack's integration configuration survives one — so anything inline in it lands in a plaintext file beside the database. A URL is the way this happens in practice: `https://user:hunter2@prom.local:9090` validates, stores, and exports readable. Credentials go through `secret_id`, encrypted by `SecretStore`. The integrations router is the only place that can enforce it: reject a URL carrying userinfo, and take a credential as its own field that becomes a `secret` row. `db.py` documents the invariant; this is where it is kept.
+
 Each router follows one shape: validate the body with a pydantic model, write the row, then
 
 ```python
@@ -3106,6 +3178,28 @@ git commit -m "feat(server): the configuration API"
 
 ### Task 14: Docker image and compose files
 
+**Carried from task 13:**
+
+- **The container makes one outbound HTTP call of its own.** `POST /api/integrations/{id}/test` fetches the operator's Prometheus from inside the server, via `app.state.probe`. Nothing else in this image dials out. Neither compose file needs to do anything about that on a LAN, but a deployment that puts the server behind an egress policy has to allow it, or the Test button fails with a connection error that reads like a wrong URL. Worth one line in `server/README.md`.
+- **`GET /api/daemons` assembles a snapshot per rack** to fill `config_error`, which is the only signal a rack that cannot be given a configuration has. It is a handful of SQLite reads and one pydantic validation per daemon — nothing for four racks — but it is the one list endpoint whose cost is not O(rows). If a healthcheck is ever pointed at it instead of `/api/health`, that becomes a per-interval cost; do not.
+  - **Measured after task 13's fix round: 9.9 ms for four racks, on the event loop.** The route is `async def` because `Hub` is event-loop-affine, so that whole time is time the server is relaying no frames — tens of milliseconds on a Pi, and it grows with the rack count and with the size of the `template` table, which every rack's snapshot carries in full. Left as it is deliberately: making it cheap is a design change, not a fix. The two candidates are caching the assembled snapshot per daemon and invalidating it from `change`, or answering `config_error` from a column that `change` writes — the second being the one `changes.config_error` argues against today, because the reasons are spread across four tables and an edit to any of them can make a rack servable again without naming it. Whichever is chosen, it belongs with the interface that made the list a thing polled rather than read.
+- Task 14's own two MUST CHECK items stand unchanged: `proxy_headers` (task 11 corrected the note — uvicorn 0.52.1 defaults it on and `__main__.py` now passes both explicitly), and whether `load_or_create_key`'s permission check accepts the key it writes as uid 10001 inside the volume.
+
+**Carried to M3b, which is where every one of these is read:**
+
+- **The "saved but not pushed" contract, in three parts.** A mutation that could not be given to every rack it affects says so, and this is the shape of it. Branch on the header, not on the status code.
+  - **`X-Unservable-Daemons` is the signal.** Present on any mutation response — `200`, `201` or `202` — when one or more of the racks that edit affected could not be given a configuration. The value is a comma-separated list of daemon ids, ascending: `X-Unservable-Daemons: 3,7`. Absent means every affected rack was pushed, or there was none to push. This is the only part of the contract that can name a rack, and the only part that survives a route declaring its own status code.
+  - **`202` means *no* affected rack got it.** Not "one rack somewhere is broken" — it is per edit, not per server, which matters because the rack-wide routes (`PATCH /api/settings`, every template edit) affect every rack there is. A settings change with one stuck rack out of four answers `200` with the header set, because it really did reach three racks. `202` says the edit is on disk and on no glass.
+  - **A route that declares its own status keeps it.** `POST /api/screens`, `POST /api/integrations` and `POST /api/daemons` answer `201` even when nothing was pushed — the row exists and its representation is in the body — and the header is what says the rack did not get it. So an interface that only checks `response.status === 202` will miss the create case; check the header.
+  - The reason per rack stays in `config_error` on `GET /api/daemons` — a sentence, not a header — and the recovery is usually the next edit plus `POST /api/daemons/{id}/push`.
+- **`POST /api/daemons/{id}/push` reports the send, not the socket.** `delivered` is `true` only when a snapshot really left the server. A rack that is connected but has no servable configuration answers `202`, `delivered: false` and the header; so does one whose send timed out. `version` is minted either way, which is what makes the next connect push.
+- **A pairing token is shown exactly once**, by `POST /api/daemons` and by `POST /api/daemons/{id}/rotate-key`, and by nothing else ever. Losing it means rotating again.
+- **`credential` is write-only.** It is a field on the integration bodies and on no response; `has_credential` is the only thing a read tells you. An empty string clears it. An *enabled* integration may not hold one in M3a and the API says so — M4 is what gives one somewhere to go.
+- **A preview is not mount-corrected**, exactly like the live frames on `/ws/ui`: `rotation` and `hflip` describe how a panel is bolted in, and the browser shows what a person standing at the rack sees. The interface must not rotate either of them.
+- **Types come from the OpenAPI document**, so every route carries an explicit response model — including the ones whose body is one field. A route returning a bare `dict` would generate as `object` and be typed by hand, which is what §7.2 forbids.
+- **`frames_dropped` still has nothing carrying it upstream.** `FrameStream.dropped` reaches `status.json` and stops there; `Heartbeat.status` is still sent empty and there is still no exporter. Task 13 built neither, so the obligation is unchanged and now belongs to whichever of the two M3b or M4 builds first.
+- **The Test button reports the first sample of each query**, not the value the panel will show: `reduce`, `label` and `strip` are the daemon poller's semantics and are deliberately not reimplemented in the server. The interface should label it as a reachability check rather than a preview of the reading.
+
 **Files:**
 - Create: `deploy/Dockerfile`, `deploy/compose.pi.yaml`, `deploy/compose.remote.yaml`, `server/README.md`
 - Test: `server/tests/test_deploy.py`
@@ -3114,23 +3208,229 @@ git commit -m "feat(server): the configuration API"
 - Consumes: everything above
 - Produces: an image serving the API on `:8080` with its database in a volume
 
+**Decisions already made for this task, with the reasons, so the implementer does not re-litigate them:**
+
+- **No Node stage, no SPA, in M3a.** The earlier draft of this task built a placeholder `web/` through a Node builder. A build stage that compiles nothing is a stage that is never exercised, and the first real SPA would meet it already rotted. M3b adds the Node stage together with the thing it builds. This image serves the API only.
+- **`arm64` is the supported target; `armv7` must still build.** Measured against PyPI on 2026-08-12: `cryptography` 50.0.0 publishes `manylinux_2_31_armv7l` wheels, but `argon2-cffi-bindings` 25.1.0 publishes **aarch64 only** — no 32-bit ARM wheel at all. On a 32-bit Raspberry Pi OS, `argon2-cffi-bindings` therefore compiles from its vendored Argon2 C sources, and `python:3.12-slim` has no compiler, so the build dies at `error: command 'gcc' failed: No such file or directory` — a failure that reads like a broken Dockerfile rather than a missing wheel. The builder stage installs `gcc` and `libc6-dev` for exactly this. On arm64 and x86 they cost one apt layer in a stage that is thrown away; on armv7 they are the difference between an image and an hour of confusion. Do not move them to the runtime stage.
+- **The runtime is `python:3.12-slim`, not Alpine.** musl means no manylinux wheel matches and every C dependency rebuilds.
+
 - [ ] **Step 1: Write the failing test**
 
-`server/tests/test_deploy.py` parses the compose files and asserts what actually matters and can be checked without Docker: the data volume is mounted so the database survives a container restart; `ORS_SECRET_KEY` is passed through rather than baked in; the published port matches the server's default; the Pi compose file does *not* try to run the daemon in a container; and the Dockerfile's final stage runs as a non-root user.
+Add `pyyaml>=6` to the root `[dependency-groups] dev` list — the test parses compose files and nothing else in the workspace needs YAML at runtime.
+
+`server/tests/test_deploy.py`. These assertions are the ones that can be made without a Docker daemon, and each is here because the opposite has broken a real deployment:
+
+```python
+from pathlib import Path
+
+import pytest
+import yaml
+
+DEPLOY = Path(__file__).resolve().parents[2] / "deploy"
+
+
+def compose(name: str) -> dict:
+    return yaml.safe_load((DEPLOY / name).read_text())
+
+
+@pytest.fixture
+def dockerfile() -> str:
+    return (DEPLOY / "Dockerfile").read_text()
+
+
+@pytest.mark.parametrize("name", ["compose.pi.yaml", "compose.remote.yaml"])
+def test_the_database_lives_in_a_volume(name):
+    service = compose(name)["services"]["server"]
+
+    mounts = [volume.split(":")[1] for volume in service["volumes"]]
+    assert "/var/lib/openrackscreen" in mounts, (
+        "without this the database dies with the container and the rack unpairs itself"
+    )
+
+
+@pytest.mark.parametrize("name", ["compose.pi.yaml", "compose.remote.yaml"])
+def test_the_secret_key_is_passed_through_and_not_baked_in(name, dockerfile):
+    service = compose(name)["services"]["server"]
+
+    assert "ORS_SECRET_KEY" in str(service.get("environment", "")), "the key must be injectable"
+    assert "${ORS_SECRET_KEY" in str(service["environment"]), "it must come from the host env"
+    assert "ORS_SECRET_KEY" not in dockerfile, "a key in the image is a key in the registry"
+
+
+@pytest.mark.parametrize("name", ["compose.pi.yaml", "compose.remote.yaml"])
+def test_the_published_port_matches_the_servers_default(name):
+    published = compose(name)["services"]["server"]["ports"]
+
+    assert any(str(entry).endswith(":8080") for entry in published), (
+        "ORS_PORT defaults to 8080 in __main__.py; a mismatch here is a silent 404"
+    )
+
+
+def test_the_pi_compose_file_does_not_containerise_the_daemon():
+    services = compose("compose.pi.yaml")["services"]
+
+    assert list(services) == ["server"], (
+        "the daemon needs /dev/spidev and /dev/gpiomem on the host; it stays a systemd unit"
+    )
+
+
+def test_the_final_stage_runs_as_a_non_root_user(dockerfile):
+    stages = dockerfile.split("FROM ")
+
+    assert "USER " in stages[-1], "root in the container is root on the bind-mounted data dir"
+
+
+def test_the_data_directory_is_owned_by_that_user(dockerfile):
+    assert "chown" in dockerfile, (
+        "a named volume inherits the ownership of the image path it shadows; without a chown "
+        "the non-root user cannot create ors.db and the server dies on first boot"
+    )
+
+
+def test_the_image_does_not_ship_a_compiler(dockerfile):
+    final = dockerfile.split("FROM ")[-1]
+
+    assert "gcc" not in final, "build tooling belongs in the discarded builder stage"
+
+
+def test_the_healthcheck_does_not_need_curl(dockerfile):
+    assert "HEALTHCHECK" in dockerfile
+    assert "curl" not in dockerfile, "python:3.12-slim has no curl; the check would always fail"
+```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest server/tests/test_deploy.py -q; echo "exit=$?"`
-Expected: FAIL — the files do not exist.
+Expected: FAIL — `FileNotFoundError` on `deploy/Dockerfile`; not a collection error.
 
 - [ ] **Step 3: Write minimal implementation**
 
-A multi-stage `Dockerfile`: a Node stage that builds the SPA (a placeholder `web/` in this plan; M3b fills it), then a Python stage that installs the workspace and copies the built assets. `compose.pi.yaml` runs only the server, with a note that the daemon stays a host systemd unit and why. `compose.remote.yaml` is the same server with the daemon's host reaching it over the LAN.
+`deploy/Dockerfile`:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+# uv as a binary rather than a base image: the runtime stage below wants plain
+# python:3.12-slim, and copying one static binary into the builder is cheaper
+# than reconciling two different bases.
+FROM ghcr.io/astral-sh/uv:0.5-python3.12-bookworm-slim AS builder
+
+# argon2-cffi-bindings has no 32-bit ARM wheel and compiles its vendored Argon2
+# from C on armv7. Discarded with this stage; see the note in the plan.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+WORKDIR /build
+
+# The lock and every member's manifest first, so a source-only edit reuses the
+# cached dependency layer. `uv sync` needs each workspace member's pyproject to
+# resolve `workspace = true`, including ors-daemon, which this image never runs.
+COPY uv.lock pyproject.toml ./
+COPY packages/ors-schema/pyproject.toml packages/ors-schema/
+COPY packages/ors-render/pyproject.toml packages/ors-render/
+COPY daemon/pyproject.toml daemon/
+COPY server/pyproject.toml server/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-workspace --package ors-server
+
+COPY packages/ packages/
+COPY server/ server/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --package ors-server
+
+FROM python:3.12-slim
+
+RUN useradd --system --create-home --uid 10001 ors \
+    && mkdir -p /var/lib/openrackscreen \
+    && chown ors:ors /var/lib/openrackscreen
+
+COPY --from=builder --chown=ors:ors /build/.venv /app/.venv
+ENV PATH="/app/.venv/bin:$PATH" \
+    ORS_DATA_DIR=/var/lib/openrackscreen \
+    ORS_HOST=0.0.0.0 \
+    ORS_PORT=8080
+
+USER ors
+EXPOSE 8080
+VOLUME ["/var/lib/openrackscreen"]
+
+# No curl in slim, and adding it for a healthcheck is a package and a CVE feed
+# for one HTTP GET the interpreter can already make.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health').read()"]
+
+CMD ["ors-server"]
+```
+
+`deploy/compose.pi.yaml` — server on the same host as the daemon:
+
+```yaml
+# The daemon is deliberately absent. It needs /dev/spidev0.0, /dev/spidev0.1,
+# /dev/spidev1.0, /dev/spidev1.1 and /dev/gpiomem, plus membership of the spi
+# and gpio groups; containerising that means --privileged or a device list that
+# has to be corrected every time the rack is rewired, in exchange for nothing.
+# It stays a systemd unit on the host and reaches this server on localhost.
+services:
+  server:
+    image: ghcr.io/silkepilon/openrackscreen:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Absent, the server generates a key into the data volume on first boot.
+      # Set it to keep the key with your other secrets instead; changing it
+      # afterwards makes every stored integration credential undecryptable.
+      ORS_SECRET_KEY: ${ORS_SECRET_KEY:-}
+    volumes:
+      - ors-data:/var/lib/openrackscreen
+
+volumes:
+  ors-data:
+```
+
+`deploy/compose.remote.yaml` — server anywhere, daemon on the rack:
+
+```yaml
+services:
+  server:
+    image: ghcr.io/silkepilon/openrackscreen:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      ORS_SECRET_KEY: ${ORS_SECRET_KEY:-}
+      # Uvicorn trusts X-Forwarded-For from these hosts only. Behind a reverse
+      # proxy this must name the proxy, or every login arrives from the proxy's
+      # address and the per-IP login limiter throttles the whole rack at once.
+      # Carried from Task 4.
+      FORWARDED_ALLOW_IPS: ${ORS_TRUSTED_PROXIES:-127.0.0.1}
+    volumes:
+      - ors-data:/var/lib/openrackscreen
+
+volumes:
+  ors-data:
+```
+
+`server/README.md` covers: `docker compose -f deploy/compose.pi.yaml up -d`, first-run password setup at `/`, where the key and database live, that the daemon is a host systemd unit and not part of compose, and that `ORS_SECRET_KEY` is unrecoverable once integrations exist.
+
+**Two things the implementer must check rather than assume:**
+1. ~~`FORWARDED_ALLOW_IPS` only takes effect when uvicorn runs with `--proxy-headers`.~~ **Settled in task 11's fix round, and my premise was wrong:** uvicorn 0.52.1 already defaults `proxy_headers=True`, and `forwarded_allow_ips=None` falls back to `os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1")`. So the variable was never decoration. `__main__.py` now passes both explicitly anyway — with a test asserting them against uvicorn's own signature, so a release that flips the default fails here rather than in production. Nothing left to do in this task.
+2. `load_or_create_key` refuses a key file readable by group or other. Confirm the file it creates inside the volume, under the container's umask and as uid 10001, actually satisfies its own check — a server that cannot start on second boot is worse than one that never started.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest -q; echo "exit=$?"` and, on a machine with Docker, `docker build -f deploy/Dockerfile .`
-Expected: PASS, exit 0; the image builds.
+Run: `uv run pytest -q; echo "exit=$?"`
+Expected: PASS, exit 0.
+
+Then, on a machine with Docker: `docker build -f deploy/Dockerfile .` and, if `docker buildx` is available, `docker buildx build --platform linux/arm64 -f deploy/Dockerfile .`. Report the outcome; if Docker is unavailable in the sandbox, say so plainly rather than claiming the image builds — it goes on the hardware checklist instead.
 
 - [ ] **Step 5: Commit**
 
@@ -3140,6 +3440,75 @@ git commit -m "feat(deploy): server image and compose files"
 ```
 
 ---
+
+## Known gaps carried out of task 10
+
+Recorded here rather than fixed, each with the reason. Tasks 11-13 should read these before assuming a behaviour exists.
+
+- **`system_scenes()` still ignores the config.** A server-side edit to `connecting`, `stale`, `error` or `identify` validates, caches, acks and changes nothing on the glass. Named in `_unchanged`'s exclusion list beside `timezone`. Making it act means routing the config's own `system` template through `system_scenes` and adding it to the diff as a rack-wide comparison, the way `night` is.
+- **`DaemonConfig.timezone` is not reconfigurable by a push.** The clock is built once in `__main__` and shared by every worker and poller.
+- **The panel opens inside `_off_the_bus` are unbounded**, and they now run with every kept worker's tick lock held. Recorded as a residual risk in the docstring: bounding a blocking open needs a thread whose late return hands back a backend for a device nothing owns and nothing will close — an unopenable panel forever, which is worse than the freeze it prevents. If it is ever bounded, the owner of the late backend has to be decided first.
+- **A dark panel is only retried by the next push.** That covers an open that failed, a worker that would not start, and a panel skipped because a bus-mate would not stop drawing. A rack that gets no further push keeps a dark circle with `status.json` saying why and nothing acting on it. A bounded, backed-off retry in `tick` is the obvious answer and was out of scope for task 10.
+- **`stop` can abandon the source reaper** if a `kubectl` teardown outlasts the shutdown deadline, so that child can outlive the daemon by up to its own SIGKILL wait. The same bargain as any other thread here, but it is new surface.
+- **Still open from task 9: `DaemonConfig.screens` has no `max_length`.** A well-formed push naming 10,000 screens reaches the apply path — now with a poller per integration and a reaper thread as well. The only thing in front of it is the daemon's own `MAX_MESSAGE_BYTES`, a byte count the server does not share, so the two ends can disagree about what is servable and only the rack finds out.
+
+## Carried out of the whole-branch review's fix round
+
+Five findings were fixed (see the `fix(daemon):`/`fix(server):`/`test(server):` commits at the
+end of this branch). What they *decided*, and what they left, belongs here rather than only in a
+commit message — M3b builds against every one of these.
+
+- **Only `identify` is a command.** `POST /api/daemons/{id}/command` answers **501** for `sleep`,
+  `wake` and `reload`, with the working mechanism named in the reason. **M3b must not offer buttons
+  for the other three.** They are refused rather than approximated because each is a design
+  question rather than a wiring one: `sleep`/`wake` overlap `DaemonConfig.night` and
+  `ScreenConfig.sleep_override`, which are persistent configuration the spec puts in the
+  inspector's Sleep tab, and a transient command would need new state on the render loop plus a
+  rule for which of the two wins, whether a push clears it, and whether it survives the watchdog
+  replacing a worker. `reload` has nothing local to re-read on a paired rack;
+  `POST /api/daemons/{id}/push` is it. The four-value vocabulary stays in `ors_schema.link.Command`
+  and the daemon warns on the three, because a newer server can send one.
+- **`applied_version` is on `GET /api/daemons`, and it lives in the hub.** It is what the rack has
+  acked, distinct from `config_version`, which is what this server minted. **None means "no rack has
+  told me", not "old"** — an offline rack, a rack that has not answered its first push, and a rack
+  that has just reconnected all report it, and the interface should render it as *unknown* rather
+  than as stale. It is deliberately not a column: an ack is evidence about a socket the server holds
+  now, `Hub.register` clears it on every connect precisely because a rebooted Pi comes back with
+  nothing, and persisting it would put that stale claim back in the one case somebody is reading the
+  page to diagnose. **What a server restart costs is one backoff**, because the racks re-ack.
+- **Spec §8 stands as written and the daemon now honours both its sentences.** "Nothing is
+  re-pushed if the versions already match" was already `_push_for` answering None; "daemons
+  reconnect and re-ack their version" is now `LinkClient._reack`, which sends an `Ack` second, after
+  the hello, whenever this rack holds a key and is running a version. `Hello.config_version` remains
+  a claim that may only ever *skip* a push — it was not promoted to evidence. Measured end to end
+  against a real server restart: the rack reconnects, `applied_version` equals `config_version`
+  again, and nothing is re-pushed.
+- **`daemon_event` is written by the link path** for a nack (with the reason and the version), a
+  connect (with the version the rack claims) and a disconnect. A superseded handler writes no
+  disconnect. Two events per reconnect against `MAX_EVENTS_PER_DAEMON` of 200 means a flapping rack
+  keeps about a hundred flaps of history and evicts the rest of its own — which is the right
+  direction, but it is a real bound and M3b's status panel should not assume an event is still
+  there.
+- **`SourceStatus` has no producer.** The message type exists in `ors_schema.link` and the server
+  reads it, and nothing in `ors_daemon` ever sends one. It therefore gets no `daemon_event`: an
+  event category that can never appear is its own small lie. Whatever first sends one — M4's
+  integrations are the obvious candidate — should add the event beside it.
+- **The suite's random redness was `starlette.testclient`, not us.** `WebSocketTestSession.__exit__`
+  cancels its portal task and then reads the future, and a cancel that lands while the handler is
+  still unwinding leaves the future CANCELLED. Reproduced with a plain FastAPI handler and no
+  `ors_server` import at 8 failures in 1,500 rounds; starlette 1.6.0 is the newest release and has
+  the same ordering. Contained in `server/tests/conftest.py`, at that one method, for
+  `CancelledError` only, answering falsy so a failing test still fails. **If a future starlette
+  fixes the ordering, delete the fixture** — it is one file and one autouse hook.
+
+Two things the review named that are recorded rather than fixed:
+
+- **CI does not build the Docker image.** Task 14 found three defects in the plan's own Dockerfile
+  draft by running it, and no test caught any of them. `.github/workflows/ci.yml` runs `uv run
+  pytest` and nothing else, so the image is only ever exercised by hand.
+- **`ors.db` is 0644 in the volume while `secret.key` is 0600.** Cosmetic on a single-user
+  deployment — the ciphertext is useless without the key — but it is an inconsistency somebody will
+  eventually ask about.
 
 ## Definition of done for M3a
 

@@ -1,0 +1,935 @@
+"""Booting from a cached snapshot, pairing from a shell, and wiring the two together.
+
+The supervisor's own `apply` is pinned in `test_supervisor.py`, beside the
+shutdown ordering it has to keep. What is here is the three things around it: the
+loader that decides what a rack draws when the server is unreachable, the
+`connect` command that writes the pairing, and the `run` that joins a link to a
+supervisor.
+
+Nothing here opens a socket, binds a port or touches SPI. The link and the
+supervisor are both stood in for, because what `run` is being asked is how it
+wires them, not what they do once wired.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+from ors_daemon.__main__ import DEFAULT_LINK_PATH, _command_handler, _frame_pump, main
+from ors_daemon.clock import system_clock
+from ors_daemon.config import load_cached_snapshot, resolve_screens
+from ors_daemon.frames import FramePump, FrameStream
+from ors_daemon.snapshot import SnapshotStore
+from ors_daemon.supervisor import Supervisor
+from ors_schema.daemon import DaemonConfig
+from ors_schema.link import Command, FramesRequest
+from PIL import Image
+
+SNAPSHOT: dict[str, Any] = {
+    "version": 1,
+    "timezone": "UTC",
+    "night": {"enabled": False},
+    "integrations": [],
+    "screens": [
+        {
+            "name": "CPU",
+            "position": 1,
+            "display": {"backend": "virtual", "out_dir": "/tmp/ors-panels"},
+            "template": "text-only",
+            "params": {"big": "one"},
+        }
+    ],
+}
+
+
+def write_cache(path: Path, version: int = 12, snapshot: Any = None) -> Path:
+    path.write_text(json.dumps({"version": version, "snapshot": snapshot or SNAPSHOT}))
+    return path
+
+
+def write_config(tmp_path: Path, name: str = "LOCAL") -> Path:
+    path = tmp_path / "rack.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "timezone": "UTC",
+                "night": {"enabled": False},
+                "screens": [
+                    {
+                        "name": name,
+                        "position": 1,
+                        "display": {"backend": "virtual", "out_dir": str(tmp_path / "panels")},
+                        "template": "text-only",
+                        "params": {"big": "local"},
+                    }
+                ],
+            }
+        )
+    )
+    return path
+
+
+class RecordingSupervisor:
+    """Stands in for the real one so `run` returns instead of running forever."""
+
+    instances: list[RecordingSupervisor] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self.applied: list[DaemonConfig] = []
+        self.identified: list[int | None] = []
+        self.ran = 0
+        self.stops = 0
+        # A real `Supervisor` publishes this so that everything it does not own
+        # -- the link thread here -- parks on the same event its own `stop` sets.
+        self.stop_event = _Flag()
+        RecordingSupervisor.instances.append(self)
+
+    def run_forever(self) -> None:
+        self.ran += 1
+
+    def stop(self) -> None:
+        self.stops += 1
+
+    def apply(self, config: DaemonConfig) -> None:
+        self.applied.append(config)
+
+    def identify(self, screen_id: int | None = None) -> int:
+        self.identified.append(screen_id)
+        return 0
+
+
+class _Flag:
+    def __init__(self) -> None:
+        self.value = False
+
+    def set(self) -> None:
+        self.value = True
+
+    def is_set(self) -> bool:
+        return self.value
+
+
+class FakeLink:
+    """A link that connects to nothing and records how it was built."""
+
+    instances: list[FakeLink] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self.started = 0
+        self.joins: list[float | None] = []
+        self.alive = False
+        self.sent: list[Any] = []
+        FakeLink.instances.append(self)
+
+    def send(self, message: Any) -> bool:
+        """What the frame pump is handed. A real link answers False when it is down."""
+        self.sent.append(message)
+        return False
+
+    def start(self) -> None:
+        self.started += 1
+
+    def join(self, timeout: float | None = None) -> None:
+        self.joins.append(timeout)
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+
+@pytest.fixture(autouse=True)
+def _fresh_doubles(monkeypatch: pytest.MonkeyPatch) -> None:
+    RecordingSupervisor.instances.clear()
+    FakeLink.instances.clear()
+    monkeypatch.setattr("ors_daemon.__main__.Supervisor", RecordingSupervisor)
+    monkeypatch.setattr("ors_daemon.__main__.LinkClient", FakeLink)
+    monkeypatch.setattr("ors_daemon.__main__._install_signal_handlers", lambda stop: True)
+
+
+def run(tmp_path: Path, *extra: str) -> int:
+    return main(
+        [
+            "run",
+            "--config",
+            str(tmp_path / "rack.yaml"),
+            "--status",
+            str(tmp_path / "status.json"),
+            "--link",
+            str(tmp_path / "link.json"),
+            *extra,
+        ]
+    )
+
+
+# --- the cache loader -------------------------------------------------------
+
+
+def test_a_cached_snapshot_is_loaded_with_its_version(tmp_path: Path) -> None:
+    loaded = load_cached_snapshot(write_cache(tmp_path / "snapshot.json"))
+
+    assert loaded is not None
+    config, version = loaded
+    assert version == 12
+    assert config.screens[0].name == "CPU"
+
+
+@pytest.mark.parametrize(
+    ("what", "written"),
+    [
+        ("not json at all", "{ not json"),
+        ("a bare number", "7"),
+        ("a top-level array", '[{"version": 1}]'),
+        ("a top-level string", '"snapshot"'),
+        ("null", "null"),
+        ("no version", json.dumps({"snapshot": SNAPSHOT})),
+        ("no snapshot", json.dumps({"version": 3})),
+        ("a version that is not a number", json.dumps({"version": "abc", "snapshot": SNAPSHOT})),
+        ("a version that is a list", json.dumps({"version": [1], "snapshot": SNAPSHOT})),
+        ("a version that is null", json.dumps({"version": None, "snapshot": SNAPSHOT})),
+        ("a snapshot that is a string", json.dumps({"version": 1, "snapshot": "nope"})),
+        ("a snapshot that is a list", json.dumps({"version": 1, "snapshot": []})),
+        ("a snapshot the schema refuses", json.dumps({"version": 1, "snapshot": {"screens": 4}})),
+        (
+            "a screen the schema refuses",
+            json.dumps({"version": 1, "snapshot": {"screens": [{"rotation": 45}]}}),
+        ),
+        ("an empty file", ""),
+    ],
+)
+def test_a_cache_that_cannot_be_read_is_no_cache_rather_than_a_crash(
+    tmp_path: Path, what: str, written: str
+) -> None:
+    """Task 9 shipped a loader whose docstring promised None and which raised.
+
+    The promise is load-bearing: this is read at startup, and a daemon that
+    refuses to boot over a corrupt file is four dark panels for the sake of a
+    file it does not need in order to draw. So every one of these is a shape a
+    half-written or hand-edited file really takes, not a schema violation dressed
+    up as one -- `int("abc")` raises `ValueError`, `int([1])` and `"nope"["x"]`
+    raise `TypeError`, and none of them is a `ValidationError`.
+    """
+    cache = tmp_path / "snapshot.json"
+    cache.write_text(written)
+
+    assert load_cached_snapshot(cache) is None, what
+
+
+@pytest.mark.parametrize(
+    ("what", "written"),
+    [
+        ("a version past what a float can hold", '{"version": 1e400, "snapshot": {}}'),
+        ("a version that is JSON's own infinity", '{"version": Infinity, "snapshot": {}}'),
+        ("a document nested deeper than the parser's stack", "[" * 20_000 + "]" * 20_000),
+    ],
+    # Named, or the third case puts forty kilobytes of brackets in the test id.
+    ids=["1e400", "Infinity", "20k nested arrays"],
+)
+def test_a_cache_no_narrow_guard_could_have_named_is_no_cache(
+    tmp_path: Path, what: str, written: str
+) -> None:
+    """The third time this class of bug has shipped in this milestone.
+
+    `1e400` and `Infinity` both parse to a float `int()` refuses with
+    `OverflowError`, which is an `ArithmeticError`; twenty thousand nested arrays
+    exhaust the parser's stack with `RecursionError`, which is a `RuntimeError`.
+    Neither is in any list of "what a corrupt file looks like" written from
+    experience, and both escaped `_boot`, `_run` and `main` -- which under the
+    shipped unit's `Restart=always` and `StartLimitIntervalSec=0` is a
+    five-second restart loop with four dark circles.
+
+    This is why the guard is broad: the file is untrusted input on the boot path,
+    and nothing in it is worth killing the daemon over.
+    """
+    cache = tmp_path / "snapshot.json"
+    cache.write_text(written)
+
+    assert load_cached_snapshot(cache) is None, what
+
+
+def test_a_cache_that_is_not_text_at_all_is_no_cache(tmp_path: Path) -> None:
+    """A truncated write on a Pi that lost power leaves bytes, not characters.
+
+    `read_text` raises `UnicodeDecodeError` for those, which is a `ValueError`
+    and not an `OSError` -- the same distinction that made `--status /` an
+    infinite restart loop in M2.
+    """
+    cache = tmp_path / "snapshot.json"
+    cache.write_bytes(b"\xff\xfe\x00 not utf-8")
+
+    assert load_cached_snapshot(cache) is None
+
+
+def test_a_cache_that_is_not_there_is_no_cache(tmp_path: Path) -> None:
+    assert load_cached_snapshot(tmp_path / "never-written.json") is None
+
+
+def test_a_cache_path_that_is_a_directory_is_no_cache(tmp_path: Path) -> None:
+    directory = tmp_path / "snapshot.json"
+    directory.mkdir()
+
+    assert load_cached_snapshot(directory) is None
+
+
+# --- connect ----------------------------------------------------------------
+
+
+def test_connect_writes_link_settings_a_run_can_find(tmp_path: Path) -> None:
+    link = tmp_path / "link.json"
+
+    assert (
+        main(["connect", "--server", "http://s:8080", "--token", "tok", "--link", str(link)]) == 0
+    )
+
+    written = json.loads(link.read_text())
+    assert written["server_url"] == "http://s:8080"
+    assert written["token"] == "tok"
+    assert written["key"] is None, "a key is minted by the server, never by this command"
+    assert written["cache_path"] == str(tmp_path / "snapshot.json")
+
+
+def test_connect_writes_the_pairing_no_wider_than_its_owner(tmp_path: Path) -> None:
+    """The token is the right to reconfigure this rack and draw on its panels."""
+    link = tmp_path / "link.json"
+
+    main(["connect", "--server", "http://s:8080", "--token", "tok", "--link", str(link)])
+
+    assert link.stat().st_mode & 0o777 == 0o600
+
+
+def test_connect_refuses_to_overwrite_an_existing_pairing_without_force(
+    tmp_path: Path, capsys: Any
+) -> None:
+    link = tmp_path / "link.json"
+    main(["connect", "--server", "http://s", "--token", "a", "--link", str(link)])
+
+    assert main(["connect", "--server", "http://s", "--token", "b", "--link", str(link)]) == 1
+    assert "already paired" in capsys.readouterr().err
+    assert json.loads(link.read_text())["token"] == "a", "the working pairing is untouched"
+
+
+def test_connect_replaces_a_pairing_when_it_is_told_to(tmp_path: Path) -> None:
+    link = tmp_path / "link.json"
+    main(["connect", "--server", "http://s", "--token", "a", "--link", str(link)])
+
+    assert (
+        main(["connect", "--server", "http://s", "--token", "b", "--link", str(link), "--force"])
+        == 0
+    )
+    assert json.loads(link.read_text())["token"] == "b"
+
+
+@pytest.mark.parametrize("force", [[], ["--force"]])
+def test_connect_drops_the_previous_servers_cached_snapshot(
+    tmp_path: Path, force: list[str]
+) -> None:
+    """Otherwise the next boot draws the old server's rack and claims its version.
+
+    `LinkClient._paired` clears the cache when the server answers, which covers
+    the pairing that completes. This covers the window before it: between
+    `connect` and the first successful connect there is a reboot, and the cache
+    on disk names a configuration from a server this rack has been pointed away
+    from. `_boot` hands that cache's *version* to `_link`, which claims it in
+    `Hello.config_version` -- so the new server can match the number, skip the
+    push, and leave the previous server's rack on the glass for ever.
+
+    Both invocations, and that is the point of the parametrisation: the docstring
+    used to say `--force` cleared the cache and the code cleared it always. The
+    code was right. A pairing file too corrupt to read is precisely a file that
+    cannot say which server the cache beside it came from, and `--force` is not
+    needed to get past one of those.
+    """
+    link = tmp_path / "link.json"
+    cache = write_cache(tmp_path / "snapshot.json")
+    if force:
+        main(["connect", "--server", "http://old", "--token", "a", "--link", str(link)])
+        cache = write_cache(tmp_path / "snapshot.json")
+
+    main(["connect", "--server", "http://s", "--token", "a", "--link", str(link), *force])
+
+    assert not cache.exists()
+
+
+def test_connect_run_as_root_says_the_daemon_may_not_be_able_to_read_it(
+    tmp_path: Path, capsys: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`sudo ors-daemon connect` writes a pairing the daemon's own user cannot read.
+
+    Which unpairs the rack silently: the daemon sees a `PermissionError`, runs
+    from its config file and says it was never paired. The file itself is
+    correct, so this is a note and not a failure -- said to the person who can
+    still fix it with one `chown`.
+    """
+    link = tmp_path / "link.json"
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    assert main(["connect", "--server", "http://s", "--token", "t", "--link", str(link)]) == 0
+
+    error = capsys.readouterr().err
+    assert "chown" in error
+    assert "User=openrackscreen" in error
+
+
+def test_connect_as_an_ordinary_user_says_nothing_about_ownership(
+    tmp_path: Path, capsys: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The note only says anything if the ordinary case is quiet."""
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+
+    assert (
+        main(
+            ["connect", "--server", "http://s", "--token", "t", "--link", str(tmp_path / "l.json")]
+        )
+        == 0
+    )
+    assert capsys.readouterr().err == ""
+
+
+def test_connect_refuses_a_server_url_nothing_can_dial(tmp_path: Path, capsys: Any) -> None:
+    """`--server rack:8080` names no host, and the failure belongs here.
+
+    Written to disk it is a daemon that dials nothing once a backoff forever,
+    with the reason only in its own log.
+    """
+    link = tmp_path / "link.json"
+
+    assert main(["connect", "--server", "rack:8080", "--token", "t", "--link", str(link)]) == 1
+    assert "rack:8080" in capsys.readouterr().err
+    assert not link.exists()
+
+
+def test_connect_reports_a_path_it_cannot_write_without_a_traceback(
+    tmp_path: Path, capsys: Any
+) -> None:
+    blocked = tmp_path / "file"
+    blocked.write_text("not a directory")
+
+    assert (
+        main(["connect", "--server", "http://s", "--token", "t", "--link", str(blocked / "l.json")])
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert captured.err.strip()
+
+
+@pytest.mark.parametrize("hostile", ["/", ".", ""])
+def test_connect_refuses_a_link_path_with_no_filename_rather_than_raising(
+    capsys: Any, hostile: str
+) -> None:
+    """`--link /` is M2's `--status /` bug, byte for byte.
+
+    A path with no filename has no name to derive the cache beside, and
+    `Path.with_name` answers that with `ValueError` rather than `OSError` -- so
+    it went past every guard here and out of `main` as a traceback. `main`
+    promises a message and an exit code for anything a person can mistype.
+    """
+    assert main(["connect", "--server", "http://s", "--token", "t", "--link", hostile]) == 1
+
+    error = capsys.readouterr().err
+    assert "Traceback" not in error
+    assert hostile in error or "no file name" in error
+
+
+@pytest.mark.parametrize("hostile", ["/", ".", ""])
+def test_run_boots_from_its_config_file_when_the_link_path_has_no_filename(
+    tmp_path: Path, hostile: str
+) -> None:
+    """The same typo on the other command, where the cost is higher.
+
+    `Supervisor.tick` and `LinkClient._write_cache` each defend against this by
+    name; the cache path `run` derives did not. Under `Restart=always` that is a
+    five-second restart loop with four dark circles, over a flag that names no
+    pairing this rack was ever going to find. There is a perfectly servable
+    config file, so the rack runs from it.
+    """
+    write_config(tmp_path)
+
+    assert (
+        main(
+            [
+                "run",
+                "--config",
+                str(tmp_path / "rack.yaml"),
+                "--status",
+                str(tmp_path / "status.json"),
+                "--link",
+                hostile,
+            ]
+        )
+        == 0
+    )
+    assert [
+        screen.config.name for screen in RecordingSupervisor.instances[-1].kwargs["screens"]
+    ] == ["LOCAL"]
+
+
+def test_connect_needs_no_config_file(tmp_path: Path) -> None:
+    """Pairing happens before a rack has a configuration, and after it has one
+    the configuration comes from the server. Requiring `--config` here would make
+    the first thing an operator runs the one thing they cannot yet supply."""
+    link = tmp_path / "link.json"
+
+    assert main(["connect", "--server", "http://s", "--token", "t", "--link", str(link)]) == 0
+
+
+# --- run --------------------------------------------------------------------
+
+
+def test_run_boots_from_the_cached_snapshot_when_there_is_one(tmp_path: Path) -> None:
+    """A server that is down must not be able to darken the rack, which means
+    the last thing it pushed has to be what a cold boot draws."""
+    write_config(tmp_path)
+    write_cache(tmp_path / "snapshot.json")
+
+    assert run(tmp_path) == 0
+    supervisor = RecordingSupervisor.instances[-1]
+    assert [screen.config.name for screen in supervisor.kwargs["screens"]] == ["CPU"]
+
+
+def test_run_boots_from_the_config_file_when_there_is_no_cache(tmp_path: Path) -> None:
+    write_config(tmp_path)
+
+    assert run(tmp_path) == 0
+    supervisor = RecordingSupervisor.instances[-1]
+    assert [screen.config.name for screen in supervisor.kwargs["screens"]] == ["LOCAL"]
+
+
+def test_run_boots_from_the_config_file_when_the_cache_is_corrupt(tmp_path: Path) -> None:
+    write_config(tmp_path)
+    (tmp_path / "snapshot.json").write_text("{ not json")
+
+    assert run(tmp_path) == 0
+    assert [
+        screen.config.name for screen in RecordingSupervisor.instances[-1].kwargs["screens"]
+    ] == ["LOCAL"]
+
+
+def test_run_boots_from_the_config_file_when_the_cache_names_a_template_it_cannot_serve(
+    tmp_path: Path,
+) -> None:
+    """Valid against the schema is not the same as servable.
+
+    A cached snapshot naming a template this build does not ship validates
+    perfectly and then resolves to nothing at all, which without the fallback is
+    a rack that stays dark for as long as the server is away.
+    """
+    write_config(tmp_path)
+    broken = {**SNAPSHOT, "screens": [{**SNAPSHOT["screens"][0], "template": "no-such-template"}]}
+    write_cache(tmp_path / "snapshot.json", snapshot=broken)
+
+    assert run(tmp_path) == 0
+    assert [
+        screen.config.name for screen in RecordingSupervisor.instances[-1].kwargs["screens"]
+    ] == ["LOCAL"]
+
+
+def test_run_boots_from_the_config_file_when_the_cache_names_an_unknown_timezone(
+    tmp_path: Path,
+) -> None:
+    """Night mode is computed in the configured zone, so the daemon refuses to
+    start on one the host cannot resolve -- and a cache is not worth refusing on."""
+    write_config(tmp_path)
+    write_cache(tmp_path / "snapshot.json", snapshot={**SNAPSHOT, "timezone": "Mars/Olympus"})
+
+    assert run(tmp_path) == 0
+    assert [
+        screen.config.name for screen in RecordingSupervisor.instances[-1].kwargs["screens"]
+    ] == ["LOCAL"]
+
+
+def test_run_with_neither_a_cache_nor_a_usable_config_says_so_and_leaves(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """No panel has been opened, so there is nothing to darken and nothing to
+    keep alive. What must not happen is a traceback: the audience is someone
+    reading `journalctl` after a `systemctl start` that did not take."""
+    (tmp_path / "rack.yaml").write_text("screens: [{}]")
+
+    assert run(tmp_path) == 1
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert str(tmp_path / "rack.yaml") in captured.err
+    assert RecordingSupervisor.instances == [], "nothing was started"
+
+
+def test_run_names_both_sources_when_neither_can_be_read(tmp_path: Path, capsys: Any) -> None:
+    (tmp_path / "rack.yaml").write_text("screens: [{}]")
+    (tmp_path / "snapshot.json").write_text("{ not json")
+
+    assert run(tmp_path) == 1
+    error = capsys.readouterr().err
+    assert str(tmp_path / "snapshot.json") in error
+    assert str(tmp_path / "rack.yaml") in error
+
+
+def test_run_starts_no_link_when_this_daemon_has_never_been_paired(tmp_path: Path) -> None:
+    """M2's rack still runs: a local config file and no server at all."""
+    write_config(tmp_path)
+
+    assert run(tmp_path) == 0
+    assert FakeLink.instances == []
+
+
+def test_run_starts_a_link_when_there_is_a_pairing(tmp_path: Path) -> None:
+    write_config(tmp_path)
+    link = tmp_path / "link.json"
+    link.write_text(json.dumps({"server_url": "http://s:8080", "key": "k", "daemon_id": 4}))
+
+    assert run(tmp_path) == 0
+    assert len(FakeLink.instances) == 1
+    started = FakeLink.instances[0]
+    assert started.started == 1
+    assert started.kwargs["settings"].server_url == "http://s:8080"
+    assert started.kwargs["settings_path"] == link, (
+        "the key from Paired is written here; a link without it pairs and is locked out"
+    )
+
+
+def test_a_pushed_snapshot_reaches_the_supervisor(tmp_path: Path) -> None:
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+    pushed = DaemonConfig.model_validate(SNAPSHOT)
+    FakeLink.instances[0].kwargs["on_snapshot"](pushed, 9)
+
+    assert RecordingSupervisor.instances[-1].applied == [pushed]
+
+
+def test_the_link_claims_the_version_the_rack_is_actually_running(tmp_path: Path) -> None:
+    """`Hello.config_version` lets the server skip a push, and a push it skips
+    wrongly is a rack showing the previous configuration forever."""
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+    write_cache(tmp_path / "snapshot.json", version=31)
+
+    assert run(tmp_path) == 0
+    assert FakeLink.instances[0].kwargs["config_version"] == 31
+
+
+def test_the_link_claims_no_version_when_the_rack_booted_from_its_own_file(
+    tmp_path: Path,
+) -> None:
+    """None means "I have nothing", and getting it wrong optimistically is a
+    blank rack: 0 is a real version, and the one an empty server counts from."""
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+    assert FakeLink.instances[0].kwargs["config_version"] is None
+
+
+def test_the_link_claims_no_version_when_the_cache_it_named_was_unusable(
+    tmp_path: Path,
+) -> None:
+    """A cache whose version parses but whose snapshot does not is a cache the
+    daemon did not boot from, so claiming its number claims a configuration that
+    is not on the panels."""
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+    broken = {**SNAPSHOT, "screens": [{**SNAPSHOT["screens"][0], "template": "no-such-template"}]}
+    write_cache(tmp_path / "snapshot.json", version=31, snapshot=broken)
+
+    assert run(tmp_path) == 0
+    assert FakeLink.instances[0].kwargs["config_version"] is None
+
+
+def test_the_link_parks_on_the_event_the_supervisors_own_stop_sets(tmp_path: Path) -> None:
+    """One event, not two. The link refuses to *start* an apply once it is set,
+    and `Supervisor.stop` sets it before it joins anything -- so a push already
+    in flight when SIGTERM lands is not a teardown and repaint of four panels
+    against a supervisor that is being torn down underneath it."""
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+    supervisor = RecordingSupervisor.instances[-1]
+    assert FakeLink.instances[0].kwargs["stop"] is supervisor.stop_event
+
+
+def test_run_waits_for_the_link_thread_with_a_deadline(tmp_path: Path) -> None:
+    """A wedged link must not be what keeps the process alive past `TimeoutStopSec`."""
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+    joined = FakeLink.instances[0].joins
+    assert joined, "the link thread is joined, not abandoned"
+    assert all(timeout is not None and timeout > 0 for timeout in joined)
+
+
+def test_a_link_that_will_not_start_does_not_stop_the_rack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rule the whole link exists under: no failure of it may darken the rack.
+
+    A Pi too short of memory to fork answers `Thread.start` with a
+    `RuntimeError`, and a daemon that let that out would exit rather than draw
+    the configuration it has already loaded and can serve perfectly well.
+    """
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    class Refusing(FakeLink):
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr("ors_daemon.__main__.LinkClient", Refusing)
+
+    assert run(tmp_path) == 0
+    assert RecordingSupervisor.instances[-1].ran == 1, "the rack ran anyway"
+
+
+def test_the_default_link_path_is_the_one_the_shipped_unit_creates() -> None:
+    """The two have to agree, and nothing else makes them.
+
+    The pairing is written by the *daemon* as well as by `connect` -- the key
+    from `Paired` arrives once and is unrecoverable if it is not saved -- and the
+    daemon runs as its own user under `ProtectSystem=full`. So the directory has
+    to be one systemd creates for it. If the default here ever moves out of the
+    unit's `StateDirectory`, every rack pairs successfully, logs one error, and
+    is locked out on its next boot.
+    """
+    unit = (Path(__file__).resolve().parents[1] / "examples" / "openrackscreen.service").read_text()
+
+    assert DEFAULT_LINK_PATH.is_absolute()
+    assert DEFAULT_LINK_PATH.name == "link.json"
+    assert "StateDirectory=openrackscreen" in unit
+    assert DEFAULT_LINK_PATH.parent == Path("/var/lib/openrackscreen")
+
+
+# --- frames -----------------------------------------------------------------
+
+
+def test_a_frames_request_from_the_server_reaches_the_stream_the_workers_offer_to(
+    tmp_path: Path,
+) -> None:
+    """One stream, wired to both ends: the link asks it for frames and the
+    supervisor's workers hand it panels. Two would be a rack that encodes
+    nothing for a browser that is asking, with nothing anywhere saying why."""
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+
+    handler = FakeLink.instances[0].kwargs["on_frames_request"]
+    frames = RecordingSupervisor.instances[-1].kwargs["frames"]
+    assert handler.__self__ is frames
+
+
+def test_a_link_that_drops_stops_the_stream_it_started(
+    tmp_path: Path,
+) -> None:
+    """The other end of the same wire. A subscription arrives on a socket, so
+    the daemon may not go on encoding for one that has gone -- the server asks
+    again on every connect, which is what makes forgetting free."""
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+
+    handler = FakeLink.instances[0].kwargs["on_link_down"]
+    frames = RecordingSupervisor.instances[-1].kwargs["frames"]
+    assert handler.__self__ is frames
+    assert handler.__func__ is FrameStream.disable
+
+
+def test_the_pump_sends_what_it_encodes_down_the_link(tmp_path: Path) -> None:
+    """That `_frame_pump` wires the pump's `send` to *this* link's, driven by hand.
+
+    The pump's own thread is stopped before anything is offered, and that is the
+    fix for a race rather than a tidiness: the thread this function starts calls
+    `take()` in a loop, so a test that then calls `take()` itself is two readers
+    of a queue holding one item, and whichever loses indexes an empty list. It
+    did not reproduce in 300 repetitions, and the pump was doing nothing the
+    test needed -- what is being asked is where the frames go, not that a thread
+    can carry them, which the pump's own suite covers.
+    """
+    frames = FrameStream()
+    supervisor = RecordingSupervisor()
+    supervisor.stop_event.set()
+    link = FakeLink()
+
+    pump = _frame_pump(frames, supervisor, link)
+
+    assert pump is not None
+    pump.join(5.0)
+    assert not pump.is_alive(), "the pump is still racing this test for the queue"
+    try:
+        frames.request(FramesRequest(enabled=True, screen_ids=[7]))
+        frames.offer(7, Image.new("RGB", (240, 240), (0, 128, 255)))
+        pump._one(*frames.take(1.0)[0])
+    finally:
+        frames.close()
+    assert [message.screen_id for message in link.sent] == [7]
+
+
+def test_the_frame_stream_is_closed_when_the_daemon_stops(tmp_path: Path) -> None:
+    """The pump parks on the stream, not on the stop event, so a stream left
+    open is a thread that leaves at its next poll rather than at once."""
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+
+    assert RecordingSupervisor.instances[-1].kwargs["frames"].closed is True
+
+
+def test_an_unpaired_rack_starts_no_frame_pump(tmp_path: Path) -> None:
+    """Nothing could ask for a frame and there is nowhere to put one, so the
+    thread would be a lifetime of parking and waking on a Pi with four panels."""
+    write_config(tmp_path)
+
+    assert run(tmp_path) == 0
+
+    assert FakeLink.instances == []
+    assert _frame_pump(FrameStream(), RecordingSupervisor(), None) is None
+
+
+def test_a_pump_that_will_not_start_leaves_the_rack_drawing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Pi too short of memory for one more thread still has four panels."""
+    monkeypatch.setattr(FramePump, "start", _raises)
+
+    assert _frame_pump(FrameStream(), RecordingSupervisor(), FakeLink()) is None
+
+
+def _raises(*args: Any, **kwargs: Any) -> None:
+    raise RuntimeError("can't start new thread")
+
+
+# --- commands ---------------------------------------------------------------
+
+
+def test_a_command_from_the_server_reaches_the_running_supervisor(tmp_path: Path) -> None:
+    """The wire that was never joined. `LinkClient` was built with `on_snapshot`,
+    `on_frames_request` and `on_link_down` and no `on_command` at all, so
+    `_dispatch` logged "nothing is listening for this" and the API's
+    `POST /api/daemons/{id}/command` answered `{"delivered": true}` for a message
+    that reached no supervisor -- a button that lies by a different road from the
+    one its own docstring reasons about.
+    """
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+
+    handler = FakeLink.instances[0].kwargs["on_command"]
+    assert handler is not None
+    handler(Command(command="identify", screen_id=None))
+    assert RecordingSupervisor.instances[-1].identified == [None]
+
+
+class _RealRack:
+    """A real `Supervisor` over virtual panels, for the handler's own tests.
+
+    A double that only recorded the call would prove the handler was called and
+    nothing about what each command *means* against a rack that is driving
+    panels -- which is the whole question, since three of the four turn out to
+    mean nothing here at all.
+    """
+
+    def __init__(self, tmp_path: Path, screens: int = 2) -> None:
+        raw = {
+            "version": 1,
+            "timezone": "UTC",
+            "night": {"enabled": False},
+            "integrations": [],
+            "screens": [
+                {
+                    "id": position * 10,
+                    "name": f"S{position}",
+                    "position": position,
+                    "display": {"backend": "virtual", "out_dir": str(tmp_path / "panels")},
+                    "template": "text-only",
+                    "params": {"line1": "x"},
+                }
+                for position in range(1, screens + 1)
+            ],
+        }
+        config = DaemonConfig.model_validate(raw)
+        self.supervisor = Supervisor(
+            config=config,
+            screens=resolve_screens(config),
+            store=SnapshotStore(),
+            clock=system_clock("UTC"),
+            status_path=tmp_path / "status.json",
+        )
+        self.supervisor.start()
+        self.handler = _command_handler(self.supervisor)
+
+    def scenes(self) -> list[str | None]:
+        return [worker.current_scene for worker in self.supervisor.workers]
+
+
+def test_identify_off_the_link_paints_the_ordinals_on_a_real_rack(tmp_path: Path) -> None:
+    rack = _RealRack(tmp_path)
+    try:
+        rack.handler(Command(command="identify"))
+
+        assert rack.scenes() == ["identify", "identify"]
+    finally:
+        rack.supervisor.stop()
+
+
+def test_identify_off_the_link_can_name_one_panel(tmp_path: Path) -> None:
+    rack = _RealRack(tmp_path)
+    try:
+        rack.handler(Command(command="identify", screen_id=20))
+
+        assert rack.scenes()[1] == "identify"
+        assert rack.scenes()[0] != "identify"
+    finally:
+        rack.supervisor.stop()
+
+
+@pytest.mark.parametrize("command", ["sleep", "wake", "reload"])
+def test_a_command_this_build_cannot_honour_says_so_and_touches_nothing(
+    tmp_path: Path, command: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The three that have no honest meaning against a running supervisor.
+
+    `sleep` and `wake` are what the night window and `ScreenConfig.sleep_override`
+    already are, and deciding which of a transient command and a persistent
+    configuration field wins is a design question rather than a wiring one;
+    `reload` has nothing to reload, because a paired rack's configuration comes
+    from the server and `POST /api/daemons/{id}/push` is how it is re-sent. The
+    server refuses all three, so nothing this daemon is talking to can send one
+    -- but a newer server or a replayed message can, and the answer is a line
+    somebody can act on rather than silence.
+    """
+    rack = _RealRack(tmp_path)
+    try:
+        before = rack.scenes()
+        with caplog.at_level("WARNING"):
+            rack.handler(Command(command=command))
+
+        assert rack.scenes() == before
+        assert [record.command for record in caplog.records if hasattr(record, "command")] == [
+            command
+        ]
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_command_arriving_while_the_daemon_stops_touches_no_panel(tmp_path: Path) -> None:
+    """The panels are slept and their serial devices closed by then, and on a
+    GC9A01 a command written to one that has been torn down is a write to
+    nothing. `_dispatch` runs on the thread the stop event is consulted on, so
+    the message really can arrive here."""
+    rack = _RealRack(tmp_path)
+    rack.supervisor.stop()
+    before = rack.scenes()
+
+    rack.handler(Command(command="identify"))
+
+    assert rack.scenes() == before
+    assert "identify" not in before

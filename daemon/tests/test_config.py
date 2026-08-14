@@ -9,6 +9,7 @@ from ors_daemon.config import (
     resolve_screens,
     system_scenes,
 )
+from ors_render import load_builtin_templates
 
 BASE = {
     "version": 1,
@@ -347,6 +348,47 @@ def test_an_inline_template_shadowing_a_builtin_is_logged(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="ors_daemon.config"):
         resolve_screens(config)
     assert "ring-gauge" in caplog.text
+
+
+def builtin_dump(name: str, **overrides):
+    """A built-in exactly as the server ships it back in a snapshot.
+
+    `builtin: true` is the whole point: the server sends every template it holds,
+    its seeded copies of this build's own built-ins included, so a config with
+    seven of these in it is the normal case and not a rack owner overriding
+    anything.
+    """
+    return {**load_builtin_templates()[name].model_dump(mode="json"), **overrides}
+
+
+def test_the_servers_copy_of_a_builtin_is_not_a_user_override(tmp_path, caplog):
+    """Every snapshot carries all seven built-ins. Warning about them once per
+    config load is seven lines saying nothing, and it buries the one line that
+    means a rack owner really did shadow one."""
+    pushed = {**BASE, "templates": {name: builtin_dump(name) for name in load_builtin_templates()}}
+    config = load_config(write(tmp_path, pushed))
+
+    with caplog.at_level(logging.DEBUG, logger="ors_daemon.config"):
+        resolve_screens(config)
+
+    assert caplog.text == ""
+
+
+def test_a_pushed_builtin_that_differs_from_this_build_is_noted_once(tmp_path, caplog):
+    """The cross-wheel case: the server's seeded copy is what the browser drew
+    its preview from, so it still wins the merge -- but the two ends being on
+    different releases is worth knowing when a panel and the preview disagree."""
+    edited = builtin_dump(
+        "ring-gauge", scenes=[{"name": "custom", "elements": [{"type": "text", "text": "X"}]}]
+    )
+    config = load_config(write(tmp_path, {**BASE, "templates": {"ring-gauge": edited}}))
+
+    with caplog.at_level(logging.DEBUG, logger="ors_daemon.config"):
+        screens = resolve_screens(config)
+
+    assert [record.levelno for record in caplog.records] == [logging.INFO]
+    assert "ring-gauge" in caplog.text
+    assert screens[0].scenes[0].name == "custom", "the server's copy still wins the merge"
 
 
 # --- the fingerprint: which config, not which schema -------------------------
