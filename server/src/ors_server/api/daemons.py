@@ -183,7 +183,11 @@ async def rotate_daemon_key(request: Request, response: Response, daemon_id: int
             missing=f"no daemon {daemon_id}",
         )
         token = rotate_key(edit.connection, daemon_id)
-        edit.affects(daemon_id)
+        # No rack to tell, its own included. A rotation changes credentials and
+        # no configuration at all, so minting a version would be a number for a
+        # change that did not happen -- and the push it caused would go down a
+        # socket whose credential the database has just forgotten.
+        edit.affects_nobody()
         edit.record(daemon_id, "warning", "rotate-key", "the key was revoked and a token minted")
     log.warning("a daemon key was rotated", extra={"daemon": daemon_id})
     return DaemonCreated(id=daemon_id, name=row["name"], token=token)

@@ -304,6 +304,64 @@ def test_preview_draws_the_screens_own_template(client_and_daemon):
     assert first != second
 
 
+def test_preview_draws_the_screens_own_parameters(client_and_daemon):
+    """A template is a scene with holes in it and the parameters are what fill
+    them, so a preview that rendered without them would draw the same picture
+    for every screen using one template -- which is most of a rack."""
+    client, daemon_id = client_and_daemon
+    one = create(client, daemon_id, name="one", params={"title": "CPU"})["id"]
+    two = create(client, daemon_id, name="two", position=9, params={"title": "MEMORY"})["id"]
+
+    first = client.get(f"/api/screens/{one}/preview").content
+    second = client.get(f"/api/screens/{two}/preview").content
+
+    assert first != second
+
+
+def test_preview_falls_back_to_the_templates_declared_defaults(client_and_daemon):
+    """`bind_params` is the bridge between `params_schema`, where a default is
+    written, and what a renderer reads. A preview using the row's parameters
+    alone would draw a screen that has overridden nothing as an empty panel."""
+    client, daemon_id = client_and_daemon
+    client.post(
+        "/api/templates",
+        json={
+            "name": "defaulted",
+            "params_schema": {"label": {"type": "string", "default": "from the template"}},
+            "scenes": [{"elements": [{"type": "text", "text": "{{params.label}}", "size": 40}]}],
+        },
+    )
+    plain = create(client, daemon_id, name="plain", template="defaulted", params={})["id"]
+    overridden = create(
+        client,
+        daemon_id,
+        name="overridden",
+        position=9,
+        template="defaulted",
+        params={"label": "from the screen"},
+    )["id"]
+
+    default_drawn = client.get(f"/api/screens/{plain}/preview").content
+    override_drawn = client.get(f"/api/screens/{overridden}/preview").content
+
+    assert default_drawn != override_drawn
+    blank = client.get(f"/api/screens/{_blank(client, daemon_id)}/preview").content
+    assert default_drawn != blank, "the declared default has to reach the canvas"
+
+
+def _blank(client: TestClient, daemon_id: int) -> int:
+    """A screen of the same template whose parameter really is empty."""
+    client.post(
+        "/api/templates",
+        json={
+            "name": "undefaulted",
+            "params_schema": {"label": {"type": "string"}},
+            "scenes": [{"elements": [{"type": "text", "text": "{{params.label}}", "size": 40}]}],
+        },
+    )
+    return create(client, daemon_id, name="blank", position=11, template="undefaulted")["id"]
+
+
 def test_preview_of_a_screen_that_does_not_exist_is_a_404(client):
     assert client.get("/api/screens/4242/preview").status_code == 404
 

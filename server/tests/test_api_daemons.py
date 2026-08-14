@@ -209,6 +209,23 @@ def test_deleting_a_daemon_leaves_another_racks_screens_alone(client, daemon_id)
     assert [screen["id"] for screen in client.get("/api/screens").json()] == [kept]
 
 
+def test_deleting_a_daemon_does_not_repaint_the_racks_that_are_left(client, daemon_id):
+    """Deleting one rack changes no other rack's configuration.
+
+    `affects_nobody` is what says so, and it has to be said: the default is
+    every daemon, so without it every surviving rack is minted a version and
+    pushed a snapshot identical to the one it is already running -- which the
+    daemon cannot dedupe, because the number is new.
+    """
+    other = client.post("/api/daemons", json={"name": "other-rack"}).json()["id"]
+    other_rack = Rack(client, other)
+
+    client.delete(f"/api/daemons/{daemon_id}")
+
+    assert other_rack.of_type("config") == []
+    assert listed(client, other)["config_version"] == 0
+
+
 def test_deleting_a_daemon_that_is_already_gone_is_a_404(client, daemon_id):
     client.delete(f"/api/daemons/{daemon_id}")
 
@@ -284,6 +301,38 @@ def test_rotating_twice_leaves_only_the_second_token_working(client, daemon_id):
     assert first != second
     assert claim_token(client.app.state.database, first) is None
     assert claim_token(client.app.state.database, second) is not None
+
+
+def test_rotating_a_key_leaves_every_other_rack_alone(client, daemon_id):
+    """A rotation changes one rack's credentials and no rack's configuration.
+
+    Declared, because the affected set defaults to every daemon: without the
+    declaration this endpoint mints a version for every rack on the server and
+    pushes each of them a snapshot, which is a teardown and a repaint of four
+    panels apiece because somebody revoked a key somewhere else.
+    """
+    other = client.post("/api/daemons", json={"name": "other-rack"}).json()["id"]
+    other_rack = Rack(client, other)
+
+    client.post(f"/api/daemons/{daemon_id}/rotate-key")
+
+    assert other_rack.of_type("config") == []
+    assert listed(client, other)["config_version"] == 0
+
+
+def test_rotating_a_key_does_not_repaint_the_rack_it_belongs_to_either(client, daemon_id):
+    """Its own rack included: the key changed, the configuration did not.
+
+    A push here would be pointless as well as costly -- the daemon is about to
+    be unable to authenticate, so the snapshot goes to a socket that is on its
+    way out.
+    """
+    rack = Rack(client, daemon_id)
+
+    client.post(f"/api/daemons/{daemon_id}/rotate-key")
+
+    assert rack.of_type("config") == []
+    assert listed(client, daemon_id)["config_version"] == 0
 
 
 def test_rotating_a_key_for_a_daemon_that_does_not_exist_is_a_404(client):
@@ -381,6 +430,19 @@ def test_pushing_now_mints_a_new_version_because_the_daemon_dedupes_on_it(client
 
     assert listed(client, daemon_id)["config_version"] > before
     assert rack.of_type("config")[-1]["version"] > before
+
+
+def test_the_version_a_push_reports_is_the_version_that_was_sent(client, daemon_id):
+    """The number in the response is what the interface shows and what anybody
+    debugging a blank rack compares against the daemon's log. A response that
+    reported the old version -- or nought -- would say the push was the one the
+    daemon has already refused to apply."""
+    rack = Rack(client, daemon_id)
+
+    reported = client.post(f"/api/daemons/{daemon_id}/push").json()["version"]
+
+    assert reported == rack.of_type("config")[-1]["version"]
+    assert reported == listed(client, daemon_id)["config_version"]
 
 
 def test_pushing_to_an_offline_rack_is_saved_for_its_next_connect(client, daemon_id):
