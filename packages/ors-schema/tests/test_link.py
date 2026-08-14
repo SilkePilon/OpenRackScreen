@@ -551,3 +551,50 @@ def test_the_bound_on_a_frame_is_a_quarter_of_a_mebibyte_and_not_uvicorn_s_defau
     """
     assert MAX_FRAME_BYTES == 256 * 1024 == 262_144
     assert MAX_FRAME_BYTES * 64 == 16 * 1024 * 1024, "uvicorn's default is 64 of these"
+
+
+def test_a_frame_addressed_to_a_flag_is_not_a_frame_addressed_to_screen_one():
+    """`bool` is an `int` in Python and pydantic's lax mode takes it as one.
+
+    `{"screen_id": true}` therefore validated as 1 -- a frame from a daemon that
+    sent a flag where an id belongs would be relayed to whoever is watching row
+    id 1, painting one rack's panel with another's picture and telling nobody.
+    `ws_ui._Request` refused the same thing on the browser socket and
+    `ws_daemon._about` in a log field; this is the third place and the one both
+    of those should have been able to lean on.
+    """
+    with pytest.raises(ValidationError) as refused:
+        Frame(screen_id=True, seq=1, webp=b"x")
+
+    assert "flag" in str(refused.value)
+    # Off the wire as well as in Python: the JSON literal is how it really arrives.
+    with pytest.raises(ValidationError):
+        Frame.model_validate_json('{"type": "frame", "screen_id": true, "seq": 1, "webp": "eA=="}')
+
+
+def test_a_command_addressed_to_a_flag_is_refused_the_same_way():
+    """Lower impact -- the server mints its own commands -- and the same defect.
+
+    A command carrying `true` would identify, sleep or wake whichever panel holds
+    row id 1, which on a four-panel rack is a one-in-four chance of looking
+    correct.
+    """
+    with pytest.raises(ValidationError) as refused:
+        Command(command="identify", screen_id=True)
+
+    assert "flag" in str(refused.value)
+
+
+def test_a_command_may_still_name_no_screen_at_all():
+    """The whole rack, which is what `sleep` and `wake` usually mean.
+
+    None is not a flag and must survive the validator that refuses one -- a
+    check written as `if not screen_id` would take this with it.
+    """
+    assert Command(command="sleep").screen_id is None
+
+
+def test_a_screen_id_of_one_still_parses_on_both_messages():
+    """The value the bug aliased to. Refusing it would be the same bug inverted."""
+    assert Frame(screen_id=1, seq=1, webp=b"x").screen_id == 1
+    assert Command(command="identify", screen_id=1).screen_id == 1

@@ -201,6 +201,30 @@ inheriting a default that has nothing to do with a panel.
 """
 
 
+def _not_a_flag(screen_id: object) -> object:
+    """Refuse a JSON `true` where a row id belongs, on every message that carries one.
+
+    `bool` is an `int` in Python and pydantic's lax mode takes it as one, so
+    `{"screen_id": true}` validates as `1` and addresses whatever screen holds
+    row id 1. On a `Frame` that is one rack's panel painted with another's
+    picture, with nothing anywhere saying so; on a `Command` it is `identify`
+    lighting up somebody else's glass.
+
+    Here rather than at the two ends that read these fields, which is where it
+    was answered twice already -- `ws_ui._Request` on the browser socket and
+    `ws_daemon._about` in a log field. A rule about what a field may hold belongs
+    to the field, and a third copy at a third caller is a fourth caller waiting
+    to forget it.
+
+    A validator and not `StrictInt`, because strictness would also refuse the
+    `"7"` a JSON producer may legitimately send for an integer; what is wrong
+    with `true` is that it is not a number at all.
+    """
+    if isinstance(screen_id, bool):
+        raise ValueError("a screen id is a row id, not a flag")
+    return screen_id
+
+
 class Frame(_Message):
     """One rendered panel image, on its way to a browser watching the rack.
 
@@ -225,6 +249,11 @@ class Frame(_Message):
     # limit is the message, so the bound has to be on the payload it is derived
     # from. See `MAX_FRAME_BYTES` for what a real panel weighs.
     webp: bytes = Field(max_length=MAX_FRAME_BYTES)
+
+    @field_validator("screen_id", mode="before")
+    @classmethod
+    def _screen_id_is_a_row_id(cls, screen_id: object) -> object:
+        return _not_a_flag(screen_id)
 
 
 class LogLine(_Message):
@@ -286,6 +315,17 @@ class Command(_Message):
     type: Literal["command"] = "command"
     command: Literal["identify", "sleep", "wake", "reload"]
     screen_id: int | None = None
+    """Which panel, or None for the whole rack -- which is what `sleep` usually means.
+
+    None passes the validator below untouched: an absence is not a flag, and a
+    check written as `if not screen_id` would refuse the commonest command there
+    is.
+    """
+
+    @field_validator("screen_id", mode="before")
+    @classmethod
+    def _screen_id_is_a_row_id(cls, screen_id: object) -> object:
+        return _not_a_flag(screen_id)
 
 
 MAX_REQUESTED_FPS = 60.0
