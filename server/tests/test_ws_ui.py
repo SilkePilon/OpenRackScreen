@@ -1191,11 +1191,20 @@ async def test_a_tab_subscribing_twice_to_one_panel_says_so_once(tmp_path):
 
     Not the same question as two tabs on one screen, which still restates the
     whole set: there the connection really did acquire a subscription.
+
+    The repeats come after the coalescing window has closed, so a request they
+    caused would go out at once rather than being deferred into one this
+    assertion cannot see. Counting straight after `handled()` proves nothing:
+    everything is deferred inside the window, including the messages that should
+    have caused nothing at all.
     """
     app = build(tmp_path)
     daemon_id, screens = rack(app)
     pi = Rack(app, daemon_id)
     browser, handler = await browsing(app)
+    browser.say(action="subscribe", screen_id=screens[0])
+    await pi.told(True, screens)
+    await asyncio.sleep(ws_ui.ARM_INTERVAL_S * 1.2)
 
     for _ in range(3):
         browser.say(action="subscribe", screen_id=screens[0])
