@@ -1,0 +1,42 @@
+# OpenRackScreen server, anywhere on the LAN; the daemon stays on the rack.
+#
+#   docker compose -f deploy/compose.remote.yaml up -d
+#
+# The difference from compose.pi.yaml is the reverse-proxy variable below and
+# nothing else. The daemon is not here for the same reason it is not there --
+# it is a systemd unit on the Pi -- except that here it is on a different
+# machine, so each rack's `ors-daemon connect --server` names this host rather
+# than localhost.
+services:
+  server:
+    image: ghcr.io/silkepilon/openrackscreen:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # See compose.pi.yaml for why this is the bare name rather than a
+      # `${ORS_SECRET_KEY:-}` substitution. Short version: compose turns an
+      # unset variable into an empty one, and the server refuses an empty key.
+      - ORS_SECRET_KEY
+      # Uvicorn trusts X-Forwarded-For from these hosts only, and reads this
+      # variable whenever proxy headers are on -- which they are, passed
+      # explicitly in __main__.py rather than inherited. Behind a reverse proxy
+      # this must name the proxy, or every login arrives from the proxy's own
+      # address and the per-IP login limiter throttles everybody at once, on the
+      # first wrong password anyone types. Carried from Task 4.
+      #
+      # A substitution with a default is right here and wrong for the key above:
+      # 127.0.0.1 is uvicorn's own fallback and a safe value to be given
+      # explicitly, whereas there is no safe default for a secret.
+      - FORWARDED_ALLOW_IPS=${ORS_TRUSTED_PROXIES:-127.0.0.1}
+    volumes:
+      # Named, not a bind mount. See compose.pi.yaml -- the argument about the
+      # daemon's state directory is specific to the Pi, but "let Docker own the
+      # directory whose ownership the image sets" holds either way.
+      - ors-data:/var/lib/openrackscreen
+
+volumes:
+  ors-data:

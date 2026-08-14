@@ -1,0 +1,46 @@
+# The build context is the repository root, because the server is one member of
+# a uv workspace and the build needs the lock file and the shared packages. That
+# makes this file load-bearing rather than tidy: without it the context is the
+# 130 MB working tree, of which 116 MB is `.venv`, and every build ships all of
+# it to the daemon before reading a single instruction. Over a network to a Pi
+# that is the whole build time.
+#
+# It is also a correctness problem, not only a speed one. `COPY server/ server/`
+# would copy a host `.venv` if one existed there, and a virtualenv built against
+# the host's interpreter landing in the image is a broken image that takes a
+# while to diagnose.
+
+# Virtualenvs. The image builds its own; a host one is wrong for it by
+# construction -- wrong interpreter, wrong platform, absolute shebangs.
+.venv/
+venv/
+**/.venv/
+
+# History and tooling state. Nothing in the build reads them.
+.git/
+.github/
+.gitignore
+.superpowers/
+.pytest_cache/
+.ruff_cache/
+**/__pycache__/
+*.py[cod]
+
+# Bytecode and databases from a local run. An `ors.db` copied into the image
+# would be shadowed by the volume at runtime, so it would not even be used --
+# just published, with whatever is in it.
+*.db
+*.sqlite3
+.env
+
+# Planning prose and the deploy files themselves. The Dockerfile is read by the
+# builder before the context is consulted, so excluding this directory does not
+# exclude the Dockerfile.
+docs/
+deploy/
+
+# The daemon. It is a systemd unit on the rack and never runs in this image; its
+# `pyproject.toml` is the one thing the build needs, to resolve the workspace,
+# and that is re-admitted below.
+daemon/
+!daemon/pyproject.toml

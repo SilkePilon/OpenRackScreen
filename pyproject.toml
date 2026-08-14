@@ -35,12 +35,21 @@ ors-server = { workspace = true }
 # wedges the whole run rather than failing it -- and CI records that as a
 # stalled build, not a red one. Three unrelated one-line edits to
 # `ws_daemon.py` were each measured doing exactly that.
+# `pyyaml` is here for `test_deploy.py`, which reads the compose files as
+# documents rather than as text -- asserting on the text is how a published port
+# ends up matched by a substring of a comment. It is *already* installed in this
+# workspace, because `ors-daemon` depends on it to read `rack.yaml`, and that is
+# exactly why it is named here: a server-side test that imports it by accident,
+# through a dependency of a package it does not depend on, breaks the day the
+# daemon stops parsing YAML. `ors-server` itself does not, and the image does
+# not ship it.
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.0,<2",
     "pytest-timeout>=2.3",
     "ruff>=0.6",
     "httpx2>=2.10",
+    "pyyaml>=6",
 ]
 
 [tool.pytest.ini_options]
