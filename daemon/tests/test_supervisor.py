@@ -2853,3 +2853,77 @@ def drain(frames: FrameStream) -> int:
         assert frame is not None
         return frame.seq
     raise AssertionError("no frame was offered")
+
+
+# --- what an ordinary push costs on a rack with nothing wrong with it --------
+
+
+def test_an_ordinary_apply_does_not_wait_out_a_healthy_workers_heartbeat_floor(
+    tmp_path: Path, watch_parks: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The case the overrun test manufactures with a wedged worker is the case a
+    healthy rack was in on every single push.
+
+    A worker that is awake, unfaulted and drawing parks in
+    `SnapshotStore.wait_for_change`, and until `wake` existed the slot's stop
+    event did not notify that condition -- so `_retire` set the flag and then
+    joined against a worker that would not look at it until its five-second
+    floor elapsed. Measured on a one-screen virtual rack, four consecutive
+    applies: 2.008s, 3.003s (overran, worker abandoned), 0.001s, 1.019s. The
+    only reason it is not five seconds is that `APPLY_BUDGET` cuts it off at
+    three, which is the whole of it -- three seconds out of the daemon's
+    ten-second shutdown budget, three seconds in which the link thread reads
+    nothing and beats nothing, and an ERROR saying the apply went wrong on a
+    push where nothing did.
+
+    Nothing here is a race the test can lose. `watch_parks` reports from inside
+    the store's lock, so the worker is provably parked before the apply starts:
+    a test that merely waited for a frame would sometimes catch it between
+    `tick` and `_wait`, where the stop event is read anyway and the defect is
+    invisible.
+    """
+    rack = Rack(tmp_path, screens=1)
+    condition = watch_parks(rack.store)
+    rack.supervisor.start()
+    retiring = rack.supervisor.workers[0]
+    try:
+        condition.await_parks(1)
+        started = time.monotonic()
+        with caplog.at_level("ERROR"):
+            rack.supervisor.apply(edited(rack.raw, name="renamed"))
+        elapsed = time.monotonic() - started
+        # Read here and not after the `finally`, which closes the store and
+        # would release the worker itself -- the question is whether *the apply*
+        # joined it or gave up on it.
+        joined = not retiring.is_alive()
+    finally:
+        rack.supervisor.stop()
+
+    assert joined, "the retired worker was abandoned rather than joined"
+    assert elapsed < 1.0, f"an ordinary push cost {elapsed:.3f}s of the link thread"
+    assert not [record for record in caplog.records if "overran" in record.getMessage()], (
+        "the overrun ERROR fired on a rack with nothing wrong with it"
+    )
+    assert [worker.screen_name for worker in rack.supervisor.workers] == ["renamed"]
+
+
+def test_an_apply_that_retires_nothing_does_not_wake_the_rack(tmp_path: Path) -> None:
+    """`wake` is cheap and not free: every worker re-tests its predicate.
+
+    An apply that only *adds* a screen retires no slot and sets no stop event,
+    so there is nothing for the kept workers to re-read -- and waking them
+    anyway would be a lock and four predicate calls per push for no news.
+    """
+    rack = Rack(tmp_path, screens=1)
+    woken: list[int] = []
+    rack.store.wake = lambda: woken.append(1)  # type: ignore[method-assign]
+    rack.supervisor.start()
+    try:
+        raw = config_dict(tmp_path, screens=2)
+        raw["screens"][0] = rack.raw["screens"][0]
+        rack.supervisor.apply(DaemonConfig.model_validate(raw))
+
+        assert woken == []
+        assert len(rack.supervisor.workers) == 2
+    finally:
+        rack.supervisor.stop()

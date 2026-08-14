@@ -375,7 +375,16 @@ class ScreenWorker(threading.Thread):
             # moving it, so that wait returns instantly, every lap, forever.
             self._stop_event.wait(timeout)
             return
-        self._store.wait_for_change(self._seen_version, timeout=timeout)
+        # The stop event goes in as well as the version, and it is the branch
+        # that runs on every lap of a healthy rack -- so it is the one where
+        # leaving it out cost the most. The other two above park on the event
+        # directly and end the instant a `Supervisor._retire` sets it; this one
+        # parks on the store, which a `threading.Event` does not notify, so
+        # without this a retirement was noticed only when the floor elapsed.
+        # `SnapshotStore.wake` is the notification behind the flag; between them
+        # they are what turns "the flag is only read between waits" into a wait
+        # that reads it.
+        self._store.wait_for_change(self._seen_version, timeout=timeout, stop=self._stop_event)
 
     def _select(self, snapshot: Snapshot) -> tuple[Scene, str, RenderContext]:
         """The scene to draw, its name, and the context both stages agreed on.

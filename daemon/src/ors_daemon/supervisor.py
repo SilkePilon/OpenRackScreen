@@ -1012,13 +1012,34 @@ class Supervisor:
         of these panels is this one -- which is what makes it safe to blank them
         afterwards whether or not the joins succeed.
 
+        *Then the store is woken, once, before the first join.* Setting a
+        `threading.Event` notifies nothing, and a healthy worker -- awake,
+        unfaulted, drawing -- spends its life parked in
+        `SnapshotStore.wait_for_change` rather than on its own event. So the
+        flag alone was read only when that wait timed out, which is a whole
+        heartbeat floor of five seconds, and the join below then spent whatever
+        of `APPLY_BUDGET` was left. Measured on a one-screen virtual rack, four
+        consecutive applies: 2.008s, 3.003s (overran, worker abandoned), 0.001s,
+        1.019s -- on a rack with nothing wrong with it, on the branch that runs
+        100% of the time. This is `stop`'s `self._store.close()` applied to the
+        one retirement that is not a shutdown; the two are the same fix, and
+        only the shutdown had it.
+
+        Once for the rack rather than once per slot, and only when there is
+        something to say: `wake` re-tests every waiter's predicate, so the
+        workers that are staying pay a predicate call each and go back to
+        waiting for what is left of their timeout.
+
         The joins share one deadline. A worker that does not make it is logged
         and abandoned, exactly as `stop` abandons one, because there is no way to
         kill a Python thread and waiting longer buys nothing.
         """
+        if not retired:
+            return
         for slot in retired:
             slot.panel.revoke()
             slot.stop.set()
+        self._store.wake()
         for slot in retired:
             if slot.worker is None:
                 continue

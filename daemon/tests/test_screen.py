@@ -597,7 +597,7 @@ def test_a_drawing_worker_waits_for_the_data_it_last_drew_to_change() -> None:
     worker, store, _ = make()
     calls: list[tuple[int, float]] = []
 
-    def record(version: int, timeout: float) -> bool:
+    def record(version: int, timeout: float, stop=None) -> bool:
         calls.append((version, timeout))
         return False
 
@@ -607,6 +607,36 @@ def test_a_drawing_worker_waits_for_the_data_it_last_drew_to_change() -> None:
     worker._wait()
 
     assert calls == [(worker._seen_version, 5.0)]
+
+
+def test_the_ordinary_wait_is_also_cut_short_by_this_worker_being_retired() -> None:
+    """The branch that runs 100% of the time on a healthy rack, and the one that
+    was left out when the flag-read-between-waits defect was fixed everywhere
+    else.
+
+    The other two branches of `_wait` park on the stop event itself, so they
+    already end the moment `Supervisor._retire` sets it. This one parks on the
+    store, which the event does not notify -- so an apply set the flag, joined
+    against a worker that was not watching it, and spent whatever was left of
+    the five-second floor. It is not a matter of shaving milliseconds off a
+    push: three of those seconds come out of the daemon's ten-second shutdown
+    budget, the link thread reads nothing and beats nothing while they pass, and
+    the overrun ERROR beside them fires on an ordinary healthy rack, which
+    retires it as a signal.
+    """
+    worker, store, _ = make()
+    handed: list[object] = []
+
+    def record(version: int, timeout: float, stop=None) -> bool:
+        handed.append(stop)
+        return False
+
+    store.wait_for_change = record  # type: ignore[method-assign]
+    publish(store)
+    worker.tick()
+    worker._wait()
+
+    assert handed == [worker._stop_event]
 
 
 def test_the_loop_closes_the_panel_on_the_way_out() -> None:
@@ -621,7 +651,7 @@ def test_the_loop_closes_the_panel_on_the_way_out() -> None:
 def test_a_wait_that_blows_up_does_not_take_the_thread_down() -> None:
     worker, store, display = make()
 
-    def boom(version: int, timeout: float) -> bool:
+    def boom(version: int, timeout: float, stop=None) -> bool:
         # Set from in here so the guard's own fallback wait returns at once:
         # the point is that the loop survives, not how long it pauses for.
         worker._stop_event.set()
@@ -683,9 +713,12 @@ def test_the_thread_draws_until_it_is_told_to_stop() -> None:
     display = RecordingDisplay()
     drawn = threading.Event()
     display.on_show = drawn.set
-    # A floor this short only bounds how long the loop sits in `wait_for_change`
-    # after the stop event is set; nothing in the test waits for it to elapse.
-    worker, store, _ = make(display=display, floor=0.05)
+    # The default floor, deliberately. This used to pass a floor of 0.05 so that
+    # the join below could not sit out a wait the stop event did not reach --
+    # which was the defect, worked around in a test rather than seen. The stop
+    # event now goes into `wait_for_change`, so a worker parked there leaves at
+    # once whatever the floor is, and this asserts it at the value a rack runs.
+    worker, store, _ = make(display=display)
 
     worker.start()
     try:
