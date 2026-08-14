@@ -11,7 +11,9 @@ from ors_server.secrets import SecretStore, load_or_create_key
 from ors_server.snapshot import (
     SnapshotError,
     build_snapshot,
+    build_snapshot_on,
     bump_config_version,
+    bump_config_version_on,
     scenes_json,
     seed_builtin_templates,
 )
@@ -662,3 +664,58 @@ def test_a_snapshot_names_each_screen_by_the_row_id_frames_are_routed_with(tmp_p
         (third, 5),
         (second, 9),
     ]
+
+
+def test_a_snapshot_can_be_assembled_on_a_connection_that_is_mid_edit(tmp_path):
+    """What the configuration API needs, and what its own connection cannot give it.
+
+    A mutation writes its row inside a transaction and has to know, before it
+    commits, whether the result is a configuration a daemon could run. A
+    `build_snapshot` that opens a connection of its own is a *reader*: in WAL
+    it sees the last committed state, so it would validate the rows as they were
+    before the edit and pass a change that breaks the rack.
+    """
+    database, secrets, daemon_id = fixtures(tmp_path)
+
+    with closing(database.connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        add_screen(connection, daemon_id, position=3, name="uncommitted")
+        assembled = build_snapshot_on(connection, secrets, daemon_id)
+        names_from_another_connection = [
+            screen.name for screen in build_snapshot(database, secrets, daemon_id).screens
+        ]
+        connection.execute("ROLLBACK")
+
+    assert "uncommitted" in [screen.name for screen in assembled.screens]
+    assert "uncommitted" not in names_from_another_connection, (
+        "a second connection is what the API compares against, and it must not see this"
+    )
+
+
+def test_a_version_can_be_minted_on_a_connection_that_is_mid_edit(tmp_path):
+    """The same requirement for the counter, and for the same reason.
+
+    `bump_config_version` opening its own connection while the caller holds a
+    write transaction is not merely a stale read -- it is a second writer against
+    a locked database, which SQLite answers with `database is locked`.
+    """
+    database, _, daemon_id = fixtures(tmp_path)
+
+    with closing(database.connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        minted = bump_config_version_on(connection, daemon_id)
+        connection.execute("ROLLBACK")
+
+    assert minted == 1
+    with closing(database.connect()) as connection:
+        rolled_back = connection.execute(
+            "SELECT config_version FROM daemon WHERE id = ?", (daemon_id,)
+        ).fetchone()["config_version"]
+    assert rolled_back == 0, "a version minted inside a transaction dies with it"
+
+
+def test_minting_a_version_for_a_daemon_that_is_gone_still_raises_on_a_connection(tmp_path):
+    database, _, _ = fixtures(tmp_path)
+
+    with closing(database.connect()) as connection, pytest.raises(KeyError):
+        bump_config_version_on(connection, 4242)

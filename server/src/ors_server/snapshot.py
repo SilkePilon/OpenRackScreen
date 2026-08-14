@@ -104,6 +104,18 @@ def seed_builtin_templates(database: Database) -> None:
 
 
 def bump_config_version(database: Database, daemon_id: int) -> int:
+    """Advance this daemon's generation counter, on a connection of its own.
+
+    See `bump_config_version_on` for what it does and why it is one statement.
+    This wrapper is for the callers that have no transaction to join -- the
+    daemon socket, and anything measuring the counter -- and it is the only
+    difference between the two.
+    """
+    with closing(database.connect()) as connection:
+        return bump_config_version_on(connection, daemon_id)
+
+
+def bump_config_version_on(connection: sqlite3.Connection, daemon_id: int) -> int:
     """Advance this daemon's generation counter and return the new value.
 
     One statement, so no two callers are handed the same number. An UPDATE
@@ -128,13 +140,18 @@ def bump_config_version(database: Database, daemon_id: int) -> int:
     release: the "Processing Order" section describes the interleaved behaviour
     as a pre-release prototype and says why it was abandoned. The oldest
     SQLite behind a distro Python 3.11 is Debian bookworm's 3.40.1.)
+
+    The connection is the caller's, because the configuration API mints this
+    number inside the same transaction as the edit it belongs to. Opening one
+    here instead would be a second writer against a database the caller has
+    already locked -- `sqlite3.OperationalError: database is locked` -- and, if
+    it somehow got past that, a version that survived a rolled-back edit.
     """
-    with closing(database.connect()) as connection:
-        row = connection.execute(
-            "UPDATE daemon SET config_version = config_version + 1"
-            " WHERE id = ? RETURNING config_version",
-            (daemon_id,),
-        ).fetchone()
+    row = connection.execute(
+        "UPDATE daemon SET config_version = config_version + 1"
+        " WHERE id = ? RETURNING config_version",
+        (daemon_id,),
+    ).fetchone()
     if row is None:
         raise KeyError(f"no daemon {daemon_id}")
     return int(row["config_version"])
@@ -237,6 +254,26 @@ def _templates(connection: sqlite3.Connection) -> dict[str, dict[str, Any]]:
 
 
 def build_snapshot(database: Database, secrets: SecretStore, daemon_id: int) -> DaemonConfig:
+    """Assemble a snapshot from what is committed, on a connection of its own.
+
+    See `build_snapshot_on` for what it assembles. The pair exists because a
+    mutation in the configuration API has to ask this question *of its own
+    uncommitted write* -- a connection opened here is a reader, and in WAL a
+    reader sees the last committed state, so it would validate the rows as they
+    were before the edit and wave through a change that breaks the rack.
+
+    This form is still the right one for the daemon socket, which has no
+    transaction to join, and it is what the API compares against when it needs
+    to know whether a configuration was *already* unservable before the edit it
+    is holding -- which is exactly a question about what is committed.
+    """
+    with closing(database.connect()) as connection:
+        return build_snapshot_on(connection, secrets, daemon_id)
+
+
+def build_snapshot_on(
+    connection: sqlite3.Connection, secrets: SecretStore, daemon_id: int
+) -> DaemonConfig:
     """Assemble what this daemon should be running, as the model it already loads.
 
     The wire format is `DaemonConfig` itself, so a snapshot goes through exactly
@@ -250,19 +287,18 @@ def build_snapshot(database: Database, secrets: SecretStore, daemon_id: int) -> 
     configuration API and the daemon socket to add an argument neither of them
     has an opinion about.
     """
-    with closing(database.connect()) as connection:
-        if connection.execute("SELECT 1 FROM daemon WHERE id = ?", (daemon_id,)).fetchone() is None:
-            raise KeyError(f"no daemon {daemon_id}")
+    if connection.execute("SELECT 1 FROM daemon WHERE id = ?", (daemon_id,)).fetchone() is None:
+        raise KeyError(f"no daemon {daemon_id}")
 
-        settings = {
-            row["key"]: row["value"] for row in connection.execute("SELECT key, value FROM setting")
-        }
-        payload: dict[str, Any] = {
-            "version": 1,
-            "screens": _screens(connection, daemon_id),
-            "integrations": _integrations(connection, daemon_id),
-            "templates": _templates(connection),
-        }
+    settings = {
+        row["key"]: row["value"] for row in connection.execute("SELECT key, value FROM setting")
+    }
+    payload: dict[str, Any] = {
+        "version": 1,
+        "screens": _screens(connection, daemon_id),
+        "integrations": _integrations(connection, daemon_id),
+        "templates": _templates(connection),
+    }
     # Absent keys are left out entirely rather than defaulted here, so the one
     # place a default is written stays `DaemonConfig`. A second copy in this
     # module would be a rack running a timezone the schema never chose.
