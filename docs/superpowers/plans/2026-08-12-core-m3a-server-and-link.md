@@ -3178,6 +3178,22 @@ git commit -m "feat(server): the configuration API"
 
 ### Task 14: Docker image and compose files
 
+**Carried from task 13:**
+
+- **The container makes one outbound HTTP call of its own.** `POST /api/integrations/{id}/test` fetches the operator's Prometheus from inside the server, via `app.state.probe`. Nothing else in this image dials out. Neither compose file needs to do anything about that on a LAN, but a deployment that puts the server behind an egress policy has to allow it, or the Test button fails with a connection error that reads like a wrong URL. Worth one line in `server/README.md`.
+- **`GET /api/daemons` assembles a snapshot per rack** to fill `config_error`, which is the only signal a rack that cannot be given a configuration has. It is a handful of SQLite reads and one pydantic validation per daemon — nothing for four racks — but it is the one list endpoint whose cost is not O(rows). If a healthcheck is ever pointed at it instead of `/api/health`, that becomes a per-interval cost; do not.
+- Task 14's own two MUST CHECK items stand unchanged: `proxy_headers` (task 11 corrected the note — uvicorn 0.52.1 defaults it on and `__main__.py` now passes both explicitly), and whether `load_or_create_key`'s permission check accepts the key it writes as uid 10001 inside the volume.
+
+**Carried to M3b, which is where every one of these is read:**
+
+- **A mutation may answer `202`.** It means the edit was saved and no rack was given it, because that rack's configuration was already unservable before the edit — the interface must not treat it as a plain success. The reason is `config_error` on `GET /api/daemons`, per rack, and the recovery is usually the next edit plus `POST /api/daemons/{id}/push`.
+- **A pairing token is shown exactly once**, by `POST /api/daemons` and by `POST /api/daemons/{id}/rotate-key`, and by nothing else ever. Losing it means rotating again.
+- **`credential` is write-only.** It is a field on the integration bodies and on no response; `has_credential` is the only thing a read tells you. An empty string clears it. An *enabled* integration may not hold one in M3a and the API says so — M4 is what gives one somewhere to go.
+- **A preview is not mount-corrected**, exactly like the live frames on `/ws/ui`: `rotation` and `hflip` describe how a panel is bolted in, and the browser shows what a person standing at the rack sees. The interface must not rotate either of them.
+- **Types come from the OpenAPI document**, so every route carries an explicit response model — including the ones whose body is one field. A route returning a bare `dict` would generate as `object` and be typed by hand, which is what §7.2 forbids.
+- **`frames_dropped` still has nothing carrying it upstream.** `FrameStream.dropped` reaches `status.json` and stops there; `Heartbeat.status` is still sent empty and there is still no exporter. Task 13 built neither, so the obligation is unchanged and now belongs to whichever of the two M3b or M4 builds first.
+- **The Test button reports the first sample of each query**, not the value the panel will show: `reduce`, `label` and `strip` are the daemon poller's semantics and are deliberately not reimplemented in the server. The interface should label it as a reachability check rather than a preview of the reading.
+
 **Files:**
 - Create: `deploy/Dockerfile`, `deploy/compose.pi.yaml`, `deploy/compose.remote.yaml`, `server/README.md`
 - Test: `server/tests/test_deploy.py`

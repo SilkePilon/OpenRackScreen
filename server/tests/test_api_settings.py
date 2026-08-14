@@ -57,7 +57,15 @@ def test_a_fresh_server_reports_the_defaults_the_schema_would_have_used(client):
 def test_the_admin_password_hash_is_not_a_setting_this_route_answers_with(client):
     """`setting` is a key-value table and the password hash lives in it. A
     `SELECT *` here is one line, and it puts an argon2 hash of the admin's
-    password into a JSON response that the SPA then holds in memory."""
+    password into a JSON response that the SPA then holds in memory.
+
+    Two things stop it and this test can only see one of them. `SettingsView` is
+    what really does it -- a route answering with the whole table fails this
+    test, measured -- and the `key IN (...)` in `_view` is a second line that no
+    test can distinguish, because a mutation removing it changes nothing while
+    the model still names its two fields. Kept anyway: the day somebody builds a
+    response *from* the dict, the allow-list is what is already there.
+    """
     with closing(client.app.state.database.connect()) as connection:
         stored = connection.execute(
             "SELECT value FROM setting WHERE key = 'admin_password_hash'"
