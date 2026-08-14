@@ -198,6 +198,96 @@ def test_a_query_containing_an_at_sign_is_not_mistaken_for_a_url(client, daemon_
     assert created.status_code == 201
 
 
+def test_a_url_carrying_only_a_password_is_refused_too(client, daemon_id):
+    """The half of the check with no username in it at all.
+
+    `https://:hunter2@prom.local` has a falsy `username` and a real `password`,
+    so a check written as `parsed.username` alone accepts it -- and the whole
+    plaintext lands in `integration.config` and in the next export. Named
+    separately from the username half because a mutant dropping either one is
+    invisible to a test that only sends `user:pass`.
+    """
+    refused = create(
+        client, daemon_id, config={**PROM, "url": f"https://:{CREDENTIAL}@prom.local:9090"}
+    )
+
+    assert refused.status_code == 422
+    assert "credential" in refused.json()["detail"]
+    assert CREDENTIAL not in refused.text
+    assert client.get("/api/integrations").json() == []
+
+
+UNPARSEABLE = [
+    # `urlsplit` raises `ValueError("Invalid IPv6 URL")` on a netloc holding an
+    # unbalanced bracket, and every one of these carries a password through it.
+    # Treating "the parser refused" as "not a URL" is what let the first three
+    # store and export in plaintext.
+    "https://admin:{secret}@[fd00::1:9090",
+    "https://user:{secret}@[::1",
+    "http://a:{secret}@[::1",
+    "https://admin:{secret}@]fd00::1[:9090",
+]
+
+
+@pytest.mark.parametrize("template", UNPARSEABLE)
+def test_a_url_the_parser_cannot_read_is_refused_rather_than_waved_through(
+    client, daemon_id, template
+):
+    """A URL the parser cannot parse is not a URL that passed the check.
+
+    Measured before this was refused: 201, the plaintext in `integration.config`,
+    in `GET /api/integrations`, and verbatim in `Database.export()` -- the
+    artefact that exists so a rack's configuration survives a schema bump.
+    """
+    refused = create(client, daemon_id, config={**PROM, "url": template.format(secret=CREDENTIAL)})
+
+    assert refused.status_code == 422
+    assert CREDENTIAL not in refused.text
+    assert client.get("/api/integrations").json() == []
+    assert CREDENTIAL not in json.dumps(client.app.state.database.export())
+
+
+REFUSED = [
+    # Every shape that carries userinfo, including the ones that look like they
+    # do not. `urlsplit` strips ASCII tab and newline before it parses, lowercases
+    # the scheme, and does not decode percent-escapes in userinfo -- so all four
+    # of the middle cases are a credential wearing a disguise.
+    "https://admin:{secret}@prom.local:9090",
+    "https://{secret}@prom.local",
+    "https://admin:@prom.local",
+    "https://admin:{secret}@[fd00::1]:9090",
+    "https://user%40example.com:{secret}@prom.local",
+    "https://ad\tmin:{secret}@prom.local",
+    "https://ad\nmin:{secret}@prom.local",
+    "HTTPS://admin:{secret}@prom.local",
+]
+
+ALLOWED = [
+    # And every shape that does not. An `@` is not evidence of anything on its
+    # own: it is a PromQL modifier, and it is a legal path character.
+    "http://prom.local:9090/a@b",
+    "http://[fd00::1]:9090",
+    "http://prom.local:9090",
+]
+
+
+@pytest.mark.parametrize("template", REFUSED)
+def test_every_shape_that_carries_userinfo_is_refused(client, daemon_id, template):
+    refused = create(client, daemon_id, config={**PROM, "url": template.format(secret=CREDENTIAL)})
+
+    assert refused.status_code == 422
+    assert CREDENTIAL not in refused.text
+
+
+@pytest.mark.parametrize("url", ALLOWED)
+def test_a_url_that_carries_no_credential_is_left_alone(client, daemon_id, url):
+    """The other half, and the one a blunter check breaks: refusing every string
+    with an `@` or a `[` in it would refuse the addresses people really type."""
+    created = create(client, daemon_id, config={**PROM, "url": url})
+
+    assert created.status_code == 201, created.text
+
+
 def test_a_credential_becomes_an_encrypted_secret_row(client, daemon_id):
     created = create(client, daemon_id, credential=CREDENTIAL, enabled=False)
 

@@ -363,6 +363,24 @@ def _no_userinfo(value: Any, path: str = "config") -> None:
 
     A string is treated as a URL only when it parses as one with a scheme and a
     host, so a PromQL query containing an `@` is left alone.
+
+    **A string the parser refuses is refused too**, and that is not a fallback --
+    it is the hole this check had. `urlsplit` raises `ValueError("Invalid IPv6
+    URL")` on any netloc holding an unbalanced bracket, and
+    `https://admin:hunter2@[fd00::1:9090` is exactly that: it never reaches the
+    userinfo test below, so treating the raise as "not a URL" answered 201 and
+    put the plaintext in `integration.config`, in every listing, and verbatim in
+    the export. Measured. There is no reading of an address the parser cannot
+    read under which it is safe, so it is not read.
+
+    The trade that buys is narrow and real: a string that is not a URL at all,
+    but happens to contain `//` followed by an unmatched `[` before the next
+    delimiter, is refused as well. That is the only shape affected -- a bracket
+    on its own is fine, and so is `sum(rate(x[5m])) // 2` -- and the answer to it
+    is a 422 naming the field, not a credential in a plaintext file.
+
+    Neither message quotes the value. The reason for the refusal is the shape of
+    the string, and the string is the thing that may be a password.
     """
     if isinstance(value, dict):
         for key, item in value.items():
@@ -376,8 +394,15 @@ def _no_userinfo(value: Any, path: str = "config") -> None:
         return
     try:
         parsed = urlsplit(value)
-    except ValueError:
-        return
+    except ValueError as error:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{path} looks like a URL and cannot be parsed as one, so it cannot be checked"
+                " for a credential. `config` is exported in plain text beside the database;"
+                " correct the address, and send any credential as `credential` instead."
+            ),
+        ) from error
     if parsed.scheme and parsed.netloc and (parsed.username or parsed.password):
         raise HTTPException(
             status_code=422,
