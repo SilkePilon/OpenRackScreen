@@ -3452,6 +3452,64 @@ Recorded here rather than fixed, each with the reason. Tasks 11-13 should read t
 - **`stop` can abandon the source reaper** if a `kubectl` teardown outlasts the shutdown deadline, so that child can outlive the daemon by up to its own SIGKILL wait. The same bargain as any other thread here, but it is new surface.
 - **Still open from task 9: `DaemonConfig.screens` has no `max_length`.** A well-formed push naming 10,000 screens reaches the apply path — now with a poller per integration and a reaper thread as well. The only thing in front of it is the daemon's own `MAX_MESSAGE_BYTES`, a byte count the server does not share, so the two ends can disagree about what is servable and only the rack finds out.
 
+## Carried out of the whole-branch review's fix round
+
+Five findings were fixed (see the `fix(daemon):`/`fix(server):`/`test(server):` commits at the
+end of this branch). What they *decided*, and what they left, belongs here rather than only in a
+commit message — M3b builds against every one of these.
+
+- **Only `identify` is a command.** `POST /api/daemons/{id}/command` answers **501** for `sleep`,
+  `wake` and `reload`, with the working mechanism named in the reason. **M3b must not offer buttons
+  for the other three.** They are refused rather than approximated because each is a design
+  question rather than a wiring one: `sleep`/`wake` overlap `DaemonConfig.night` and
+  `ScreenConfig.sleep_override`, which are persistent configuration the spec puts in the
+  inspector's Sleep tab, and a transient command would need new state on the render loop plus a
+  rule for which of the two wins, whether a push clears it, and whether it survives the watchdog
+  replacing a worker. `reload` has nothing local to re-read on a paired rack;
+  `POST /api/daemons/{id}/push` is it. The four-value vocabulary stays in `ors_schema.link.Command`
+  and the daemon warns on the three, because a newer server can send one.
+- **`applied_version` is on `GET /api/daemons`, and it lives in the hub.** It is what the rack has
+  acked, distinct from `config_version`, which is what this server minted. **None means "no rack has
+  told me", not "old"** — an offline rack, a rack that has not answered its first push, and a rack
+  that has just reconnected all report it, and the interface should render it as *unknown* rather
+  than as stale. It is deliberately not a column: an ack is evidence about a socket the server holds
+  now, `Hub.register` clears it on every connect precisely because a rebooted Pi comes back with
+  nothing, and persisting it would put that stale claim back in the one case somebody is reading the
+  page to diagnose. **What a server restart costs is one backoff**, because the racks re-ack.
+- **Spec §8 stands as written and the daemon now honours both its sentences.** "Nothing is
+  re-pushed if the versions already match" was already `_push_for` answering None; "daemons
+  reconnect and re-ack their version" is now `LinkClient._reack`, which sends an `Ack` second, after
+  the hello, whenever this rack holds a key and is running a version. `Hello.config_version` remains
+  a claim that may only ever *skip* a push — it was not promoted to evidence. Measured end to end
+  against a real server restart: the rack reconnects, `applied_version` equals `config_version`
+  again, and nothing is re-pushed.
+- **`daemon_event` is written by the link path** for a nack (with the reason and the version), a
+  connect (with the version the rack claims) and a disconnect. A superseded handler writes no
+  disconnect. Two events per reconnect against `MAX_EVENTS_PER_DAEMON` of 200 means a flapping rack
+  keeps about a hundred flaps of history and evicts the rest of its own — which is the right
+  direction, but it is a real bound and M3b's status panel should not assume an event is still
+  there.
+- **`SourceStatus` has no producer.** The message type exists in `ors_schema.link` and the server
+  reads it, and nothing in `ors_daemon` ever sends one. It therefore gets no `daemon_event`: an
+  event category that can never appear is its own small lie. Whatever first sends one — M4's
+  integrations are the obvious candidate — should add the event beside it.
+- **The suite's random redness was `starlette.testclient`, not us.** `WebSocketTestSession.__exit__`
+  cancels its portal task and then reads the future, and a cancel that lands while the handler is
+  still unwinding leaves the future CANCELLED. Reproduced with a plain FastAPI handler and no
+  `ors_server` import at 8 failures in 1,500 rounds; starlette 1.6.0 is the newest release and has
+  the same ordering. Contained in `server/tests/conftest.py`, at that one method, for
+  `CancelledError` only, answering falsy so a failing test still fails. **If a future starlette
+  fixes the ordering, delete the fixture** — it is one file and one autouse hook.
+
+Two things the review named that are recorded rather than fixed:
+
+- **CI does not build the Docker image.** Task 14 found three defects in the plan's own Dockerfile
+  draft by running it, and no test caught any of them. `.github/workflows/ci.yml` runs `uv run
+  pytest` and nothing else, so the image is only ever exercised by hand.
+- **`ors.db` is 0644 in the volume while `secret.key` is 0600.** Cosmetic on a single-user
+  deployment — the ciphertext is useless without the key — but it is an inconsistency somebody will
+  eventually ask about.
+
 ## Definition of done for M3a
 
 - `uv run pytest` passes from a clean checkout with no hardware; ruff clean; CI green.
