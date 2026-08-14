@@ -366,23 +366,57 @@ def _view(row: sqlite3.Row) -> ScreenView:
         daemon_id=int(row["daemon_id"]),
         name=row["name"],
         position=int(row["position"]),
-        display=_json(row["display"]),
+        display=_readable(row["display"], row["id"], "display"),
         rotation=int(row["rotation"]),
         hflip=bool(row["hflip"]),
         enabled=bool(row["enabled"]),
         template=row["template"],
-        params=_json(row["params"]),
-        sleep_override=_json(row["sleep_override"]) if row["sleep_override"] else None,
+        params=_readable(row["params"], row["id"], "params"),
+        sleep_override=(
+            _readable(row["sleep_override"], row["id"], "sleep_override")
+            if row["sleep_override"]
+            else None
+        ),
     )
 
 
-def _json(raw: str | None) -> Any:
-    """A JSON column, or a 500 that says which -- see `snapshot._json_column`.
+def _readable(raw: str | None, screen_id: object, column: str) -> Any:
+    """A JSON column for a *listing*, or empty because it cannot be read.
 
-    Deliberately not guarded here. Every writer in this package writes
-    `json.dumps`, so a column that will not parse is a database somebody edited,
-    and `config_error` on the daemon list is where that is reported. Swallowing
-    it into an empty dict would answer a screen that draws nothing with no
-    indication that a row is unreadable.
+    Every writer in this package writes `json.dumps`, so a column that will not
+    parse is a database somebody hand-edited or restored -- and where that is
+    *reported* is `config_error` on `GET /api/daemons`, which names the table,
+    the column and the row, and which is what stops the rack being pushed at all.
+
+    So this answers the way `daemons._capabilities` answers: empty, with a
+    warning in the log. Raising made one bad row on one rack a 500 for `GET
+    /api/screens` -- every screen on every rack -- so there was no list from
+    which to find it or repair it and the editor was simply unloadable. An empty
+    document, on a page that also shows the `config_error` naming the row, is
+    strictly more than no page at all.
+
+    `RecursionError` alongside `ValueError` for the reason `snapshot._json_column`
+    gives: a well-formed document 20,000 deep is unreadable by a different road,
+    and derives from `RuntimeError`, so it goes past a guard written for a
+    malformed one.
+    """
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError):
+        log.warning(
+            "a screen column could not be read", extra={"screen": screen_id, "column": column}
+        )
+        return {}
+
+
+def _json(raw: str | None) -> Any:
+    """A JSON column on the preview path, or a 500 that says which.
+
+    Deliberately *not* the tolerant read above. A preview is one screen asked
+    for by name, so failing it costs that pane and no list; and an empty
+    `scenes` is not a template that draws nothing, it is a `ValidationError` one
+    line later with nothing in it about the column that was unreadable.
     """
     return json.loads(raw) if raw is not None else None

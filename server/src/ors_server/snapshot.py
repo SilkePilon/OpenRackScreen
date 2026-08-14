@@ -48,12 +48,24 @@ def _json_column(raw: str, table: str, column: str, row_id: object) -> Any:
     could be given", so it arrives as the exception that means that. The row is
     identified by whatever names it -- `id` for the tables that have one, the key
     for `setting` -- because the point is to be able to go and look at it.
+
+    `RecursionError` for the same reason and by a different road. A well-formed
+    document 20,000 deep passes every check on the way into the column and then
+    stops `json.loads`'s recursive descent dead -- and `RecursionError` derives
+    from `RuntimeError`, not from `ValueError`, so it went past this guard, past
+    `_servable`'s, and past `config_error`'s, and made `GET /api/daemons` a 500
+    for *every* rack on the server. That is the one route on which the reason is
+    reported, so the failure took away the page it would have been read on.
     """
     try:
         return json.loads(raw)
     except json.JSONDecodeError as error:
         raise SnapshotError(
             f"{table}.{column} of row {row_id!r} is not valid JSON: {error}"
+        ) from error
+    except RecursionError as error:
+        raise SnapshotError(
+            f"{table}.{column} of row {row_id!r} is nested too deeply to read"
         ) from error
 
 

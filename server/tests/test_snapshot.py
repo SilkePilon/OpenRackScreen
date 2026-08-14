@@ -381,6 +381,36 @@ def test_a_setting_that_is_not_json_names_the_key(tmp_path):
     assert "setting" in str(error.value) and "night" in str(error.value)
 
 
+TOO_DEEP = "[" * 20_000 + "]" * 20_000
+"""A JSON document `json.loads` cannot reach the bottom of.
+
+Well-formed, so nothing refuses it on the way into the column; 20,000 deep, so
+the recursive descent parser runs out of stack. `RecursionError` derives from
+`RuntimeError` rather than from `ValueError`, so it goes past every guard
+written for a malformed column -- which is a `SnapshotError` for one bad row
+turning into a 500 for every rack on the server.
+"""
+
+
+@pytest.mark.parametrize("column", ["display", "params"])
+def test_a_screen_column_too_deep_to_parse_names_the_row_rather_than_escaping(tmp_path, column):
+    """The same answer as a column that is not JSON, because it is the same
+    question: the database holds something no daemon could be given."""
+    database, secrets, daemon_id = fixtures(tmp_path)
+    with closing(database.connect()) as connection:
+        screen_id = connection.execute("SELECT id FROM screen WHERE name = 'CPU'").fetchone()[0]
+        connection.execute(
+            f"UPDATE screen SET {column} = ? WHERE id = ?",  # noqa: S608 - from the parametrize
+            (TOO_DEEP, screen_id),
+        )
+
+    with pytest.raises(SnapshotError) as error:
+        build_snapshot(database, secrets, daemon_id)
+
+    assert "screen" in str(error.value) and column in str(error.value)
+    assert str(screen_id) in str(error.value)
+
+
 def test_builtin_templates_are_seeded_and_travel_in_the_snapshot(tmp_path):
     database, secrets, daemon_id = fixtures(tmp_path)
 

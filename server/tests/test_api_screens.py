@@ -5,6 +5,7 @@ from contextlib import closing
 
 import pytest
 from fastapi.testclient import TestClient
+from ors_server.api.changes import UNSERVABLE_HEADER
 from ors_server.app import AppSettings, create_app
 
 SCREEN = {
@@ -58,6 +59,23 @@ def version_of(client: TestClient, daemon_id: int) -> int:
 
 def create(client: TestClient, daemon_id: int, **overrides) -> dict:
     return client.post("/api/screens", json={**SCREEN, "daemon_id": daemon_id, **overrides}).json()
+
+
+def make_unservable(client: TestClient, daemon_id: int) -> None:
+    """Put this rack into the state `build_snapshot` refuses, behind the API's back.
+
+    An enabled integration holding a credential, which no wire format in M3a can
+    carry. Written straight to the database because the API refuses to create it
+    -- which is the point: this is the state a hand-edited or restored file
+    arrives in, and the whole reason the "already unservable" branch exists.
+    """
+    with closing(client.app.state.database.connect()) as connection:
+        secret_id = connection.execute("INSERT INTO secret (ciphertext) VALUES ('x')").lastrowid
+        connection.execute(
+            "INSERT INTO integration (daemon_id, type, name, config, secret_id, enabled)"
+            " VALUES (?, 'prometheus', 'prom', '{}', ?, 1)",
+            (daemon_id, secret_id),
+        )
 
 
 # --- the guard --------------------------------------------------------------
@@ -407,13 +425,7 @@ def test_an_edit_to_a_rack_that_was_already_unservable_is_saved_anyway(client_an
     """
     client, daemon_id = client_and_daemon
     screen_id = create(client, daemon_id)["id"]
-    with closing(client.app.state.database.connect()) as connection:
-        secret_id = connection.execute("INSERT INTO secret (ciphertext) VALUES ('x')").lastrowid
-        connection.execute(
-            "INSERT INTO integration (daemon_id, type, name, config, secret_id, enabled)"
-            " VALUES (?, 'prometheus', 'prom', '{}', ?, 1)",
-            (daemon_id, secret_id),
-        )
+    make_unservable(client, daemon_id)
 
     saved = client.patch(f"/api/screens/{screen_id}", json={"rotation": 90})
 
@@ -428,13 +440,7 @@ def test_a_rack_that_cannot_be_given_a_configuration_says_so_in_the_list(client_
     panels; with it the interface can say which rack is stuck and why.
     """
     client, daemon_id = client_and_daemon
-    with closing(client.app.state.database.connect()) as connection:
-        secret_id = connection.execute("INSERT INTO secret (ciphertext) VALUES ('x')").lastrowid
-        connection.execute(
-            "INSERT INTO integration (daemon_id, type, name, config, secret_id, enabled)"
-            " VALUES (?, 'prometheus', 'prom', '{}', ?, 1)",
-            (daemon_id, secret_id),
-        )
+    make_unservable(client, daemon_id)
 
     listed = client.get("/api/daemons").json()
 
@@ -442,4 +448,166 @@ def test_a_rack_that_cannot_be_given_a_configuration_says_so_in_the_list(client_
     assert "credential" in stuck["config_error"]
     assert all(daemon["config_error"] is None for daemon in listed if daemon["id"] != daemon_id), (
         "one rack's broken configuration is not another's"
+    )
+
+
+# --- one unreadable column must not take the whole server down --------------
+
+
+TOO_DEEP = "[" * 20_000 + "]" * 20_000
+"""A well-formed JSON document `json.loads` cannot reach the bottom of.
+
+`RecursionError` derives from `RuntimeError`, not from `ValueError`, so it goes
+straight past every guard written for a column that will not parse. Only
+reachable from a database somebody hand-edited or restored -- which is exactly
+the state `config_error` exists to report, and the state in which a 500 leaves
+the operator with no page to read it on.
+"""
+
+
+def corrupt(client: TestClient, screen_id: int, column: str, value: str) -> None:
+    with closing(client.app.state.database.connect()) as connection:
+        connection.execute(
+            f"UPDATE screen SET {column} = ? WHERE id = ?",  # noqa: S608 - from the caller
+            (value, screen_id),
+        )
+
+
+@pytest.mark.parametrize("value", ["not json at all", TOO_DEEP])
+def test_one_unreadable_column_does_not_take_the_daemon_list_down(client_and_daemon, value):
+    """`GET /api/daemons` is the one place `config_error` is reported, so it is
+    the last route that may fail because a rack's configuration is broken. It
+    assembles a snapshot per rack, and an exception from any of them answers 500
+    for *every* rack -- including the ones that are fine."""
+    client, daemon_id = client_and_daemon
+    other = client.post("/api/daemons", json={"name": "other-rack"}).json()["id"]
+    screen_id = create(client, daemon_id)["id"]
+    corrupt(client, screen_id, "params", value)
+
+    listed = client.get("/api/daemons")
+
+    assert listed.status_code == 200
+    stuck = next(daemon for daemon in listed.json() if daemon["id"] == daemon_id)
+    assert stuck["config_error"] and "params" in stuck["config_error"]
+    assert next(d for d in listed.json() if d["id"] == other)["config_error"] is None
+
+
+@pytest.mark.parametrize("value", ["not json at all", TOO_DEEP])
+def test_one_unreadable_column_does_not_make_the_screen_list_unloadable(client_and_daemon, value):
+    """One bad row on one rack made the editor's whole list a 500, so there was
+    no page from which to find or fix it. Reported the way an unreadable
+    `daemon.capabilities` is -- empty, logged, and named in `config_error` --
+    rather than by refusing to answer."""
+    client, daemon_id = client_and_daemon
+    other = client.post("/api/daemons", json={"name": "other-rack"}).json()["id"]
+    kept = create(client, other, name="MEM", position=9)["id"]
+    screen_id = create(client, daemon_id)["id"]
+    corrupt(client, screen_id, "params", value)
+
+    listed = client.get("/api/screens")
+
+    assert listed.status_code == 200
+    assert {screen["id"] for screen in listed.json()} == {screen_id, kept}
+    assert next(s for s in listed.json() if s["id"] == screen_id)["params"] == {}
+    assert next(s for s in listed.json() if s["id"] == kept)["params"] == {"title": "CPU"}
+
+
+def test_an_edit_to_a_rack_with_an_unreadable_column_is_still_saved(client_and_daemon):
+    """The trap this closes from the other side: the rack is unservable, so the
+    edit is saved and not pushed rather than refused -- which is what makes the
+    edit that repairs it possible at all."""
+    client, daemon_id = client_and_daemon
+    screen_id = create(client, daemon_id)["id"]
+    corrupt(client, screen_id, "params", TOO_DEEP)
+
+    saved = client.patch(f"/api/screens/{screen_id}", json={"params": {"title": "fixed"}})
+
+    assert saved.status_code == 200, "the repair itself makes the rack servable again"
+    assert client.get(f"/api/screens/{screen_id}").json()["params"] == {"title": "fixed"}
+
+
+# --- what a mutation *says* when it could not reach a rack ------------------
+
+
+def test_the_response_names_the_racks_the_edit_could_not_reach(client_and_daemon):
+    """202 alone says only that something somewhere is wrong.
+
+    The body of a 202 is byte-identical to the body of a 200 and names no rack,
+    so an interface reading it has to re-list every daemon and diff
+    `config_error` to find out which one it was. The header is the answer, and it
+    is on every mutation whose affected set was not fully reached -- 200 and 201
+    included, which is where the status code cannot say it.
+    """
+    client, daemon_id = client_and_daemon
+    screen_id = create(client, daemon_id)["id"]
+    make_unservable(client, daemon_id)
+
+    saved = client.patch(f"/api/screens/{screen_id}", json={"rotation": 90})
+
+    assert saved.headers[UNSERVABLE_HEADER] == str(daemon_id)
+
+
+def test_an_edit_that_reached_every_rack_says_nothing_about_unservable_ones(client_and_daemon):
+    client, daemon_id = client_and_daemon
+    screen_id = create(client, daemon_id)["id"]
+
+    saved = client.patch(f"/api/screens/{screen_id}", json={"rotation": 90})
+
+    assert saved.status_code == 200
+    assert UNSERVABLE_HEADER not in saved.headers
+
+
+def test_a_create_keeps_its_201_and_reports_the_rack_in_the_header(client_and_daemon):
+    """201 is a stronger claim than 202 and this must not silently overwrite it.
+
+    The row *was* created and its representation is in the body -- which is what
+    the interface routes on -- and the fact that no rack was given it is the
+    header's to carry. Narrowing the status is only ever done to the default.
+    """
+    client, daemon_id = client_and_daemon
+    make_unservable(client, daemon_id)
+
+    created = client.post("/api/screens", json={**SCREEN, "daemon_id": daemon_id})
+
+    assert created.status_code == 201
+    assert created.headers[UNSERVABLE_HEADER] == str(daemon_id)
+    assert created.json()["id"]
+
+
+def test_one_broken_rack_does_not_make_every_racks_edit_read_as_unapplied(client):
+    """202 is per edit, not per server.
+
+    `POST /api/screens/reorder` may name screens on several racks, and the
+    rack-wide routes affect every rack there is. If one broken rack were enough,
+    202 would stop meaning "your edit was not applied" and start meaning
+    "something somewhere is wrong" -- and the edit that really was not applied
+    would be indistinguishable from one that reached three racks out of four.
+    """
+    broken = client.post("/api/daemons", json={"name": "broken-rack"}).json()["id"]
+    healthy = client.post("/api/daemons", json={"name": "healthy-rack"}).json()["id"]
+    rack = Rack(client, healthy)
+    first = create(client, broken, name="A", position=3)["id"]
+    second = create(client, healthy, name="B", position=4)["id"]
+    make_unservable(client, broken)
+
+    reordered = client.post("/api/screens/reorder", json={"ids": [second, first]})
+
+    assert reordered.status_code == 200, "the healthy rack was pushed, so this was applied"
+    assert reordered.headers[UNSERVABLE_HEADER] == str(broken)
+    assert rack.pushes, "and the rack that could be reached really was"
+
+
+def test_an_edit_no_rack_at_all_received_is_the_one_that_is_a_202(client):
+    """The other side of the same rule, and what 202 now means exactly."""
+    broken = client.post("/api/daemons", json={"name": "broken-rack"}).json()["id"]
+    other = client.post("/api/daemons", json={"name": "other-rack"}).json()["id"]
+    screen_id = create(client, broken, name="A", position=3)["id"]
+    make_unservable(client, broken)
+    make_unservable(client, other)
+
+    saved = client.patch(f"/api/screens/{screen_id}", json={"rotation": 90})
+
+    assert saved.status_code == 202
+    assert saved.headers[UNSERVABLE_HEADER] == str(broken), (
+        "and it names the rack this edit was for, not every broken rack on the server"
     )
