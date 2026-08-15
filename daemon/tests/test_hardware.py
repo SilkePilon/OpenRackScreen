@@ -217,6 +217,7 @@ class Rack:
         open_error: Exception | None = None,
         show_error: Exception | None = None,
         on_probe_show: Any = None,
+        on_open: Any = None,
         will_not_open: str | None = None,
     ) -> None:
         self.raw = raw if raw is not None else config_dict()
@@ -225,9 +226,17 @@ class Rack:
         self.probe_panels: list[RecordingPanel] = []
         self.panels: dict[str, RecordingPanel] = {}
         self.holds: list[float] = []
+        self.held_during: list[list[bool]] = []
+        """Which workers were off the bus while the pattern was being held up.
+
+        Read from inside the wait rather than after it, because "the guard was
+        taken" and "the guard was still held for the whole hold" are different
+        claims and only the second one is what `MAX_PROBE_HOLD_S` is bounding.
+        """
         self.open_error = open_error
         self.show_error = show_error
         self.on_probe_show = on_probe_show
+        self.on_open = on_open
         self.will_not_open = will_not_open
         """A configured screen whose backend refuses to build, which is a ribbon
         that is not seated: the screen is in the running configuration and has no
@@ -240,12 +249,18 @@ class Rack:
             clock=FakeClock(NOW),
             status_path=tmp_path / "status.json",
             display_factory=self._open,
-            sleeper=self.holds.append,
+            sleeper=self._hold,
             **extra,
         )
 
+    def _hold(self, seconds: float) -> None:
+        self.holds.append(seconds)
+        self.held_during.append(self.held_off())
+
     def _open(self, screen_config: ScreenConfig, name: str) -> RecordingPanel:
         self.opened.append((screen_config, name))
+        if self.on_open is not None:
+            self.on_open()
         probing = name not in SCREEN_NAMES
         if probing and self.open_error is not None:
             raise self.open_error
@@ -484,8 +499,11 @@ def test_a_probe_holds_every_worker_on_that_bus_off_the_bus(
     produced a pale grey rectangle, non-deterministically, and it stayed wrong
     because the init registers were wrong rather than the framebuffer.
 
-    Asserted at the moment it matters -- when the candidate is written to --
-    rather than afterwards, and per screen with the bound `apply` uses.
+    Asserted at each of the three moments it matters, because they are three
+    different claims: when the device is *opened* (the fifty-command init
+    sequence, which is the write M2 corrupted), when the pattern is written, and
+    for the whole of the hold -- which is what `MAX_PROBE_HOLD_S` is bounding a
+    rack-wide stall over. Per screen, with the bound `apply` uses.
     """
     granted: list[float] = []
     paused = ScreenWorker.pause
@@ -496,14 +514,20 @@ def test_a_probe_holds_every_worker_on_that_bus_off_the_bus(
 
     monkeypatch.setattr(ScreenWorker, "pause", pause)
 
-    during: list[list[bool]] = []
+    at_open: list[list[bool]] = []
+    at_paint: list[list[bool]] = []
     rack = Rack(tmp_path)
-    rack.on_probe_show = lambda: during.append(rack.held_off())
+    rack.on_probe_show = lambda: at_paint.append(rack.held_off())
     rack.supervisor.start()
+    # After `start`, so the rack's own two opens -- which happen before any
+    # worker exists -- are not what this records.
+    rack.on_open = lambda: at_open.append(rack.held_off())
     try:
         rack.probe()
 
-        assert during == [[True, True]], "the rack was on the bus while the candidate was lit"
+        assert at_open == [[True, True]], "the init sequence went out over a bus in use"
+        assert at_paint == [[True, True]], "the rack was on the bus while the candidate was lit"
+        assert rack.held_during == [[True, True]], "and it got the bus back mid-hold"
         assert granted == [BUS_GUARD_PER_SCREEN, BUS_GUARD_PER_SCREEN], (
             "each kept worker is promised a real hold, and the same one an apply promises"
         )

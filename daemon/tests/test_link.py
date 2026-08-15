@@ -741,6 +741,37 @@ def probing(hold_s: float = 0.0) -> str:
     ).model_dump_json()
 
 
+def test_a_reply_that_cannot_be_written_ends_the_connection(tmp_path: Path) -> None:
+    """Sent like an ack and not like a frame, and the difference is what happens
+    when the write fails.
+
+    `send` is the cross-thread path: it drops what it could not deliver and
+    carries on, which is right for a frame -- a stale panel image is worse than
+    no panel image, and the next one is milliseconds away. A reply is the answer
+    to a request somebody is holding a socket open for, and a socket that refuses
+    a write is a socket this loop must stop serving: the raise ends the
+    connection, the link reconnects, and the server can ask again. Swallowing it
+    leaves the receive loop reading a connection it can no longer answer on.
+    """
+
+    def probe(request: ProbeRequest) -> ProbeResult:
+        socket.send_error = OSError("broken pipe")
+        return ProbeResult(request_id=request.request_id, ok=True)
+
+    applied: list[int] = []
+    client, socket = make(
+        tmp_path,
+        [probing(), push(7)],
+        applied=lambda snapshot, version: applied.append(version),
+        on_probe=probe,
+    )
+
+    client.tick_once()
+
+    assert applied == [], "the loop went on serving a socket it could not write to"
+    assert client.connected is False
+
+
 def test_a_detect_request_is_answered_down_the_socket_it_arrived_on(tmp_path: Path) -> None:
     """The two correlated messages are the only ones whose handler *returns*
     something: an HTTP handler on the server is holding a request open on the
