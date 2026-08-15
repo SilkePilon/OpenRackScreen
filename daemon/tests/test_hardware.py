@@ -125,13 +125,21 @@ def spidevs(root: Path) -> Path:
 
 
 class RecordingPanel:
-    """A panel that records what it was asked to do, and in what order."""
+    """A panel that records what it was asked to do, and in what order.
 
-    def __init__(self, on_show: Any = None) -> None:
+    `on_show` and `on_teardown` are the same shape and exist for the same reason:
+    a call's *name* says nothing about the state of the rack at the moment it was
+    made, and every claim this file makes about the bus guard is a claim about
+    that moment. `sleep` and `close` are two SPI writes, so they need the hook as
+    much as `show` does -- see `Rack.held_at_teardown`.
+    """
+
+    def __init__(self, on_show: Any = None, on_teardown: Any = None) -> None:
         self.calls: list[str] = []
         self.images: list[Image.Image] = []
         self.show_error: Exception | None = None
         self.on_show = on_show
+        self.on_teardown = on_teardown
 
     def show(self, image: Image.Image) -> None:
         self.calls.append("show")
@@ -143,12 +151,16 @@ class RecordingPanel:
 
     def sleep(self) -> None:
         self.calls.append("sleep")
+        if self.on_teardown is not None:
+            self.on_teardown()
 
     def wake(self) -> None:
         self.calls.append("wake")
 
     def close(self) -> None:
         self.calls.append("close")
+        if self.on_teardown is not None:
+            self.on_teardown()
 
 
 class FakeMonotonic:
@@ -233,6 +245,16 @@ class Rack:
         taken" and "the guard was still held for the whole hold" are different
         claims and only the second one is what `MAX_PROBE_HOLD_S` is bounding.
         """
+        self.held_at_teardown: list[list[bool]] = []
+        """Which workers were off the bus for each of the shut-down's two writes.
+
+        `_shut_down_panel` is `sleep` then `close`, and both of them are SPI
+        traffic to the candidate: the same wire, the same M2 interleaving, the
+        same rule. Recorded from *inside* each call, because a test that only
+        reads the call names passes just as happily when the shut-down is hoisted
+        out of the guard and the two writes go out over a bus four workers have
+        already been given back.
+        """
         self.open_error = open_error
         self.show_error = show_error
         self.on_probe_show = on_probe_show
@@ -257,6 +279,9 @@ class Rack:
         self.holds.append(seconds)
         self.held_during.append(self.held_off())
 
+    def _record_teardown(self) -> None:
+        self.held_at_teardown.append(self.held_off())
+
     def _open(self, screen_config: ScreenConfig, name: str) -> RecordingPanel:
         self.opened.append((screen_config, name))
         if self.on_open is not None:
@@ -266,7 +291,10 @@ class Rack:
             raise self.open_error
         if name == self.will_not_open:
             raise DisplayError(f"{name}: no such device")
-        panel = RecordingPanel(on_show=self.on_probe_show if probing else None)
+        panel = RecordingPanel(
+            on_show=self.on_probe_show if probing else None,
+            on_teardown=self._record_teardown if probing else None,
+        )
         if probing:
             panel.show_error = self.show_error
             self.probe_panels.append(panel)
@@ -585,13 +613,23 @@ def test_a_worker_that_will_not_come_off_the_bus_refuses_the_probe(tmp_path: Pat
 
 
 def test_a_probe_closes_the_device_afterwards(tmp_path: Path) -> None:
-    """Otherwise a probed panel stays claimed and the next apply cannot open it."""
+    """Otherwise a probed panel stays claimed and the next apply cannot open it.
+
+    And the shut-down is *inside* the guard, because it is not bookkeeping: it is
+    two more SPI writes to the candidate, and the last bus-touching moment of the
+    probe. A `finally` hoisted out of the `with` -- which is a tidy-looking
+    refactor -- puts them on a wire the rack has already been given back, which is
+    the M2 interleaving again with the direction reversed.
+    """
     rack = Rack(tmp_path)
     rack.supervisor.start()
     try:
         rack.probe()
 
         assert [panel.calls for panel in rack.probe_panels] == [["show", "sleep", "close"]]
+        assert rack.held_at_teardown == [[True, True], [True, True]], (
+            "the sleep and the close went out over a bus the rack was drawing on"
+        )
     finally:
         rack.supervisor.stop()
 

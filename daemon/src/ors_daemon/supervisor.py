@@ -295,6 +295,21 @@ class ProbeRefused(Exception):
     Its message is the whole reason, with nothing prefixed: see
     `ors_daemon.hardware._reason`, which puts a class name in front of an
     exception that carries no text of its own and leaves this one alone.
+
+    *Two operator actions, deliberately flattened into one type.* "SPI0.2 is
+    driving the screen CPU" is a refusal and asks somebody to edit a
+    configuration; "SPI0.2 opened but would not take a frame" is not a refusal at
+    all -- the probe ran -- and asks somebody to reseat a ribbon. They are raised
+    as the same class on purpose, because the only consumer is
+    `hardware.probe_handler`, and the only thing it can carry back is
+    `ProbeResult(ok=False, error=<str>)`: the schema has no field for a category,
+    and adding one belongs to `packages/ors-schema` rather than here. A second
+    exception class today would be a distinction this daemon draws carefully and
+    the wire discards one frame later, and it would read as a promise that
+    somewhere downstream branches on it. So the distinction lives in the prose,
+    which is the thing that actually reaches the person -- and the moment a
+    caller needs to branch (a wizard that offers "check the ribbon" as a next
+    step), the split and the schema field are one change, made together.
     """
 
 
@@ -1133,6 +1148,21 @@ class Supervisor:
         is on the stop event, but a `stop` running on another thread is parked on
         the lock this call holds and cannot set it, so the ceiling is what bounds
         this rather than the event. That is the reason the ceiling is small.
+
+        *This widens a risk `_off_the_bus` accepted, and by whom.* Read that
+        function's residual-risk note: an open performed inside the guard has no
+        deadline on it, so a `spidev` open that blocks for ever freezes every kept
+        panel on its last frame for the life of the process, out of the watchdog's
+        reach. Until this existed, the only way to reach that open with wiring
+        nobody had proved was an administrator pushing a configuration. A probe
+        reaches it with a `dc`, an `rst` and an `hz` that are *by construction* a
+        guess typed into a wizard -- the likeliest input there is to make an open
+        misbehave -- from any session-guarded operator. The risk is unchanged in
+        kind and the same argument still holds against bounding it here (a
+        bounded open whose thread returns late leaks the device); what changed is
+        who can reach it, and that is worth knowing before this is exposed to a
+        rate limit rather than a review. It is on the hardware checklist: on a
+        real Pi, does an open with the wrong `dc`/`rst` raise, or block?
 
         Under `_shutdown_lock` like `tick`, `apply` and `identify`, because it
         walks `_slots` and `_screens` and pauses workers -- and the lock ordering
