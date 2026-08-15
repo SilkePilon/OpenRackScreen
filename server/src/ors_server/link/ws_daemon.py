@@ -14,10 +14,12 @@ from ors_schema.link import (
     Ack,
     ConfigPush,
     DaemonMessage,
+    DetectResult,
     Frame,
     Hello,
     Nack,
     Paired,
+    ProbeResult,
     parse_daemon_message,
 )
 from pydantic import ValidationError
@@ -461,6 +463,21 @@ async def _handle(state: State, session: _Session, message: DaemonMessage) -> No
             "nack",
             f"the rack refused configuration version {message.config_version}: {message.reason}",
         )
+    elif isinstance(message, DetectResult | ProbeResult):
+        # The answer to a question a request handler is parked on. Without this
+        # branch it falls to the catch-all below, is logged as "a daemon said
+        # something", and the wait expires with the answer already in the
+        # building -- so the interface reports a rack that did not respond about
+        # a rack that responded correctly.
+        #
+        # The message and not `session.connection`, unlike an `Ack` two branches
+        # up, and the difference is the point: an ack describes a boot, so one
+        # read from a superseded socket describes a boot that is over. A reply
+        # answers one question asked exactly once, and the daemon sends it down
+        # whichever socket it holds when it has the answer -- so a reply arriving
+        # over a connection the hub has already replaced is still the only answer
+        # that question will ever get. The hub matches it by `request_id`.
+        state.hub.deliver_reply(message)
     elif isinstance(message, Frame):
         # The refusal is logged inside `_owns`, which is the only thing that
         # knows how many frames a single line is standing for.

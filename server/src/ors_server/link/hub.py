@@ -5,11 +5,35 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-from ors_schema.link import MAX_WATCHED_SCREENS, Command, ConfigPush, Frame, FramesRequest
+from ors_schema.link import (
+    MAX_PROBE_HOLD_S,
+    MAX_WATCHED_SCREENS,
+    Command,
+    ConfigPush,
+    DetectRequest,
+    DetectResult,
+    Frame,
+    FramesRequest,
+    ProbeRequest,
+    ProbeResult,
+)
 
 log = logging.getLogger(__name__)
 
 Sender = Callable[[str | bytes], Awaitable[None]]
+
+Request = DetectRequest | ProbeRequest
+"""What may be asked of a rack and waited on, as opposed to merely sent.
+
+The two of them are exactly the messages that carry a `request_id`, which is
+what this file needs of them: everything else on `ServerMessage` -- a config
+push, a command, a frames request -- is fire-and-forget by design, and has no
+id to key a wait on. Named rather than left as a union at the call site so that
+whoever adds the third one is told where it has to be added.
+"""
+
+Reply = DetectResult | ProbeResult
+"""The answering half. Same reasoning, from the other end of the wire."""
 
 SEND_TIMEOUT = 5.0
 """How long one send to a daemon may take before the socket is given up on.
@@ -35,6 +59,47 @@ client ends up sending at, or the server would notice a silent daemon before
 this ever fires and the bound would be decoration. The client does not exist
 yet -- there is no heartbeat cadence in `daemon/src/ors_daemon/` to measure
 against today -- so that constraint belongs to whoever writes it.
+"""
+
+
+REQUEST_TIMEOUT = MAX_PROBE_HOLD_S + 2 * SEND_TIMEOUT
+"""How long a caller waits for one rack's answer before giving up on it.
+
+`SEND_TIMEOUT`'s argument, one message further on. A request handler is parked
+on this call -- `POST /api/daemons/{id}/detect` and `/probe` are the callers --
+so a rack that has stopped answering must not be able to hold it open for as
+long as it likes. Unbounded, one Pi that accepted a socket and then wedged its
+worker thread costs a request handler apiece for every operator who presses the
+button, and the interface spins against a rack that will never speak.
+
+Forty seconds, and unlike `SEND_TIMEOUT` the number is not free to be chosen on
+its own: `ProbeRequest.hold_s` is bounded by `MAX_PROBE_HOLD_S`, which is thirty,
+so a probe this server will accept and send can legally keep a panel lit for
+thirty seconds before the daemon has a single thing to say about it. Anything at
+or below that is a wait that expires on probes that are working perfectly --
+honestly reported and wrong every time, because a timeout is indistinguishable
+from a rack that has gone, and the wizard's advice would be to check the wiring
+that had just proved itself. The remaining ten seconds are the round trip either
+side of the hold, which is `SEND_TIMEOUT` twice over: the request has to reach a
+Pi and the answer has to come back, and this file has already decided how long
+one leg of that may take.
+
+Written as that sum and not as `40.0`, because neither half of it is this file's
+to choose alone: a schema that raised the hold, against a literal left here,
+would be a probe that always times out -- and nothing would say so until an
+operator was standing in front of a rack that had just worked.
+
+It is not the sum of every bound on the path. The send is bounded separately and
+happens before the wait starts, so a request whose socket wedges costs
+`SEND_TIMEOUT` and then returns -- it never reaches this at all. What this covers
+is the interval in which the daemon has the question and the server has nothing
+to do but wait.
+
+Overshooting and undershooting cost differently here, as they do for the send.
+Overshooting holds a handler open on a rack that is already known to be quiet;
+undershooting fails a probe that worked, which is the failure this feature exists
+to make impossible to have. So it is set past the worst legal case rather than at
+a typical one -- a wizard's probe holds for a second or two, and never meets this.
 """
 
 
@@ -92,6 +157,28 @@ class Connection:
     """
 
 
+@dataclass(frozen=True)
+class _Wait:
+    """One caller parked on one answer, and the rack the answer has to come from.
+
+    The daemon id is here and not derivable from anywhere else: the table is
+    keyed by `request_id`, because that is what the reply carries, and `drop`
+    has to be able to find every wait belonging to one connection without
+    reading any of the messages back.
+    """
+
+    daemon_id: int
+    future: asyncio.Future[Reply | None]
+    """Resolved with the reply, or with None by `drop` when the rack goes away.
+
+    A result and not an exception for either outcome, for the reason `_send`
+    returns a bool: neither is an error. `request` answers None to a caller that
+    has to *say* whether an answer came back, and one `None` covering "offline",
+    "the send never left", "nobody answered in time" and "the rack went away
+    mid-question" is one thing for that caller to check rather than four.
+    """
+
+
 class Hub:
     """Who is connected, what they have acked, and who is watching which screen.
 
@@ -117,6 +204,16 @@ class Hub:
         self._acked: dict[int, int] = {}
         self._watchers: dict[int, set[asyncio.Queue[Watched]]] = {}
         self._daemon_watchers: set[asyncio.Queue[Watched]] = set()
+        self._pending: dict[str, _Wait] = {}
+        """Every question a caller is still waiting on, by `request_id`.
+
+        By the id of the question and not by the rack it was asked of, which is
+        the only key that can be right: two of these can be in flight to one
+        daemon at once -- a detect and a probe, or two probes from two operators
+        -- and a table keyed by the daemon holds one entry for both, so one
+        caller gets the other's answer and the other never gets one at all. The
+        reply carries the id back for exactly this reason.
+        """
         self._send_timeout = send_timeout
 
     def register(self, daemon_id: int, send: Sender) -> Connection:
@@ -169,6 +266,7 @@ class Hub:
         # confirmed is not evidence about the one it will be running when it
         # comes back. Also what stops `_acked` outliving the daemon rows.
         self._acked.pop(connection.daemon_id, None)
+        self._abandon_waits(connection.daemon_id)
         # After the delete, and only past the identity guard above: a superseded
         # handler reaching here seconds after its daemon reconnected would
         # otherwise paint the rack as unplugged in every open tab while it is
@@ -234,6 +332,147 @@ class Hub:
 
     async def request_frames(self, daemon_id: int, request: FramesRequest) -> None:
         await self._send(daemon_id, request.model_dump_json())
+
+    async def request(
+        self, daemon_id: int, message: Request, timeout: float = REQUEST_TIMEOUT
+    ) -> Reply | None:
+        """Ask one rack something and wait for its answer. None if none came back.
+
+        The one thing on this link that is not fire-and-forget, and the shape
+        every later "ask the rack something" feature gets to reuse: the caller
+        is an HTTP handler that has to answer somebody, so the question goes out,
+        the wait is keyed by the `request_id` the message carries, and the reply
+        that quotes that id back resolves it.
+
+        None for every way that fails -- no socket, a send that never left, a
+        rack that did not answer inside `timeout`, a rack that disconnected
+        mid-question -- because a caller that has to report an outcome has one
+        thing to check rather than four exception types, and because none of
+        them is an error here. What it is *not* allowed to be is ambiguous with
+        a successful answer, which is why `Reply` has no falsy member: a
+        `DetectResult` naming no panels at all is a real answer and is not this.
+
+        **Safe to await from an `async def` route, and only from one.** The two
+        lines that matter -- the registration and the identity-checked removal --
+        each run with no await inside them, and this class is event-loop-affine:
+        that is a statement about this loop and says nothing whatever about a
+        threadpool. A `def` FastAPI route calling this would be mutating
+        `_pending` from another thread while the daemon socket's reader is
+        iterating it in `drop`, which is the same failure `relay_frame` copies
+        its watcher set to survive, in a table where the consequence is a
+        crossed answer rather than a dropped frame.
+
+        `timeout` is a parameter and not only a constant because the two callers
+        are not asking the same kind of question -- a detect is a directory
+        listing and a probe holds a bus for as long as the operator asked it to.
+        The default is the one that has to cover the worst legal case; see
+        `REQUEST_TIMEOUT`.
+        """
+        if daemon_id not in self._connections:
+            # Offline is an answer and it is available now. Registering a wait
+            # anyway would spend a whole `timeout` of a request handler proving
+            # what `is_online` already knew, and the caller would be told
+            # "no answer" instead of "no rack".
+            return None
+        wait = _Wait(daemon_id=daemon_id, future=asyncio.get_running_loop().create_future())
+        # Registered *before* the send, not after it. `_send` awaits, so the
+        # daemon socket's reader runs while this call is inside it -- and a rack
+        # that answers a detect in a millisecond can have its reply read and
+        # delivered before this line would otherwise have been reached. The
+        # question that got the fastest answer would be the one that timed out.
+        self._pending[message.request_id] = wait
+        try:
+            if not await self._send(daemon_id, message.model_dump_json()):
+                # Nothing was asked, so nothing is coming. `_send` has already
+                # dropped the socket if the send is what failed, and has already
+                # resolved this wait on the way past -- which is harmless and is
+                # not what is answering here.
+                return None
+            return await asyncio.wait_for(wait.future, timeout)
+        except TimeoutError:
+            log.warning(
+                "a rack did not answer in time",
+                extra={"daemon": daemon_id, "request": message.request_id, "timeout_s": timeout},
+            )
+            return None
+        finally:
+            # On every way out, and there are four of them: the answer, the
+            # timeout, a send that never left, and the caller being cancelled --
+            # a shutdown, or a browser that hung up. An entry left behind is
+            # never looked at again, because the key was minted for one question
+            # that is now over, so it is a future and a message held for the
+            # life of the process, once per question asked.
+            #
+            # By identity, for the reason `drop` matches on identity. The ids are
+            # the caller's to mint and this class cannot make them unique: if one
+            # is reused, the second request has replaced this entry, and removing
+            # it by key alone would take the live wait out from under a caller
+            # whose answer is still on its way.
+            if self._pending.get(message.request_id) is wait:
+                del self._pending[message.request_id]
+
+    def deliver_reply(self, message: Reply) -> None:
+        """Hand a rack's answer to whoever asked for it. Called by `ws_daemon`.
+
+        Matched on `request_id` alone, and deliberately not on the connection it
+        arrived over -- which is the opposite of `record_ack`, for a reason that
+        is the same fact seen from the other side. An ack describes a boot, so
+        one read from a superseded socket describes the *previous* boot and is
+        worthless. A reply answers one question that was asked exactly once, and
+        the daemon sends it down whichever socket it has when it is ready: a
+        reply arriving over a connection the hub has since replaced is still the
+        only answer that question is ever going to get.
+
+        A reply nobody is waiting for is dropped and said so, never raised. Both
+        ways it happens are ordinary -- the wait expired and the rack answered
+        anyway, or this build never asked at all -- and the caller is the daemon
+        socket handler, which catches a disconnect and a validation error and
+        nothing else. A `KeyError` out of here is a closed link and a rack
+        offline for the duration, over a message the daemon got right.
+        """
+        wait = self._pending.get(message.request_id)
+        if wait is None or wait.future.done():
+            log.info(
+                "a reply arrived that nobody is waiting for",
+                extra={"request": message.request_id, "said": message.type},
+            )
+            return
+        wait.future.set_result(message)
+
+    def _abandon_waits(self, daemon_id: int) -> None:
+        """Tell everyone waiting on this rack that it has gone, now.
+
+        The alternative is each of them sitting out its own `REQUEST_TIMEOUT`
+        for a rack the hub has already taken offline -- forty seconds of a
+        request handler apiece, spent on a socket that is known to be closed.
+
+        Called from past `drop`'s identity guard, which is where the whole of
+        this decision lives. A superseded handler's cleanup arrives there seconds
+        after the rack reconnected, and the questions in flight are still
+        perfectly answerable: the daemon replies down whatever socket it has now,
+        and `deliver_reply` matches the id rather than the connection. Failing
+        them from a stale handler would refuse an answer that was already coming.
+
+        The entries themselves are left for `request`'s own `finally` to remove.
+        One owner for that removal, and it is the only one that can check the
+        identity of what it is removing.
+        """
+        gone = [
+            request_id
+            for request_id, wait in self._pending.items()
+            if wait.daemon_id == daemon_id and not wait.future.done()
+        ]
+        for request_id in gone:
+            # `set_result` schedules the waiting task rather than running it, so
+            # nothing re-enters this class before the loop above is finished --
+            # but the list is built first regardless, because a fan-out that
+            # mutates what it is iterating is the bug this file has already had.
+            self._pending[request_id].future.set_result(None)
+        if gone:
+            log.info(
+                "a rack went away with questions in flight",
+                extra={"daemon": daemon_id, "requests": sorted(gone)},
+            )
 
     def watch_daemons(self, queue: asyncio.Queue[Watched]) -> None:
         """Send this queue the online set whenever it changes, until it unwatches.

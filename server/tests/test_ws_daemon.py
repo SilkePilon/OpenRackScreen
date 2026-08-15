@@ -14,10 +14,15 @@ from ors_schema.link import (
     MAX_WATCHED_SCREENS,
     PROTOCOL_VERSION,
     Ack,
+    DetectRequest,
+    DetectResult,
     Frame,
     Heartbeat,
     Hello,
     Nack,
+    PanelCandidate,
+    ProbeRequest,
+    ProbeResult,
     SourceStatus,
 )
 from ors_server.app import AppSettings, create_app
@@ -596,6 +601,44 @@ async def test_an_ack_from_a_superseded_handler_is_discarded(tmp_path):
     await _handle(app.state, stale, Ack(config_version=7))
 
     assert hub.acked_version(daemon_id) is None, "an ack from a boot that is over"
+
+
+async def test_a_result_from_a_rack_reaches_whoever_asked_for_it(tmp_path):
+    """The one line that makes `Hub.request` a feature rather than a table.
+
+    Nothing else routes a `detect_result` or a `probe_result`: without this
+    branch they fall to the catch-all that logs "a daemon said something", the
+    request handler's wait expires with the answer already in the building, and
+    the wizard reports a rack that did not respond about a rack that responded
+    correctly. Both kinds, because one `isinstance` covers both and a branch
+    that quietly stopped covering one of them would still route the other.
+    """
+    app, daemon_id, token = build(tmp_path)
+    hub = app.state.hub
+    session = _Session(
+        daemon_id=daemon_id, connection=hub.register(daemon_id, nowhere), owned=set()
+    )
+    detecting = asyncio.create_task(hub.request(daemon_id, DetectRequest(request_id="detect-9f3a")))
+    probing = asyncio.create_task(
+        hub.request(
+            daemon_id,
+            ProbeRequest(
+                request_id="probe-4c7b", bus=1, cs=2, dc=23, rst=24, hz=40_000_000, hold_s=3.0
+            ),
+        )
+    )
+    # One turn of the loop is enough: both waits are registered before either
+    # request is sent, so each task reaches that point the moment it is started.
+    await asyncio.sleep(0)
+
+    found = PanelCandidate(bus=1, cs=2, claimed_by=None)
+    await _handle(app.state, session, DetectResult(request_id="detect-9f3a", panels=[found]))
+    await _handle(app.state, session, ProbeResult(request_id="probe-4c7b", ok=True))
+
+    detected = await asyncio.wait_for(detecting, PROMPTLY)
+    probed = await asyncio.wait_for(probing, PROMPTLY)
+    assert detected is not None and [(p.bus, p.cs) for p in detected.panels] == [(1, 2)]
+    assert probed is not None and probed.ok is True
 
 
 async def test_a_hello_does_not_get_to_say_what_this_daemon_s_standing_is(tmp_path):
