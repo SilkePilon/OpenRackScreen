@@ -216,6 +216,22 @@ function reading(screens: ScreenRow[]) {
 /** The three the inspector adds when a panel is selected. */
 const INSPECTING = [TEMPLATES, INTEGRATIONS, SETTINGS]
 
+/**
+ * A write held open, so a test can be somewhere in the middle of one.
+ *
+ * There is no other way to stand in the window that matters here: everything
+ * else in this file settles inside the click that started it, and "the user did
+ * something while the PATCH was still on the wire" is a state msw only reaches
+ * if the handler is made to wait for the test.
+ */
+function held() {
+  let release = () => {}
+  const promise = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  return { promise, release: () => release() }
+}
+
 type Rig = {
   sockets: FakeSocket[]
   live(): FakeSocket
@@ -691,6 +707,153 @@ describe("the screens page", () => {
     expect(await screen.findByText(/every rack was given it/i)).toBeInTheDocument()
     await userEvent.click(screen.getByRole("switch", { name: "Override for this panel" }))
     expect(screen.queryByText(/every rack was given it/i)).not.toBeInTheDocument()
+  })
+
+  it("follows a reorder in the boxes nobody has touched, and keeps the ones they have", async () => {
+    // A reorder moves the panel the inspector is open on. The row changes on the
+    // server, the list is refetched, and a Position box seeded once at mount
+    // still holds the ordinal the panel used to have -- so the form *differs*
+    // from the row, Save lights up for an edit nobody made, and pressing it
+    // PATCHes the panel back where it just came from. An interface offering a
+    // button that silently reverses what somebody just did is the defect; the
+    // rule that closes it is that an untouched control follows the row.
+    //
+    // And the other half of the rule in the same test, because a fix that
+    // reseeded *everything* would pass the first half and throw away what
+    // somebody was typing: a touched box keeps what they put in it.
+    const sent: unknown[] = []
+    const bodies: unknown[] = []
+    let rows = [WEATHER, TRAINS, KITCHEN]
+    server.use(
+      SIGNED_IN,
+      http.get("/api/daemons", () => HttpResponse.json(RACKS)),
+      http.get("/api/screens", () => HttpResponse.json(rows)),
+      ...INSPECTING,
+      // `POST /api/screens/reorder` renumbers everything named, from 1, and
+      // answers the rack as it now is. Computed from the request rather than
+      // hard-coded, because this test drives two reorders.
+      http.post("/api/screens/reorder", async ({ request }) => {
+        const body = (await request.json()) as { ids: number[] }
+        sent.push(body)
+        rows = body.ids.flatMap((id, index) => {
+          const row = rows.find((each) => each.id === id)
+          return row === undefined ? [] : [{ ...row, position: index + 1 }]
+        })
+        return HttpResponse.json(rows)
+      }),
+      http.patch("/api/screens/:screen_id", async ({ request }) => {
+        bodies.push(await request.json())
+        return HttpResponse.json(rows.find((row) => row.id === TRAINS.id) ?? TRAINS)
+      }),
+    )
+    const rig = mountScreens()
+    await rig.connect()
+
+    await userEvent.click(await screen.findByRole("button", { name: "Trains" }))
+    const box = await screen.findByRole("spinbutton", { name: "Position" })
+    expect(box).toHaveValue(2)
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled()
+
+    await userEvent.click(canvasOf("pi-loft").getByRole("button", { name: "Move Trains left" }))
+    await waitFor(() => expect(drawn("pi-loft")).toEqual([13, 12, 11]))
+
+    // The box nobody touched says where the panel now is, and there is nothing
+    // to save. Against a box frozen at mount it reads 2, Save is live, and the
+    // press undoes the move.
+    expect(box).toHaveValue(1)
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled()
+    expect(screen.getByText("Position 1 on pi-loft")).toBeInTheDocument()
+
+    // Now one box is touched and the rack moves under it again.
+    const named = screen.getByRole("textbox", { name: "Name" })
+    await userEvent.type(named, " (loft)")
+    await userEvent.click(canvasOf("pi-loft").getByRole("button", { name: "Move Trains right" }))
+    await waitFor(() => expect(drawn("pi-loft")).toEqual([12, 13, 11]))
+
+    expect(sent).toEqual([{ ids: [13, 12, 11] }, { ids: [12, 13, 11] }])
+    // What somebody typed survived the refetch; what they did not touch followed
+    // it.
+    expect(named).toHaveValue("Trains (loft)")
+    expect(box).toHaveValue(2)
+
+    await userEvent.click(screen.getByRole("button", { name: "Save changes" }))
+
+    // The name and nothing else. A `position` in this body is the reorder being
+    // undone by the save, which is the whole defect.
+    await waitFor(() => expect(bodies).toEqual([{ name: "Trains (loft)" }]))
+  })
+
+  it("forgets a write once the form has moved past it, even mid-flight", async () => {
+    // The same rule, on the other side: "Saved, and every rack was given it." --
+    // and the destructive unservable alert with it -- has to go when the form
+    // moves past the write it describes, *including* when the moving happened
+    // while that write was still on the wire. The report of an edit made during
+    // a PATCH cannot be acted on at the time, because `reset()` would throw away
+    // an outcome nobody has seen; if it is dropped rather than deferred there is
+    // no second clean-to-unsaved edge afterwards to clear the notice, and it
+    // stands over a form holding newer edits.
+    const patched: unknown[] = []
+    let rows = [WEATHER, TRAINS, KITCHEN]
+    const flight = held()
+    server.use(
+      SIGNED_IN,
+      http.get("/api/daemons", () => HttpResponse.json(RACKS)),
+      http.get("/api/screens", () => HttpResponse.json(rows)),
+      ...INSPECTING,
+      http.patch("/api/screens/:screen_id", async ({ request }) => {
+        patched.push(await request.json())
+        await flight.promise
+        const next = { ...KITCHEN, hflip: true }
+        rows = rows.map((row) => (row.id === KITCHEN.id ? next : row))
+        return HttpResponse.json(next)
+      }),
+    )
+    const rig = mountScreens()
+    await rig.connect()
+
+    await userEvent.click(await screen.findByRole("button", { name: "Kitchen" }))
+    await userEvent.click(await screen.findByRole("switch", { name: "Horizontal flip" }))
+    await userEvent.click(screen.getByRole("button", { name: "Save changes" }))
+    await waitFor(() => expect(patched).toEqual([{ hflip: true }]))
+    // Still on the wire: nothing has been said about it yet.
+    expect(screen.queryByText(/every rack was given it/i)).not.toBeInTheDocument()
+
+    // Changed their mind while it was in flight -- the switch goes back, so the
+    // form matches the row again -- and then typed. That second edit is the one
+    // that has to survive being made at the wrong moment.
+    await userEvent.click(screen.getByRole("switch", { name: "Horizontal flip" }))
+    await userEvent.type(screen.getByRole("textbox", { name: "Name" }), "!")
+
+    await act(async () => {
+      flight.release()
+    })
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled(),
+    )
+
+    // The write landed and the row came back with it, so the switch -- touched,
+    // and therefore kept -- now disagrees with the row and the form is unsaved.
+    expect(screen.getByRole("switch", { name: "Horizontal flip" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    )
+    expect(screen.getByRole("textbox", { name: "Name" })).toHaveValue("Kitchen!")
+    // And nothing on screen claims that state was saved.
+    expect(screen.queryByText(/every rack was given it/i)).not.toBeInTheDocument()
+
+    // The notice is reachable in this fixture, which is what stops the assertion
+    // above from passing because something else went wrong.
+    server.use(
+      http.patch("/api/screens/:screen_id", async ({ request }) => {
+        patched.push(await request.json())
+        const next = { ...KITCHEN, name: "Kitchen!", hflip: false }
+        rows = rows.map((row) => (row.id === KITCHEN.id ? next : row))
+        return HttpResponse.json(next)
+      }),
+    )
+    await userEvent.click(screen.getByRole("button", { name: "Save changes" }))
+    expect(await screen.findByText(/every rack was given it/i)).toBeInTheDocument()
+    expect(patched).toEqual([{ hflip: true }, { name: "Kitchen!", hflip: false }])
   })
 
   it("changes the template a panel draws, and sends nothing else with it", async () => {

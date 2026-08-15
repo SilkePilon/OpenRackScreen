@@ -124,6 +124,37 @@ function sameWiring(left: Wiring, right: Wiring): boolean {
   return (Object.keys(left) as (keyof Wiring)[]).every((key) => left[key] === right[key])
 }
 
+/** Every control on this tab, in the shape a form holds it. */
+type Draft = {
+  name: string
+  position: string
+  template: string
+  rotation: Rotation
+  hflip: boolean
+  enabled: boolean
+  wiring: Wiring
+}
+
+/**
+ * The row, as this form would show it if nobody had touched anything.
+ *
+ * Recomputed on every render rather than frozen into `useState`, because the
+ * row moves under the form: a reorder from the canvas renumbers this panel, a
+ * save refetches the list, another tab renames it. See `ConfigTab` for what is
+ * done about that.
+ */
+function readDraft(screen: Screen): Draft {
+  return {
+    name: screen.name,
+    position: String(screen.position),
+    template: screen.template,
+    rotation: rotationFrom(String(screen.rotation)),
+    hflip: screen.hflip,
+    enabled: screen.enabled,
+    wiring: readWiring(screen.display),
+  }
+}
+
 /**
  * What a panel is: its name, where it sits, what it draws, and how it is wired.
  *
@@ -141,6 +172,28 @@ function sameWiring(left: Wiring, right: Wiring): boolean {
  * are stated below the fields so a refusal reads as an answer to something,
  * and are left to the server to apply, because the server is what the rack
  * agrees with.
+ *
+ * **The form is an overlay on the row, not a copy of it.** State here holds
+ * only the fields somebody has actually touched; every other control reads
+ * straight off `screen`, so it follows the server. That rule is what this tab
+ * needed and did not have: pressing a reorder arrow with the inspector open
+ * renumbers this panel on the server, and a Position box still holding the
+ * ordinal it was seeded with then *differs* from the row -- so Save lit up for
+ * an edit nobody made, and pressing it moved the panel back where it had just
+ * come from. Now the untouched box follows the reorder and Save stays quiet.
+ *
+ * The cost is stated plainly: once a control is touched it is pinned until the
+ * inspector is pointed at another screen, so a concurrent change to *that one
+ * field* is neither shown nor merged -- the person keeps what they typed and
+ * their save overwrites the other change. That is the trade, and it is the one
+ * worth taking: the alternative loses what somebody is in the middle of
+ * typing, and PATCH carries only the fields that differ, so an untouched field
+ * changed elsewhere is never written back by this form at all.
+ *
+ * `wiring` is pinned as a whole document rather than field by field, because
+ * that is how it is written: `display` is one column, one model, validated as
+ * one document, and a `display` body assembled half from what somebody typed
+ * and half from a row that moved underneath them is a pinout nobody chose.
  */
 export function ConfigTab({
   screen,
@@ -151,26 +204,32 @@ export function ConfigTab({
   screen: Screen
   save: (body: ScreenBody) => void
   saving: boolean
-  /** Called when this form starts holding an unsaved edit; see `Inspector`. */
-  edited: () => void
+  /**
+   * Called when this form starts holding an unsaved edit; see `Inspector`.
+   *
+   * Answers whether it took the report. `false` means ask again on the next
+   * render, which is how an edit made during a write in flight is not lost.
+   */
+  edited: () => boolean
 }) {
   const fieldId = useId()
   const field = (part: string) => `${fieldId}-${part}`
   const templates = useTemplates()
 
-  const [name, setName] = useState(screen.name)
-  const [position, setPosition] = useState(String(screen.position))
-  const [template, setTemplate] = useState(screen.template)
-  const [rotation, setRotation] = useState(() => rotationFrom(String(screen.rotation)))
-  const [hflip, setHflip] = useState(screen.hflip)
-  const [enabled, setEnabled] = useState(screen.enabled)
-  const [wiring, setWiring] = useState(() => readWiring(screen.display))
-
-  // What the server last said, which is what "changed" is measured against.
-  // Recomputed rather than remembered from the first render: after a save the
-  // list is refetched, the row arrives with the new values, and the fields that
-  // were just written stop counting as changes.
-  const saved = readWiring(screen.display)
+  // What the server last said, which is what "changed" is measured against and
+  // what every untouched control shows. Recomputed rather than remembered from
+  // the first render: after a save the list is refetched, the row arrives with
+  // the new values, and the fields that were just written stop counting as
+  // changes.
+  const row = readDraft(screen)
+  // Only what somebody touched. A key absent here is a control that has no
+  // opinion of its own and follows the row.
+  const [touched, setTouched] = useState<Partial<Draft>>({})
+  const edit = (part: Partial<Draft>) => setTouched((held) => ({ ...held, ...part }))
+  const shown: Draft = { ...row, ...touched }
+  // One box of the pinout is the whole pinout: `display` is written as one
+  // document, so touching any of it pins all of it.
+  const wire = (part: Partial<Wiring>) => edit({ wiring: { ...shown.wiring, ...part } })
 
   /**
    * Exactly the fields that differ, and never one more.
@@ -184,15 +243,15 @@ export function ConfigTab({
    */
   function changes(): ScreenBody {
     const body: ScreenBody = {}
-    if (name !== screen.name) body.name = name
+    if (shown.name !== screen.name) body.name = shown.name
     // An unreadable or empty box asks for nothing rather than for position 0.
-    const wanted = positionOf(position)
+    const wanted = positionOf(shown.position)
     if (wanted !== null && wanted !== screen.position) body.position = wanted
-    if (template !== screen.template) body.template = template
-    if (rotation !== screen.rotation) body.rotation = rotation
-    if (hflip !== screen.hflip) body.hflip = hflip
-    if (enabled !== screen.enabled) body.enabled = enabled
-    if (!sameWiring(wiring, saved)) body.display = toDisplay(wiring)
+    if (shown.template !== screen.template) body.template = shown.template
+    if (shown.rotation !== screen.rotation) body.rotation = shown.rotation
+    if (shown.hflip !== screen.hflip) body.hflip = shown.hflip
+    if (shown.enabled !== screen.enabled) body.enabled = shown.enabled
+    if (!sameWiring(shown.wiring, row.wiring)) body.display = toDisplay(shown.wiring)
     return body
   }
 
@@ -207,13 +266,17 @@ export function ConfigTab({
   // for, and a select with no matching option would draw that as blank -- which
   // reads as "no template" rather than as "the one it names is gone".
   const names = templates.data?.map((each) => each.name) ?? []
-  const options = names.includes(template) ? names : [template, ...names]
+  const options = names.includes(shown.template) ? names : [shown.template, ...names]
 
   return (
     <div className="grid gap-4 pt-4">
       <div className="grid gap-2">
         <Label htmlFor={field("name")}>Name</Label>
-        <Input id={field("name")} value={name} onChange={(event) => setName(event.target.value)} />
+        <Input
+          id={field("name")}
+          value={shown.name}
+          onChange={(event) => edit({ name: event.target.value })}
+        />
       </div>
 
       <div className="grid gap-2">
@@ -222,13 +285,13 @@ export function ConfigTab({
           id={field("position")}
           type="number"
           min={1}
-          value={position}
-          onChange={(event) => setPosition(event.target.value)}
+          value={shown.position}
+          onChange={(event) => edit({ position: event.target.value })}
         />
         <p className="text-xs text-muted-foreground">
-          {positionOf(position) === null
+          {positionOf(shown.position) === null
             ? `${
-                position.trim() === "" ? "Empty" : "Not a whole number"
+                shown.position.trim() === "" ? "Empty" : "Not a whole number"
               }, so this panel keeps the position it has. The arrows under the rack renumber the ` +
               "whole rack at once, which is the safer way to move one."
             : "Where this panel sits from the left. The arrows under the rack renumber the whole " +
@@ -238,7 +301,7 @@ export function ConfigTab({
 
       <div className="grid gap-2">
         <Label htmlFor={field("template")}>Template</Label>
-        <Select value={template} onValueChange={setTemplate}>
+        <Select value={shown.template} onValueChange={(next) => edit({ template: next })}>
           <SelectTrigger id={field("template")}>
             <SelectValue />
           </SelectTrigger>
@@ -255,8 +318,8 @@ export function ConfigTab({
       <div className="grid gap-2">
         <Label htmlFor={field("rotation")}>Rotation</Label>
         <Select
-          value={String(rotation)}
-          onValueChange={(next) => setRotation(rotationFrom(next))}
+          value={String(shown.rotation)}
+          onValueChange={(next) => edit({ rotation: rotationFrom(next) })}
         >
           <SelectTrigger id={field("rotation")}>
             <SelectValue />
@@ -277,12 +340,20 @@ export function ConfigTab({
 
       <div className="flex items-center justify-between gap-4">
         <Label htmlFor={field("hflip")}>Horizontal flip</Label>
-        <Switch id={field("hflip")} checked={hflip} onCheckedChange={setHflip} />
+        <Switch
+          id={field("hflip")}
+          checked={shown.hflip}
+          onCheckedChange={(next) => edit({ hflip: next })}
+        />
       </div>
 
       <div className="flex items-center justify-between gap-4">
         <Label htmlFor={field("enabled")}>Enabled</Label>
-        <Switch id={field("enabled")} checked={enabled} onCheckedChange={setEnabled} />
+        <Switch
+          id={field("enabled")}
+          checked={shown.enabled}
+          onCheckedChange={(next) => edit({ enabled: next })}
+        />
       </div>
 
       <div className="grid gap-3 rounded-md border p-3">
@@ -291,9 +362,9 @@ export function ConfigTab({
         <div className="grid gap-2">
           <Label htmlFor={field("backend")}>Backend</Label>
           <Select
-            value={wiring.backend}
+            value={shown.wiring.backend}
             onValueChange={(next) =>
-              setWiring({ ...wiring, backend: next === "virtual" ? "virtual" : "gc9a01" })
+              wire({ backend: next === "virtual" ? "virtual" : "gc9a01" })
             }
           >
             <SelectTrigger id={field("backend")}>
@@ -312,8 +383,8 @@ export function ConfigTab({
             <Input
               id={field("bus")}
               type="number"
-              value={wiring.spi_bus}
-              onChange={(event) => setWiring({ ...wiring, spi_bus: event.target.value })}
+              value={shown.wiring.spi_bus}
+              onChange={(event) => wire({ spi_bus: event.target.value })}
             />
           </div>
           <div className="grid gap-2">
@@ -321,8 +392,8 @@ export function ConfigTab({
             <Input
               id={field("cs")}
               type="number"
-              value={wiring.spi_cs}
-              onChange={(event) => setWiring({ ...wiring, spi_cs: event.target.value })}
+              value={shown.wiring.spi_cs}
+              onChange={(event) => wire({ spi_cs: event.target.value })}
             />
           </div>
           <div className="grid gap-2">
@@ -330,8 +401,8 @@ export function ConfigTab({
             <Input
               id={field("dc")}
               type="number"
-              value={wiring.dc}
-              onChange={(event) => setWiring({ ...wiring, dc: event.target.value })}
+              value={shown.wiring.dc}
+              onChange={(event) => wire({ dc: event.target.value })}
             />
           </div>
           <div className="grid gap-2">
@@ -339,8 +410,8 @@ export function ConfigTab({
             <Input
               id={field("rst")}
               type="number"
-              value={wiring.rst}
-              onChange={(event) => setWiring({ ...wiring, rst: event.target.value })}
+              value={shown.wiring.rst}
+              onChange={(event) => wire({ rst: event.target.value })}
             />
           </div>
         </div>
@@ -350,8 +421,8 @@ export function ConfigTab({
           <Input
             id={field("hz")}
             type="number"
-            value={wiring.hz}
-            onChange={(event) => setWiring({ ...wiring, hz: event.target.value })}
+            value={shown.wiring.hz}
+            onChange={(event) => wire({ hz: event.target.value })}
           />
         </div>
 
@@ -359,8 +430,8 @@ export function ConfigTab({
           <Label htmlFor={field("out")}>Output directory</Label>
           <Input
             id={field("out")}
-            value={wiring.out_dir}
-            onChange={(event) => setWiring({ ...wiring, out_dir: event.target.value })}
+            value={shown.wiring.out_dir}
+            onChange={(event) => wire({ out_dir: event.target.value })}
           />
         </div>
 

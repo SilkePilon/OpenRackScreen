@@ -126,8 +126,13 @@ export function DataTab({
   screen: Screen
   save: (body: ScreenBody) => void
   saving: boolean
-  /** Called when this form starts holding an unsaved edit; see `Inspector`. */
-  edited: () => void
+  /**
+   * Called when this form starts holding an unsaved edit; see `Inspector`.
+   *
+   * Answers whether it took the report. `false` means ask again on the next
+   * render, which is how an edit made during a write in flight is not lost.
+   */
+  edited: () => boolean
 }) {
   const fieldId = useId()
   const templates = useTemplates()

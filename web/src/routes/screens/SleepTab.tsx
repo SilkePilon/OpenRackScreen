@@ -51,6 +51,12 @@ function describe(night: NightWindow, timezone: string): string {
  * Turning the override off sends `sleep_override: null`, which is a change and
  * not an absence: `_columns` uses `exclude_unset` rather than `exclude_none`
  * precisely so that "this screen has stopped overriding the rack" is sayable.
+ *
+ * Every control here is an overlay on the row, as in `ConfigTab`: `null` state
+ * means untouched and follows `screen`, anything else is what somebody chose
+ * and is kept. Three of the four already worked that way for a different
+ * reason -- they wait on `GET /api/settings` -- and the override switch was
+ * the one seeded at mount.
  */
 export function SleepTab({
   screen,
@@ -61,8 +67,13 @@ export function SleepTab({
   screen: Screen
   save: (body: ScreenBody) => void
   saving: boolean
-  /** Called when this form starts holding an unsaved edit; see `Inspector`. */
-  edited: () => void
+  /**
+   * Called when this form starts holding an unsaved edit; see `Inspector`.
+   *
+   * Answers whether it took the report. `false` means ask again on the next
+   * render, which is how an edit made during a write in flight is not lost.
+   */
+  edited: () => boolean
 }) {
   const fieldId = useId()
   const field = (part: string) => `${fieldId}-${part}`
@@ -70,7 +81,13 @@ export function SleepTab({
 
   const held = readNight(screen.sleep_override)
   const night = settings.data?.night
-  const [overriding, setOverriding] = useState(held !== null)
+  // `null` is "nobody has touched this switch" here too, and for the same
+  // reason as the three states below plus one more: `screen` moves under this
+  // form -- a save refetches the list, another tab edits the row -- and a
+  // switch seeded once at mount would go on saying what the panel used to hold.
+  // Untouched, it follows the row; touched, it keeps what somebody chose.
+  const [override, setOverride] = useState<boolean | null>(null)
+  const overriding = override ?? held !== null
   // `null` is "nobody has touched this box", not a value, and the three lines
   // below are why it has to be a state of its own: a panel with no override of
   // its own starts from **the window it is already keeping**, which is the
@@ -104,7 +121,7 @@ export function SleepTab({
 
       <div className="flex items-center justify-between gap-4">
         <Label htmlFor={field("override")}>Override for this panel</Label>
-        <Switch id={field("override")} checked={overriding} onCheckedChange={setOverriding} />
+        <Switch id={field("override")} checked={overriding} onCheckedChange={setOverride} />
       </div>
 
       {overriding && (

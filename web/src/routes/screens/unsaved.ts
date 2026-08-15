@@ -24,15 +24,25 @@ import { useEffect, useRef } from "react"
  * Mounting already unsaved is not an edit either -- a tab builds its form from
  * the row, so that only happens when the row and the form disagree about
  * something nobody touched.
+ *
+ * **The report is only discharged when the caller takes it**, which is what
+ * `began`'s answer is for. A write that is still in flight has an outcome
+ * nobody has seen, so the inspector cannot act on the edit yet and says so by
+ * answering `false`; the transition is then still owed, and is delivered on the
+ * next render -- the one the mutation settling causes. Without that, somebody
+ * typing *during* a PATCH got a clean-to-unsaved edge that was swallowed, and
+ * "Saved, and every rack was given it." stood over a form holding newer edits
+ * with no further transition left to clear it.
  */
-export function useUnsaved(unsaved: boolean, began: () => void) {
+export function useUnsaved(unsaved: boolean, began: () => boolean) {
   // Not in a dependency array: `began` is written inline by the caller and is a
   // new function on every render, and the ref below is what makes this fire
   // once regardless. So the effect runs after every render and does nothing on
   // almost all of them.
   const before = useRef(unsaved)
   useEffect(() => {
-    if (unsaved && !before.current) began()
+    // Left where it was when the report was refused, so it is made again.
+    if (unsaved && !before.current && !began()) return
     before.current = unsaved
   })
 }

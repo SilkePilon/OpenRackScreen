@@ -157,9 +157,18 @@ function ScreenInspector({ screen, racks }: { screen: Screen; racks: Daemon[] })
    * Guarded on the mutation being settled: `reset()` on an idle mutation still
    * dispatches a re-render for nothing, and calling it on a *pending* one would
    * throw away the outcome of a write that is still in flight.
+   *
+   * **What the answer means.** `false` is "not taken, ask again", and only a
+   * pending write gives it: somebody who types while the PATCH is on the wire
+   * has made an edit this cannot act on yet, and `useUnsaved` keeps owing the
+   * report until the mutation settles and a re-render brings it back. Reporting
+   * it once and dropping it is how the success notice -- or the destructive
+   * unservable alert -- came to stand over a form that had already moved on.
    */
   const edited = () => {
+    if (patch.isPending) return false
     if (patch.isSuccess || patch.isError) patch.reset()
+    return true
   }
 
   return (
