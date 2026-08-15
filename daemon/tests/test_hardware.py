@@ -663,6 +663,33 @@ def test_a_hold_longer_than_this_rack_can_afford_is_cut_to_what_it_can(tmp_path:
         rack.supervisor.stop()
 
 
+@pytest.mark.parametrize(
+    ("asked", "held"),
+    [(0.0, 0.0), (-1.0, 0.0), (float("nan"), 0.0), (float("inf"), PROBE_HOLD_BUDGET)],
+)
+def test_a_hold_that_is_not_a_duration_is_not_waited_out(
+    tmp_path: Path, asked: float, held: float
+) -> None:
+    """Zero is legitimate -- a script does not look at the glass -- and the other
+    three cannot arrive off the wire, because `ProbeRequest.hold_s` refuses them.
+
+    Answered here anyway, and NaN is the one that needs saying: it compares False
+    against everything, so `min` hands it straight back and every bound written as
+    a comparison lets it through. `frames._capped` records the same trap costing a
+    Pi's CPU; here it would be a wait this module has no answer for, taken with
+    four panels frozen behind it. `probe` is a public method, and a guard that
+    depends on its caller having validated the argument is not a guard.
+    """
+    rack = Rack(tmp_path)
+    rack.supervisor.start()
+    try:
+        rack.probe(hold_s=asked)
+
+        assert rack.holds == [held]
+    finally:
+        rack.supervisor.stop()
+
+
 def test_probing_a_rack_that_is_shutting_down_touches_no_panel(tmp_path: Path) -> None:
     """The panels are slept and their serial devices closed by then, and on a
     GC9A01 a command written to one that has been torn down is a write to
