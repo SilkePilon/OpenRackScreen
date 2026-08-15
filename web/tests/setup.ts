@@ -18,6 +18,22 @@ import { server } from "./msw"
 // library provides for exactly this. Notifications still go through the whole
 // real observer machinery -- nothing is stubbed and no result is invented --
 // they simply land on the tick that caused them.
+//
+// What it costs, said here so the next author knows before relying on it. This
+// is global and never restored -- module scope of the setup file, so every
+// suite in this project, now and later, runs with synchronous cache
+// propagation. The one property that is no longer observable anywhere in these
+// tests is the *ordering* between a `setQueryData` and the async work after it:
+// in a browser the notify lands one macrotask later, so a component may render
+// once more with the old data before it sees the new, and no test here can
+// assert that it does. Nothing in this milestone reads that ordering -- React
+// batches within a task either way -- which is why the trade is taken.
+//
+// The narrower alternative, for a suite that ever does need the real schedule:
+// leave the scheduler alone and write `await act(() =>
+// vi.advanceTimersByTimeAsync(0))` after the message that changed the cache.
+// That would have fixed the two tests this was installed for without changing
+// the environment for anybody else.
 notifyManager.setScheduler((notify) => notify())
 
 // jsdom brings no `Request` of its own, so the global is Node's (undici), which
