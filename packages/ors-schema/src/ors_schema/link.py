@@ -554,7 +554,7 @@ class PanelCandidate(BaseModel):
 
     bus: int = Field(ge=0, le=MAX_WIRING_NUMBER)
     cs: int = Field(ge=0, le=MAX_WIRING_NUMBER)
-    claimed_by: str | None = Field(max_length=MAX_SCREEN_NAME)
+    claimed_by: str | None = Field(min_length=1, max_length=MAX_SCREEN_NAME)
     """The name of the screen currently driving this device, or None when it is free.
 
     A name and not a flag or an id, because it is read by a person choosing a
@@ -566,6 +566,15 @@ class PanelCandidate(BaseModel):
     the two answers -- "free" -- which is plausible enough that nothing
     downstream would question it, and the probe would then take a device out
     from under a running worker.
+
+    Bounded below at 1 as well as above, for `MAX_REQUEST_ID`'s reason and one
+    more of its own. A screen name cannot be created empty -- both
+    `ors_server.api.screens` and `daemon.ScreenConfig.name` require a character
+    -- so a name that could not have been created cannot honestly be a claim on
+    a device. And `""` is *falsy*: the natural `if candidate.claimed_by:` reads
+    a claimed device as free, the probe then takes it out from under a live
+    worker, and that is the interleaving spec 6.3 exists to prevent. `None` is
+    the one value that reads as free, and it reads that way correctly.
     """
 
     @field_validator("bus", "cs", mode="before")
@@ -639,6 +648,24 @@ class ProbeRequest(_Message):
         # report honestly on whatever it lit. See `not_a_flag`.
         return not_a_flag(value, what="a bus, chip select, pin or clock is a number")
 
+    @field_validator("hold_s", mode="before")
+    @classmethod
+    def _a_hold_is_a_duration_not_a_flag(cls, value: object) -> object:
+        # A float is not exempt from the rule the five ints obey: `true` is 1 in
+        # pydantic's lax mode here too, and 1.0 is squarely inside this field's
+        # range. `FramesRequest.fps` leaves the same coercion open and is not a
+        # regression to match, because what it buys there is a stream at the
+        # wrong rate, which the next request corrects. This holds every worker
+        # on the bus off the bus (spec 6.3) for a second nobody asked for, and
+        # then reports as though the requested duration was honoured -- there is
+        # no later message that corrects a stall that already happened.
+        #
+        # Its own validator rather than another field on the one above, because
+        # the reason is what an operator reads: a `hold_s` refused with "a bus,
+        # chip select, pin or clock is a number" would be a correct refusal
+        # carrying a false reason, which is the defect `what` was added to stop.
+        return not_a_flag(value, what="a hold is a duration in seconds")
+
 
 class ProbeResult(_Message):
     """Whether the daemon could drive that wiring, and what stopped it if not.
@@ -647,13 +674,30 @@ class ProbeResult(_Message):
     and it means "the device opened and the pattern was written", never "the
     operator saw it". Only the person in front of the rack can answer that, which
     is why the wizard asks them afterwards rather than trusting this.
+
+    The pair is deliberately unconstrained: nothing here forces an `error` when
+    `ok` is false, and nothing forbids one when it is true. A `model_validator`
+    tying them would turn a daemon that forgot the reason into a *refused
+    message*, and a refused reply is answered by the server's wait expiring --
+    so the operator would read "timed out" for a probe that failed for a reason
+    the daemon knew. Filling `error` on failure and leaving it out on success is
+    a producer obligation on the daemon (task 11), not a wire rule; a reader
+    should treat `ok` as the verdict and `error` as commentary.
     """
 
     type: Literal["probe_result"] = "probe_result"
     request_id: str = Field(min_length=1, max_length=MAX_REQUEST_ID)
     ok: bool
-    error: str | None = Field(default=None, max_length=MAX_PROBE_ERROR)
-    """Why it failed, in the driver's words, or None. Defaulted because success has none."""
+    error: str | None = Field(default=None, min_length=1, max_length=MAX_PROBE_ERROR)
+    """Why it failed, in the driver's words, or None. Defaulted because success has none.
+
+    Bounded below at 1, exactly as `claimed_by` is, and for the same reason
+    inverted: `""` is falsy, so a refusal carrying a zero-length explanation is
+    indistinguishable from one carrying no explanation to every truthiness check
+    that will read it -- and "a refusal with no reason in it" is a bug this repo
+    has already shipped and fixed once. A daemon with nothing to say sends
+    nothing, and `None` says exactly that.
+    """
 
 
 DaemonMessage = Annotated[

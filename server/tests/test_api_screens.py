@@ -5,7 +5,14 @@ from contextlib import closing
 
 import pytest
 from fastapi.testclient import TestClient
+from ors_schema.link import (
+    MAX_SCREEN_NAME,
+    DetectResult,
+    PanelCandidate,
+    parse_daemon_message,
+)
 from ors_server.api.changes import UNSERVABLE_HEADER
+from ors_server.api.screens import MAX_NAME
 from ors_server.app import AppSettings, create_app
 
 SCREEN = {
@@ -675,3 +682,45 @@ def test_an_edit_no_rack_at_all_received_is_the_one_that_is_a_202(client):
     assert saved.headers[UNSERVABLE_HEADER] == str(broken), (
         "and it names the rack this edit was for, not every broken rack on the server"
     )
+
+
+# --- the name bound the wire restates --------------------------------------
+
+
+def test_a_name_this_server_will_create_still_fits_in_a_detect_result(client_and_daemon):
+    """Two constants that have to agree and cannot import each other.
+
+    `ors_schema.link.MAX_SCREEN_NAME` bounds `PanelCandidate.claimed_by` -- the
+    name of the screen already driving an SPI device -- and it is the *server's*
+    `MAX_NAME` restated, because `ors-schema` may not import `ors-server`. Only a
+    comment holds them together at either end. This suite may import both, so the
+    assertion lives here, the way the daemon's suite pins `MAX_WATCHED_SCREENS`
+    against `_MAX_TRACKED_SCREENS`.
+
+    What the drift costs is silent: raise `MAX_NAME` to 128 and a screen created
+    with a 100-character name becomes a claim no `DetectResult` can carry, so the
+    whole detection reply fails to parse, the wait expires, and the wizard tells
+    an operator the rack did not answer.
+
+    The longest name this server will actually create is created here and then
+    carried over the wire, rather than only compared: the equality is the claim,
+    and a name a `POST /api/screens` accepts arriving in a `DetectResult` is the
+    thing the equality is *for*.
+    """
+    client, daemon_id = client_and_daemon
+
+    assert MAX_SCREEN_NAME == MAX_NAME
+
+    longest = "x" * MAX_NAME
+    created = client.post("/api/screens", json={**SCREEN, "daemon_id": daemon_id, "name": longest})
+
+    assert created.status_code == 201, "the server creates a name this long"
+
+    claimed = parse_daemon_message(
+        DetectResult(
+            request_id="detect-1",
+            panels=[PanelCandidate(bus=3, cs=1, claimed_by=longest)],
+        ).model_dump_json()
+    )
+
+    assert claimed.panels[0].claimed_by == longest

@@ -703,6 +703,31 @@ def test_no_number_on_a_probe_may_arrive_as_a_flag(field: str):
         parse_server_message(wire)
 
 
+def test_a_hold_may_not_arrive_as_a_flag_either_although_it_is_a_float():
+    """The one wire number on these messages that is not an int, held to the same rule.
+
+    `true` is 1.0 here as readily as it is 1 in `bus`, and 1.0 is squarely inside
+    this field's range, so without the guard a probe holds every worker on that
+    bus off the bus (spec 6.3) for a second nobody asked for and then reports as
+    though the requested duration was honoured. `FramesRequest.fps` leaves the
+    same coercion open, and that is not a precedent to follow rather than a
+    difference: a stream at the wrong rate is corrected by the next request; a
+    stall that already happened is not corrected by anything.
+
+    The reason is asserted too, for the twins' reason above -- a duration refused
+    with "a bus, chip select, pin or clock is a number" would name a kind of
+    field this one is not.
+    """
+    with pytest.raises(ValidationError) as refused:
+        probe(hold_s=True)
+
+    assert "a hold is a duration in seconds, not a flag" in str(refused.value)
+
+    wire = json.dumps({"type": "probe", "request_id": "rq", **WIRING, "hold_s": True})
+    with pytest.raises(ValidationError):
+        parse_server_message(wire)
+
+
 @pytest.mark.parametrize("field", ["bus", "cs"])
 def test_no_number_on_a_candidate_may_arrive_as_a_flag_either(field: str):
     """The reply half carries the same kind of number and takes the same lie.
@@ -710,9 +735,18 @@ def test_no_number_on_a_candidate_may_arrive_as_a_flag_either(field: str):
     A candidate whose `bus` arrived as `true` names device 1.x in a list the
     wizard is about to offer, and the operator picks a row that describes a
     device the daemon never found.
+
+    The reason is asserted as well as the refusal, exactly as the probe's twin
+    above does it: a `PanelCandidate` that refused `true` with "a screen id is a
+    row id" would pass a bare `pytest.raises` while telling the operator about a
+    field this message does not have, which is the false-reason defect the `what`
+    argument exists to prevent.
     """
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as refused:
         PanelCandidate(**{"bus": 2, "cs": 3, "claimed_by": None, field: True})
+
+    assert "flag" in str(refused.value)
+    assert "screen id" not in str(refused.value), "the reason has to name the field's kind"
 
 
 def test_a_screen_id_still_refuses_a_flag_in_the_words_it_always_used():
@@ -927,6 +961,50 @@ def test_a_claim_is_a_screen_name_and_is_bounded_like_one():
         PanelCandidate(bus=2, cs=3, claimed_by="x" * (MAX_SCREEN_NAME + 1))
 
 
+def test_an_empty_claim_is_not_a_free_device_and_is_not_a_name_either():
+    """`""` reads as free to every truthiness check and is not a name that exists.
+
+    Both halves matter and the second is the one that is easy to lose. `""` must
+    be refused: it is falsy, so `if candidate.claimed_by:` -- the natural line in
+    the enumerator and in the wizard -- reads a *claimed* device as available,
+    the probe takes it out from under a live worker, and that is exactly the
+    interleaving spec 6.3 blames for M2's pale grey rectangles. It is also a name
+    no screen could have been created with (`ors_server.api.screens` and
+    `ScreenConfig.name` both require a character), so it cannot honestly be a
+    claim on anything.
+
+    And `None` must still parse, which is `test_a_command_may_still_name_no_screen_at_all`'s
+    lesson: a guard written as `if not claimed_by: raise` refuses the empty
+    string and takes the one legal way of saying "nobody is driving this" with
+    it. Off the wire on both counts, because that is how it arrives.
+
+    The shortest name that *can* exist is asserted for the same reason one step
+    further in: the server creates a screen called "A" (`min_length=1`), and a
+    bound of two here would make that rack's whole detection reply unparseable --
+    a wizard that says the rack did not answer because one panel is named after a
+    letter. Measured: without this line, raising the bound to 2 survives.
+    """
+    assert PanelCandidate(bus=2, cs=3, claimed_by="A").claimed_by == "A"
+
+    free = parse_daemon_message(
+        '{"type": "detect_result", "request_id": "r18",'
+        ' "panels": [{"bus": 2, "cs": 3, "claimed_by": null}]}'
+    )
+
+    assert isinstance(free, DetectResult)
+    assert free.panels[0].claimed_by is None
+
+    with pytest.raises(ValidationError) as refused:
+        parse_daemon_message(
+            '{"type": "detect_result", "request_id": "r19",'
+            ' "panels": [{"bus": 2, "cs": 3, "claimed_by": ""}]}'
+        )
+
+    assert [(e["type"], e["loc"]) for e in refused.value.errors()] == [
+        ("string_too_short", ("detect_result", "panels", 0, "claimed_by"))
+    ]
+
+
 def test_a_detect_result_keeps_every_candidate_where_the_daemon_put_it():
     """Three devices, no number equal to its own index or to its neighbour's field.
 
@@ -972,7 +1050,13 @@ def test_a_detect_result_that_omits_its_panels_is_not_a_rack_with_none():
 def test_a_detect_result_may_not_name_more_devices_than_a_rack_could_have():
     """The list is built from a directory listing on a machine the server cannot
     see, and the interface renders a row per entry."""
-    at_bound = [PanelCandidate(bus=n, cs=1, claimed_by=None) for n in range(MAX_PANEL_CANDIDATES)]
+    # `bus=n + 3` rather than `bus=n`: nothing here asserts a bus today, but a
+    # fixture whose field equals its own list index is the identity trap this
+    # project has already been bitten by three times, and it costs nothing to
+    # keep the two apart before some later assertion leans on it.
+    at_bound = [
+        PanelCandidate(bus=n + 3, cs=1, claimed_by=None) for n in range(MAX_PANEL_CANDIDATES)
+    ]
 
     assert len(DetectResult(request_id="r8", panels=at_bound).panels) == MAX_PANEL_CANDIDATES
 
@@ -983,9 +1067,17 @@ def test_a_detect_result_may_not_name_more_devices_than_a_rack_could_have():
         )
 
 
-def test_a_probe_result_carries_the_reason_it_failed():
-    """A refusal with no reason in it is the failure this project has already
-    shipped once. `ok` alone would leave the wizard saying "that did not work"."""
+def test_the_reason_a_probe_failed_survives_the_wire():
+    """A driver's own words, out of the daemon and into the operator's hands intact.
+
+    Named for what it checks and no more. It supplies the error itself, so
+    nothing here requires a daemon to send one -- and by design nothing does:
+    `ProbeResult` deliberately has no `model_validator` tying `error` to `ok`,
+    because a reply the server refuses to parse is answered by a *timeout*
+    rather than by a failure. Always filling it is a producer obligation on task
+    11, recorded in the report and in `ProbeResult`'s docstring, not a claim this
+    test is in a position to make.
+    """
     failed = parse_daemon_message(
         ProbeResult(
             request_id="r10", ok=False, error="[Errno 2] No such file: /dev/spidev2.3"
@@ -1012,6 +1104,45 @@ def test_an_error_the_server_would_refuse_to_read_is_worse_than_a_short_one():
 
     with pytest.raises(ValidationError):
         ProbeResult(request_id="r13", ok=False, error="x" * (MAX_PROBE_ERROR + 1))
+
+
+def test_a_refusal_with_a_zero_length_reason_in_it_is_not_a_reason():
+    """The same rule as `claimed_by`'s, inverted, on the field that explains a failure.
+
+    `error=""` is falsy, so a failure carrying it is indistinguishable from one
+    carrying nothing to every check that will read it -- and "a refusal with no
+    reason in it" is a bug this repo has already shipped and fixed once. A daemon
+    with nothing to say has a way of saying so.
+
+    That way is the other half of this test and the half a `if not error: raise`
+    would destroy: `None` -- whether omitted or sent explicitly -- is legal, on a
+    failure as much as on a success, because forcing a reason would turn a daemon
+    that forgot one into a message the server refuses to parse, and the operator
+    would then read a timeout instead of a failure.
+
+    A one-character reason is asserted for `claimed_by`'s reason: a bound of two
+    would refuse a driver's terse line and cost the operator the reason
+    altogether, which is the very thing this field exists to carry. Measured:
+    without this line, raising the bound to 2 survives.
+    """
+    assert ProbeResult(request_id="r23", ok=False, error="?").error == "?"
+
+    with pytest.raises(ValidationError) as refused:
+        parse_daemon_message(
+            '{"type": "probe_result", "request_id": "r20", "ok": false, "error": ""}'
+        )
+
+    assert [(e["type"], e["loc"]) for e in refused.value.errors()] == [
+        ("string_too_short", ("probe_result", "error"))
+    ]
+
+    for reasonless in (
+        '{"type": "probe_result", "request_id": "r21", "ok": false}',
+        '{"type": "probe_result", "request_id": "r22", "ok": false, "error": null}',
+    ):
+        parsed = parse_daemon_message(reasonless)
+        assert isinstance(parsed, ProbeResult)
+        assert parsed.error is None and parsed.ok is False
 
 
 @pytest.mark.parametrize(
