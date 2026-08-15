@@ -16,8 +16,10 @@
       // `src/components/ui` is shadcn CLI output in its entirety -- the global
       // constraint is that components are added with `pnpm dlx shadcn@latest
       // add` and never hand-written here -- and a great many of those files
-      // export a variants object beside their component (button, badge, table,
-      // sheet, toggle, sonner). The rule exists to protect Fast Refresh in a
+      // export a variants object beside their component -- button and sheet do
+      // today; badge, table, toggle and sonner will when a later task adds
+      // them, which is why this is a directory and not a list. The rule exists
+      // to protect Fast Refresh in a
       // file a human maintains, so in this directory it is unactionable by
       // construction: the only way to satisfy it is to edit generated code the
       // next `add` overwrites. Off for the directory, and one file at a time
