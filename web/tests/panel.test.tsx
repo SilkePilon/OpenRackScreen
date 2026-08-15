@@ -527,9 +527,9 @@ describe("a panel", () => {
     // Three counters, because they fail for different mistakes. `shell` commits
     // for anything in the tree, which is where provider state shows up; `page`
     // is a component between the provider and the panel, which is where a
-    // context or a prop would; `panel` is the panel's own render, which is what
-    // the `staleRef` bail-out in `setStaleness` is for -- `setStale(false)`
-    // once per frame is the cost this design exists to avoid.
+    // context or a prop would; `panel` is the panel's own render, which is
+    // where the `staleRef` bail-out in `setStaleness` shows up -- see the
+    // daemons message below for why it only shows up after one.
     let shellCommits = 0
     let pageRenders = 0
     let panelCommits = 0
@@ -560,6 +560,19 @@ describe("a panel", () => {
     const mounted = { shell: shellCommits, page: pageRenders, panel: panelCommits }
     expect(mounted.page).toBe(1)
 
+    // One genuine re-render of the panel's own fiber, deliberately, before the
+    // frames -- and the only reason this test can see the `staleRef` bail-out
+    // at all. Rack 7 goes offline and rack 23 stays up; the panel is on 23, so
+    // `offline` is false before and after and nothing it displays moves. What
+    // does move is React's bookkeeping: the daemons query the panel reads
+    // notifies, the panel renders, and that render leaves a lane on the fiber's
+    // *alternate*, which is what the eager-state-bailout path is gated on.
+    // Without this message the panel's fiber is pristine for the whole test,
+    // every `setStale(false)` is discarded eagerly whether the guard is there
+    // or not, and the counter below reads the same number either way.
+    act(() => rig.live().deliver(JSON.stringify({ type: "daemons", online: [23] })))
+    expect(panel(41)).toHaveAttribute("data-state", "live")
+
     for (let frame = 0; frame < 8; frame += 1) {
       act(() => rig.live().deliver(frameMessage(41, 200 + frame, bytesFor(41))))
       await act(() => rig.decoder.settleAll())
@@ -569,8 +582,15 @@ describe("a panel", () => {
     // just as well for an interface that drew nothing at all.
     expect(rig.canvas.only().drawn).toHaveLength(8)
     expect(pageRenders).toBe(mounted.page)
-    expect(panelCommits).toBe(mounted.panel)
-    expect(shellCommits).toBe(mounted.shell)
+    // Exactly one, and it is the daemons message: the eight frames add nothing.
+    // Delete `if (staleRef.current === next) return` and this is two -- the
+    // first frame after that render finds the alternate still carrying its
+    // lane, so `setStale(false)` schedules a render and a commit that change
+    // nothing at all. Only one, because that render clears the lane again; the
+    // cost of dropping the guard is one wasted commit per genuine render of
+    // this panel, not one per frame.
+    expect(panelCommits).toBe(mounted.panel + 1)
+    expect(shellCommits).toBe(mounted.shell + 1)
   })
 
   it("keeps its picture across a resize, without waiting for the next frame", async () => {

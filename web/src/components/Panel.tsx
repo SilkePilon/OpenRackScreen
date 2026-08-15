@@ -103,17 +103,27 @@ export function Panel({
   const [stale, setStale] = useState(false)
   // A ref beside the state, so a frame arriving twice a second on a panel that
   // is already live sets nothing and renders nothing. `useState` bails out on
-  // an unchanged value, but it may render once before it does, and once per
-  // frame is the cost this whole design exists to avoid.
+  // an unchanged value, but only sometimes before rendering, and this is what
+  // makes it always.
   //
-  // Kept knowing that no test can see it, which the mutation sweep proved: with
-  // this line removed, `setStale(false)` runs on every frame and the panel's
-  // own render counter does not move. React 19 computes the next state eagerly
-  // when a fiber has no other pending update and returns without scheduling if
-  // it is `Object.is`-equal, so the extra dispatch is free *there*. That is a
-  // heuristic React documents as "may still need to render one more time", not
-  // a guarantee, and this line is what makes the property true rather than
-  // likely.
+  // The sometimes is worth stating exactly, because it decides what the line
+  // costs to remove. React 19.2.8 takes the eager path in `dispatchSetState`
+  // only when `0 === fiber.lanes && (null === alternate || 0 === alternate.lanes)`
+  // -- not merely when the fiber has no pending update of its own.
+  // `enqueueUpdate` marks *both* the fiber and its alternate, and `beginWork`
+  // clears only the work-in-progress's lanes, so for one dispatch after any
+  // genuine update-driven render of this component the alternate still carries
+  // that lane and the eager bailout is off: `setStale(false)` schedules a
+  // render and a commit that change nothing. The next render's `bailoutHooks`
+  // does `current.lanes &= ~lanes` and turns it back on, which is why the cost
+  // is one wasted commit and not one per frame.
+  //
+  // So without this line every panel pays a render and a commit after every
+  // staleness transition and every `daemons` message -- and a `Profiler` counts
+  // it. `re-renders neither the interface above it nor itself, eight frames
+  // running` is where: it flips a rack the panel is not on, to dirty the fiber
+  // without changing anything the panel shows, and then asserts one commit
+  // across the message and eight frames. Two without the guard.
   const staleRef = useRef(false)
   const staleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
