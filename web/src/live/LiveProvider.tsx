@@ -69,11 +69,20 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       onFrame: (frame) => frameStore.push(frame),
     })
 
-    // Registered before the dial, not after. Registering replays the screens
-    // that already have a panel on them -- React runs a child's effects before
-    // its parent's, so every panel below this one has already subscribed by
-    // now -- and the client holds what it is asked for until the handshake
-    // finishes, so those go out on `open` with the rest.
+    // Registering replays the screens that already have a panel on them --
+    // React runs a child's effects before its parent's, so every panel below
+    // this one has already subscribed by now -- and the client holds what it is
+    // asked for until the handshake finishes, so those go out on `open` with
+    // the rest. The replay is load-bearing; without it every panel on a first
+    // page load would be watched by nobody.
+    //
+    // Before the dial rather than after, though nothing can currently tell:
+    // what has to be true is that the set is complete before the socket
+    // *opens*, and no browser opens one synchronously from `new WebSocket`. So
+    // this order is the one that needs no argument about when `onopen` can
+    // fire, not one a test can distinguish -- a mutant that swaps the two lines
+    // survives the suite, and is disclosed as equivalent rather than papered
+    // over with a test that would only be asserting this line's position.
     const stopWatching = frameStore.onWatchedChange((screenId, watched) => {
       if (watched) live.subscribe(screenId)
       else live.unsubscribe(screenId)

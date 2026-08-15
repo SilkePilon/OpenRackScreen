@@ -12,8 +12,8 @@ import { recordCanvas, stubDecoder } from "./paint"
 // that returned the wrong screen's bitmap, or delivered by index, cannot pass
 // anything here by coincidence.
 //
-// Screens: 41, 12, 58, 31, 77, 63, 96, 84, 19. Seqs: 104 and up, plus one that
-// goes backwards. Racks: 7 and 23.
+// Screens: 41, 12, 58, 31, 77, 63, 96, 84, 52, 19. Seqs: 104 and up, plus one
+// that goes backwards. Racks: 7 and 23.
 const bytesFor = (mark: number) => new Uint8Array([0xff, 0xd8, mark, 0x00, mark])
 
 afterEach(() => {
@@ -206,6 +206,31 @@ describe("the frame store", () => {
     expect(decoder.made[1].closed).toBe(false)
 
     release()
+  })
+
+  it("closes a frame that finishes decoding after its last panel has gone", async () => {
+    // The third and last of the moments this store closes a bitmap, and the one
+    // with nobody to hand it to: the panel unmounted while `createImageBitmap`
+    // was still working, so the decode lands on a screen that has no drawers and
+    // no stream. Nothing will ever draw it and nothing but this store can close
+    // it -- and a store that kept it would hold a picture, and an entry for the
+    // screen it belongs to, for a panel that is not on the page any more.
+    const decoder = stubDecoder()
+    const store = createFrameStore()
+    const drew: unknown[] = []
+    const release = store.subscribe(52, (bitmap) => drew.push(bitmap))
+
+    store.push({ screenId: 52, seq: 111, bytes: bytesFor(52) })
+    release()
+    await decoder.settleAll()
+
+    expect(drew).toEqual([])
+    expect(decoder.made[0].closes).toBe(1)
+    // And the screen stayed forgotten. `lastAt` is what a panel's grace period
+    // is measured from, so a decode that wrote one here would make a panel
+    // remounting on this screen an hour later be born stale against a stream
+    // that stopped before it existed.
+    expect(store.lastAt(52)).toBeNull()
   })
 
   it("skips a frame the browser cannot decode and keeps the one on screen", async () => {
