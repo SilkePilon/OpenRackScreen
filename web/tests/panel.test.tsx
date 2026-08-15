@@ -12,7 +12,7 @@ import { ThemeProvider } from "../src/theme/theme-provider"
 import { collectSockets, type FakeSocket } from "./fake-socket"
 import { recordCanvas, stubDecoder, type BitmapDecoder, type CanvasRecorder } from "./paint"
 
-// Racks 7 and 23, screens 41, 12, 58, 31, 77 and 63. No rack id is a screen id,
+// Racks 7 and 23, screens 41, 12, 58, 31, 77, 63 and 29. No rack id is a screen id,
 // no id is its own index in the arrays below, and the rack a panel belongs to is
 // never the first entry in the daemons list -- so a panel that read the wrong
 // rack's `online`, or the first one it found, cannot pass.
@@ -362,6 +362,43 @@ describe("a panel", () => {
       { action: "subscribe", screen_id: 12 },
       { action: "unsubscribe", screen_id: 12 },
     ])
+  })
+
+  it("leaves no timer armed when it unmounts", () => {
+    // The staleness deadline is a `setTimeout`, and a panel that goes away with
+    // one still armed leaves a closure holding its canvas until it fires. On the
+    // Screens page panels come and go with the selection, so that is one dangling
+    // timer per panel somebody clicked past -- and nothing anywhere would say so,
+    // because a `setState` on an unmounted component is silent in React 19.
+    //
+    // Rendered against its own client with `gcTime: Infinity` so the count means
+    // what it says: a query whose last observer unmounts otherwise schedules its
+    // own collection, and a timer belonging to the cache is indistinguishable
+    // here from one belonging to the panel.
+    vi.useFakeTimers()
+    // Nothing here asserts a draw, but the recorder still goes in: jsdom's own
+    // `getContext` logs "without installing the canvas npm package" to the
+    // console every time a panel asks it for one, and a suite whose output is
+    // not silent is a suite nobody reads the warnings of.
+    recordCanvas()
+    const sockets = collectSockets()
+    const queryClient = new QueryClient({ defaultOptions: { queries: { gcTime: Infinity } } })
+    queryClient.setQueryData(daemonsKey, [rack(7, "Loft", true), rack(23, "Attic", true)])
+    const view = render(
+      <StrictMode>
+        <QueryClientProvider client={queryClient}>{panelOf(29, 23)}</QueryClientProvider>
+      </StrictMode>,
+    )
+    const socket = sockets.at(-1)
+    if (socket === undefined) throw new Error("the interface dialled nothing")
+    act(() => socket.accept())
+
+    // Armed while it is on screen. Without this the assertion below would hold
+    // just as well for a panel that never watched its own silence at all.
+    expect(vi.getTimerCount()).toBe(1)
+
+    view.unmount()
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   it("draws nothing rather than throwing when the browser gives no 2d context", async () => {

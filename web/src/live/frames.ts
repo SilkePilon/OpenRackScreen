@@ -146,8 +146,10 @@ export function createFrameStore(): FrameStore {
       const drawers = panels.get(screenId)
       // A frame for a screen nobody is watching, which is the window between a
       // panel unmounting and the unsubscribe reaching the Pi. Dropped before it
-      // costs a decode.
-      if (drawers === undefined || drawers.size === 0) return
+      // costs a decode. There is no `size === 0` half to this test because there
+      // is no such state: an entry is made with its first subscriber and deleted
+      // with its last, so an empty set is never one of these.
+      if (drawers === undefined) return
       newest.set(screenId, seq)
 
       // `image/webp` because that is what the daemon encodes and what the
@@ -158,11 +160,21 @@ export function createFrameStore(): FrameStore {
       // eight times a second forever.
       createImageBitmap(new Blob([bytes], { type: "image/webp" }))
         .then((bitmap) => {
-          // Two ways this decode is no longer wanted, and both end the same:
-          // close it here, because a bitmap nobody draws is still memory.
+          // This decode is no longer the one wanted: a newer frame was pushed
+          // while it was decoding, or the last panel on this screen went away
+          // and took the whole entry -- `newest` is deleted with it, so a screen
+          // nobody watches matches no `seq` at all. Both end the same way,
+          // because a bitmap nobody draws is still memory.
           if (newest.get(screenId) !== seq) return bitmap.close()
+          // Narrowing rather than a second rule. `newest` and `panels` are made
+          // and forgotten together, so the line above has already returned for
+          // every screen this could be undefined for -- and a mutant that draws
+          // into an empty set here survives the suite for exactly that reason.
+          // Spelled out because `for (const draw of undefined)` throws, and
+          // because if those two ever stop being deleted together the bitmap
+          // should leak nothing rather than take the socket callback with it.
           const stillWatching = panels.get(screenId)
-          if (stillWatching === undefined || stillWatching.size === 0) return bitmap.close()
+          if (stillWatching === undefined) return bitmap.close()
 
           releaseShown(screenId)
           showing.set(screenId, bitmap)
