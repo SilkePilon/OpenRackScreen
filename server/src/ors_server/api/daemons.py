@@ -20,15 +20,28 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from contextlib import closing
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from typing import Annotated, Any, Literal
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
-from ors_schema.link import Command, not_a_flag
+from ors_schema.link import (
+    MAX_SPI_HZ,
+    MAX_WIRING_NUMBER,
+    Command,
+    DetectRequest,
+    DetectResult,
+    PanelCandidate,
+    ProbeRequest,
+    ProbeResult,
+    not_a_flag,
+)
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.datastructures import State
 
 from ors_server.api.changes import change, config_error, one_row
+from ors_server.link.hub import SEND_TIMEOUT
 from ors_server.pairing import mint_token_on, rotate_key
 
 log = logging.getLogger(__name__)
@@ -200,6 +213,146 @@ class Pushed(BaseModel):
 
 class Deleted(BaseModel):
     deleted: int
+
+
+DETECT_TIMEOUT = 2 * SEND_TIMEOUT
+"""How long a rack has to answer a detect before the caller is told it did not.
+
+Ten seconds, and deliberately not `REQUEST_TIMEOUT`'s forty. That default has to
+cover the worst *legal* case on the wire, which is a probe holding a panel lit
+for thirty seconds; a detect lists `/dev/spidev*` and reads the running
+configuration, so what is being waited on here is a round trip and a directory
+listing. `SEND_TIMEOUT` twice over is the same shape `REQUEST_TIMEOUT` is built
+from -- one for the question to reach a socket, one for the answer to come back
+-- and it is what an operator pressing Detect on an interface is prepared to sit
+through.
+
+Passed explicitly rather than defaulted, which is what `Hub.request` takes a
+`timeout` parameter *for*: the two callers below are not asking the same kind of
+question, and a rack that has stopped answering should not hold a request
+handler open for forty seconds over a question it could have answered in one.
+"""
+
+MAX_HOLD_S = 5.0
+"""The longest hold this route will ask a rack for, in seconds.
+
+**Not `MAX_PROBE_HOLD_S`, which is thirty.** The wire allows thirty and the
+daemon silently cuts to five: `ors_daemon.supervisor.PROBE_HOLD_BUDGET` is 5.0,
+a request past it is truncated rather than refused, and `ProbeResult` carries no
+field saying it was. So a request for ten seconds is answered `ok: true` by a
+rack that lit the panel for five -- and an interface counting down ten seconds
+has an operator looking up at second six, seeing dark glass, and answering "no,
+nothing lit" about wiring that is fine. That is a wrong answer about hardware,
+arrived at from two correct components, and this bound is where it is stopped:
+refused at the edge, where there is still somebody to tell.
+
+Written down here rather than imported, because `ors-server` may not import
+`ors-daemon` -- the same arrangement `MAX_SCREEN_NAME` and
+`ors_server.api.screens.MAX_NAME` already have, and it holds for the same reason:
+the two ends have to agree, and a number that could not be honoured cannot
+honestly be offered. Whoever changes `PROBE_HOLD_BUDGET` changes this, and
+`test_api_detect.py` states the pair together so the disagreement has somewhere
+to fail.
+"""
+
+PROBE_TIMEOUT = MAX_HOLD_S + 2 * SEND_TIMEOUT
+"""How long a rack has to answer a probe. Fifteen seconds.
+
+`REQUEST_TIMEOUT`'s own formula, with the hold this route will actually ask for
+in place of the largest the wire permits: the daemon replies once the hold is
+over, so the wait has to outlast the hold and the two sends around it. Bounding
+it here rather than taking the forty-second default is what keeps a rack that
+went quiet from parking a request handler for four times as long as the longest
+probe it could have been running.
+"""
+
+
+class ProbeBody(BaseModel):
+    """The wiring an operator typed in, for one candidate panel.
+
+    Every field is required and none has a default, which is the point of the
+    endpoint: `DisplayConfig` defaults `spi_bus` and `spi_cs` to 0 and `hz` to
+    40 MHz, and a probe that filled a field in from a default would be proving
+    wiring nobody chose and reporting it as the wiring that was asked for. What
+    is being tested is the guess that is about to be saved, whole.
+
+    `extra="forbid"` for `PanelCandidate`'s reason inverted: a wizard sending
+    `spi_bus` or `pattern` has to be told, rather than have the field ignored and
+    the probe run against something else.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    bus: int = Field(ge=0, le=MAX_WIRING_NUMBER)
+    cs: int = Field(ge=0, le=MAX_WIRING_NUMBER)
+    dc: int = Field(ge=0, le=MAX_WIRING_NUMBER)
+    rst: int = Field(ge=0, le=MAX_WIRING_NUMBER)
+    hz: int = Field(ge=1, le=MAX_SPI_HZ)
+    hold_s: float = Field(ge=0.0, le=MAX_HOLD_S, allow_inf_nan=False)
+    """Seconds to leave the pattern up, at most `MAX_HOLD_S`. Zero is allowed:
+    a script does not look."""
+
+    @field_validator("bus", "cs", "dc", "rst", "hz", mode="before")
+    @classmethod
+    def _wiring_is_a_number_not_a_flag(cls, value: object) -> object:
+        # `ProbeRequest` has this rule and it has to be here as well, for
+        # `CommandBody.screen_id`'s reason: this model is *upstream* of that one.
+        # `bool` is an `int` and pydantic's lax mode takes it as one, so
+        # `{"bus": true}` would arrive at `ProbeRequest` as an honest 1 -- and 1
+        # is a plausible bus, chip select, GPIO line and clock, so the probe
+        # would light some other device and report truthfully on whatever it lit.
+        return not_a_flag(value, what="a bus, chip select, pin or clock is a number")
+
+    @field_validator("hold_s", mode="before")
+    @classmethod
+    def _a_hold_is_a_duration_not_a_flag(cls, value: object) -> object:
+        # Its own validator rather than a sixth name above, because the reason is
+        # what an operator reads: a `hold_s` refused with "a bus, chip select,
+        # pin or clock is a number" would be a correct refusal carrying a false
+        # reason.
+        return not_a_flag(value, what="a hold is a duration in seconds")
+
+
+class Detected(BaseModel):
+    """What one rack answered a detect with.
+
+    An object rather than a bare list, so that a later field -- when the daemon
+    can say something about a device beyond its number -- is an addition rather
+    than a change of shape for every caller.
+
+    `PanelCandidate` is reused rather than restated, unlike `DaemonView`, and the
+    difference is what each model is protecting against. `DaemonView` exists
+    because the row behind it carries `token_hash` and `key_hash`; this one
+    carries three numbers off the wire that were built for a person to read, and
+    two declarations of the same three fields is how the interface and the daemon
+    come to disagree about `claimed_by`.
+    """
+
+    panels: list[PanelCandidate]
+
+
+class Probed(BaseModel):
+    """Whether the rack could drive that wiring, and what stopped it if not.
+
+    `ok` is the verdict and it means "the device opened and the pattern was
+    written", never "the operator saw it" -- only the person in front of the rack
+    can answer that, which is why the wizard asks them afterwards rather than
+    trusting this.
+
+    A failed probe is a 200 carrying `ok: false`, not an HTTP error. The probe
+    ran, the rack answered, and the answer is no: "SPI2.5 is already driving the
+    screen 'CPU'" is as useful a result as a panel lighting up, and it is a fact
+    about the rack's wiring rather than about this request. The statuses below
+    are kept for the things that are: no rack, no answer, or a second probe on a
+    bus that is already held.
+    """
+
+    ok: bool
+    error: str | None
+    """The rack's own words for why it failed, or None. Commentary, never the
+    verdict: `ProbeResult` deliberately permits `ok=False` with no reason and
+    `ok=True` with one, because a validator tying the pair would turn a daemon
+    that forgot the sentence into a probe that answers with a *timeout*."""
 
 
 class EventView(BaseModel):
@@ -450,6 +603,241 @@ async def push_now(request: Request, response: Response, daemon_id: int) -> Push
     return Pushed(
         version=edit.versions[daemon_id],
         delivered=edit.delivered.get(daemon_id, False),
+    )
+
+
+@router.post(
+    "/daemons/{daemon_id}/detect",
+    responses={
+        502: {"description": "the rack answered something that was not a detect result"},
+        503: {"description": "the rack is not connected, and only the rack knows its hardware"},
+        504: {"description": "the rack is connected and did not answer in time"},
+    },
+)
+async def detect_panels(request: Request, daemon_id: int) -> Detected:
+    """Ask a rack what SPI devices it has, and who is already driving each one.
+
+    The first question the add-screen wizard asks, and nothing in this server can
+    answer it: which `/dev/spidev*` a Pi exposes is a fact about that Pi, and
+    which of them a running worker is mid-frame on is a fact about that Pi's
+    supervisor. So this asks, and waits.
+
+    Changes nothing, and is not a `change`: it lists a directory on somebody
+    else's machine. Detection is also **not rate-limited** -- two operators
+    detecting at once is two directory listings -- which is exactly where it
+    parts company with the probe below.
+
+    **Three ways there is no answer, and they are three different answers.** A
+    rack that is not connected is a 503, because the thing to do is start the
+    daemon. A rack that is connected and silent is a 504, because the thing to do
+    is look at what it is busy with. A rack that answers the *other* question is a
+    502: `Hub.deliver_reply` matches the id and the rack, and nothing on the wire
+    says which question a reply belongs to, so a `ProbeResult` carrying this
+    request's id resolves this wait -- and it has no `panels`. Answering that with
+    a 500 would report a rack's confusion as this server's.
+    """
+    state = request.app.state
+    with closing(state.database.connect()) as connection:
+        one_row(
+            connection,
+            "SELECT id FROM daemon WHERE id = ?",
+            (daemon_id,),
+            missing=f"no daemon {daemon_id}",
+        )
+    reply = await state.hub.request(
+        daemon_id,
+        DetectRequest(request_id=_question_id("detect")),
+        timeout=DETECT_TIMEOUT,
+    )
+    if reply is None:
+        raise _no_answer(state, daemon_id, "detect", DETECT_TIMEOUT)
+    if not isinstance(reply, DetectResult):
+        raise _wrong_answer(daemon_id, "detect", reply)
+    return Detected(panels=reply.panels)
+
+
+@router.post(
+    "/daemons/{daemon_id}/probe",
+    responses={
+        409: {"description": "that rack is already probing a panel; see one_probe_at_a_time"},
+        502: {"description": "the rack answered something that was not a probe result"},
+        503: {"description": "the rack is not connected, and a probe cannot be deferred"},
+        504: {"description": "the rack is connected and did not answer in time"},
+    },
+)
+async def probe_panel(request: Request, daemon_id: int, body: ProbeBody) -> Probed:
+    """Light one candidate panel with the wiring an operator supplied, and hold it.
+
+    The other half of detection, and the half that touches hardware: enumeration
+    cannot discover `dc` and `rst` -- a GC9A01 has no readable id over 4-wire SPI
+    and the GPIO lines were chosen with a screwdriver -- so this is the guess
+    being tested, and the proof is a human seeing the glass come on.
+
+    **`hold_s` is bounded at `MAX_HOLD_S`, which is 5.0 and not the wire's 30.**
+    The daemon cuts a longer hold to five and says nothing about having done it,
+    so a countdown longer than five seconds asks an operator about a panel that
+    is already dark. Whatever builds an interface on this route may not count
+    past that number; the constant's docstring is the whole argument.
+
+    **One probe at a time per rack** (spec 6.4), which is `one_probe_at_a_time`
+    and lives here rather than in the hub: it is a rule about a *bus*, and the
+    hub deliberately lets one rack hold several waits at once. A second probe is
+    refused with a 409 and a sentence, because the alternative -- two panel inits
+    interleaved on one bus -- is the failure the daemon's bus guard exists to
+    prevent, and because an operator standing at the rack needs to be told which
+    of the two lit panels they are looking at.
+
+    `ok: false` is a **200**. The rack answered; the answer is no. The statuses
+    are for the questions this server could not get answered at all -- see
+    `detect_panels` for the 503/504/502 split, which is the same one.
+    """
+    state = request.app.state
+    with closing(state.database.connect()) as connection:
+        one_row(
+            connection,
+            "SELECT id FROM daemon WHERE id = ?",
+            (daemon_id,),
+            missing=f"no daemon {daemon_id}",
+        )
+    with one_probe_at_a_time(state, daemon_id):
+        reply = await state.hub.request(
+            daemon_id,
+            ProbeRequest(
+                request_id=_question_id("probe"),
+                bus=body.bus,
+                cs=body.cs,
+                dc=body.dc,
+                rst=body.rst,
+                hz=body.hz,
+                hold_s=body.hold_s,
+            ),
+            timeout=PROBE_TIMEOUT,
+        )
+    if reply is None:
+        raise _no_answer(state, daemon_id, "probe", PROBE_TIMEOUT)
+    if not isinstance(reply, ProbeResult):
+        raise _wrong_answer(daemon_id, "probe", reply)
+    return Probed(ok=reply.ok, error=reply.error)
+
+
+@contextmanager
+def one_probe_at_a_time(state: State, daemon_id: int) -> Iterator[None]:
+    """Spec 6.4's rule, and the only place it is implemented.
+
+    A probe is a real panel init -- roughly 160 ms of resets and register writes,
+    then a frame -- and it takes the daemon's bus guard for its whole hold, so
+    every worker sharing that bus is held off it. Two at once on one rack is two
+    inits interleaved on one bus, which is M2's defect returning by another road.
+
+    Kept as a set of rack ids on `app.state` rather than a lock, because the
+    answer to the second caller is a **refusal with a reason** and not a queue. A
+    lock would leave the second operator waiting out the first one's hold and
+    then lighting a panel nobody was watching for; `Hub.request`'s `None` would
+    make it a timeout, which is the wrong report for somebody standing in front
+    of the rack.
+
+    Safe without any lock of its own for the reason the hub is: the test and the
+    add below have no await between them, and every caller is an `async def`
+    route on the one event loop. A `def` route would break that, and the sweep in
+    `test_api_routes.py` is what stops one being written.
+
+    Released in a `finally`, so every way out gives the rack back: the answer, a
+    timeout, a rack that vanished, a cancelled caller -- and a 502 raised on the
+    reply is deliberately outside the block, so the rack is free before this
+    server starts composing an error about it. Held instead of released, one
+    silent probe would refuse every later probe on that rack until a restart.
+    """
+    try:
+        probing: set[int] = state.probing_racks
+    except AttributeError:
+        # First probe of this process, on this app. Created here rather than in
+        # `create_app` so that the rule and its storage are one thing to read;
+        # `state` is per app, which is what keeps a dozen apps in one test run
+        # from sharing a rack id. Reached by name and not through `getattr`,
+        # which the router sweep in `test_api_routes.py` forbids outright --
+        # a dynamic lookup makes its "no router pushes on its own" check blind.
+        #
+        # `probing_racks` rather than `probing`, because `state.probe` next door
+        # is the Prometheus query function, and two attributes a letter apart on
+        # one object is a mix-up waiting for whoever reads this next.
+        probing = state.probing_racks = set()
+    if daemon_id in probing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"daemon {daemon_id} is already probing a panel, and a probe holds that "
+            f"rack's SPI bus for up to {MAX_HOLD_S:g}s. Wait for it to finish and try again",
+        )
+    probing.add(daemon_id)
+    try:
+        yield
+    finally:
+        probing.discard(daemon_id)
+
+
+def _question_id(question: str) -> str:
+    """A correlation id for one question, unique across every rack and every
+    question this server has ever asked.
+
+    `uuid4` and not a counter, per rack or otherwise. `Hub.deliver_reply` matches
+    an id *and* the rack it came back from, so a collision across racks is already
+    refused -- but `Hub.request`'s cleanup removes its entry by identity precisely
+    because it cannot trust these to be unique, and a reused id there takes a live
+    wait out from under a caller whose answer is still on its way. The prefix is
+    for whoever is reading the log beside a Pi's; 39 characters, against
+    `MAX_REQUEST_ID`'s 64.
+    """
+    return f"{question}-{uuid4().hex}"
+
+
+def _no_answer(state: State, daemon_id: int, question: str, timeout: float) -> HTTPException:
+    """503 or 504 for a question that came back with nothing.
+
+    `Hub.request` answers `None` to four different things -- no socket, a send
+    that never left, nobody answering in time, and a rack that went away
+    mid-question -- and that is the right signature for the hub and the wrong
+    answer for a person: "the rack is not plugged in" and "the rack is connected
+    and ignoring me" send somebody to different rooms.
+
+    **Asked after the call and not before it, and that is the race.** A check in
+    front of the question is a fact about the moment before it was asked: a rack
+    that disconnects while the question is in flight would be reported as a
+    timeout, and the operator would go looking for a busy daemon on a Pi that is
+    powered off. The hub abandons every wait belonging to a connection it drops,
+    so `None` arrives immediately in that case and this reads the state that is
+    true *now* -- which is the state the answer is about. The mirror case is
+    honest too: a rack that dropped and reconnected inside one question is online
+    here and is told it did not answer, which is exactly what happened.
+    """
+    if not state.hub.is_online(daemon_id):
+        return HTTPException(
+            status_code=503,
+            detail=f"daemon {daemon_id} is not connected, so nothing could ask it to {question}. "
+            "Only the rack knows its own hardware: start the daemon on the Pi and watch "
+            "GET /api/daemons for it to come online",
+        )
+    return HTTPException(
+        status_code=504,
+        detail=f"daemon {daemon_id} is connected but did not answer the {question} within "
+        f"{timeout:g}s. It may be applying a configuration and holding its bus -- see "
+        f"GET /api/events?daemon_id={daemon_id}, then try again",
+    )
+
+
+def _wrong_answer(
+    daemon_id: int, question: str, reply: DetectResult | ProbeResult
+) -> HTTPException:
+    """A reply that answers the other question, which nothing on the wire forbids.
+
+    `Hub.deliver_reply` matches the `request_id` and the rack, deliberately and
+    for good reasons of its own, so the *type* is this route's to check. 502
+    rather than 500: the rack is the upstream that answered something else, and
+    the difference is where somebody goes to look.
+    """
+    return HTTPException(
+        status_code=502,
+        detail=f"daemon {daemon_id} answered the {question} with {reply.type!r}, "
+        "which is not a reply to it. Check that the rack is running a build of "
+        "ors-daemon this server knows",
     )
 
 

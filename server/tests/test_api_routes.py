@@ -57,6 +57,13 @@ MUTATES_NOTHING = {
     # dry-runs an integration's queries and answers with what came back.
     "POST /api/daemons/{daemon_id}/command",
     "POST /api/integrations/{integration_id}/test",
+    # The two questions the add-screen wizard asks a rack. Both read the `daemon`
+    # row to answer 404 for a rack nobody created, and then ask the Pi: `detect`
+    # lists its SPI devices, `probe` lights one panel with wiring an operator
+    # typed. Neither writes anything -- what they are about is hardware this
+    # server has no row for yet, which is the whole reason they exist.
+    "POST /api/daemons/{daemon_id}/detect",
+    "POST /api/daemons/{daemon_id}/probe",
 }
 
 
