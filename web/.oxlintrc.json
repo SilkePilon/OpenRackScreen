@@ -1,8 +1,31 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
   "plugins": ["react", "typescript", "oxc"],
+  // oxlint reports its default `correctness` rules at warn severity and exits 0,
+  // which lets defects like `no-const-assign` land with a green `pnpm lint`.
+  // Promoting the category to error is what makes the gate a gate.
+  "categories": {
+    "correctness": "error"
+  },
   "rules": {
     "react/rules-of-hooks": "error",
     "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
+  },
+  "overrides": [
+    {
+      // These three files each export a non-component alongside a component,
+      // and none of them are ours to edit: button.tsx and sidebar.tsx are
+      // shadcn CLI output, and theme-provider.tsx is shadcn's dark-mode recipe
+      // that the brief mandates verbatim. Scoped off here rather than repo-wide
+      // so a hand-written file still gets the rule.
+      "files": [
+        "src/components/ui/button.tsx",
+        "src/components/ui/sidebar.tsx",
+        "src/theme/theme-provider.tsx"
+      ],
+      "rules": {
+        "react/only-export-components": "off"
+      }
+    }
+  ]
 }

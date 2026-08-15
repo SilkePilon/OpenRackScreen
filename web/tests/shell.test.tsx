@@ -41,4 +41,11 @@ describe("the shell", () => {
     expect(document.documentElement).not.toHaveClass("dark");
     expect(localStorage.getItem("ors-theme")).toBe("light");
   });
+
+  it("restores the stored theme over the default", () => {
+    localStorage.setItem("ors-theme", "light");
+    shell();
+    expect(document.documentElement).toHaveClass("light");
+    expect(document.documentElement).not.toHaveClass("dark");
+  });
 });
