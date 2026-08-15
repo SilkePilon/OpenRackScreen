@@ -1,0 +1,15 @@
+# pnpm 11 refuses to run a dependency's install scripts until somebody has said
+# so in writing, and until then *every* pnpm command -- `pnpm test` included --
+# exits 1 with ERR_PNPM_IGNORED_BUILDS. So this is a gate answer, not a
+# preference.
+#
+# msw's postinstall only prints a note about `msw init`, which writes the
+# browser service worker. This project does not use it: the tests intercept
+# through `setupServer` in Node.
+#
+# The answer lives here rather than in package.json's `pnpm` field because
+# pnpm 11 reads these settings from the workspace file only. There is no
+# `packages:` key: `web/` is one project, not a workspace, and adding one would
+# move the lockfile's importer out from under CI's cache path.
+allowBuilds:
+  msw: false

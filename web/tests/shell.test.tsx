@@ -1,15 +1,21 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, beforeEach } from "vitest";
+import { MemoryRouter } from "react-router";
 import { AppShell } from "../src/components/AppShell";
 import { ThemeProvider } from "../src/theme/theme-provider";
 
+// The sidebar's nav items are router links now, and a `Link` outside a router
+// throws. This is the shell on its own, so a memory history is enough -- the
+// whole interface at a route is `renderApp` in ./render.
 function shell() {
   return render(
     <ThemeProvider defaultTheme="dark" storageKey="ors-theme">
-      <AppShell>
-        <p>rack</p>
-      </AppShell>
+      <MemoryRouter>
+        <AppShell>
+          <p>rack</p>
+        </AppShell>
+      </MemoryRouter>
     </ThemeProvider>,
   );
 }
