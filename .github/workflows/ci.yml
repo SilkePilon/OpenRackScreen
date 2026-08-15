@@ -30,11 +30,21 @@ jobs:
       # be on PATH before anything can ask it where its store is.
       - uses: pnpm/action-setup@v6
         with:
-          version: 11
+          # No `version:` here on purpose. The version is pinned by
+          # `packageManager` in web/package.json, which this points at, so CI and
+          # a developer's shell resolve the same pnpm from one line. A bare
+          # `version: 11` would be the only unpinned link in the chain -- the
+          # action resolves it with `pnpm self-update 11` at run time, so an
+          # unrelated 11.x release could change lockfile handling and break
+          # `--frozen-lockfile` on a PR that touched nothing. The action's default
+          # for this input is the repository root, which has no package.json at
+          # all; it tolerates that, but naming the file is the point.
+          package_json_file: web/package.json
           cache: true
           # The lockfile is not at the repository root -- the interface is one
-          # directory of a uv workspace -- and the default would hash nothing and
-          # cache against a key that never changes.
+          # directory of a uv workspace -- so the default `pnpm-lock.yaml`
+          # resolves to nothing and the action throws "Some specified paths were
+          # not resolved, unable to cache dependencies."
           cache_dependency_path: web/pnpm-lock.yaml
       - uses: actions/setup-node@v7
         with:

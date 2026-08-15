@@ -20,6 +20,11 @@ describe("the generated schema", () => {
       capabilities: {},
     };
     expect(daemon.applied_version).toBe(7);
+    // The literal above only proves the response model still exists. A field
+    // that degraded to `unknown` -- a pydantic type widened to `Any`, say --
+    // would still accept `7` and still pass that assertion. This is the part
+    // that notices.
+    expectTypeOf<Daemon["applied_version"]>().toEqualTypeOf<number | null>();
   });
 
   it("knows a pairing token is only ever on the create response", () => {
