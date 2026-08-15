@@ -34,6 +34,73 @@ export function useCachedDaemons(): Daemon[] | undefined {
   return useQuery<Daemon[]>({ queryKey: daemonsKey, queryFn: skipToken }).data
 }
 
+/**
+ * The racks, asked of the server.
+ *
+ * The other half of `useCachedDaemons`, on the same key: this is the hook that
+ * *fills* the entry, and the Daemons page is the page that legitimately asks.
+ * A page that only needs to know who is up mounts the cached one instead --
+ * `GET /api/daemons` assembles a snapshot per rack on the event loop, and
+ * that is time the server owes to relaying frames.
+ *
+ * Nothing polls. What keeps `online` true between fetches is the `daemons`
+ * message writing this same entry through `setQueryData` in `LiveProvider`,
+ * which is the only other source of it there is.
+ */
+export function useDaemons() {
+  return useQuery<Daemon[]>({
+    queryKey: daemonsKey,
+    queryFn: async () => {
+      const { data, error, response } = await api.GET("/api/daemons")
+      if (!data) {
+        throw new ApiError(response.status, detailFrom(error) ?? "the racks could not be read")
+      }
+      return data
+    },
+  })
+}
+
+/** A rack and the token that pairs it. Answered once, by two routes, and never listed. */
+export type DaemonCreated = components["schemas"]["DaemonCreated"]
+
+/** What `POST /api/daemons/{id}/push` answers: the version it minted, and whether it left. */
+export type Pushed = components["schemas"]["Pushed"]
+
+/** What a DELETE answers. No route in M3a answers 204, this one included. */
+export type Deleted = components["schemas"]["Deleted"]
+
+/** One line of a rack's recent history. */
+export type DaemonEvent = components["schemas"]["EventView"]
+
+/** Per rack, because the route is per rack and so is the ring behind it. */
+export const eventsKey = (daemonId: number) => ["events", daemonId] as const
+
+/**
+ * How many events a rack's panel asks for.
+ *
+ * Well under the server's `MAX_EVENTS_PER_DAEMON` of 200, on purpose: the panel
+ * is a glance at what just happened, and a rack that has been flapping fills
+ * two hundred rows with connects and disconnects that say nothing a person can
+ * act on beyond the first few.
+ */
+export const RECENT_EVENTS = 20
+
+/** A rack's recent events, newest first, as the route answers them. */
+export function useEvents(daemonId: number) {
+  return useQuery<DaemonEvent[]>({
+    queryKey: eventsKey(daemonId),
+    queryFn: async () => {
+      const { data, error, response } = await api.GET("/api/events", {
+        params: { query: { daemon_id: daemonId, limit: RECENT_EVENTS } },
+      })
+      if (!data) {
+        throw new ApiError(response.status, detailFrom(error) ?? "the events could not be read")
+      }
+      return data
+    },
+  })
+}
+
 export type Session = {
   authenticated: boolean
   password_set: boolean

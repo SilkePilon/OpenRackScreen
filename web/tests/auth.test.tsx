@@ -183,6 +183,11 @@ describe("getting in", () => {
           ? HttpResponse.json({ ok: true })
           : HttpResponse.json({ detail: "wrong password" }, { status: 401 })
       }),
+      // Signing in lands on /daemons, which is a real page now and asks for the
+      // racks. Empty, so no rack card is drawn and nothing asks for events
+      // either: this test is about where the redirect goes, and an unstubbed
+      // request would fail it for a reason that has nothing to do with that.
+      http.get("/api/daemons", () => HttpResponse.json([])),
     )
     // Turned away from /screens, not /daemons. The destination after signing in
     // is unconditional (`LoginPage` navigates to /daemons), so starting at

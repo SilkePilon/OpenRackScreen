@@ -6,6 +6,7 @@ import { setUnauthorizedHandler } from "@/api/client"
 import { sessionKey } from "@/api/queries"
 import { AppShell } from "@/components/AppShell"
 import { RequireSession } from "@/routes/RequireSession"
+import { DaemonsPage } from "@/routes/daemons/DaemonsPage"
 import { LoginPage } from "@/routes/login/LoginPage"
 import { SetupPage } from "@/routes/setup/SetupPage"
 
@@ -87,7 +88,7 @@ function App() {
         }
       >
         <Route index element={<Navigate to="/daemons" replace />} />
-        <Route path="/daemons" element={<Placeholder title="Daemons" />} />
+        <Route path="/daemons" element={<DaemonsPage />} />
         <Route path="/screens" element={<Placeholder title="Screens" />} />
         <Route path="/templates" element={<Placeholder title="Templates" />} />
         <Route path="/integrations" element={<Placeholder title="Integrations" />} />
