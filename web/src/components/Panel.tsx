@@ -105,6 +105,15 @@ export function Panel({
   // is already live sets nothing and renders nothing. `useState` bails out on
   // an unchanged value, but it may render once before it does, and once per
   // frame is the cost this whole design exists to avoid.
+  //
+  // Kept knowing that no test can see it, which the mutation sweep proved: with
+  // this line removed, `setStale(false)` runs on every frame and the panel's
+  // own render counter does not move. React 19 computes the next state eagerly
+  // when a fiber has no other pending update and returns without scheduling if
+  // it is `Object.is`-equal, so the extra dispatch is free *there*. That is a
+  // heuristic React documents as "may still need to render one more time", not
+  // a guarantee, and this line is what makes the property true rather than
+  // likely.
   const staleRef = useRef(false)
   const staleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
