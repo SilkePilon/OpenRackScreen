@@ -364,6 +364,45 @@ describe("a panel", () => {
     ])
   })
 
+  it("follows its screen when the one it is asked for changes", async () => {
+    // A panel is a component at a position, not a component per screen: a page
+    // that renders one panel and changes which screen it shows -- the inspector
+    // following a selection -- reconciles to the same instance. A subscription
+    // that did not follow would leave this canvas drawing the screen it started
+    // on, and on a rack of panels showing the same kind of picture that is a
+    // wrong image nobody would notice.
+    const rig = mount(panelOf(41, 23), [rack(7, "Loft", true), rack(23, "Attic", true)])
+    act(() => rig.live().accept())
+    expect(rig.live().requests).toEqual([{ action: "subscribe", screen_id: 41 }])
+
+    rig.rerender(
+      <StrictMode>
+        <QueryClientProvider client={rig.queryClient}>
+          <LiveProvider>
+            <Panel screenId={12} daemonId={23} size={PANEL_SIZE} />
+          </LiveProvider>
+        </QueryClientProvider>
+      </StrictMode>,
+    )
+
+    // Off the old one before on to the new one, and both on the wire: a screen
+    // left subscribed goes on costing its rack the WebP encode for a panel that
+    // is not showing it.
+    expect(rig.live().requests).toEqual([
+      { action: "subscribe", screen_id: 41 },
+      { action: "unsubscribe", screen_id: 41 },
+      { action: "subscribe", screen_id: 12 },
+    ])
+
+    // And it draws the new screen's frames and not the old screen's, which is
+    // the thing the subscription was for.
+    act(() => rig.live().deliver(frameMessage(12, 104, bytesFor(12))))
+    act(() => rig.live().deliver(frameMessage(41, 105, bytesFor(41))))
+    await act(() => rig.decoder.settleAll())
+    expect(rig.canvas.only().drawn).toHaveLength(1)
+    expect(rig.decoder.blobs).toHaveLength(1)
+  })
+
   it("leaves no timer armed when it unmounts", () => {
     // The staleness deadline is a `setTimeout`, and a panel that goes away with
     // one still armed leaves a closure holding its canvas until it fires. On the
