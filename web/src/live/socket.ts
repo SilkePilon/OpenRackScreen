@@ -94,6 +94,14 @@ const JITTER = 0.25
  * to prevent. The threshold is the cap itself: a link that held for as long as
  * the longest wait this client would have imposed has proved the server is
  * there, and anything shorter is a flap that should go on climbing.
+ *
+ * The cost, named rather than left to be rediscovered: a link that flaps every
+ * twenty seconds but *works* in between never clears the counter, so it settles
+ * at half-minute gaps where a reset-on-open would be back in a second. That is
+ * the trade being made, and it is made this way on purpose -- the failure it
+ * accepts is a slow recovery on a link that is already broken, and the failure
+ * it refuses is a tab hammering a restarting server once a second for hours.
+ * The second one takes a server down; the first one takes a few seconds.
  */
 const STABLE_MS = MAX_DELAY_MS
 
@@ -245,11 +253,19 @@ export function createLiveSocket({
       try {
         bytes = decode(webp)
       } catch {
-        // Named rather than swallowed, and the payload is logged with it: the
-        // only way to get here is the server having changed which alphabet it
-        // sends, and the first character of what it sent is the answer. See
-        // `decode`, and `_frame_message` in `ws_ui.py`.
-        return skip(`a frame whose base64 this browser cannot read, for screen ${screenId}`, webp)
+        // Named rather than swallowed, and the head of the payload is logged
+        // with it: the only way to get here is the server having changed which
+        // alphabet it sends, and the first characters of what it sent are the
+        // whole answer. Sliced like every other skip above, because this is the
+        // one branch that fires on *every* frame once it fires at all -- four
+        // panels at 2 fps is some 80 KB/s of strings the console holds on to,
+        // and devtools that have to be closed are no use for the incident this
+        // line exists to diagnose. See `decode`, and `_frame_message` in
+        // `ws_ui.py`.
+        return skip(
+          `a frame whose base64 this browser cannot read, for screen ${screenId}`,
+          webp.slice(0, 120),
+        )
       }
       onFrame({ screenId, seq, bytes })
       return

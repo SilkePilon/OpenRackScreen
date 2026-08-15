@@ -77,6 +77,13 @@ type Harness = {
 
 const running: LiveSocket[] = []
 
+// `now` is deliberately *not* passed: the default is `() => performance.now()`,
+// and under fake timers that is the clock this file already advances, so the
+// wiring that ships is the wiring under test. Nothing is gained by restating it
+// here and something is lost -- a default nobody constructs is a default nobody
+// tests, and `now` drives the one rule in this module that is not obvious.
+// `random` is passed only by the tests that assert an exact delay, so every
+// other test runs on `Math.random` as the browser will.
 function harness(options: { random?: () => number } = {}): Harness {
   const sockets: FakeSocket[] = []
   const dialledAt: number[] = []
@@ -86,8 +93,7 @@ function harness(options: { random?: () => number } = {}): Harness {
     url: "ws://rack.invalid/ws/ui",
     onDaemons: (online) => daemons.push(online),
     onFrame: (frame) => frames.push(frame),
-    now: () => performance.now(),
-    random: options.random ?? (() => 0),
+    ...(options.random === undefined ? {} : { random: options.random }),
     openSocket: (url) => {
       const socket = new FakeSocket(url)
       sockets.push(socket)
@@ -113,6 +119,7 @@ afterEach(() => {
   while (running.length > 0) running.pop()?.close()
   vi.useRealTimers()
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
 
 describe("the browser socket", () => {
@@ -198,7 +205,17 @@ describe("the browser socket", () => {
     socket.deliver(JSON.stringify({ type: "hello", online: [4] }))
     socket.deliver("{not json at all")
     socket.deliver(JSON.stringify({ type: "daemons" }))
+    // An array. Worth being exact about which door this leaves by, because it
+    // is not the one it looks like: an array *is* an object, so it passes the
+    // object guard and is skipped for having no `type` this build knows.
     socket.deliver(JSON.stringify([9, 23]))
+    // The two that do reach the object guard: valid JSON, not objects. `null`
+    // is the one that matters -- `typeof null` is `"object"`, so without the
+    // `message === null` half of that guard, reading `.type` off it throws a
+    // TypeError straight out of `onmessage` instead of skipping one message,
+    // and nothing after it on this socket is read at all.
+    socket.deliver("null")
+    socket.deliver("42")
     // A frame with no image in it. Delivered as one, it would reach the store
     // as `webp: undefined` and be drawn as nothing on a panel that was working.
     socket.deliver(JSON.stringify({ type: "frame", screen_id: 41, seq: 7 }))
@@ -216,7 +233,7 @@ describe("the browser socket", () => {
 
     expect(test.daemons).toEqual([[9, 23]])
     expect(test.frames).toEqual([])
-    expect(warn).toHaveBeenCalledTimes(6)
+    expect(warn).toHaveBeenCalledTimes(8)
     expect(socket.state).toBe("open")
     expect(test.live.state).toBe("open")
     // Not closed *and* not replaced: a client that answered a bad message by
@@ -371,9 +388,14 @@ describe("the browser socket", () => {
     const far = await spread(() => 0.9)
 
     expect(middle).not.toBe(far)
+    // The band is `(750, 1000]`, and the endpoints are that way round: the
+    // jitter is `1 - 0.25 * random()` with `random` in `[0, 1)`, so 1000 is
+    // attainable -- it is the delay `backs off, and caps` pins exactly -- and
+    // 750 is not. Asserted the other way round, this test would reject the one
+    // value its sibling calls canonical.
     for (const delay of [middle, far]) {
-      expect(delay).toBeLessThan(1000)
-      expect(delay).toBeGreaterThanOrEqual(750)
+      expect(delay).toBeLessThanOrEqual(1000)
+      expect(delay).toBeGreaterThan(750)
     }
   })
 
@@ -382,7 +404,9 @@ describe("the browser socket", () => {
     // reset-on-open would dial once a second forever. The backoff is reset by a
     // connection that lasted, not by one that merely happened.
     vi.useFakeTimers()
-    const test = harness()
+    // Pinned to the top of the jitter band, because this test asserts each
+    // delay to the millisecond from both sides.
+    const test = harness({ random: () => 0 })
     test.live.connect()
 
     const flap = async (openFor: number, expected: number) => {
@@ -422,7 +446,8 @@ describe("the browser socket", () => {
     // survive it is the backoff: the first reconnect after a fresh connect is
     // the first one, not the ninth.
     vi.useFakeTimers()
-    const test = harness()
+    // Pinned: the assertion below is an exact delay, not a band.
+    const test = harness({ random: () => 0 })
     test.live.connect()
     current(test).drop()
     await vi.advanceTimersByTimeAsync(1000)
@@ -473,5 +498,56 @@ describe("the browser socket", () => {
     expect(down.live.state).toBe("closed")
     await vi.advanceTimersByTimeAsync(60_000)
     expect(down.sockets).toHaveLength(1)
+  })
+
+  // The three defaults are the configuration that actually ships: every test
+  // above injects a socket, and most of them would go on passing if `openSocket`
+  // dialled the wrong url, `now` stood still and `random` never varied. These
+  // two, plus `keeps backing off…` running on the default clock, are what put
+  // the shipped wiring under test rather than the wiring the tests build.
+
+  it("dials the browser's own WebSocket, at the url it was given", () => {
+    // Nothing else in this file constructs the client without a dialler, so
+    // this is the only test that can see the default at all -- and the default
+    // is the one line of this module the browser actually runs.
+    const dialled: FakeSocket[] = []
+    class Recorded extends FakeSocket {
+      constructor(url: string) {
+        super(url)
+        dialled.push(this)
+      }
+    }
+    vi.stubGlobal("WebSocket", Recorded)
+
+    const live = createLiveSocket({
+      url: "ws://rack.invalid/ws/ui",
+      onDaemons: () => {},
+      onFrame: () => {},
+    })
+    running.push(live)
+    live.connect()
+
+    // The url, not merely *a* url: a dialler that dropped its argument would
+    // open a socket to whatever this module was built with.
+    expect(dialled.map((socket) => socket.url)).toEqual(["ws://rack.invalid/ws/ui"])
+    expect(live.state).toBe("connecting")
+  })
+
+  it("draws its jitter from Math.random when it is not given a source", async () => {
+    // `random: () => 0` everywhere above would let the default be `() => 0`
+    // too, and the whole point of the jitter is that it is not a constant in
+    // production. This asserts the browser's own source is the one consulted,
+    // and that its draw reaches the delay: 0.5 is a quarter of the way down the
+    // band, so 1000 becomes 875 and neither endpoint could be mistaken for it.
+    vi.useFakeTimers()
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.5)
+    const test = harness()
+    test.live.connect()
+    const droppedAt = performance.now()
+    current(test).drop()
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    expect(random).toHaveBeenCalled()
+    expect((test.dialledAt.at(-1) ?? Number.NaN) - droppedAt).toBe(875)
   })
 })
