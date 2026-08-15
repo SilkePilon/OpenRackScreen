@@ -217,6 +217,7 @@ class Rack:
         open_error: Exception | None = None,
         show_error: Exception | None = None,
         on_probe_show: Any = None,
+        will_not_open: str | None = None,
     ) -> None:
         self.raw = raw if raw is not None else config_dict()
         config = DaemonConfig.model_validate(self.raw)
@@ -227,6 +228,10 @@ class Rack:
         self.open_error = open_error
         self.show_error = show_error
         self.on_probe_show = on_probe_show
+        self.will_not_open = will_not_open
+        """A configured screen whose backend refuses to build, which is a ribbon
+        that is not seated: the screen is in the running configuration and has no
+        slot, no panel and no worker."""
         extra: dict[str, Any] = {} if shutdown_clock is None else {"shutdown_clock": shutdown_clock}
         self.supervisor = Supervisor(
             config=config,
@@ -244,6 +249,8 @@ class Rack:
         probing = name not in SCREEN_NAMES
         if probing and self.open_error is not None:
             raise self.open_error
+        if name == self.will_not_open:
+            raise DisplayError(f"{name}: no such device")
         panel = RecordingPanel(on_show=self.on_probe_show if probing else None)
         if probing:
             panel.show_error = self.show_error
@@ -389,6 +396,32 @@ def test_a_screen_that_drives_no_spi_device_claims_none(tmp_path: Path) -> None:
         rack.supervisor.stop()
 
 
+def test_a_screen_whose_panel_would_not_open_still_claims_its_device(tmp_path: Path) -> None:
+    """The running configuration, not the open panels, and the difference is a
+    ribbon that is not seated.
+
+    That screen has no slot, no panel and no worker -- and it is still the screen
+    that device belongs to. `_diff` tries the open again on the next push, so
+    offering it to the wizard as free would invite an operator to give a second
+    screen a device the first one is about to take back. Refusing the probe is
+    the conservative direction, and the cost is named: proving that screen's own
+    wiring is what `identify` and a config edit are for.
+    """
+    rack = Rack(tmp_path, will_not_open="CPU")
+    rack.supervisor.start()
+    try:
+        assert [worker.screen_name for worker in rack.supervisor.workers] == ["MEM"]
+        assert rack.supervisor.claimed_devices() == {
+            (CPU_BUS, CPU_CS): "CPU",
+            (MEM_BUS, MEM_CS): "MEM",
+        }
+
+        with pytest.raises(ProbeRefused):
+            rack.probe(bus=CPU_BUS, cs=CPU_CS)
+    finally:
+        rack.supervisor.stop()
+
+
 def test_a_name_too_long_for_the_wire_is_shortened_rather_than_refused(tmp_path: Path) -> None:
     """`ScreenConfig.name` has no upper bound and `PanelCandidate.claimed_by`
     has one, so a hand-written YAML with a paragraph for a name would make every
@@ -475,6 +508,29 @@ def test_a_probe_holds_every_worker_on_that_bus_off_the_bus(
             "each kept worker is promised a real hold, and the same one an apply promises"
         )
         assert rack.held_off() == [False, False], "and every one of them got its panel back"
+    finally:
+        rack.supervisor.stop()
+
+
+def test_a_probe_runs_under_the_lock_an_apply_and_a_shutdown_take(tmp_path: Path) -> None:
+    """`_shutdown_lock`, like `tick`, `apply` and `identify`, because it walks
+    `_slots` and `_screens` and pauses workers.
+
+    Without it an apply can be swapping that list and the panels behind it while
+    this is holding four of them off the bus and writing an init sequence to a
+    fifth -- and a `stop` can be sleeping and closing the panels it has just
+    paused. Asked at the moment it matters, from inside the paint, and asked of
+    the lock rather than inferred from a wait that did not finish: a wait proves
+    only that something was busy.
+    """
+    owned: list[bool] = []
+    rack = Rack(tmp_path)
+    rack.on_probe_show = lambda: owned.append(rack.supervisor._shutdown_lock._is_owned())
+    rack.supervisor.start()
+    try:
+        rack.probe()
+
+        assert owned == [True]
     finally:
         rack.supervisor.stop()
 
