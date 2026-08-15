@@ -20,21 +20,33 @@ function Placeholder({ title }: { title: string }) {
   )
 }
 
+/**
+ * The one route whose 401 does not mean the session ended.
+ *
+ * `POST /api/auth/login` answers 401 for a wrong password. Keying this on the
+ * endpoint that refused rather than on the page the user happens to be on is
+ * the difference between two rules that agree today only because the login form
+ * lives at /login: an expiry discovered while sitting on the login page is a
+ * real 401 and must be handled, and a page that posts credentials from anywhere
+ * else must not be redirected out from under itself.
+ */
+function isPasswordAttempt(url: string) {
+  return new URL(url, window.location.origin).pathname === "/api/auth/login"
+}
+
 function App() {
   const navigate = useNavigate()
   const location = useLocation()
   const queryClient = useQueryClient()
-  // Refs, not state: the handler below is called from a fetch, outside any
-  // render, and has to read what is true *now* -- and setting either of these
-  // must not re-render the whole route tree.
-  const atLogin = useRef(location.pathname === "/login")
+  // A ref, not state: the handler below is called from a fetch, outside any
+  // render, and has to read what is true *now* -- and setting it must not
+  // re-render the whole route tree.
   const returning = useRef(false)
 
   useEffect(() => {
-    atLogin.current = location.pathname === "/login"
-    // Arriving at /login re-arms it: the next session to expire has somewhere
-    // to be sent again.
-    if (atLogin.current) returning.current = false
+    // Arriving at /login re-arms the latch: the next session to expire has
+    // somewhere to be sent again.
+    if (location.pathname === "/login") returning.current = false
   }, [location.pathname])
 
   useEffect(() => {
@@ -42,11 +54,10 @@ function App() {
     // outlives every navigation. Every session-guarded route answers 401 once
     // the cookie is gone, and a page that loads three things loses the session
     // three times at once.
-    setUnauthorizedHandler(() => {
-      // Already here. A 401 from the login route is a wrong password, not an
-      // expired session, and sending it to /login again would only stack up a
-      // history entry per attempt.
-      if (atLogin.current) return
+    setUnauthorizedHandler((url) => {
+      // A refused password, not an ended session. Sending it to /login would
+      // only stack up a history entry per attempt.
+      if (isPasswordAttempt(url)) return
       // Already on the way. Without this, concurrent 401s each push an entry
       // and the back button walks through them one refused request at a time.
       if (returning.current) return

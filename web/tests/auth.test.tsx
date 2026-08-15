@@ -1,9 +1,13 @@
-import { act, screen, waitFor } from "@testing-library/react"
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
+import { act, render, screen } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { http, HttpResponse } from "msw"
+import { MemoryRouter } from "react-router"
 import { describe, expect, it } from "vitest"
 
 import { api } from "../src/api/client"
+import { sessionKey } from "../src/api/queries"
+import { RequireSession } from "../src/routes/RequireSession"
 import { server } from "./msw"
 import { renderApp } from "./render"
 
@@ -61,10 +65,36 @@ describe("getting in", () => {
 
     expect(await screen.findByRole("heading", { name: /sign in/i })).toBeInTheDocument()
     // Once. Two 401s are one return to /login, not one per refused request --
-    // and nothing bounces back and forth between the guard and the login page.
-    await waitFor(() => expect(meCalls).toBeLessThan(4))
+    // and this is also the loop assertion: a guard and a login page bouncing
+    // off each other would add an entry per bounce, not settle at one.
     expect(pushes()).toBe(1)
     expect(path()).toBe("/login")
+  })
+
+  it("treats a 401 from a guarded route as an expiry even while on the login page", async () => {
+    server.use(
+      me({ authenticated: false, password_set: true }),
+      http.get("/api/daemons", () =>
+        HttpResponse.json({ detail: "not authenticated" }, { status: 401 }),
+      ),
+    )
+    const { queryClient, pushes } = renderApp({ at: "/login" })
+    expect(await screen.findByRole("heading", { name: /sign in/i })).toBeInTheDocument()
+
+    // A session that was still believed in a moment ago -- cached by the guard
+    // on the way here, or by another tab -- and a guarded request that has just
+    // discovered it is gone. The user's location says nothing about that.
+    queryClient.setQueryData(sessionKey, { authenticated: true, password_set: true })
+    await act(async () => {
+      await api.GET("/api/daemons")
+    })
+
+    // Keyed on the endpoint that refused, this is an expiry and is handled: the
+    // cached "there is a session" is dropped and the app returns to /login.
+    // Keyed on the pathname the user is on, it is swallowed and the stale
+    // answer stays in the cache for the next guard to believe.
+    expect(queryClient.getQueryData(sessionKey)).toBeUndefined()
+    expect(pushes()).toBe(1)
   })
 
   it("refuses a second browser racing the first to claim the password", async () => {
@@ -139,7 +169,7 @@ describe("getting in", () => {
     expect(screen.queryByText(/wrong password/i)).not.toBeInTheDocument()
   })
 
-  it("signs in and lands on the page it turned away", async () => {
+  it("signs in and goes to the rack, not back to the page it was turned away from", async () => {
     let authenticated = false
     server.use(
       http.get("/api/auth/me", () =>
@@ -153,16 +183,57 @@ describe("getting in", () => {
           : HttpResponse.json({ detail: "wrong password" }, { status: 401 })
       }),
     )
-    // Asked for the rack first, the way anyone actually arrives. That is what
-    // leaves a "not signed in" answer in the cache for the guard to read again
-    // a moment later, so signing in has to be more than a redirect.
-    renderApp({ at: "/daemons" })
+    // Turned away from /screens, not /daemons. The destination after signing in
+    // is unconditional (`LoginPage` navigates to /daemons), so starting at
+    // /daemons would make the origin and the destination the same string and
+    // the assertion could not tell "goes where it was going" from "always goes
+    // to the rack". Returning to the origin is not implemented and is not this
+    // task's requirement; this asserts what the code does.
+    //
+    // Arriving through the guard is still the point: it is what leaves a "not
+    // signed in" answer in the cache for the guard to read again a moment
+    // later, so signing in has to be more than a redirect.
+    const { path } = renderApp({ at: "/screens" })
     expect(await screen.findByRole("heading", { name: /sign in/i })).toBeInTheDocument()
 
     await userEvent.type(await screen.findByLabelText(/password/i), "the-real-password")
     await userEvent.click(screen.getByRole("button", { name: /sign in/i }))
 
     expect(await screen.findByRole("heading", { name: "Daemons" })).toBeInTheDocument()
+    expect(path()).toBe("/daemons")
+  })
+
+  it("gives up on the session after one refusal, not after a retry", async () => {
+    let meCalls = 0
+    server.use(
+      http.get("/api/auth/me", () => {
+        meCalls += 1
+        return HttpResponse.json({ detail: "boom" }, { status: 500 })
+      }),
+    )
+
+    // Deliberately not `renderApp`: its client sets `retry: false` as a default
+    // for *every* query, which masks each hook's own policy -- `useSession`'s
+    // included. This client keeps the library's default of three retries and
+    // only takes the backoff away, so the number of requests is the hook's
+    // setting and nothing else, and no test waits for a timer.
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retryDelay: 0 } } })
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <RequireSession>
+            <h1>Daemons</h1>
+          </RequireSession>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+
+    expect(await screen.findByText(/did not answer/i)).toBeInTheDocument()
+    // The error screen arrives either way; that it arrives after exactly one
+    // refusal is `useSession`'s own `retry: false`. Which screen is legal to
+    // show is what this answer decides, so a server that cannot answer has to
+    // say so now rather than three backoffs from now.
+    expect(meCalls).toBe(1)
   })
 
   it("says the server did not answer rather than guessing which screen to show", async () => {

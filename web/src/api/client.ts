@@ -51,24 +51,28 @@ export function detailFrom(error: unknown): string | null {
   return null;
 }
 
-let unauthorized: (() => void) | null = null;
+let unauthorized: ((url: string) => void) | null = null;
 
 /**
  * Register the one place a 401 is handled, and forget any earlier one.
  *
  * Every session-guarded route answers 401 once the cookie is gone, and every
  * one of them would otherwise have to notice. The middleware below is the whole
- * of that: it says *that* the session ended. What to do about it -- clearing the
- * cached session and going to /login exactly once -- is the app's, because only
- * the app knows where it currently is.
+ * of that: it says *that* a request was refused, and *which* request it was.
+ * What to do about it -- clearing the cached session and going to /login exactly
+ * once -- is the app's.
+ *
+ * The URL is load-bearing, not diagnostic. `POST /api/auth/login` answers 401
+ * for a wrong password, which is not an expired session and must not be treated
+ * as one; the only thing that tells the two apart is the endpoint that refused.
  */
-export function setUnauthorizedHandler(handler: (() => void) | null) {
+export function setUnauthorizedHandler(handler: ((url: string) => void) | null) {
   unauthorized = handler;
 }
 
 api.use({
-  onResponse({ response }) {
-    if (response.status === 401) unauthorized?.();
+  onResponse({ request, response }) {
+    if (response.status === 401) unauthorized?.(request.url);
     return undefined;
   },
 });
