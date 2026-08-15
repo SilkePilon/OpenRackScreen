@@ -470,14 +470,19 @@ async def _handle(state: State, session: _Session, message: DaemonMessage) -> No
         # building -- so the interface reports a rack that did not respond about
         # a rack that responded correctly.
         #
-        # The message and not `session.connection`, unlike an `Ack` two branches
-        # up, and the difference is the point: an ack describes a boot, so one
-        # read from a superseded socket describes a boot that is over. A reply
-        # answers one question asked exactly once, and the daemon sends it down
-        # whichever socket it holds when it has the answer -- so a reply arriving
-        # over a connection the hub has already replaced is still the only answer
-        # that question will ever get. The hub matches it by `request_id`.
-        state.hub.deliver_reply(message)
+        # The daemon id and not `session.connection`, unlike an `Ack` two
+        # branches up, and the difference is the point: an ack describes a boot,
+        # so one read from a superseded socket describes a boot that is over. A
+        # reply answers one question asked exactly once, and the daemon sends it
+        # down whichever socket it holds when it has the answer -- so a reply
+        # arriving over a connection the hub has already replaced is still the
+        # only answer that question will ever get.
+        #
+        # The id is passed rather than nothing at all because the hub matches on
+        # the rack as well as on the `request_id`: the ids are minted by whoever
+        # asked, so without this one rack's answer can resolve another rack's
+        # question and the caller never learns it was answered by the wrong Pi.
+        state.hub.deliver_reply(session.daemon_id, message)
     elif isinstance(message, Frame):
         # The refusal is logged inside `_owns`, which is the only thing that
         # knows how many frames a single line is standing for.

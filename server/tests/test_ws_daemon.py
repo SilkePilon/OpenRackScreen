@@ -641,6 +641,33 @@ async def test_a_result_from_a_rack_reaches_whoever_asked_for_it(tmp_path):
     assert probed is not None and probed.ok is True
 
 
+async def test_a_result_read_from_a_superseded_socket_still_reaches_its_caller(tmp_path):
+    """The daemon id, and deliberately not the `Connection` an `Ack` is checked
+    against -- which is what keeps the hub's rack check from becoming a socket
+    check by another name.
+
+    A rack that reconnects while a question is in flight answers down whatever
+    socket it holds by the time it has the answer, and the handler that reads it
+    may be either one. An ack from a superseded socket describes a boot that is
+    over and is worth nothing; a reply answers a question asked exactly once, so
+    refusing it because the socket underneath was replaced throws away the only
+    answer that question is ever going to get -- and the caller waits out the
+    full `REQUEST_TIMEOUT` for something that already arrived.
+    """
+    app, daemon_id, token = build(tmp_path)
+    hub = app.state.hub
+    stale = _Session(daemon_id=daemon_id, connection=hub.register(daemon_id, nowhere), owned=set())
+    asking = asyncio.create_task(hub.request(daemon_id, DetectRequest(request_id="detect-1d05")))
+    await asyncio.sleep(0)
+    hub.register(daemon_id, nowhere)  # the rack reconnected with the question in flight
+
+    found = PanelCandidate(bus=1, cs=2, claimed_by=None)
+    await _handle(app.state, stale, DetectResult(request_id="detect-1d05", panels=[found]))
+
+    detected = await asyncio.wait_for(asking, PROMPTLY)
+    assert detected is not None and [(p.bus, p.cs) for p in detected.panels] == [(1, 2)]
+
+
 async def test_a_hello_does_not_get_to_say_what_this_daemon_s_standing_is(tmp_path):
     """`status` is pairing's to write, and connecting is not pairing.
 

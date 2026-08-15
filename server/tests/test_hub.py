@@ -860,7 +860,7 @@ async def test_a_reply_reaches_the_caller_that_asked_for_it():
 
     asking = asyncio.create_task(hub.request(RACK, detect()))
     await until_sent(socket, 1)
-    hub.deliver_reply(DetectResult(request_id=DETECTING, panels=[PANEL]))
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
 
     reply = await asyncio.wait_for(asking, 1)
     assert DETECTING in socket.sent[0], "the question really went to the rack"
@@ -885,8 +885,8 @@ async def test_two_requests_in_flight_do_not_cross():
     probing = asyncio.create_task(hub.request(RACK, probe()))
     await until_sent(socket, 2)
 
-    hub.deliver_reply(ProbeResult(request_id=PROBING, ok=True))
-    hub.deliver_reply(DetectResult(request_id=DETECTING, panels=[PANEL]))
+    hub.deliver_reply(RACK, ProbeResult(request_id=PROBING, ok=True))
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
 
     probed = await asyncio.wait_for(probing, 1)
     detected = await asyncio.wait_for(detecting, 1)
@@ -933,11 +933,40 @@ async def test_a_reply_for_a_request_nobody_is_waiting_on_is_dropped(caplog):
     caplog.clear()
 
     with caplog.at_level(logging.INFO, logger="ors_server.link.hub"):
-        hub.deliver_reply(ProbeResult(request_id=PROBING, ok=True))
-        hub.deliver_reply(DetectResult(request_id=NEVER_ASKED, panels=[]))
+        hub.deliver_reply(RACK, ProbeResult(request_id=PROBING, ok=True))
+        hub.deliver_reply(RACK, DetectResult(request_id=NEVER_ASKED, panels=[]))
 
     assert [record.request for record in caplog.records] == [PROBING, NEVER_ASKED]
     assert hub.is_online(RACK) is True, "and the rack is no worse off for having answered"
+
+
+async def test_one_racks_answer_does_not_resolve_another_racks_question():
+    """A reply is matched on the id *and* on the rack it came from.
+
+    The ids are the caller's to mint and this class cannot make them unique --
+    which is why `request`'s own cleanup checks identity rather than the key.
+    Trusting them to be unique *across* racks as well is that same assumption
+    made twice and defended once: a route minting `f"detect-{n}"` per rack, or
+    reusing a per-rack counter, has rack 12 answering rack 7's question as a
+    matter of routine. The caller then gets a panel list, believes it describes
+    rack 7, and the wizard offers an operator wiring for hardware on another Pi.
+
+    The two answers differ in their panels and not only in their rack, so a
+    crossed one fails on what it *said* and not merely on where it came from.
+    """
+    hub, socket, other_socket = Hub(), FakeSocket(), FakeSocket()
+    hub.register(RACK, socket.send)
+    hub.register(OTHER_RACK, other_socket.send)
+    asking = asyncio.create_task(hub.request(RACK, detect()))
+    await until_sent(socket, 1)
+
+    hub.deliver_reply(OTHER_RACK, DetectResult(request_id=DETECTING, panels=[]))
+    await asyncio.sleep(0)
+
+    assert not asking.done(), "another rack's answer is not an answer to this question"
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
+    answer = await asyncio.wait_for(asking, 1)
+    assert answer is not None and answer.panels == [PANEL], "and the rack's own answer still lands"
 
 
 async def test_a_dropped_connection_fails_every_request_in_flight():
@@ -961,7 +990,7 @@ async def test_a_dropped_connection_fails_every_request_in_flight():
     assert await asyncio.wait_for(detecting, 1) is None
     assert await asyncio.wait_for(probing, 1) is None, "every one of them, not the first"
     assert not elsewhere.done(), "another rack's request is not this rack's to fail"
-    hub.deliver_reply(DetectResult(request_id=ELSEWHERE, panels=[]))
+    hub.deliver_reply(OTHER_RACK, DetectResult(request_id=ELSEWHERE, panels=[]))
     answered = await asyncio.wait_for(elsewhere, 1)
     assert answered is not None and answered.request_id == ELSEWHERE
 
@@ -1000,6 +1029,12 @@ async def test_the_wait_outlasts_the_longest_probe_a_rack_may_be_asked_for():
     """
     assert REQUEST_TIMEOUT > MAX_PROBE_HOLD_S, "a legal probe outlives its own answer"
     assert REQUEST_TIMEOUT - MAX_PROBE_HOLD_S > SEND_TIMEOUT, "and a round trip past it"
+    # The pin is the two lines above: they compare symbols from two packages, so
+    # a schema that raises the hold fails here rather than in front of an
+    # operator. The line below is not that and should not be read as it -- the
+    # default is *spelled* `REQUEST_TIMEOUT`, so this compares the constant with
+    # itself. What it does catch, which is the whole of its job, is somebody
+    # replacing that default with a literal and cutting the relationship loose.
     assert signature(Hub.request).parameters["timeout"].default == REQUEST_TIMEOUT, (
         "and that is what a caller who names no timeout gets"
     )
@@ -1021,7 +1056,7 @@ async def test_a_late_drop_from_a_replaced_connection_leaves_the_live_request_wa
     await until_sent(second, 1)
 
     hub.drop(superseded)
-    hub.deliver_reply(DetectResult(request_id=DETECTING, panels=[PANEL]))
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
 
     answer = await asyncio.wait_for(asking, 1)
     assert answer is not None, "a superseded cleanup must not fail the live socket's waits"
@@ -1044,7 +1079,7 @@ async def test_neither_an_answer_nor_a_timeout_leaves_a_wait_behind():
 
     asking = asyncio.create_task(hub.request(RACK, detect()))
     await until_sent(socket, 1)
-    hub.deliver_reply(DetectResult(request_id=DETECTING, panels=[PANEL]))
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
     await asyncio.wait_for(asking, 1)
 
     assert hub._pending == {}, "an answered question is finished with"
@@ -1068,7 +1103,7 @@ async def test_a_caller_that_gives_up_leaves_no_wait_behind():
 
     assert hub._pending == {}
     # And the answer that arrives for it anyway is dropped rather than raising.
-    hub.deliver_reply(DetectResult(request_id=DETECTING, panels=[PANEL]))
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
 
 
 async def test_a_request_that_never_left_the_server_is_not_waited_on():
@@ -1099,7 +1134,7 @@ async def test_a_reply_that_beats_the_send_back_into_the_server_is_not_missed():
 
     asking = asyncio.create_task(hub.request(RACK, detect()))
     await asyncio.wait_for(socket.started.wait(), 1)
-    hub.deliver_reply(DetectResult(request_id=DETECTING, panels=[PANEL]))
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
     socket.release.set()
 
     answer = await asyncio.wait_for(asking, 1)
@@ -1122,7 +1157,7 @@ async def test_an_answer_arriving_after_the_rack_was_dropped_does_not_raise():
     await until_sent(socket, 1)
 
     hub.drop(connection)
-    hub.deliver_reply(DetectResult(request_id=DETECTING, panels=[PANEL]))
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
 
     assert await asyncio.wait_for(asking, 1) is None, "the rack had already gone"
 
@@ -1144,7 +1179,7 @@ async def test_a_reused_request_id_does_not_take_the_live_wait_with_it():
     first.cancel()  # the first caller gives up, holding an id it no longer owns
     with pytest.raises(asyncio.CancelledError):
         await first
-    hub.deliver_reply(DetectResult(request_id=DETECTING, panels=[PANEL]))
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
 
     answer = await asyncio.wait_for(second, 1)
     assert answer is not None and answer.panels == [PANEL]

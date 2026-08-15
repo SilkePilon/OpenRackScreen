@@ -93,7 +93,10 @@ It is not the sum of every bound on the path. The send is bounded separately and
 happens before the wait starts, so a request whose socket wedges costs
 `SEND_TIMEOUT` and then returns -- it never reaches this at all. What this covers
 is the interval in which the daemon has the question and the server has nothing
-to do but wait.
+to do but wait. The two legs do stack on the path that succeeds and then goes
+quiet, though, so a route's worst case is `SEND_TIMEOUT + REQUEST_TIMEOUT` --
+**forty-five seconds** -- and that, not forty, is the number to hold a browser's
+patience against.
 
 Overshooting and undershooting cost differently here, as they do for the send.
 Overshooting holds a handler open on a rack that is already known to be quiet;
@@ -342,7 +345,7 @@ class Hub:
         every later "ask the rack something" feature gets to reuse: the caller
         is an HTTP handler that has to answer somebody, so the question goes out,
         the wait is keyed by the `request_id` the message carries, and the reply
-        that quotes that id back resolves it.
+        that quotes that id back *from this rack* resolves it.
 
         None for every way that fails -- no socket, a send that never left, a
         rack that did not answer inside `timeout`, a rack that disconnected
@@ -367,6 +370,16 @@ class Hub:
         listing and a probe holds a bus for as long as the operator asked it to.
         The default is the one that has to cover the worst legal case; see
         `REQUEST_TIMEOUT`.
+
+        **Spec §6.4's "one probe at a time per rack" is not enforced here, and
+        is owed by `POST /api/daemons/{id}/probe`.** Nothing below bounds how
+        many waits one rack may hold, deliberately: §6.4's rule is about what a
+        probe does to *hardware* -- it holds a bus -- and not about how many
+        correlated waits a link may carry, so enforcing it here would bound every
+        later "ask the rack something" feature by a rule that is about one of
+        them. And this returns `None`, which is "no answer": only a route can
+        refuse a second probe with a 409 and a reason, which is what an operator
+        standing in front of the rack needs to be told instead of a timeout.
         """
         if daemon_id not in self._connections:
             # Offline is an answer and it is available now. Registering a wait
@@ -411,30 +424,43 @@ class Hub:
             if self._pending.get(message.request_id) is wait:
                 del self._pending[message.request_id]
 
-    def deliver_reply(self, message: Reply) -> None:
-        """Hand a rack's answer to whoever asked for it. Called by `ws_daemon`.
+    def deliver_reply(self, daemon_id: int, message: Reply) -> None:
+        """Hand a rack's answer to whoever asked *that rack*. From `ws_daemon`.
 
-        Matched on `request_id` alone, and deliberately not on the connection it
-        arrived over -- which is the opposite of `record_ack`, for a reason that
+        Matched on the id of the question **and** the rack it came back from,
+        which is `record_ack`'s identity guard at half strength and for the same
+        kind of reason. The ids are the caller's to mint and this class cannot
+        make them unique -- `request`'s own cleanup is written around that fact
+        -- so matching on the id alone defends against a collision *within* one
+        rack while trusting the same ids to be unique *across* racks. A route
+        minting `f"detect-{n}"` per rack, or reusing a per-rack counter, makes
+        rack 12's answer resolve rack 7's question as a matter of routine: the
+        caller is handed a panel list, believes it describes rack 7, and the
+        wizard offers an operator wiring for hardware on a different Pi.
+
+        The daemon id, though, and **not** the `Connection` it arrived over --
+        which is where this parts company with `record_ack`, for a reason that
         is the same fact seen from the other side. An ack describes a boot, so
         one read from a superseded socket describes the *previous* boot and is
         worthless. A reply answers one question that was asked exactly once, and
         the daemon sends it down whichever socket it has when it is ready: a
         reply arriving over a connection the hub has since replaced is still the
-        only answer that question is ever going to get.
+        only answer that question is ever going to get. So this refuses another
+        *rack*, and nothing else.
 
-        A reply nobody is waiting for is dropped and said so, never raised. Both
-        ways it happens are ordinary -- the wait expired and the rack answered
-        anyway, or this build never asked at all -- and the caller is the daemon
-        socket handler, which catches a disconnect and a validation error and
-        nothing else. A `KeyError` out of here is a closed link and a rack
-        offline for the duration, over a message the daemon got right.
+        A reply nobody is waiting for is dropped and said so, never raised. All
+        three ways it happens are ordinary -- the wait expired and the rack
+        answered anyway, this build never asked at all, or the id belongs to
+        another rack's question -- and the caller is the daemon socket handler,
+        which catches a disconnect and a validation error and nothing else. A
+        `KeyError` out of here is a closed link and a rack offline for the
+        duration, over a message the daemon got right.
         """
         wait = self._pending.get(message.request_id)
-        if wait is None or wait.future.done():
+        if wait is None or wait.daemon_id != daemon_id or wait.future.done():
             log.info(
                 "a reply arrived that nobody is waiting for",
-                extra={"request": message.request_id, "said": message.type},
+                extra={"daemon": daemon_id, "request": message.request_id, "said": message.type},
             )
             return
         wait.future.set_result(message)
@@ -450,8 +476,9 @@ class Hub:
         this decision lives. A superseded handler's cleanup arrives there seconds
         after the rack reconnected, and the questions in flight are still
         perfectly answerable: the daemon replies down whatever socket it has now,
-        and `deliver_reply` matches the id rather than the connection. Failing
-        them from a stale handler would refuse an answer that was already coming.
+        and `deliver_reply` matches the rack and the question rather than the
+        connection. Failing them from a stale handler would refuse an answer that
+        was already coming.
 
         The entries themselves are left for `request`'s own `finally` to remove.
         One owner for that removal, and it is the only one that can check the
@@ -617,6 +644,13 @@ class Hub:
         the snapshot is pushed again on the next connect. What the boolean is for
         is a caller that has to *say* whether anything left.
         """
+        # **No await may precede this check.** `request` refuses an offline rack
+        # up front, and that refusal is only belt-and-braces because this returns
+        # False without ever suspending -- so a wait registered ahead of the send
+        # is removed in the same synchronous stretch. Anything awaited above this
+        # line -- a per-daemon lock, a metric, a queue -- makes that refusal the
+        # only thing standing between an offline rack and a wait left visible
+        # across a yield for another handler to resolve, and no test here says so.
         connection = self._connections.get(daemon_id)
         if connection is None:
             # Offline is a normal state, not an error: the edit is already
