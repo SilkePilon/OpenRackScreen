@@ -777,12 +777,21 @@ def test_a_reason_too_long_for_the_wire_is_shortened_rather_than_refused(tmp_pat
         rack.supervisor.stop()
 
 
-def test_a_failure_with_nothing_to_say_still_says_something(tmp_path: Path) -> None:
+@pytest.mark.parametrize("failure", [DisplayError(), DisplayError("   \n ")])
+def test_a_failure_with_nothing_to_say_still_says_something(
+    tmp_path: Path, failure: Exception
+) -> None:
     """`ProbeResult.error` refuses `""` -- it is falsy, so a refusal with a
     zero-length reason reads as no reason at all -- and plenty of driver
     exceptions carry no message. The class name is what is left, and it is more
-    than a timeout."""
-    rack = Rack(tmp_path, open_error=DisplayError())
+    than a timeout.
+
+    Whitespace is the same nothing wearing a coat: it is truthy in Python, so a
+    reason made of a newline passes every emptiness check this daemon and the
+    schema make, and lands in the interface as a blank line where the reason
+    should be.
+    """
+    rack = Rack(tmp_path, open_error=failure)
     rack.supervisor.start()
     try:
         result = probe_handler(rack.supervisor)(probe_request())
