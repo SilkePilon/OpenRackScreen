@@ -64,9 +64,10 @@ describe("getting in", () => {
     })
 
     expect(await screen.findByRole("heading", { name: /sign in/i })).toBeInTheDocument()
-    // Once. Two 401s are one return to /login, not one per refused request --
-    // and this is also the loop assertion: a guard and a login page bouncing
-    // off each other would add an entry per bounce, not settle at one.
+    // Once. Two 401s are one return to /login, not one per refused request.
+    // NOT a loop assertion, despite reading like one: the guard redirects with
+    // <Navigate replace>, which adds no history entry, so a guard/login bounce
+    // would never move this number. It catches one-per-refusal, nothing else.
     expect(pushes()).toBe(1)
     expect(path()).toBe("/login")
   })

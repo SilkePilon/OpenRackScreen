@@ -31,6 +31,9 @@ function Placeholder({ title }: { title: string }) {
  * else must not be redirected out from under itself.
  */
 function isPasswordAttempt(url: string) {
+  // Tied to the client's `baseUrl: "/"`, not derived from it. If the interface
+  // is ever served under a sub-path this stops matching SILENTLY, and every
+  // wrong password redirects to /login instead of showing the refusal.
   return new URL(url, window.location.origin).pathname === "/api/auth/login"
 }
 
