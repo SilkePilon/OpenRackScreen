@@ -23,10 +23,17 @@ import { cn } from "@/lib/utils"
 /**
  * How often a frame is due, in milliseconds.
  *
- * The server asks each daemon for `fps: 2.0` (`FramesRequest.fps`, whose
- * default is 2.0 and whose ceiling is 5.0), so a watched panel produces a frame
+ * The server never names a rate: `hub.py` builds its `FramesRequest` with
+ * `enabled` and `screen_ids` and nothing else, so what each daemon is asked for
+ * is `FramesRequest.fps`'s default of 2.0, and a watched panel produces a frame
  * every 500 ms. Not a guess and not a preference: it is the rate the other end
  * was asked for.
+ *
+ * Two ceilings sit above that default and neither is this number. The schema
+ * bounds the field at `MAX_REQUESTED_FPS = 60.0`, and the daemon caps whatever
+ * it is handed at its own `MAX_FPS = 5.0`. Both are bounds on a rate nothing in
+ * this interface requests, and if the server ever starts asking for one, this
+ * constant is where it has to be said again.
  */
 export const FRAME_INTERVAL_MS = 500
 
