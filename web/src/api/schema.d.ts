@@ -285,6 +285,101 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/daemons/{daemon_id}/detect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Detect Panels
+         * @description Ask a rack what SPI devices it has, and who is already driving each one.
+         *
+         *     The first question the add-screen wizard asks, and nothing in this server can
+         *     answer it: which `/dev/spidev*` a Pi exposes is a fact about that Pi, and
+         *     which of them a running worker is mid-frame on is a fact about that Pi's
+         *     supervisor. So this asks, and waits.
+         *
+         *     Changes nothing, and is not a `change`: it lists a directory on somebody
+         *     else's machine. Detection is also **not rate-limited** -- two operators
+         *     detecting at once is two directory listings -- which is exactly where it
+         *     parts company with the probe below.
+         *
+         *     **Three ways there is no answer, and they are three different answers.** A
+         *     rack that is not connected is a 503, because the thing to do is start the
+         *     daemon. A rack that is connected and silent is a 504, because the thing to do
+         *     is look at what it is busy with. A rack that answers the *other* question is a
+         *     502: `Hub.deliver_reply` matches the id and the rack, and nothing on the wire
+         *     says which question a reply belongs to, so a `ProbeResult` carrying this
+         *     request's id resolves this wait -- and it has no `panels`. Answering that with
+         *     a 500 would report a rack's confusion as this server's.
+         */
+        post: operations["detect_panels_api_daemons__daemon_id__detect_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/daemons/{daemon_id}/probe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Probe Panel
+         * @description Light one candidate panel with the wiring an operator supplied, and hold it.
+         *
+         *     The other half of detection, and the half that touches hardware: enumeration
+         *     cannot discover `dc` and `rst` -- a GC9A01 has no readable id over 4-wire SPI
+         *     and the GPIO lines were chosen with a screwdriver -- so this is the guess
+         *     being tested, and the proof is a human seeing the glass come on.
+         *
+         *     **`hold_s` is bounded at `PROBE_HOLD_BUDGET`, which is 5.0 and not the wire's
+         *     30.** The daemon cuts a longer hold to five and says nothing about having done
+         *     it, so a countdown longer than five seconds asks an operator about a panel
+         *     that is already dark. Whatever builds an interface on this route may not count
+         *     past that number; the constant lives in `ors_schema.link`, both ends import
+         *     that one symbol, and its docstring is the whole argument.
+         *
+         *     **One probe at a time per rack** (spec 6.4), which is `one_probe_at_a_time`
+         *     and lives here rather than in the hub: it is a rule about a *bus*, and the
+         *     hub deliberately lets one rack hold several waits at once. A second probe is
+         *     refused with a 409 and a sentence, because the alternative -- two panel inits
+         *     interleaved on one bus -- is the failure the daemon's bus guard exists to
+         *     prevent, and because an operator standing at the rack needs to be told which
+         *     of the two lit panels they are looking at.
+         *
+         *     `ok: false` is a **200**. The rack answered; the answer is no. The statuses
+         *     are for the questions this server could not get answered at all -- see
+         *     `detect_panels` for the 503/504/502 split, which is the same one.
+         *
+         *     **A 409 here does not mean what `send_command`'s does, and that is a
+         *     divergence worth naming.** `send_command` two functions up answers 409 for a
+         *     rack that is *not connected*; this route and `detect_panels` answer **503**
+         *     for that same condition,
+         *     and this route keeps 409 for the one thing a retry in a moment really does
+         *     fix -- a probe already in flight. 503 is the better status for an absent rack
+         *     (it is this server saying the upstream it needs is not there, and `Retry-After`
+         *     is meaningful for it) but changing `send_command` is a break in a shipped
+         *     route and belongs to whoever is willing to version it. Until then an interface
+         *     handling `POST /api/daemons/{id}/*` cannot read 409 by itself: it has to know
+         *     which route it asked.
+         */
+        post: operations["probe_panel_api_daemons__daemon_id__probe_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/events": {
         parameters: {
             query?: never;
@@ -686,6 +781,25 @@ export interface components {
             delivered: boolean;
         };
         /**
+         * Detected
+         * @description What one rack answered a detect with.
+         *
+         *     An object rather than a bare list, so that a later field -- when the daemon
+         *     can say something about a device beyond its number -- is an addition rather
+         *     than a change of shape for every caller.
+         *
+         *     `PanelCandidate` is reused rather than restated, unlike `DaemonView`, and the
+         *     difference is what each model is protecting against. `DaemonView` exists
+         *     because the row behind it carries `token_hash` and `key_hash`; this one
+         *     carries three numbers off the wire that were built for a person to read, and
+         *     two declarations of the same three fields is how the interface and the daemon
+         *     come to disagree about `claimed_by`.
+         */
+        Detected: {
+            /** Panels */
+            panels: components["schemas"]["PanelCandidate"][];
+        };
+        /**
          * DisplayConfig
          * @description Where a screen's pixels go: a real panel, or a directory of PNGs.
          *
@@ -1042,6 +1156,31 @@ export interface components {
              */
             end: string;
         };
+        /**
+         * PanelCandidate
+         * @description One `/dev/spidev<bus>.<cs>` the daemon found, and who is already driving it.
+         *
+         *     Not a `_Message`: it is a member of one, it carries no `type`, and nothing
+         *     dispatches on it. It forbids extra fields all the same, and for a sharper
+         *     reason than the envelope's -- `claimed_by` is the field a probe consults
+         *     before it touches a device, so a daemon that sent `claimedBy` or `claimed`
+         *     would have every device read as *free*, and the wizard would offer an
+         *     operator a panel a live worker is mid-frame on. A misspelling has to be an
+         *     error naming the field, not a silent "nobody is using this".
+         *
+         *     There is no `dc` or `rst` here, and that is the whole shape of the feature:
+         *     a GC9A01 has no readable id over 4-wire SPI and the GPIO lines were chosen
+         *     with a screwdriver, so enumeration can say which devices exist and nothing
+         *     more. The operator supplies the wiring and `ProbeRequest` proves it.
+         */
+        PanelCandidate: {
+            /** Bus */
+            bus: number;
+            /** Cs */
+            cs: number;
+            /** Claimed By */
+            claimed_by: string | null;
+        };
         /** ParamSpec */
         ParamSpec: {
             /**
@@ -1062,6 +1201,56 @@ export interface components {
         PasswordBody: {
             /** Password */
             password: string;
+        };
+        /**
+         * ProbeBody
+         * @description The wiring an operator typed in, for one candidate panel.
+         *
+         *     Every field is required and none has a default, which is the point of the
+         *     endpoint: `DisplayConfig` defaults `spi_bus` and `spi_cs` to 0 and `hz` to
+         *     40 MHz, and a probe that filled a field in from a default would be proving
+         *     wiring nobody chose and reporting it as the wiring that was asked for. What
+         *     is being tested is the guess that is about to be saved, whole.
+         *
+         *     `extra="forbid"` for `PanelCandidate`'s reason inverted: a wizard sending
+         *     `spi_bus` or `pattern` has to be told, rather than have the field ignored and
+         *     the probe run against something else.
+         */
+        ProbeBody: {
+            /** Bus */
+            bus: number;
+            /** Cs */
+            cs: number;
+            /** Dc */
+            dc: number;
+            /** Rst */
+            rst: number;
+            /** Hz */
+            hz: number;
+            /** Hold S */
+            hold_s: number;
+        };
+        /**
+         * Probed
+         * @description Whether the rack could drive that wiring, and what stopped it if not.
+         *
+         *     `ok` is the verdict and it means "the device opened and the pattern was
+         *     written", never "the operator saw it" -- only the person in front of the rack
+         *     can answer that, which is why the wizard asks them afterwards rather than
+         *     trusting this.
+         *
+         *     A failed probe is a 200 carrying `ok: false`, not an HTTP error. The probe
+         *     ran, the rack answered, and the answer is no: "SPI2.5 is already driving the
+         *     screen 'CPU'" is as useful a result as a panel lighting up, and it is a fact
+         *     about the rack's wiring rather than about this request. The statuses below
+         *     are kept for the things that are: no rack, no answer, or a second probe on a
+         *     bus that is already held.
+         */
+        Probed: {
+            /** Ok */
+            ok: boolean;
+            /** Error */
+            error: string | null;
         };
         /** Pushed */
         Pushed: {
@@ -1878,6 +2067,125 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
+            };
+        };
+    };
+    detect_panels_api_daemons__daemon_id__detect_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                daemon_id: number;
+            };
+            cookie?: {
+                ors_session?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Detected"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description the rack answered something that was not a detect result */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the rack is not connected, and only the rack knows its hardware */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the rack is connected and did not answer in time */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    probe_panel_api_daemons__daemon_id__probe_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                daemon_id: number;
+            };
+            cookie?: {
+                ors_session?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProbeBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Probed"];
+                };
+            };
+            /** @description that rack is already probing a panel; see one_probe_at_a_time */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description the rack answered something that was not a probe result */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the rack is not connected, and a probe cannot be deferred */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the rack is connected and did not answer in time */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
