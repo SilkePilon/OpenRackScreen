@@ -24,7 +24,17 @@ export type Sent<Body> = {
 
 /** An edit that landed, and the racks that have not been given it. */
 export type Saved<Body> = {
-  /** What the route answered with. `undefined` for the routes that answer 204. */
+  /**
+   * What the route answered with, or `undefined` if there was no body to read.
+   *
+   * Not a 204 case: no M3a route answers 204, `DELETE` included -- it answers
+   * `{"deleted": n}` with the default 200. It is optional because that is what
+   * openapi-fetch hands back when a *successful* response has no parseable
+   * body of the declared content type: a proxy's HTML under a 200, a truncated
+   * response, a route that grows an empty body later. A caller that reads a
+   * field off it without checking is one deployment quirk from a TypeError, so
+   * the type makes it check.
+   */
   body: Body | undefined
   /**
    * The racks this edit could not be pushed to, ascending, from the header.
@@ -53,7 +63,8 @@ export type Saved<Body> = {
  * 2. **Refetch rather than patch.** There are no optimistic updates here and
  *    there must not be: the server can accept an edit, save it, and never push
  *    it, and a patched cache would draw that as applied. The affected queries
- *    are invalidated on success and the answer comes back from the server.
+ *    are invalidated when the mutation settles -- either way, saved or refused
+ *    -- and the answer comes back from the server.
  * 3. **Turn a refusal into an error** carrying the server's own sentence, so a
  *    page can render it rather than inventing one.
  *
@@ -62,11 +73,12 @@ export type Saved<Body> = {
  * the screen list, a pairing touches the daemons, a template assignment touches
  * both -- and a rule guessed here would be wrong on the page nobody checked.
  *
- * The invalidation is returned from `onSuccess`, which TanStack Query awaits,
- * so the mutation is not settled until the refetch is done and a caller closing
- * a dialog on success closes it over fresh rows. A refetch that fails does not
- * fail the mutation: `invalidateQueries` swallows it, and it should -- the edit
- * really was saved.
+ * The invalidation is returned from `onSettled`, which TanStack Query awaits on
+ * both paths, so the mutation is not settled until the refetch is done and a
+ * caller closing a dialog on success closes it over fresh rows. A refetch that
+ * fails changes nothing about the mutation's own outcome: `invalidateQueries`
+ * swallows a query's rejection, so a saved edit stays saved and a refusal
+ * reaches the caller as the `ApiError` it was, not as whatever the refetch hit.
  */
 export function useMutate<Body, Variables = void>({
   send,
@@ -89,11 +101,16 @@ export function useMutate<Body, Variables = void>({
       }
       return { body: data, unservable: parseUnservable(response.headers) }
     },
-    // Only on success. A refusal rolls the whole edit back on the server -- the
-    // `change` context manager sees to that -- so there is nothing stale to
-    // refetch, and refetching would pull the form the user is still reading the
-    // refusal on out from under them.
-    onSuccess: () =>
+    // On settle, so a refusal invalidates too, which is what the spec's failure
+    // table says a failed mutation does. The rule underneath it is that no
+    // server state is invented by the client: a refusal does roll the whole
+    // edit back -- the `change` context manager sees to that -- but "the whole
+    // edit" is the server's account of what happened, and treating the cache as
+    // already correct because of it is the client deciding what the server
+    // holds. So it re-asks instead of assuming, and what it draws afterwards is
+    // what the server actually has. A page that must not lose what the user is
+    // typing keeps that in form state, which no refetch can reach.
+    onSettled: () =>
       Promise.all(invalidates.map((queryKey) => queryClient.invalidateQueries({ queryKey }))),
   })
 }

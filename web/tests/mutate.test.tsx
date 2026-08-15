@@ -1,4 +1,9 @@
-import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query"
+import {
+  QueryClient,
+  QueryClientProvider,
+  useQuery,
+  type DefaultOptions,
+} from "@tanstack/react-query"
 import { act, renderHook, waitFor } from "@testing-library/react"
 import { http, HttpResponse } from "msw"
 import { StrictMode, type ReactNode } from "react"
@@ -10,6 +15,7 @@ import type { components } from "../src/api/schema"
 import { server } from "./msw"
 
 type ScreenView = components["schemas"]["ScreenView"]
+type DaemonView = components["schemas"]["DaemonView"]
 
 // Three racks -- 4, 9 and 15 -- and screens 11, 12 and 7, at positions 1, 3 and
 // 2, listed in the order 12 then 11. No id here equals an array index, a
@@ -29,6 +35,23 @@ function panel(fields: { id: number; position: number; name: string; rack: numbe
     template: "clock",
     params: {},
     sleep_override: null,
+  }
+}
+
+function rack(fields: { id: number; name: string }): DaemonView {
+  return {
+    id: fields.id,
+    name: fields.name,
+    status: "online",
+    online: true,
+    config_version: 5,
+    applied_version: 5,
+    config_error: null,
+    version: "0.1.0",
+    capabilities: {},
+    last_seen: "2026-08-15T10:00:00Z",
+    paired_at: "2026-08-01T09:00:00Z",
+    created_at: "2026-08-01T09:00:00Z",
   }
 }
 
@@ -58,19 +81,44 @@ const newScreen: components["schemas"]["NewScreen"] = {
 function listing(rows: ScreenView[]) {
   let asked = 0
   let listed = rows
+  let refusal: number | null = null
   return {
     handler: http.get("/api/screens", () => {
       asked += 1
+      if (refusal !== null) {
+        return HttpResponse.json({ detail: "the screens did not list" }, { status: refusal })
+      }
       return HttpResponse.json(listed)
     }),
     asked: () => asked,
     answerWith: (next: ScreenView[]) => {
       listed = next
     },
+    /** From here on the list itself fails, which is what a refetch can hit. */
+    refuseWith: (status: number) => {
+      refusal = status
+    },
+  }
+}
+
+/** The racks, for the one write that makes two different lists stale at once. */
+function racking(rows: DaemonView[]) {
+  let asked = 0
+  let listed = rows
+  return {
+    handler: http.get("/api/daemons", () => {
+      asked += 1
+      return HttpResponse.json(listed)
+    }),
+    asked: () => asked,
+    answerWith: (next: DaemonView[]) => {
+      listed = next
+    },
   }
 }
 
 const screensKey = ["screens"] as const
+const daemonsKey = ["daemons"] as const
 
 /**
  * A page's worth of writing: the list it reads, and three edits that change it.
@@ -111,18 +159,59 @@ function useSaving() {
   return { screens, create, rename, reorder }
 }
 
-function mounted() {
-  // No `defaultOptions` at all, deliberately. `renderApp`'s blanket
+/**
+ * Deleting a rack: the one write here that makes two different lists stale.
+ *
+ * This is why `invalidates` is a list and not a key. `DELETE /api/daemons/{id}`
+ * cascades to that rack's screens, so an interface that re-asked only the first
+ * key it was given would go on drawing screens on a rack that is gone -- and
+ * would draw them as freshly fetched, not as stale.
+ */
+function useUnracking() {
+  const screens = useQuery({
+    queryKey: screensKey,
+    queryFn: async () => {
+      const { data, error, response } = await api.GET("/api/screens")
+      if (!data) {
+        throw new ApiError(response.status, detailFrom(error) ?? "the screens did not list")
+      }
+      return data
+    },
+  })
+  const daemons = useQuery({
+    queryKey: daemonsKey,
+    queryFn: async () => {
+      const { data, error, response } = await api.GET("/api/daemons")
+      if (!data) {
+        throw new ApiError(response.status, detailFrom(error) ?? "the racks did not list")
+      }
+      return data
+    },
+  })
+  const unrack = useMutate({
+    send: (id: number) =>
+      api.DELETE("/api/daemons/{daemon_id}", { params: { path: { daemon_id: id } } }),
+    invalidates: [screensKey, daemonsKey],
+  })
+  return { screens, daemons, unrack }
+}
+
+function mounted<T>(hook: () => T, defaultOptions?: DefaultOptions) {
+  // No `defaultOptions` unless a test asks, deliberately. `renderApp`'s blanket
   // `retry: false` would mask what two of these tests measure -- that a write
   // is attempted once and not retried, which for a POST is the difference
-  // between one screen and two.
-  const queryClient = new QueryClient()
+  // between one screen and two. The one test that passes any turns retries off
+  // for *queries* only, so the mutation is still measured with its real policy.
+  const queryClient = new QueryClient(defaultOptions ? { defaultOptions } : undefined)
   const wrapper = ({ children }: { children: ReactNode }) => (
     <StrictMode>
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     </StrictMode>
   )
-  return renderHook(useSaving, { wrapper })
+  // The client comes back too, because one thing worth asserting is in the
+  // cache rather than in a render: rendered state is a macrotask behind, the
+  // cache is not.
+  return Object.assign(renderHook(hook, { wrapper }), { queryClient })
 }
 
 /** The list has arrived and nothing is in flight, so a request count is stable. */
@@ -147,7 +236,7 @@ describe("saving something, and being told which rack did not get it", () => {
         HttpResponse.json(added, { status: 201, headers: { "X-Unservable-Daemons": "15" } }),
       ),
     )
-    const { result } = mounted()
+    const { result } = mounted(useSaving)
     await quiet(() => result.current.screens)
 
     let saved: Saved<ScreenView> | undefined
@@ -177,14 +266,20 @@ describe("saving something, and being told which rack did not get it", () => {
         return HttpResponse.json(renamedCpu)
       }),
     )
-    const { result } = mounted()
+    const { result, queryClient } = mounted(useSaving)
     await quiet(() => result.current.screens)
     const askedBefore = list.asked()
     list.answerWith([clock, renamedCpu])
 
     let saved: Saved<ScreenView> | undefined
+    let cachedWhenSettled: unknown
     await act(async () => {
       saved = await result.current.rename.mutateAsync({ id: 11, name: "gauge" })
+      // Read *inside* the act block, on the line after the mutation settled and
+      // before anything else has had a turn. Read after the block it would say
+      // nothing: `act` flushes the queue on the way out, and a refetch nobody
+      // waited for would have finished by then too.
+      cachedWhenSettled = queryClient.getQueryData(screensKey)
     })
 
     expect(saved?.unservable).toEqual([])
@@ -195,6 +290,13 @@ describe("saving something, and being told which rack did not get it", () => {
     // read the moment `mutateAsync` resolves, which is what makes it an
     // assertion about `onSuccess` and not about some later render.
     expect(list.asked()).toBe(askedBefore + 1)
+    // And *answered* before it settled, not merely asked. The invalidation is
+    // returned from `onSettled` and TanStack awaits it, so the refetched rows
+    // are in the cache the moment `mutateAsync` resolves. A `useMutate` that
+    // fired the invalidation without returning it would settle with "cpu" still
+    // cached, and a dialog closing on success would close over the row it just
+    // edited.
+    expect(cachedWhenSettled).toEqual([clock, renamedCpu])
     // And the new name arrived from the server. No optimistic patch put it
     // there: the handler above answers the PATCH, and the list only says
     // "gauge" because it was fetched again afterwards.
@@ -212,7 +314,7 @@ describe("saving something, and being told which rack did not get it", () => {
         }),
       ),
     )
-    const { result } = mounted()
+    const { result } = mounted(useSaving)
     await quiet(() => result.current.screens)
     const askedBefore = list.asked()
     list.answerWith([clock, renamedCpu])
@@ -243,7 +345,7 @@ describe("saving something, and being told which rack did not get it", () => {
         HttpResponse.json([cpu, clock], { headers: { "X-Unservable-Daemons": "4,15" } }),
       ),
     )
-    const { result } = mounted()
+    const { result } = mounted(useSaving)
     await quiet(() => result.current.screens)
 
     let saved: Saved<ScreenView[]> | undefined
@@ -255,7 +357,43 @@ describe("saving something, and being told which rack did not get it", () => {
     await waitFor(() => expect(result.current.reorder.isSuccess).toBe(true))
   })
 
-  it("surfaces a refusal, refetches nothing, and does not send the write twice", async () => {
+  it("re-asks every list the write was said to make stale, not just the first", async () => {
+    const list = listing([clock, cpu])
+    const kept = [rack({ id: 15, name: "hall" }), rack({ id: 9, name: "loft" })]
+    const racks = racking([...kept, rack({ id: 4, name: "shed" })])
+    server.use(
+      list.handler,
+      racks.handler,
+      // Deleting a rack cascades to its screens in M3a's schema, which is why
+      // this one write names two keys. `Deleted` with the default 200 -- no
+      // route in this API answers 204.
+      http.delete("/api/daemons/:daemon_id", () => HttpResponse.json({ deleted: 1 })),
+    )
+    const { result } = mounted(useUnracking)
+    await quiet(() => result.current.screens)
+    await quiet(() => result.current.daemons)
+    const screensBefore = list.asked()
+    const racksBefore = racks.asked()
+    // Rack 4 is gone and cpu went with it, so both lists answer differently now.
+    list.answerWith([clock])
+    racks.answerWith(kept)
+
+    await act(async () => {
+      await result.current.unrack.mutateAsync(4)
+    })
+
+    // Both, and this is the assertion the single-key tests cannot make: an
+    // implementation that invalidated only `invalidates[0]` passes every one of
+    // them and leaves the rack list on screen naming a rack that is deleted.
+    expect(list.asked()).toBe(screensBefore + 1)
+    expect(racks.asked()).toBe(racksBefore + 1)
+    await waitFor(() => {
+      expect(result.current.screens.data).toHaveLength(1)
+      expect(result.current.daemons.data?.map((one) => one.id)).toEqual([15, 9])
+    })
+  })
+
+  it("surfaces a refusal, re-asks what it holds, and does not send the write twice", async () => {
     let attempts = 0
     const list = listing([clock, cpu])
     server.use(
@@ -268,7 +406,7 @@ describe("saving something, and being told which rack did not get it", () => {
         )
       }),
     )
-    const { result } = mounted()
+    const { result } = mounted(useSaving)
     await quiet(() => result.current.screens)
     const askedBefore = list.asked()
 
@@ -280,12 +418,58 @@ describe("saving something, and being told which rack did not get it", () => {
 
     await waitFor(() => expect(result.current.rename.error).toBeInstanceOf(ApiError))
     expect((result.current.rename.error as ApiError).status).toBe(422)
-    // Nothing was written, so nothing in the cache is out of date -- and a
-    // refetch here would replace what the user is looking at, and their unsaved
-    // edit with it, on the one screen where they need to read the refusal.
-    expect(list.asked()).toBe(askedBefore)
+    // Asked again even though the write was refused. The client does not get to
+    // decide that the rollback left the cache exactly as it found it -- that is
+    // the server's account of the edit, not this client's, and the rule is that
+    // no server state is invented here. So it re-asks, and this count is read
+    // the moment `mutateAsync` rejects, which makes it a claim about `onSettled`
+    // and not about some later render.
+    expect(list.asked()).toBe(askedBefore + 1)
     // A mutation is not a query: a retried PATCH is a second write.
     expect(attempts).toBe(1)
+  })
+
+  it("hands back the refusal even when the refetch it triggers fails as well", async () => {
+    const list = listing([clock, cpu])
+    server.use(
+      list.handler,
+      http.patch("/api/screens/:screen_id", () =>
+        HttpResponse.json(
+          { detail: "screen 11 names a bus this rack does not have" },
+          { status: 422 },
+        ),
+      ),
+    )
+    // Retries off for *queries only*, so the refetch fails once rather than
+    // four times over a backoff. The mutation keeps its real policy, which is
+    // what the test above measures.
+    const { result } = mounted(useSaving, { queries: { retry: false } })
+    await quiet(() => result.current.screens)
+    const askedBefore = list.asked()
+    // Now the whole server is unhappy: the write is refused *and* the list that
+    // the refusal invalidates cannot be fetched either.
+    list.refuseWith(503)
+
+    let refusal: unknown
+    await act(async () => {
+      refusal = await result.current.rename
+        .mutateAsync({ id: 11, name: "gauge" })
+        .then(() => undefined)
+        .catch((error: unknown) => error)
+    })
+
+    // The error the caller must see is the one its own write produced. The
+    // failing refetch does not replace it, does not swallow it and does not
+    // surface as an unhandled rejection: `invalidateQueries` catches a query's
+    // rejection, so `onSettled` resolves and the mutation rethrows the 422.
+    expect(refusal).toBeInstanceOf(ApiError)
+    expect((refusal as ApiError).status).toBe(422)
+    expect((refusal as ApiError).message).toMatch(/does not have/)
+    // It really was attempted, and it really did fail.
+    expect(list.asked()).toBe(askedBefore + 1)
+    await waitFor(() => expect(result.current.screens.isError).toBe(true))
+    // And the mutation is in error, not in success, after all that.
+    expect(result.current.rename.isError).toBe(true)
   })
 
   it("says something readable when the refusal is a validation report", async () => {
@@ -300,7 +484,7 @@ describe("saving something, and being told which rack did not get it", () => {
         ),
       ),
     )
-    const { result } = mounted()
+    const { result } = mounted(useSaving)
     await quiet(() => result.current.screens)
 
     await act(async () => {
@@ -323,7 +507,7 @@ describe("saving something, and being told which rack did not get it", () => {
         return HttpResponse.json(renamedCpu)
       }),
     )
-    const { result } = mounted()
+    const { result } = mounted(useSaving)
     await quiet(() => result.current.screens)
 
     await act(async () => {
@@ -348,7 +532,7 @@ describe("saving something, and being told which rack did not get it", () => {
         HttpResponse.json({ detail: "not authenticated" }, { status: 401 }),
       ),
     )
-    const { result } = mounted()
+    const { result } = mounted(useSaving)
     await quiet(() => result.current.screens)
 
     await act(async () => {
