@@ -58,6 +58,7 @@ from ors_daemon.config import (
 )
 from ors_daemon.displays import DisplayBackend, build_display
 from ors_daemon.frames import FramePump, FrameStream
+from ors_daemon.hardware import SPI_ROOT, detect_handler, probe_handler
 from ors_daemon.link import (
     LinkClient,
     LinkError,
@@ -517,6 +518,14 @@ def _link(
             # or draws. See `FrameStream.request` on why the message is
             # whole-daemon state rather than one screen's subscription.
             on_frames_request=frames.request,
+            # The two that answer. Without them `_answer` logs that nothing here
+            # can reply and the server's wait expires, which the operator reads
+            # as a rack that did not respond -- the same lie `on_command`'s
+            # absence told, arriving as a timeout instead of as a false
+            # `delivered: true`. `SPI_ROOT` is passed rather than reached for
+            # inside the handler so that no test of this ever reads `/dev`.
+            on_detect=detect_handler(supervisor, SPI_ROOT),
+            on_probe=probe_handler(supervisor),
             # And the other end of it. A subscription arrives on a socket, so it
             # ends with that socket: without this the pump goes on encoding
             # WebP for a browser nothing can reach, for as long as the server is

@@ -43,12 +43,17 @@ from ors_schema.link import (
     Ack,
     Command,
     ConfigPush,
+    DetectRequest,
+    DetectResult,
     FramesRequest,
     Heartbeat,
     Hello,
     LogLine,
     Nack,
     Paired,
+    PanelCandidate,
+    ProbeRequest,
+    ProbeResult,
     parse_daemon_message,
 )
 
@@ -728,6 +733,91 @@ def test_a_frames_request_reaches_its_handler(tmp_path: Path) -> None:
     client.tick_once()
 
     assert [request.screen_ids for request in seen] == [[1, 2]]
+
+
+def probing(hold_s: float = 0.0) -> str:
+    return ProbeRequest(
+        request_id="rq-4b1", bus=0, cs=2, dc=25, rst=17, hz=32_000_000, hold_s=hold_s
+    ).model_dump_json()
+
+
+def test_a_detect_request_is_answered_down_the_socket_it_arrived_on(tmp_path: Path) -> None:
+    """The two correlated messages are the only ones whose handler *returns*
+    something: an HTTP handler on the server is holding a request open on the
+    other end of this socket, and the reply has to reach the connection that
+    asked rather than whichever one is current afterwards."""
+
+    def detect(request: DetectRequest) -> DetectResult:
+        return DetectResult(
+            request_id=request.request_id,
+            panels=[PanelCandidate(bus=0, cs=1, claimed_by="CPU")],
+        )
+
+    client, socket = make(
+        tmp_path, [DetectRequest(request_id="rq-91").model_dump_json()], on_detect=detect
+    )
+
+    client.tick_once()
+
+    assert [
+        (reply.request_id, reply.panels[0].claimed_by) for reply in only(socket, DetectResult)
+    ] == [("rq-91", "CPU")]
+
+
+def test_a_probe_request_is_answered_too(tmp_path: Path) -> None:
+    def probe(request: ProbeRequest) -> ProbeResult:
+        return ProbeResult(request_id=request.request_id, ok=False, error="no such device")
+
+    client, socket = make(tmp_path, [probing()], on_probe=probe)
+
+    client.tick_once()
+
+    assert [(reply.request_id, reply.ok, reply.error) for reply in only(socket, ProbeResult)] == [
+        ("rq-4b1", False, "no such device")
+    ]
+
+
+def test_a_request_this_daemon_cannot_answer_is_said_out_loud(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """M3a's defect, in the shape it would take here.
+
+    `_link` built the client without `on_command` and four commands were inert
+    while the route answered `delivered: true`. A correlated request has no ack
+    to lie with -- it simply goes unanswered, and the operator reads the server's
+    wait expiring as a rack that did not respond. So the debug line `_dispatch`
+    gets away with is a warning here, naming the request.
+    """
+    client, socket = make(tmp_path, [probing()])
+
+    with caplog.at_level("WARNING", logger="ors_daemon.link"):
+        client.tick_once()
+
+    assert only(socket, ProbeResult) == []
+    assert [record.said for record in caplog.records if hasattr(record, "said")] == ["probe"]
+
+
+def test_a_handler_that_raises_instead_of_answering_does_not_cost_the_link(
+    tmp_path: Path,
+) -> None:
+    """The handlers this end passes turn every failure into a reply, so getting
+    here is a bug in the daemon -- and a bug in the daemon must not be what costs
+    the rack the one socket it can be reconfigured over."""
+
+    def explode(request: ProbeRequest) -> ProbeResult:
+        raise RuntimeError("the probe is on fire")
+
+    applied: list[int] = []
+    client, _ = make(
+        tmp_path,
+        [probing(), push(7)],
+        applied=lambda snapshot, version: applied.append(version),
+        on_probe=explode,
+    )
+
+    client.tick_once()
+
+    assert applied == [7]
 
 
 def test_a_connection_ending_is_told_to_whoever_was_producing_for_it(tmp_path: Path) -> None:
