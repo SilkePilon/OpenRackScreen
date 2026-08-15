@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { act, render, screen, within } from "@testing-library/react"
-import { StrictMode, type ReactNode } from "react"
+import { Profiler, StrictMode, type ReactNode } from "react"
 import { MemoryRouter } from "react-router"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
@@ -12,10 +12,17 @@ import { ThemeProvider } from "../src/theme/theme-provider"
 import { collectSockets, type FakeSocket } from "./fake-socket"
 import { recordCanvas, stubDecoder, type BitmapDecoder, type CanvasRecorder } from "./paint"
 
-// Racks 7 and 23, screens 41, 12, 58, 31, 77, 63 and 29. No rack id is a screen id,
-// no id is its own index in the arrays below, and the rack a panel belongs to is
-// never the first entry in the daemons list -- so a panel that read the wrong
-// rack's `online`, or the first one it found, cannot pass.
+// Racks 7 and 23, screens 41, 12, 58, 31, 77, 63 and 29. No rack id is a screen
+// id and no id is its own index in the arrays below, so a panel that read the
+// wrong rack's `online`, or delivered by index, cannot pass by coincidence.
+//
+// The stronger property -- that a panel's own rack is *second* in the daemons
+// list, which is what kills "read the first rack you find" -- holds in every
+// test that reads a rack's `online`, and those are the ones it has to hold in:
+// `says offline, not stale, when its rack has gone` puts panel 58 on rack 23
+// with rack 7 ahead of it. It is not claimed of the whole file, and it is not
+// true there: `puts the racks the socket names online` has its panel on rack 7,
+// which is first, and asserts the cache rather than anything the panel read.
 const PANEL_SIZE = 120
 
 /** One rack as `GET /api/daemons` reports it, with only the fields this task reads. */
@@ -76,19 +83,20 @@ type Rig = {
  * decide what this one draws, and `queryFn` is never reached: the daemons query
  * in this task is read-only, written by the socket and by nothing else, so no
  * test here makes a network request and MSW has nothing to refuse.
+ *
+ * `strict: false` is for the one kind of test that counts renders, where
+ * StrictMode's deliberate double render would make the number mean mounts
+ * rather than renders. Nothing else may use it.
  */
-function mount(children: ReactNode, racks?: Daemon[]) {
+function mount(children: ReactNode, racks?: Daemon[], { strict = true } = {}) {
   const canvas = recordCanvas()
   const decoder = stubDecoder()
   const sockets = collectSockets()
   const queryClient = new QueryClient()
   if (racks !== undefined) queryClient.setQueryData(daemonsKey, racks)
 
-  const view = render(
-    <StrictMode>
-      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
-    </StrictMode>,
-  )
+  const tree = <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  const view = render(strict ? <StrictMode>{tree}</StrictMode> : tree)
 
   const rig: Rig = {
     sockets,
@@ -115,7 +123,30 @@ function panelOf(screenId: number, daemonId: number) {
 
 const panel = (screenId: number) => screen.getByTestId(`panel-${screenId}`)
 
+/**
+ * Hide or show the tab, exactly as a browser does it.
+ *
+ * jsdom's `visibilityState` is a getter on `Document.prototype` that always
+ * answers "visible" and fires nothing, so both halves are stood in for: the
+ * property is redefined once for this file, and the event is dispatched by
+ * hand. Substituting the environment, not the code -- what `LiveProvider`
+ * listens to and reads is what a browser gives it.
+ */
+let visibility: DocumentVisibilityState = "visible"
+Object.defineProperty(document, "visibilityState", {
+  configurable: true,
+  get: () => visibility,
+})
+
+function tabIs(state: DocumentVisibilityState) {
+  visibility = state
+  document.dispatchEvent(new Event("visibilitychange"))
+}
+
 afterEach(() => {
+  // Back to a visible tab, or the next test in this file inherits a hidden one
+  // and subscribes nothing.
+  visibility = "visible"
   vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
@@ -364,6 +395,86 @@ describe("a panel", () => {
     ])
   })
 
+  it("watches nothing while the tab is hidden, and everything again when it comes back", async () => {
+    // Spec §5.4: "Subscribe on mount, unsubscribe on unmount *and on tab-hide*.
+    // A closed tab that kept its subscription would leave the Pi encoding WebP
+    // for nobody." A tab on a second monitor is four panels' worth of WebP a
+    // rack encodes twice a second for a page no one can see.
+    const rig = mount(panelOf(12, 23), [rack(7, "Loft", true), rack(23, "Attic", true)])
+    act(() => rig.live().accept())
+    act(() => rig.live().deliver(frameMessage(12, 104, bytesFor(12))))
+    await act(() => rig.decoder.settleAll())
+    const painted = rig.canvas.only().ops
+    expect(rig.live().requests).toEqual([{ action: "subscribe", screen_id: 12 }])
+
+    act(() => tabIs("hidden"))
+    expect(rig.live().requests).toEqual([
+      { action: "subscribe", screen_id: 12 },
+      { action: "unsubscribe", screen_id: 12 },
+    ])
+    // On the wire and nowhere else. The panel is still mounted, so the store
+    // still holds its bitmap and the glass still shows it -- a tab coming back
+    // to a black canvas that fills in half a second later is the failure the
+    // store's "forget the screen with its last panel" rule would cause if it
+    // were reused here.
+    expect(rig.canvas.only().ops).toEqual(painted)
+    expect(rig.decoder.made[0].closed).toBe(false)
+
+    act(() => tabIs("visible"))
+    expect(rig.live().requests).toEqual([
+      { action: "subscribe", screen_id: 12 },
+      { action: "unsubscribe", screen_id: 12 },
+      { action: "subscribe", screen_id: 12 },
+    ])
+
+    // And the stream really is running again, into the same canvas.
+    act(() => rig.live().deliver(frameMessage(12, 105, bytesFor(12))))
+    await act(() => rig.decoder.settleAll())
+    expect(rig.canvas.only().drawn).toHaveLength(2)
+  })
+
+  it("does not subscribe a panel that mounts while the tab is hidden", async () => {
+    // The other half of the same rule. A hidden tab is not a still page: a
+    // query settling or a socket message renders it, and a panel that mounted
+    // there would put a screen back on the wire that the hide had just taken
+    // off it -- the Pi encoding for a page nobody can see, which is what §5.4
+    // forbids however the subscription got there.
+    function Rack({ inspector }: { inspector: boolean }) {
+      return (
+        <LiveProvider>
+          <Panel screenId={41} daemonId={23} size={PANEL_SIZE} />
+          {inspector && <Panel screenId={58} daemonId={23} size={PANEL_SIZE} />}
+        </LiveProvider>
+      )
+    }
+    const rig = mount(<Rack inspector={false} />, [rack(7, "Loft", true), rack(23, "Attic", true)])
+    act(() => rig.live().accept())
+    act(() => tabIs("hidden"))
+    expect(rig.live().requests).toEqual([
+      { action: "subscribe", screen_id: 41 },
+      { action: "unsubscribe", screen_id: 41 },
+    ])
+
+    rig.rerender(
+      <StrictMode>
+        <QueryClientProvider client={rig.queryClient}>
+          <Rack inspector />
+        </QueryClientProvider>
+      </StrictMode>,
+    )
+    expect(rig.live().requests).toHaveLength(2)
+
+    // It goes out with the rest on the way back, from the set the provider
+    // keeps -- not from the socket's, which the hide emptied.
+    act(() => tabIs("visible"))
+    expect(rig.live().requests).toEqual([
+      { action: "subscribe", screen_id: 41 },
+      { action: "unsubscribe", screen_id: 41 },
+      { action: "subscribe", screen_id: 41 },
+      { action: "subscribe", screen_id: 58 },
+    ])
+  })
+
   it("follows its screen when the one it is asked for changes", async () => {
     // A panel is a component at a position, not a component per screen: a page
     // that renders one panel and changes which screen it shows -- the inspector
@@ -401,6 +512,100 @@ describe("a panel", () => {
     await act(() => rig.decoder.settleAll())
     expect(rig.canvas.only().drawn).toHaveLength(1)
     expect(rig.decoder.blobs).toHaveLength(1)
+  })
+
+  it("re-renders neither the interface above it nor itself, eight frames running", async () => {
+    // The rule §4.4 states and the reason this store exists, pinned where a
+    // regression would actually land: the whole path, socket to canvas, with
+    // `LiveProvider` mounted. `frames.test.tsx` counts renders on a parent that
+    // pushes into the store directly, which cannot fail for state held in the
+    // provider -- and the provider is the one component holding both the socket
+    // and a position above the entire signed-in interface, so a `useState` for
+    // the latest frame written there would re-render the shell eight times a
+    // second and pass that test.
+    //
+    // Three counters, because they fail for different mistakes. `shell` commits
+    // for anything in the tree, which is where provider state shows up; `page`
+    // is a component between the provider and the panel, which is where a
+    // context or a prop would; `panel` is the panel's own render, which is what
+    // the `staleRef` bail-out in `setStaleness` is for -- `setStale(false)`
+    // once per frame is the cost this design exists to avoid.
+    let shellCommits = 0
+    let pageRenders = 0
+    let panelCommits = 0
+
+    function Page() {
+      pageRenders += 1
+      return (
+        <Profiler id="panel" onRender={() => (panelCommits += 1)}>
+          <Panel screenId={41} daemonId={23} size={PANEL_SIZE} />
+        </Profiler>
+      )
+    }
+
+    // No StrictMode: it renders everything twice on purpose, and this test's
+    // numbers have to mean renders. What StrictMode proves -- that neither
+    // effect leaks when it is mounted twice -- every other test here covers.
+    const rig = mount(
+      <Profiler id="shell" onRender={() => (shellCommits += 1)}>
+        <LiveProvider>
+          <Page />
+        </LiveProvider>
+      </Profiler>,
+      [rack(7, "Loft", true), rack(23, "Attic", true)],
+      { strict: false },
+    )
+    act(() => rig.live().accept())
+
+    const mounted = { shell: shellCommits, page: pageRenders, panel: panelCommits }
+    expect(mounted.page).toBe(1)
+
+    for (let frame = 0; frame < 8; frame += 1) {
+      act(() => rig.live().deliver(frameMessage(41, 200 + frame, bytesFor(41))))
+      await act(() => rig.decoder.settleAll())
+    }
+
+    // Eight frames really did land: without this the three counters below hold
+    // just as well for an interface that drew nothing at all.
+    expect(rig.canvas.only().drawn).toHaveLength(8)
+    expect(pageRenders).toBe(mounted.page)
+    expect(panelCommits).toBe(mounted.panel)
+    expect(shellCommits).toBe(mounted.shell)
+  })
+
+  it("keeps its picture across a resize, without waiting for the next frame", async () => {
+    // `width` and `height` on a canvas are its drawing surface, and assigning
+    // either resets it to transparent black. The Screens page changes panel
+    // sizes with its layout, so a panel that only ever drew on arrival would go
+    // black for up to a frame interval -- half a second at 2 fps -- every time.
+    const rig = mount(panelOf(63, 23), [rack(7, "Loft", true), rack(23, "Attic", true)])
+    act(() => rig.live().accept())
+    act(() => rig.live().deliver(frameMessage(63, 104, bytesFor(63))))
+    await act(() => rig.decoder.settleAll())
+    expect(rig.canvas.only().drawn).toHaveLength(1)
+
+    const bigger = PANEL_SIZE + 80
+    rig.rerender(
+      <StrictMode>
+        <QueryClientProvider client={rig.queryClient}>
+          <LiveProvider>
+            <Panel screenId={63} daemonId={23} size={bigger} />
+          </LiveProvider>
+        </QueryClientProvider>
+      </StrictMode>,
+    )
+
+    // Drawn again, at the new size, from the picture the store still holds --
+    // and no frame arrived and nothing was decoded a second time.
+    const drawn = rig.canvas.only().drawn
+    expect(drawn).toHaveLength(2)
+    expect(drawn[1].args).toEqual([rig.decoder.made[0], 0, 0, bigger, bigger])
+    expect(rig.decoder.blobs).toHaveLength(1)
+    expect(rig.decoder.made[0].closed).toBe(false)
+    // The subscription did not follow the size: a re-subscribe would drop this
+    // screen's last subscriber for an instant, and the store forgets a screen
+    // with its last panel -- closing the very bitmap the redraw wants.
+    expect(rig.live().requests).toEqual([{ action: "subscribe", screen_id: 63 }])
   })
 
   it("leaves no timer armed when it unmounts", () => {

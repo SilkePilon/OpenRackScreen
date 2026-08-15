@@ -69,6 +69,19 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       onFrame: (frame) => frameStore.push(frame),
     })
 
+    /**
+     * The screens with a panel on them, which is not the same as what is on the
+     * wire.
+     *
+     * The store announces what is *on the page*; the socket is told what this
+     * tab wants *now*, and a hidden tab wants nothing. Kept here rather than
+     * asked of either side: the store is about panels and has no idea a tab can
+     * be hidden, and the socket's own set is the answer to "what did I ask for",
+     * which is exactly what a hide empties.
+     */
+    const onScreen = new Set<number>()
+    const hidden = () => document.visibilityState === "hidden"
+
     // Registering replays the screens that already have a panel on them --
     // React runs a child's effects before its parent's, so every panel below
     // this one has already subscribed by now -- and the client holds what it is
@@ -84,12 +97,46 @@ export function LiveProvider({ children }: { children: ReactNode }) {
     // survives the suite, and is disclosed as equivalent rather than papered
     // over with a test that would only be asserting this line's position.
     const stopWatching = frameStore.onWatchedChange((screenId, watched) => {
-      if (watched) live.subscribe(screenId)
-      else live.unsubscribe(screenId)
+      if (!watched) {
+        onScreen.delete(screenId)
+        live.unsubscribe(screenId)
+        return
+      }
+      onScreen.add(screenId)
+      // Not while the tab is hidden. A panel can mount with the tab in the
+      // background -- a query settling, a socket message, anything that renders
+      // -- and subscribing there is the same encode for nobody that hiding the
+      // tab just stopped. It goes out on the way back, from the set.
+      if (!hidden()) live.subscribe(screenId)
     })
+
+    /**
+     * A hidden tab watches nothing, and picks it all up again on the way back.
+     *
+     * Spec §5.4: "Frames flow only while someone is watching. Subscribe on
+     * mount, unsubscribe on unmount and on tab-hide. A closed tab that kept its
+     * subscription would leave the Pi encoding WebP for nobody." A backgrounded
+     * tab is four panels' worth of WebP a rack encodes twice a second for a page
+     * nobody can see, and the Pi is the machine paying for it.
+     *
+     * On the wire and nowhere else. The panels stay mounted and the store keeps
+     * every bitmap it holds, so a tab coming back shows its last picture at once
+     * rather than a black canvas -- the store's "forget the screen with its last
+     * panel" rule is about a panel going away, and no panel has gone away here.
+     * The staleness a hidden tab accumulates is true and is left alone: nothing
+     * was arriving, and the panel says so until the first frame back.
+     */
+    const onVisibility = () => {
+      for (const screenId of onScreen) {
+        if (hidden()) live.unsubscribe(screenId)
+        else live.subscribe(screenId)
+      }
+    }
+    document.addEventListener("visibilitychange", onVisibility)
     live.connect()
 
     return () => {
+      document.removeEventListener("visibilitychange", onVisibility)
       stopWatching()
       // For good: no reconnect follows this one. StrictMode mounts this effect
       // twice, and a client left dialling would be a second connection to the

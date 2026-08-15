@@ -70,7 +70,9 @@ type PanelState = "live" | "stale" | "offline"
  * The dimensions come off the canvas rather than from a prop, so the draw path
  * has no dependency on a React value and a resized panel needs no
  * re-subscription -- which would otherwise drop this screen's last subscriber
- * for an instant and take the picture with it.
+ * for an instant and take the picture with it. What a resize *does* need is a
+ * repaint, because the browser empties the surface when the attribute is
+ * assigned; that is the second effect below.
  */
 function paint(context: CanvasRenderingContext2D, canvas: HTMLCanvasElement, bitmap: ImageBitmap) {
   const { width, height } = canvas
@@ -170,6 +172,34 @@ export function Panel({
       }
     }
   }, [screenId])
+
+  /**
+   * Put the picture back after a resize, without waiting for the next frame.
+   *
+   * `width` and `height` on a canvas are the drawing surface, not a style, and
+   * assigning either -- which React does the moment `size` changes -- resets it
+   * to transparent black even when the value is the same. At 2 fps the next
+   * frame is up to 500 ms away, so a panel that only drew on arrival would go
+   * black for half a second every time the Screens page changed its layout.
+   *
+   * A second effect rather than `size` in the subscription's dependencies: a
+   * re-subscribe would drop this screen's last subscriber for an instant, and
+   * the store forgets a screen with its last panel -- closing the bitmap the
+   * resize is trying to keep. So the subscription is left alone and the picture
+   * is asked for instead.
+   *
+   * It runs on mount too, where it draws whatever the replay in `subscribe`
+   * just drew, one redundant `drawImage` on a screen that already had a
+   * picture. Cheap, and cheaper than a ref remembering which run this is.
+   */
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (canvas === null) return
+    const context = canvas.getContext("2d")
+    if (context === null) return
+    const bitmap = frameStore.current(screenId)
+    if (bitmap !== null) paint(context, canvas, bitmap)
+  }, [screenId, size])
 
   const state: PanelState = offline ? "offline" : stale ? "stale" : "live"
 

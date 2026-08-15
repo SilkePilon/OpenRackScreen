@@ -18,7 +18,15 @@
 
 import type { LiveFrame } from "./socket"
 
-/** What a panel is handed, and what it must not close. See `push`. */
+/**
+ * What a panel is handed, and what it must not close -- or keep. See `push`.
+ *
+ * A bitmap is on loan for the duration of the call. The store closes it the
+ * moment it stops being the one on screen, which is as soon as the next frame
+ * lands, so a panel that stashed one in a ref would be holding a closed bitmap
+ * half a second later and its next `drawImage` would throw. Draw it, and ask
+ * `current` if you need it again.
+ */
 export type DrawFrame = (bitmap: ImageBitmap) => void
 
 export type FrameStore = {
@@ -34,6 +42,16 @@ export type FrameStore = {
   subscribe(screenId: number, draw: DrawFrame): () => void
   /** One frame off the wire. Decoded, then handed to that screen's panels. */
   push(frame: LiveFrame): void
+  /**
+   * The bitmap that screen is showing, or `null` if it is showing none.
+   *
+   * For a panel that has to paint again without a frame having arrived: a
+   * canvas whose `width` or `height` attribute is assigned has had its drawing
+   * surface reset to transparent black by the browser, and at 2 fps the next
+   * frame is up to half a second away. The same loan as `DrawFrame` -- draw it,
+   * do not close it and do not keep it.
+   */
+  current(screenId: number): ImageBitmap | null
   /**
    * When that screen's last frame was drawn, or `null` if none has been.
    *
@@ -193,6 +211,10 @@ export function createFrameStore(): FrameStore {
           // with no owner, from inside a socket callback.
           console.warn(`the frame store could not decode a frame for screen ${screenId}`, reason)
         })
+    },
+
+    current(screenId) {
+      return showing.get(screenId) ?? null
     },
 
     lastAt(screenId) {
