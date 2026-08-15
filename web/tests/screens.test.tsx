@@ -927,6 +927,9 @@ describe("the screens page", () => {
     )
     expect(screen.getByLabelText("Dark from")).toHaveValue("22:30")
     expect(screen.getByLabelText("Light again at")).toHaveValue("06:15")
+    // And nothing to save until one of them moves: writing the window a panel
+    // already keeps is an edit nobody made, with a push to the rack behind it.
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled()
 
     await userEvent.click(screen.getByRole("switch", { name: "Override for this panel" }))
     await userEvent.click(screen.getByRole("button", { name: "Save changes" }))
@@ -1034,6 +1037,12 @@ describe("the screens page", () => {
     expect(
       screen.queryByRole("combobox", { name: "Insert a reading into Thresholds" }),
     ).not.toBeInTheDocument()
+
+    // Nothing has been touched, so there is nothing to save -- and this tab has
+    // to say so for itself. An empty `params` PATCH is accepted, bumps the
+    // rack's `config_version` and pushes a snapshot for an edit nobody made;
+    // the Config tab's own version of this assertion pins only the Config tab.
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled()
 
     // The readings this rack's integrations really publish, offered by the name
     // a binding has to use: the integration's own `name`, then the field.
