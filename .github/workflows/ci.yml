@@ -36,9 +36,11 @@ jobs:
           # `version: 11` would be the only unpinned link in the chain -- the
           # action resolves it with `pnpm self-update 11` at run time, so an
           # unrelated 11.x release could change lockfile handling and break
-          # `--frozen-lockfile` on a PR that touched nothing. The action's default
-          # for this input is the repository root, which has no package.json at
-          # all; it tolerates that, but naming the file is the point.
+          # `--frozen-lockfile` on a PR that touched nothing. This line is
+          # load-bearing, not a clarity nicety: the default is `package.json` at
+          # the repository root, which does not exist here, and with no
+          # `version:` to fall back on the action fails with "No pnpm version is
+          # specified."
           package_json_file: web/package.json
           cache: true
           # The lockfile is not at the repository root -- the interface is one
