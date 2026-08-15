@@ -47,6 +47,8 @@ export function LoginPage() {
     })
   }
 
+  const refused = login.isError ? refusal(login.error) : null
+
   return (
     <main className="flex min-h-svh flex-col items-center justify-center p-6">
       <Card className="w-full max-w-sm">
@@ -68,10 +70,10 @@ export function LoginPage() {
                 onChange={(event) => setPassword(event.target.value)}
               />
             </div>
-            {login.isError && (
+            {refused && (
               <Alert variant="destructive">
-                <AlertTitle>{refusal(login.error).title}</AlertTitle>
-                <AlertDescription>{refusal(login.error).body}</AlertDescription>
+                <AlertTitle>{refused.title}</AlertTitle>
+                <AlertDescription>{refused.body}</AlertDescription>
               </Alert>
             )}
             <Button type="submit" disabled={password.length === 0 || login.isPending}>
