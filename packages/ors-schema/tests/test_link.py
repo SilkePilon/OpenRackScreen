@@ -14,6 +14,7 @@ from ors_schema.link import (
     MAX_SPI_HZ,
     MAX_WATCHED_SCREENS,
     MAX_WIRING_NUMBER,
+    PROBE_HOLD_BUDGET,
     PROTOCOL_VERSION,
     Ack,
     Command,
@@ -820,6 +821,23 @@ def test_the_bound_on_a_hold_is_seconds_and_not_minutes():
     hold longer than the wait is a question whose answer nobody is left to hear.
     """
     assert MAX_PROBE_HOLD_S == 30.0
+
+
+def test_the_hold_a_rack_really_gives_is_under_the_hold_the_wire_may_ask_for():
+    """Two numbers about one hold, and the pair is the point.
+
+    `MAX_PROBE_HOLD_S` is what a `ProbeRequest` may *say*; `PROBE_HOLD_BUDGET` is
+    what a rack *gives*, and the daemon cuts to it without the reply mentioning
+    that it did. A budget at or above the wire bound would be a number no message
+    could ever ask for -- and the truncation the daemon performs would be dead
+    code, which is a different rack from the one this schema is describing.
+
+    Absolute, for the reason the bound above is: every other assertion about it
+    is relative and would survive it drifting to half a second, which is a probe
+    nobody standing at a rack can see.
+    """
+    assert PROBE_HOLD_BUDGET == 5.0
+    assert PROBE_HOLD_BUDGET < MAX_PROBE_HOLD_S
 
 
 def test_the_other_numbers_these_messages_are_bounded_by_are_the_ones_they_claim():

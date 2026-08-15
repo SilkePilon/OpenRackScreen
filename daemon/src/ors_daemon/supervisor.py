@@ -58,6 +58,21 @@ from ors_schema.daemon import (
     ScreenConfig,
     TunnelConfig,
 )
+
+# `PROBE_HOLD_BUDGET` is what a probe really holds a panel lit for, and this
+# module is one of its two ends: `_capped_hold` cuts a longer request down to it
+# and `ProbeResult` says nothing about having done so, so the server has to
+# refuse a longer `hold_s` at its edge -- and the two ends may not each write the
+# number down. It lives in `ors_schema.link` beside `MAX_PROBE_HOLD_S`, the wire
+# bound, which is the only place both `ors-daemon` and `ors-server` can import.
+#
+# **Its value is load-bearing here and the argument is in its docstring.** `probe`
+# holds `_shutdown_lock` for the whole hold, so the budget is additive with
+# `SHUTDOWN_BUDGET`'s ten and the CLI's `LINK_JOIN_TIMEOUT` of three against the
+# shipped unit's `TimeoutStopSec=30` -- about nineteen seconds at five, and about
+# forty-four at the wire's thirty, which is a SIGKILL with four panels still lit.
+# Whoever raises it reads that docstring first.
+from ors_schema.link import PROBE_HOLD_BUDGET
 from PIL import Image
 
 from ors_daemon.clock import Clock
@@ -241,33 +256,6 @@ Per screen rather than "whatever is left", which is exactly the defect
 `BUS_GUARD_BUDGET` was split out to fix: one wedged worker spending the lot
 means every panel after it is offered nothing and the last screens of a rack are
 never numbered.
-"""
-
-PROBE_HOLD_BUDGET = 5.0
-"""The longest a probe will hold a candidate panel lit, in seconds.
-
-The second of two bounds on the same number, and both exist on purpose:
-`ors_schema.link.MAX_PROBE_HOLD_S` owns what the *message* may ask for -- thirty
-seconds, and it is what refuses an infinity -- and this owns what this hardware
-can be asked to give, which is the division `MAX_REQUESTED_FPS` and
-`ors_daemon.frames.MAX_FPS` already draw. A request past this is cut to it rather
-than refused: an operator who asked for thirty and got five has seen the panel,
-where a refusal leaves them with nothing to look at.
-
-Five seconds, and the ceiling is a shutdown rather than a person's patience.
-`probe` holds `_shutdown_lock` and the bus guard for the whole of it, so every
-kept worker is frozen on its last frame and a SIGTERM landing meanwhile waits it
-out -- `stop` blocks on that same lock and only takes its own deadline once it
-has it. That time is *additive* with `SHUTDOWN_BUDGET`'s ten and the CLI's
-`LINK_JOIN_TIMEOUT` of three, against the shipped unit's `TimeoutStopSec` of
-thirty: five here leaves the same kind of margin `APPLY_BUDGET` reasons about,
-and thirty here would not. Waiting on the stop event rather than sleeping does
-not rescue it, and the docstring on `probe` says why.
-
-The floor is the thing being waited on, which is a human looking at a shelf and
-saying "that one". The daemon's own `identify --hold` is in the same units for
-the same purpose, and a second or two is what it takes; five is comfortably past
-that. One panel at a time, so nobody is walking a rack inside it.
 """
 
 SOURCE_TEARDOWN_BUDGET = 12.0

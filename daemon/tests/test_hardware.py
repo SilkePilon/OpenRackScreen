@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from ors_daemon import supervisor
 from ors_daemon.__main__ import _link
 from ors_daemon.clock import FakeClock
 from ors_daemon.config import resolve_screens, system_scenes
@@ -44,6 +45,7 @@ from ors_daemon.snapshot import SnapshotStore
 from ors_daemon.supervisor import _BUS_GUARD_PER_SCREEN as BUS_GUARD_PER_SCREEN
 from ors_daemon.supervisor import PROBE_HOLD_BUDGET, ProbeRefused, Supervisor
 from ors_render import RenderContext, render_scene
+from ors_schema import link
 from ors_schema.daemon import DaemonConfig, ScreenConfig
 from ors_schema.link import (
     MAX_PANEL_CANDIDATES,
@@ -779,6 +781,24 @@ def test_a_hold_longer_than_this_rack_can_afford_is_cut_to_what_it_can(tmp_path:
         assert rack.holds == [PROBE_HOLD_BUDGET]
     finally:
         rack.supervisor.stop()
+
+
+def test_the_hold_this_rack_gives_is_the_shared_number_and_not_a_copy_of_it() -> None:
+    """The cut happens here and the refusal happens in the server, so both ends
+    have to mean the same five seconds.
+
+    Written down at both ends, lowering this one alone is a rack that goes dark
+    at second two while an interface counts down five, and the operator answers
+    "no, nothing lit" about wiring that is fine -- which is the defect the budget
+    exists to close, arriving from the other direction. So it is *one symbol*:
+    `ors_schema.link` owns it, this module imports it, and
+    `ors_server.api.daemons` imports the same one (its own suite asserts that
+    half, because a daemon test may not import the server). Identity rather than
+    equality on purpose -- `PROBE_HOLD_BUDGET = 5.0` written here again would
+    still be equal, and would still drift the next time the number moves.
+    """
+    assert supervisor.PROBE_HOLD_BUDGET is link.PROBE_HOLD_BUDGET
+    assert link.PROBE_HOLD_BUDGET < link.MAX_PROBE_HOLD_S, "a budget no message could ask for"
 
 
 @pytest.mark.parametrize(

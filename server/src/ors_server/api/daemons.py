@@ -29,6 +29,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from ors_schema.link import (
     MAX_SPI_HZ,
     MAX_WIRING_NUMBER,
+    PROBE_HOLD_BUDGET,
     Command,
     DetectRequest,
     DetectResult,
@@ -233,34 +234,14 @@ question, and a rack that has stopped answering should not hold a request
 handler open for forty seconds over a question it could have answered in one.
 """
 
-MAX_HOLD_S = 5.0
-"""The longest hold this route will ask a rack for, in seconds.
-
-**Not `MAX_PROBE_HOLD_S`, which is thirty.** The wire allows thirty and the
-daemon silently cuts to five: `ors_daemon.supervisor.PROBE_HOLD_BUDGET` is 5.0,
-a request past it is truncated rather than refused, and `ProbeResult` carries no
-field saying it was. So a request for ten seconds is answered `ok: true` by a
-rack that lit the panel for five -- and an interface counting down ten seconds
-has an operator looking up at second six, seeing dark glass, and answering "no,
-nothing lit" about wiring that is fine. That is a wrong answer about hardware,
-arrived at from two correct components, and this bound is where it is stopped:
-refused at the edge, where there is still somebody to tell.
-
-Written down here rather than imported, because `ors-server` may not import
-`ors-daemon` -- the same arrangement `MAX_SCREEN_NAME` and
-`ors_server.api.screens.MAX_NAME` already have, and it holds for the same reason:
-the two ends have to agree, and a number that could not be honoured cannot
-honestly be offered. Whoever changes `PROBE_HOLD_BUDGET` changes this, and
-`test_api_detect.py` states the pair together so the disagreement has somewhere
-to fail.
-"""
-
-PROBE_TIMEOUT = MAX_HOLD_S + 2 * SEND_TIMEOUT
+PROBE_TIMEOUT = PROBE_HOLD_BUDGET + 2 * SEND_TIMEOUT
 """How long a rack has to answer a probe. Fifteen seconds.
 
-`REQUEST_TIMEOUT`'s own formula, with the hold this route will actually ask for
-in place of the largest the wire permits: the daemon replies once the hold is
-over, so the wait has to outlast the hold and the two sends around it. Bounding
+`REQUEST_TIMEOUT`'s own formula, with `PROBE_HOLD_BUDGET` -- the hold a rack
+really gives -- in place of `MAX_PROBE_HOLD_S`, the largest the wire permits: the
+daemon replies once the hold is over, so the wait has to outlast the hold and the
+two sends around it. It is derived from the shared constant rather than written
+as fifteen, so lowering the budget shortens this wait with it. Bounding
 it here rather than taking the forty-second default is what keeps a rack that
 went quiet from parking a request handler for four times as long as the longest
 probe it could have been running.
@@ -288,9 +269,13 @@ class ProbeBody(BaseModel):
     dc: int = Field(ge=0, le=MAX_WIRING_NUMBER)
     rst: int = Field(ge=0, le=MAX_WIRING_NUMBER)
     hz: int = Field(ge=1, le=MAX_SPI_HZ)
-    hold_s: float = Field(ge=0.0, le=MAX_HOLD_S, allow_inf_nan=False)
-    """Seconds to leave the pattern up, at most `MAX_HOLD_S`. Zero is allowed:
-    a script does not look."""
+    hold_s: float = Field(ge=0.0, le=PROBE_HOLD_BUDGET, allow_inf_nan=False)
+    """Seconds to leave the pattern up, at most `PROBE_HOLD_BUDGET` -- **five, and
+    not the wire's thirty**. The daemon cuts a longer hold to five and the reply
+    says nothing about having done it, so a request past this is refused here,
+    where there is still somebody to tell; the constant's docstring in
+    `ors_schema.link` is the whole argument, and it is the same symbol the daemon
+    cuts with. Zero is allowed: a script does not look."""
 
     @field_validator("bus", "cs", "dc", "rst", "hz", mode="before")
     @classmethod
@@ -673,11 +658,12 @@ async def probe_panel(request: Request, daemon_id: int, body: ProbeBody) -> Prob
     and the GPIO lines were chosen with a screwdriver -- so this is the guess
     being tested, and the proof is a human seeing the glass come on.
 
-    **`hold_s` is bounded at `MAX_HOLD_S`, which is 5.0 and not the wire's 30.**
-    The daemon cuts a longer hold to five and says nothing about having done it,
-    so a countdown longer than five seconds asks an operator about a panel that
-    is already dark. Whatever builds an interface on this route may not count
-    past that number; the constant's docstring is the whole argument.
+    **`hold_s` is bounded at `PROBE_HOLD_BUDGET`, which is 5.0 and not the wire's
+    30.** The daemon cuts a longer hold to five and says nothing about having done
+    it, so a countdown longer than five seconds asks an operator about a panel
+    that is already dark. Whatever builds an interface on this route may not count
+    past that number; the constant lives in `ors_schema.link`, both ends import
+    that one symbol, and its docstring is the whole argument.
 
     **One probe at a time per rack** (spec 6.4), which is `one_probe_at_a_time`
     and lives here rather than in the hub: it is a rule about a *bus*, and the
@@ -690,6 +676,18 @@ async def probe_panel(request: Request, daemon_id: int, body: ProbeBody) -> Prob
     `ok: false` is a **200**. The rack answered; the answer is no. The statuses
     are for the questions this server could not get answered at all -- see
     `detect_panels` for the 503/504/502 split, which is the same one.
+
+    **A 409 here does not mean what `send_command`'s does, and that is a
+    divergence worth naming.** `send_command` two functions up answers 409 for a
+    rack that is *not connected*; this route and `detect_panels` answer **503**
+    for that same condition,
+    and this route keeps 409 for the one thing a retry in a moment really does
+    fix -- a probe already in flight. 503 is the better status for an absent rack
+    (it is this server saying the upstream it needs is not there, and `Retry-After`
+    is meaningful for it) but changing `send_command` is a break in a shipped
+    route and belongs to whoever is willing to version it. Until then an interface
+    handling `POST /api/daemons/{id}/*` cannot read 409 by itself: it has to know
+    which route it asked.
     """
     state = request.app.state
     with closing(state.database.connect()) as connection:
@@ -729,6 +727,17 @@ def one_probe_at_a_time(state: State, daemon_id: int) -> Iterator[None]:
     every worker sharing that bus is held off it. Two at once on one rack is two
     inits interleaved on one bus, which is M2's defect returning by another road.
 
+    **What this guard is exactly: one probe in flight *from this server*.** It is
+    not "one probe on that bus", and the difference is `PROBE_TIMEOUT`. The slot
+    is released when this process stops waiting -- fifteen seconds -- and not when
+    the rack stops holding the bus, so a rack that has not replied by then frees
+    the slot here while it may still be mid-hold, and the next probe is admitted
+    into that. The same gap opens sideways: the set lives on `app.state`, so two
+    server processes in front of one rack would each admit a probe. **The real
+    interlock is the daemon's own bus guard**, which serialises them at the
+    hardware; this is the half that can answer the second caller with a sentence
+    instead of a silence, and that is all it claims.
+
     Kept as a set of rack ids on `app.state` rather than a lock, because the
     answer to the second caller is a **refusal with a reason** and not a queue. A
     lock would leave the second operator waiting out the first one's hold and
@@ -765,7 +774,8 @@ def one_probe_at_a_time(state: State, daemon_id: int) -> Iterator[None]:
         raise HTTPException(
             status_code=409,
             detail=f"daemon {daemon_id} is already probing a panel, and a probe holds that "
-            f"rack's SPI bus for up to {MAX_HOLD_S:g}s. Wait for it to finish and try again",
+            f"rack's SPI bus for up to {PROBE_HOLD_BUDGET:g}s. Wait for it to finish "
+            "and try again",
         )
     probing.add(daemon_id)
     try:

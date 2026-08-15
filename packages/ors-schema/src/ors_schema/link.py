@@ -500,10 +500,49 @@ magnitude past that and still short enough that the server's bounded wait for
 the reply can outlast it -- ten minutes, which is what an unbounded `hold_s`
 invited, is a request whose answer nobody is left to hear.
 
-The daemon bounds it again with the number it can actually afford. Both exist on
-purpose: this end owns what the *message* may say, and the Pi owns what its own
-panels can be asked for, which is the same division `MAX_REQUESTED_FPS` and
-`ors_daemon.frames.MAX_FPS` already draw.
+The number a rack will actually honour is `PROBE_HOLD_BUDGET` below, and the two
+are different facts: **this one says what may be asked for, that one says what is
+given.** A request between them is truncated rather than refused.
+"""
+
+PROBE_HOLD_BUDGET = 5.0
+"""How long a probe really holds a panel lit, in seconds. The *effective* bound.
+
+`MAX_PROBE_HOLD_S` above is the **wire** bound -- what a `ProbeRequest` may ask
+for. This is what a rack honours: `ors_daemon.supervisor._capped_hold` cuts a
+longer request down to it, and **`ProbeResult` carries no field saying it did**.
+The two numbers are two different facts and both are needed, which is the same
+division `MAX_REQUESTED_FPS` and `ors_daemon.frames.MAX_FPS` already draw.
+
+**It lives here because it has two ends and no one owner.** The daemon cuts at
+it; the server refuses a `hold_s` past it at the edge, where there is still
+somebody to tell. Written down twice, lowering one copy is a rack that lights a
+panel for two seconds while an interface counts down five -- the operator looks
+up at second three, sees dark glass, and answers "no, nothing lit" about wiring
+that is fine. That is a wrong answer about hardware assembled from two correct
+components, and one symbol is what stops it: `ors_daemon.supervisor` and
+`ors_server.api.daemons` both import *this* name, and neither restates the
+number. This module imports neither of them, so the dependency runs one way.
+
+**Five, and the ceiling is a shutdown rather than a person's patience.**
+`ors_daemon.supervisor.probe` holds `_shutdown_lock` and the bus guard for the
+whole hold, so every kept worker is frozen on its last frame and a SIGTERM
+landing meanwhile waits it out -- `stop` blocks on that same lock and only takes
+its own deadline once it has it. That time is *additive* with the daemon's
+`SHUTDOWN_BUDGET` of ten and the CLI's `LINK_JOIN_TIMEOUT` of three, plus the
+apply budget a probe can land behind: about nineteen seconds against the shipped
+unit's `TimeoutStopSec=30`. Thirty here would be about forty-four, which is a
+SIGKILL with four GC9A01s still lit until somebody pulls the power. Waiting on
+the stop event rather than sleeping does not rescue it, and the docstring on
+`ors_daemon.supervisor.probe` says why.
+
+**The floor is a human looking at a shelf and saying "that one"**, which takes a
+second or two; the daemon's own `identify --hold` is in the same units for the
+same purpose. Five is comfortably past that, and one panel is probed at a time,
+so nobody is walking a rack inside it.
+
+It must stay under `MAX_PROBE_HOLD_S`, and `test_link.py` says so: a budget above
+the wire bound would be a number no message could ever ask for.
 """
 
 MAX_PROBE_ERROR = 512

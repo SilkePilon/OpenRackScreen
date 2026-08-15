@@ -20,11 +20,9 @@ entirely would pass against it.
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import inspect
 import json
-import textwrap
 from contextlib import closing
 
 import httpx2
@@ -32,9 +30,21 @@ import pytest
 from fastapi import FastAPI
 from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
+from ors_schema import link
 from ors_schema.link import MAX_REQUEST_ID, DetectResult, PanelCandidate, ProbeResult
 from ors_server.api import daemons
 from ors_server.app import AppSettings, create_app
+from ors_server.link.hub import SEND_TIMEOUT
+
+# The AST checks the two rules below are read with, taken from the sweep that
+# owns them rather than copied. A second copy is a second thing to keep true:
+# `test_api_routes.py`'s `writes` reads an f-string's leading text and treats a
+# statement it cannot see as a write, and the copy that stood here did neither --
+# so a route this file swore wrote nothing could have been believed by the weaker
+# of two checkers with the same name. Imported by path because the suite runs
+# with `--import-mode=importlib`, under which a bare `test_api_routes` is not a
+# module name.
+from server.tests.test_api_routes import opens_a_change, writes
 
 DETECT_PATH = "/api/daemons/{daemon_id}/detect"
 PROBE_PATH = "/api/daemons/{daemon_id}/probe"
@@ -345,7 +355,7 @@ def test_a_rack_that_answers_the_other_question_is_not_reported_as_a_result(clie
             return ProbeResult(request_id=asked["request_id"], ok=True)
         return DetectResult(request_id=asked["request_id"], panels=[])
 
-    Rack(client.app, daemon_id, reply=crossed)
+    rack = Rack(client.app, daemon_id, reply=crossed)
 
     detected = client.post(detect_of(daemon_id))
     probed = client.post(probe_of(daemon_id), json=WIRING)
@@ -354,6 +364,15 @@ def test_a_rack_that_answers_the_other_question_is_not_reported_as_a_result(clie
     assert probed.status_code == 502
     assert "probe_result" in detected.json()["detail"]
     assert "detect_result" in probed.json()["detail"]
+
+    # And the rack is still probeable afterwards: the 502 is composed outside the
+    # `with`, so the guard has already released -- the fourth release path, and
+    # the only one the three named release tests do not reach. Held instead, a
+    # rack running one build ahead of this server would refuse every later probe
+    # until a restart, which is the wrong rack to take out of service.
+    rack.reply = answering()
+
+    assert client.post(probe_of(daemon_id), json=WIRING).status_code == 200
 
 
 def test_a_question_for_a_daemon_that_does_not_exist_is_a_404(client):
@@ -505,17 +524,30 @@ def test_a_probe_may_not_ask_for_a_hold_the_rack_would_silently_cut(client, daem
 
 
 def test_the_longest_hold_this_route_takes_is_the_one_the_rack_will_really_give(client, daemon_id):
-    """5.0 is accepted and reaches the rack unchanged. The number is stated here
-    rather than imported: `ors-server` may not import `ors-daemon`, so the two
-    ends agree by being written down at both, exactly as `MAX_SCREEN_NAME` is."""
+    """The bound is accepted, reaches the rack unchanged, and is **the same symbol
+    the daemon cuts with**.
+
+    `ors-server` may not import `ors-daemon`, so a number written down at both
+    ends could only ever be restated here -- and nothing would have failed if
+    `PROBE_HOLD_BUDGET` were lowered: the daemon would cut at the new value, this
+    route would still accept five, and the operator would again be told a hold
+    that is not the one honoured. That is the direction the bound exists to close,
+    so the constant lives in `ors_schema.link`, which both ends depend on and
+    neither is.
+
+    Identity rather than equality, deliberately: `MAX_HOLD_S = 5.0` written here
+    again would satisfy `==` and would drift the next time the number moves.
+    `daemon/tests/test_hardware.py` asserts the other half of the pair.
+    """
     rack = Rack(client.app, daemon_id)
 
-    assert daemons.MAX_HOLD_S == 5.0
+    assert daemons.PROBE_HOLD_BUDGET is link.PROBE_HOLD_BUDGET
+    assert daemons.PROBE_TIMEOUT == link.PROBE_HOLD_BUDGET + 2 * SEND_TIMEOUT
 
-    answer = client.post(probe_of(daemon_id), json={**WIRING, "hold_s": daemons.MAX_HOLD_S})
+    answer = client.post(probe_of(daemon_id), json={**WIRING, "hold_s": link.PROBE_HOLD_BUDGET})
 
     assert answer.status_code == 200
-    assert rack.questions("probe")[0]["hold_s"] == 5.0
+    assert rack.questions("probe")[0]["hold_s"] == link.PROBE_HOLD_BUDGET
 
 
 @pytest.mark.parametrize("field", ["bus", "cs", "dc", "rst", "hz", "hold_s"])
@@ -637,65 +669,3 @@ def endpoint(app: FastAPI, path: str):
         if (context.path or context.original_route.path) == path:
             return context.original_route.endpoint
     raise AssertionError(f"no route matches {path}")
-
-
-WRITING_STATEMENTS = ("insert", "update", "delete", "replace", "create", "drop", "alter")
-
-
-def opens_a_change(function: object) -> bool:
-    """Whether this function really opens `async with change(...)`.
-
-    Parsed rather than grepped, for the reason `test_api_routes.py` gives: this
-    module's routes *discuss* the rule in their docstrings, and a substring
-    search over the source is a check they pass by talking about it.
-    """
-    for node in ast.walk(_tree(function)):
-        if not isinstance(node, ast.AsyncWith):
-            continue
-        for item in node.items:
-            call = item.context_expr
-            if isinstance(call, ast.Call) and _called(call.func) == "change":
-                return True
-    return False
-
-
-def writes(function: object) -> bool:
-    """Whether this function executes a statement that changes a row. A statement
-    that cannot be read statically counts as a write."""
-    for node in ast.walk(_tree(function)):
-        if not isinstance(node, ast.Call) or _called(node.func) != "execute":
-            continue
-        if not node.args:
-            return True
-        statement = node.args[0]
-        if not isinstance(statement, ast.Constant) or not isinstance(statement.value, str):
-            return True
-        head = statement.value.strip().split(None, 1)
-        if head and head[0].lower() in WRITING_STATEMENTS:
-            return True
-    return False
-
-
-def _tree(function: object) -> ast.AST:
-    return ast.parse(textwrap.dedent(inspect.getsource(function)))
-
-
-def _called(func: ast.expr) -> str | None:
-    if isinstance(func, ast.Attribute):
-        return func.attr
-    if isinstance(func, ast.Name):
-        return func.id
-    return None
-
-
-def test_the_write_check_reads_the_statement_rather_than_the_method():
-    """`execute` is how every read reaches SQLite here too, so the verb decides."""
-
-    def reads(connection) -> None:  # noqa: ANN001 - a stand-in
-        connection.execute("SELECT id FROM daemon WHERE id = ?", (3,))
-
-    def writes_a_row(connection) -> None:  # noqa: ANN001
-        connection.execute("UPDATE daemon SET name = 'x' WHERE id = ?", (3,))
-
-    assert writes(reads) is False
-    assert writes(writes_a_row) is True
