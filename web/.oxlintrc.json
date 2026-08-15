@@ -13,16 +13,27 @@
   },
   "overrides": [
     {
-      // These three files each export a non-component alongside a component,
-      // and none of them are ours to edit: button.tsx and sidebar.tsx are
-      // shadcn CLI output, and theme-provider.tsx is shadcn's dark-mode recipe
-      // that the brief mandates verbatim. Scoped off here rather than repo-wide
-      // so a hand-written file still gets the rule.
-      "files": [
-        "src/components/ui/button.tsx",
-        "src/components/ui/sidebar.tsx",
-        "src/theme/theme-provider.tsx"
-      ],
+      // `src/components/ui` is shadcn CLI output in its entirety -- the global
+      // constraint is that components are added with `pnpm dlx shadcn@latest
+      // add` and never hand-written here -- and a great many of those files
+      // export a variants object beside their component (button, badge, table,
+      // sheet, toggle, sonner). The rule exists to protect Fast Refresh in a
+      // file a human maintains, so in this directory it is unactionable by
+      // construction: the only way to satisfy it is to edit generated code the
+      // next `add` overwrites. Off for the directory, and one file at a time
+      // was the same decision made three times with more churn.
+      "files": ["src/components/ui/**"],
+      "rules": {
+        "react/only-export-components": "off"
+      }
+    },
+    {
+      // Its own entry, and deliberately not folded into the one above: this is
+      // not CLI output but shadcn's dark-mode recipe that the brief mandates
+      // verbatim, so it is exempt for a different reason and stops being exempt
+      // if that mandate ever lifts. A hand-written file anywhere else -- any
+      // component of ours outside `components/ui` -- still gets the rule.
+      "files": ["src/theme/theme-provider.tsx"],
       "rules": {
         "react/only-export-components": "off"
       }

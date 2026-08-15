@@ -1,4 +1,4 @@
-import { screen, within } from "@testing-library/react"
+import { screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { http, HttpResponse } from "msw"
 import { describe, expect, it } from "vitest"
@@ -164,6 +164,38 @@ describe("the racks", () => {
     expect(again.getByRole("textbox", { name: /name/i })).toBeInTheDocument()
     expect(again.queryByText(TOKEN)).not.toBeInTheDocument()
     expect(document.body).not.toHaveTextContent(TOKEN)
+  })
+
+  it("keeps the typed name when the server refuses it as a duplicate", async () => {
+    server.use(
+      SIGNED_IN,
+      // The name really is taken, which is the case the route refuses.
+      listing([rack({ id: 42, name: "pi-rack" })]),
+      NO_EVENTS,
+      http.post("/api/daemons", () =>
+        HttpResponse.json({ detail: "a daemon named 'pi-rack' exists" }, { status: 409 }),
+      ),
+    )
+    renderApp({ at: "/daemons" })
+
+    await userEvent.click(await screen.findByRole("button", { name: "Pair a rack" }))
+    const named = await screen.findByRole("textbox", { name: /name/i })
+    await userEvent.type(named, "pi-rack")
+    await userEvent.click(screen.getByRole("button", { name: "Mint the pairing token" }))
+
+    const dialog = within(await screen.findByRole("dialog"))
+    expect(await dialog.findByRole("alert")).toHaveTextContent(
+      "a daemon named 'pi-rack' exists",
+    )
+    // The promise this dialog makes about a refusal: what was typed is still
+    // where it was, so the fix is one edit away rather than a re-type. The name
+    // lives in form state for exactly this -- `useMutate` invalidates on settle
+    // and no refetch can reach it.
+    expect(dialog.getByRole("textbox", { name: /name/i })).toHaveValue("pi-rack")
+    expect(named).toHaveValue("pi-rack")
+    // And nothing was minted, so nothing is claiming to be a token.
+    expect(dialog.queryByText(/only time it is shown/i)).not.toBeInTheDocument()
+    expect(dialog.getByRole("button", { name: "Mint the pairing token" })).toBeInTheDocument()
   })
 
   it("reports delivered honestly when a push reached nobody", async () => {
@@ -347,6 +379,124 @@ describe("the racks", () => {
     expect(dialog.getByText(/cannot be undone/i)).toBeInTheDocument()
   })
 
+  it("deletes the rack it named, and the card goes with it", async () => {
+    // Two racks, so "it deleted a rack" and "it deleted *this* rack" are
+    // different outcomes. 42 is the one confirmed; 17 must survive it.
+    const racks = [rack({ id: 17, name: "pi-loft" }), rack({ id: 42, name: "pi-cellar" })]
+    const deleted: number[] = []
+    server.use(
+      SIGNED_IN,
+      // The row really goes, so the list after the delete is the list the
+      // invalidation asks for and not a fixture that pretends.
+      http.get("/api/daemons", () =>
+        HttpResponse.json(racks.filter((each) => !deleted.includes(each.id))),
+      ),
+      NO_EVENTS,
+      http.delete("/api/daemons/:daemon_id", ({ params }) => {
+        deleted.push(Number(params.daemon_id))
+        // What the route really answers: the default 200 carrying the id it
+        // removed. No route in M3a answers 204, this one included.
+        return HttpResponse.json({ deleted: Number(params.daemon_id) })
+      }),
+    )
+    renderApp({ at: "/daemons" })
+
+    expect(await screen.findByRole("heading", { name: "pi-cellar" })).toBeInTheDocument()
+    await userEvent.click(card("pi-cellar").getByRole("button", { name: "Delete" }))
+    await userEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", {
+        name: "Delete the rack",
+      }),
+    )
+
+    // Gone from the page, because `invalidates: [daemonsKey]` asked the server
+    // again rather than patching the list here.
+    await waitFor(() =>
+      expect(screen.queryByRole("heading", { name: "pi-cellar" })).not.toBeInTheDocument(),
+    )
+    // The id that was on the wire, and it is the rack the confirmation named --
+    // not 17, the other row, and not 1, which is what an array index or a
+    // count-shaped body would have said.
+    expect(deleted).toEqual([42])
+    expect(screen.getByRole("heading", { name: "pi-loft" })).toBeInTheDocument()
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+  })
+
+  it("closes a confirmed delete even when the list cannot be re-read", async () => {
+    // The delete lands and the refetch behind it does not. `invalidateQueries`
+    // swallows a query's rejection, so the mutation still succeeds, the list
+    // keeps the rows it last read -- and the deleted rack's card is therefore
+    // still on the page. It is the one success in which nothing unmounts the
+    // dialog, so it is the only state that can tell `onSuccess: () =>
+    // setOpen(false)` from its absence: without it the confirmation stays up,
+    // asking again about a rack that is already gone, and pressing it a second
+    // time earns a 404.
+    const deleted: number[] = []
+    server.use(
+      SIGNED_IN,
+      http.get("/api/daemons", () => {
+        if (deleted.length > 0) {
+          return HttpResponse.json({ detail: "the database is locked" }, { status: 500 })
+        }
+        return HttpResponse.json([
+          rack({ id: 17, name: "pi-loft" }),
+          rack({ id: 42, name: "pi-cellar" }),
+        ])
+      }),
+      NO_EVENTS,
+      http.delete("/api/daemons/:daemon_id", ({ params }) => {
+        deleted.push(Number(params.daemon_id))
+        return HttpResponse.json({ deleted: Number(params.daemon_id) })
+      }),
+    )
+    renderApp({ at: "/daemons" })
+
+    expect(await screen.findByRole("heading", { name: "pi-cellar" })).toBeInTheDocument()
+    await userEvent.click(card("pi-cellar").getByRole("button", { name: "Delete" }))
+    await userEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", {
+        name: "Delete the rack",
+      }),
+    )
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    expect(deleted).toEqual([42])
+    // The card the dialog belonged to is still drawn, from the last list that
+    // could be read -- so what closed the dialog was the answer, not an unmount.
+    expect(screen.getByRole("heading", { name: "pi-cellar" })).toBeInTheDocument()
+    expect(await screen.findByText("the database is locked")).toBeInTheDocument()
+  })
+
+  it("leaves a refused delete on screen, in the server's own words", async () => {
+    server.use(
+      SIGNED_IN,
+      listing([rack({ id: 17, name: "pi-loft" }), rack({ id: 42, name: "pi-cellar" })]),
+      NO_EVENTS,
+      // What another tab having already deleted it looks like from here. The
+      // sentence is the route's own (`missing=f"no daemon {daemon_id}"`), and
+      // the interface has none of its own to invent.
+      http.delete("/api/daemons/:daemon_id", () =>
+        HttpResponse.json({ detail: "no daemon 42" }, { status: 404 }),
+      ),
+    )
+    renderApp({ at: "/daemons" })
+
+    expect(await screen.findByRole("heading", { name: "pi-cellar" })).toBeInTheDocument()
+    await userEvent.click(card("pi-cellar").getByRole("button", { name: "Delete" }))
+    await userEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", {
+        name: "Delete the rack",
+      }),
+    )
+
+    // Still up, still asking, with the reason in it. A dialog that dismissed
+    // itself here would leave the rack on the page and nothing saying why.
+    const dialog = within(await screen.findByRole("dialog"))
+    expect(await dialog.findByRole("alert")).toHaveTextContent("no daemon 42")
+    expect(dialog.getByRole("button", { name: "Delete the rack" })).toBeInTheDocument()
+    expect(dialog.getByRole("heading", { name: "Delete pi-cellar?" })).toBeInTheDocument()
+  })
+
   it("labels the event list as recent, not as history", async () => {
     const asks: string[] = []
     server.use(
@@ -393,15 +543,22 @@ describe("the racks", () => {
     expect(loft.queryByRole("heading", { name: /history/i })).not.toBeInTheDocument()
     expect(loft.queryByText(/history/i)).not.toBeInTheDocument()
 
-    // And it asks for a recent slice, of this rack. Bounded by the ring the
-    // label promises: a panel that asked for more rows than a rack can hold
-    // would be a panel drawing everything and calling it recent, and one that
-    // asked for none of a named rack would be drawing somebody else's.
+    // And it asks for a recent slice, of this rack. Both bounds are the label's
+    // own promise rather than the server's: `limit` is accepted anywhere in
+    // 1..500, and "a glance at what just happened" lives in a much narrower
+    // band than that.
+    //
+    //   * At most a quarter of the ring. 200 is everything a rack can hold, so
+    //     asking for it is drawing the whole ring into a card and calling it
+    //     recent -- which is the panel this label exists to not be.
+    //   * At least a few rows. A flapping rack spends two events per reconnect,
+    //     so a limit of one or two is a panel that shows a disconnect with the
+    //     connect that explains it already pushed off the end.
     const asked = new URL(asks[0]).searchParams
     expect(asked.get("daemon_id")).toBe("17")
     const limit = Number(asked.get("limit"))
-    expect(limit).toBeGreaterThanOrEqual(1)
-    expect(limit).toBeLessThanOrEqual(200)
+    expect(limit).toBeGreaterThanOrEqual(5)
+    expect(limit).toBeLessThanOrEqual(50)
   })
 
   it("says a rotated rack is unpaired until the new token reaches it", async () => {
