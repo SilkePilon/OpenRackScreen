@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
+import { useUnsaved } from "@/routes/screens/unsaved"
 
 type ScreenBody = components["schemas"]["ScreenBody"]
 type NightWindow = components["schemas"]["NightWindow"]
@@ -60,20 +61,12 @@ export function SleepTab({
   screen: Screen
   save: (body: ScreenBody) => void
   saving: boolean
-  /** Called before every change to this form; see `Inspector`'s `edited`. */
+  /** Called when this form starts holding an unsaved edit; see `Inspector`. */
   edited: () => void
 }) {
   const fieldId = useId()
   const field = (part: string) => `${fieldId}-${part}`
   const settings = useSettings()
-
-  /** A setter that first says the form has moved on from what was last saved. */
-  function changing<T>(set: (value: T) => void): (value: T) => void {
-    return (value: T) => {
-      edited()
-      set(value)
-    }
-  }
 
   const held = readNight(screen.sleep_override)
   const night = settings.data?.night
@@ -97,6 +90,9 @@ export function SleepTab({
 
   const wanted: NightWindow | null = overriding ? shown : null
   const moved = !same(wanted, held)
+  // The last write's notice is not an answer about a form that has moved on
+  // from it.
+  useUnsaved(moved, edited)
 
   return (
     <div className="grid gap-4 pt-4">
@@ -108,22 +104,14 @@ export function SleepTab({
 
       <div className="flex items-center justify-between gap-4">
         <Label htmlFor={field("override")}>Override for this panel</Label>
-        <Switch
-          id={field("override")}
-          checked={overriding}
-          onCheckedChange={changing(setOverriding)}
-        />
+        <Switch id={field("override")} checked={overriding} onCheckedChange={setOverriding} />
       </div>
 
       {overriding && (
         <>
           <div className="flex items-center justify-between gap-4">
             <Label htmlFor={field("enabled")}>Sleeps at all</Label>
-            <Switch
-              id={field("enabled")}
-              checked={shown.enabled}
-              onCheckedChange={changing(setEnabled)}
-            />
+            <Switch id={field("enabled")} checked={shown.enabled} onCheckedChange={setEnabled} />
           </div>
 
           <div className="grid grid-cols-2 gap-2">
@@ -133,7 +121,7 @@ export function SleepTab({
                 id={field("start")}
                 type="time"
                 value={shown.start}
-                onChange={(event) => changing(setStart)(event.target.value)}
+                onChange={(event) => setStart(event.target.value)}
               />
             </div>
             <div className="grid gap-2">
@@ -142,7 +130,7 @@ export function SleepTab({
                 id={field("end")}
                 type="time"
                 value={shown.end}
-                onChange={(event) => changing(setEnd)(event.target.value)}
+                onChange={(event) => setEnd(event.target.value)}
               />
             </div>
           </div>

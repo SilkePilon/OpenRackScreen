@@ -13,6 +13,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
+import { useUnsaved } from "@/routes/screens/unsaved"
 
 type ScreenBody = components["schemas"]["ScreenBody"]
 
@@ -125,7 +126,7 @@ export function DataTab({
   screen: Screen
   save: (body: ScreenBody) => void
   saving: boolean
-  /** Called before every change to this form; see `Inspector`'s `edited`. */
+  /** Called when this form starts holding an unsaved edit; see `Inspector`. */
   edited: () => void
 }) {
   const fieldId = useId()
@@ -147,10 +148,7 @@ export function DataTab({
     const current = effective(key, spec)
     return spec.type === "boolean" ? current === true : textOf(current)
   }
-  const set = (key: string, value: string | boolean) => {
-    edited()
-    setDraft({ ...draft, [key]: value })
-  }
+  const set = (key: string, value: string | boolean) => setDraft({ ...draft, [key]: value })
 
   /**
    * The parameters map to write, or `null` if nothing in it moved.
@@ -183,6 +181,9 @@ export function DataTab({
 
   const { params, moved } = changed()
   const readings = readingsOf(integrations.data ?? [])
+  // The last write's notice is not an answer about a form that has moved on
+  // from it.
+  useUnsaved(moved, edited)
 
   if (templates.isPending) {
     return <p className="pt-4 text-sm text-muted-foreground">Reading the templates&hellip;</p>

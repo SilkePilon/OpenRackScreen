@@ -634,30 +634,62 @@ describe("the screens page", () => {
     expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled()
   })
 
-  it("stops saying an edit landed once the form has moved on from it", async () => {
+  it("stops saying an edit landed once a form has moved on from it", async () => {
     // "Saved, and every rack was given it." is an answer about a write that has
     // happened. Left on screen while somebody edits three more boxes and walks
     // away, it is a reassurance about something else -- and the destructive
     // "not every rack was given that change" is worse, because it names racks
     // against an edit the user has since abandoned.
+    //
+    // All three tabs, because each reports this for itself: one rule, and one
+    // place per form to forget it in.
+    let rows = [WEATHER, TRAINS, KITCHEN]
+    const saved = (over: Partial<ScreenRow>) => {
+      const next = { ...KITCHEN, ...over }
+      rows = rows.map((row) => (row.id === KITCHEN.id ? next : row))
+      return HttpResponse.json(next)
+    }
     server.use(
-      ...reading([WEATHER, TRAINS, KITCHEN]),
+      SIGNED_IN,
+      http.get("/api/daemons", () => HttpResponse.json(RACKS)),
+      // Answering the row as it now is, which is what makes each form clean
+      // again after its own write -- and the state in which the notice is the
+      // only thing on screen saying anything about that write.
+      http.get("/api/screens", () => HttpResponse.json(rows)),
       ...INSPECTING,
-      http.patch("/api/screens/:screen_id", () => HttpResponse.json({ ...KITCHEN, hflip: true })),
     )
     const rig = mountScreens()
     await rig.connect()
-
     await userEvent.click(await screen.findByRole("button", { name: "Kitchen" }))
+
+    // Config: saved from the switch, forgotten by the name box.
+    server.use(http.patch("/api/screens/:screen_id", () => saved({ hflip: true })))
     await userEvent.click(await screen.findByRole("switch", { name: "Horizontal flip" }))
     await userEvent.click(screen.getByRole("button", { name: "Save changes" }))
     expect(await screen.findByText(/every rack was given it/i)).toBeInTheDocument()
+    await userEvent.type(screen.getByRole("textbox", { name: "Name" }), "!")
+    expect(screen.queryByText(/every rack was given it/i)).not.toBeInTheDocument()
 
-    // The next edit, in another tab of the same inspector, so this is not the
-    // notice merely being scoped to the form that wrote it.
+    // Data: saved from a param, forgotten by another param.
+    server.use(
+      http.patch("/api/screens/:screen_id", () => saved({ params: { title: "Hallway" } })),
+    )
+    await userEvent.click(screen.getByRole("tab", { name: "Data" }))
+    const title = await screen.findByRole("textbox", { name: "Title" })
+    await userEvent.clear(title)
+    await userEvent.type(title, "Hallway")
+    await userEvent.click(screen.getByRole("button", { name: "Save changes" }))
+    expect(await screen.findByText(/every rack was given it/i)).toBeInTheDocument()
+    await userEvent.click(screen.getByRole("switch", { name: "Dimmed" }))
+    expect(screen.queryByText(/every rack was given it/i)).not.toBeInTheDocument()
+
+    // Sleep: saved by handing the window back, forgotten by taking one again.
+    server.use(http.patch("/api/screens/:screen_id", () => saved({ sleep_override: null })))
     await userEvent.click(screen.getByRole("tab", { name: "Sleep" }))
     await userEvent.click(await screen.findByRole("switch", { name: "Override for this panel" }))
-
+    await userEvent.click(screen.getByRole("button", { name: "Save changes" }))
+    expect(await screen.findByText(/every rack was given it/i)).toBeInTheDocument()
+    await userEvent.click(screen.getByRole("switch", { name: "Override for this panel" }))
     expect(screen.queryByText(/every rack was given it/i)).not.toBeInTheDocument()
   })
 

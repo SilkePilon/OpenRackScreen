@@ -140,21 +140,23 @@ function ScreenInspector({ screen, racks }: { screen: Screen; racks: Daemon[] })
   const save = (body: ScreenBody) => patch.mutate(body)
 
   /**
-   * Forget what the last write said, because the form has moved on from it.
+   * Forget what the last write said, because a form has moved on from it.
    *
    * "Saved, and every rack was given it" is true of an edit that has happened,
-   * and stops being an answer to anything the moment somebody types the next
+   * and stops being an answer to anything the moment somebody makes the next
    * one: a person who renames a panel, is told it saved, then changes their mind
    * and edits three more boxes is looking at a reassurance about a write that no
    * longer describes what is on the screen -- and the destructive "not every
    * rack was given that change" is worse, because it names racks against an edit
-   * the user has already left behind. Every tab calls this before it changes
-   * anything.
+   * the user has since abandoned.
+   *
+   * Each tab reports this through `useUnsaved`, from the same fact that decides
+   * whether its Save button is enabled, so there is one place per form rather
+   * than one per control.
    *
    * Guarded on the mutation being settled: `reset()` on an idle mutation still
-   * dispatches, so an unguarded call would re-render the inspector on every
-   * keystroke, and calling it on a *pending* one would throw away the result of
-   * a write that is still in flight.
+   * dispatches a re-render for nothing, and calling it on a *pending* one would
+   * throw away the outcome of a write that is still in flight.
    */
   const edited = () => {
     if (patch.isSuccess || patch.isError) patch.reset()

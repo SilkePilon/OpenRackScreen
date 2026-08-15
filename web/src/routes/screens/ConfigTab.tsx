@@ -13,6 +13,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
+import { useUnsaved } from "@/routes/screens/unsaved"
 
 type ScreenBody = components["schemas"]["ScreenBody"]
 type DisplayConfig = components["schemas"]["DisplayConfig"]
@@ -150,7 +151,7 @@ export function ConfigTab({
   screen: Screen
   save: (body: ScreenBody) => void
   saving: boolean
-  /** Called before every change to this form; see `Inspector`'s `edited`. */
+  /** Called when this form starts holding an unsaved edit; see `Inspector`. */
   edited: () => void
 }) {
   const fieldId = useId()
@@ -164,18 +165,6 @@ export function ConfigTab({
   const [hflip, setHflip] = useState(screen.hflip)
   const [enabled, setEnabled] = useState(screen.enabled)
   const [wiring, setWiring] = useState(() => readWiring(screen.display))
-
-  /** A setter that first says the form has moved on from what was last saved. */
-  function changing<T>(set: (value: T) => void): (value: T) => void {
-    return (value: T) => {
-      edited()
-      set(value)
-    }
-  }
-
-  /** One field of the wiring, the rest of it as it was. */
-  const wire = <K extends keyof Wiring>(part: K, value: Wiring[K]) =>
-    changing(setWiring)({ ...wiring, [part]: value })
 
   // What the server last said, which is what "changed" is measured against.
   // Recomputed rather than remembered from the first render: after a save the
@@ -209,6 +198,9 @@ export function ConfigTab({
 
   const body = changes()
   const nothingToSave = Object.keys(body).length === 0
+  // The last write's notice is not an answer about a form that has moved on
+  // from it.
+  useUnsaved(!nothingToSave, edited)
 
   // The template this screen names may not be in the list: a template deleted
   // from another tab is a screen the server then refuses to build a snapshot
@@ -221,11 +213,7 @@ export function ConfigTab({
     <div className="grid gap-4 pt-4">
       <div className="grid gap-2">
         <Label htmlFor={field("name")}>Name</Label>
-        <Input
-          id={field("name")}
-          value={name}
-          onChange={(event) => changing(setName)(event.target.value)}
-        />
+        <Input id={field("name")} value={name} onChange={(event) => setName(event.target.value)} />
       </div>
 
       <div className="grid gap-2">
@@ -235,7 +223,7 @@ export function ConfigTab({
           type="number"
           min={1}
           value={position}
-          onChange={(event) => changing(setPosition)(event.target.value)}
+          onChange={(event) => setPosition(event.target.value)}
         />
         <p className="text-xs text-muted-foreground">
           {positionOf(position) === null
@@ -250,7 +238,7 @@ export function ConfigTab({
 
       <div className="grid gap-2">
         <Label htmlFor={field("template")}>Template</Label>
-        <Select value={template} onValueChange={changing(setTemplate)}>
+        <Select value={template} onValueChange={setTemplate}>
           <SelectTrigger id={field("template")}>
             <SelectValue />
           </SelectTrigger>
@@ -268,7 +256,7 @@ export function ConfigTab({
         <Label htmlFor={field("rotation")}>Rotation</Label>
         <Select
           value={String(rotation)}
-          onValueChange={(next) => changing(setRotation)(rotationFrom(next))}
+          onValueChange={(next) => setRotation(rotationFrom(next))}
         >
           <SelectTrigger id={field("rotation")}>
             <SelectValue />
@@ -289,12 +277,12 @@ export function ConfigTab({
 
       <div className="flex items-center justify-between gap-4">
         <Label htmlFor={field("hflip")}>Horizontal flip</Label>
-        <Switch id={field("hflip")} checked={hflip} onCheckedChange={changing(setHflip)} />
+        <Switch id={field("hflip")} checked={hflip} onCheckedChange={setHflip} />
       </div>
 
       <div className="flex items-center justify-between gap-4">
         <Label htmlFor={field("enabled")}>Enabled</Label>
-        <Switch id={field("enabled")} checked={enabled} onCheckedChange={changing(setEnabled)} />
+        <Switch id={field("enabled")} checked={enabled} onCheckedChange={setEnabled} />
       </div>
 
       <div className="grid gap-3 rounded-md border p-3">
@@ -304,7 +292,9 @@ export function ConfigTab({
           <Label htmlFor={field("backend")}>Backend</Label>
           <Select
             value={wiring.backend}
-            onValueChange={(next) => wire("backend", next === "virtual" ? "virtual" : "gc9a01")}
+            onValueChange={(next) =>
+              setWiring({ ...wiring, backend: next === "virtual" ? "virtual" : "gc9a01" })
+            }
           >
             <SelectTrigger id={field("backend")}>
               <SelectValue />
@@ -323,7 +313,7 @@ export function ConfigTab({
               id={field("bus")}
               type="number"
               value={wiring.spi_bus}
-              onChange={(event) => wire("spi_bus", event.target.value)}
+              onChange={(event) => setWiring({ ...wiring, spi_bus: event.target.value })}
             />
           </div>
           <div className="grid gap-2">
@@ -332,7 +322,7 @@ export function ConfigTab({
               id={field("cs")}
               type="number"
               value={wiring.spi_cs}
-              onChange={(event) => wire("spi_cs", event.target.value)}
+              onChange={(event) => setWiring({ ...wiring, spi_cs: event.target.value })}
             />
           </div>
           <div className="grid gap-2">
@@ -341,7 +331,7 @@ export function ConfigTab({
               id={field("dc")}
               type="number"
               value={wiring.dc}
-              onChange={(event) => wire("dc", event.target.value)}
+              onChange={(event) => setWiring({ ...wiring, dc: event.target.value })}
             />
           </div>
           <div className="grid gap-2">
@@ -350,7 +340,7 @@ export function ConfigTab({
               id={field("rst")}
               type="number"
               value={wiring.rst}
-              onChange={(event) => wire("rst", event.target.value)}
+              onChange={(event) => setWiring({ ...wiring, rst: event.target.value })}
             />
           </div>
         </div>
@@ -361,7 +351,7 @@ export function ConfigTab({
             id={field("hz")}
             type="number"
             value={wiring.hz}
-            onChange={(event) => wire("hz", event.target.value)}
+            onChange={(event) => setWiring({ ...wiring, hz: event.target.value })}
           />
         </div>
 
@@ -370,7 +360,7 @@ export function ConfigTab({
           <Input
             id={field("out")}
             value={wiring.out_dir}
-            onChange={(event) => wire("out_dir", event.target.value)}
+            onChange={(event) => setWiring({ ...wiring, out_dir: event.target.value })}
           />
         </div>
 
