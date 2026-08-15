@@ -101,6 +101,112 @@ export function useEvents(daemonId: number) {
   })
 }
 
+/** One panel, as `GET /api/screens` reports it. Generated, never written here. */
+export type Screen = components["schemas"]["ScreenView"]
+
+/**
+ * Every rack's screens, on one key.
+ *
+ * One entry rather than one per rack, because the route that reorders them can
+ * name more than one rack's screens in a single call -- `POST
+ * /api/screens/reorder` reads the affected set from the rows -- so an
+ * invalidation would have to guess which per-rack entries a write touched. The
+ * list is a handful of rows; the page groups it by rack itself.
+ */
+export const screensKey = ["screens"] as const
+
+/**
+ * The screens, in the order the server puts them.
+ *
+ * `ORDER BY position, id`, server-side, and this hook does not re-sort. The
+ * tiebreak matters: two panels sharing a position is a state the schema allows,
+ * and it is the same tiebreak `snapshot._screens` uses, so what the canvas draws
+ * and what the rack renders are in the same order. A client sorting by id would
+ * draw a rack nobody wired.
+ */
+export function useScreens() {
+  return useQuery<Screen[]>({
+    queryKey: screensKey,
+    queryFn: async () => {
+      const { data, error, response } = await api.GET("/api/screens")
+      if (!data) {
+        throw new ApiError(response.status, detailFrom(error) ?? "the screens could not be read")
+      }
+      return data
+    },
+  })
+}
+
+/** One template, as `GET /api/templates` reports it. */
+export type Template = components["schemas"]["TemplateView"]
+
+/** What one of a template's parameters is, and what an editor should offer for it. */
+export type ParamSpec = components["schemas"]["ParamSpec"]
+
+/** The templates. Not per rack: a template is the server's, and any screen may name one. */
+export const templatesKey = ["templates"] as const
+
+export function useTemplates() {
+  return useQuery<Template[]>({
+    queryKey: templatesKey,
+    queryFn: async () => {
+      const { data, error, response } = await api.GET("/api/templates")
+      if (!data) {
+        throw new ApiError(response.status, detailFrom(error) ?? "the templates could not be read")
+      }
+      return data
+    },
+  })
+}
+
+/**
+ * One integration, as `GET /api/integrations` reports it.
+ *
+ * There is no credential field at all: `has_credential` is a boolean, so the
+ * interface can say one is stored and offer to replace it without the plaintext
+ * ever travelling.
+ */
+export type Integration = components["schemas"]["IntegrationView"]
+
+/** Per rack, because a screen can only bind to readings its own rack polls. */
+export const integrationsKey = (daemonId: number) => ["integrations", daemonId] as const
+
+export function useIntegrations(daemonId: number) {
+  return useQuery<Integration[]>({
+    queryKey: integrationsKey(daemonId),
+    queryFn: async () => {
+      const { data, error, response } = await api.GET("/api/integrations", {
+        params: { query: { daemon_id: daemonId } },
+      })
+      if (!data) {
+        throw new ApiError(
+          response.status,
+          detailFrom(error) ?? "the integrations could not be read",
+        )
+      }
+      return data
+    },
+  })
+}
+
+/** The server's own settings: the timezone and the night window a screen overrides. */
+export type Settings = components["schemas"]["SettingsView"]
+
+export const settingsKey = ["settings"] as const
+
+export function useSettings() {
+  return useQuery<Settings>({
+    queryKey: settingsKey,
+    queryFn: async () => {
+      const { data, error, response } = await api.GET("/api/settings")
+      if (!data) {
+        throw new ApiError(response.status, detailFrom(error) ?? "the settings could not be read")
+      }
+      return data
+    },
+  })
+}
+
 export type Session = {
   authenticated: boolean
   password_set: boolean

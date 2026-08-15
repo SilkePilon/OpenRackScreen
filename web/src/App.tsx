@@ -8,6 +8,7 @@ import { AppShell } from "@/components/AppShell"
 import { RequireSession } from "@/routes/RequireSession"
 import { DaemonsPage } from "@/routes/daemons/DaemonsPage"
 import { LoginPage } from "@/routes/login/LoginPage"
+import { ScreensPage } from "@/routes/screens/ScreensPage"
 import { SetupPage } from "@/routes/setup/SetupPage"
 
 // The pages themselves arrive in later tasks; the routes exist now so the guard
@@ -89,7 +90,7 @@ function App() {
       >
         <Route index element={<Navigate to="/daemons" replace />} />
         <Route path="/daemons" element={<DaemonsPage />} />
-        <Route path="/screens" element={<Placeholder title="Screens" />} />
+        <Route path="/screens" element={<ScreensPage />} />
         <Route path="/templates" element={<Placeholder title="Templates" />} />
         <Route path="/integrations" element={<Placeholder title="Integrations" />} />
         <Route path="/settings" element={<Placeholder title="Settings" />} />
