@@ -139,6 +139,27 @@ function ScreenInspector({ screen, racks }: { screen: Screen; racks: Daemon[] })
   const saved = patch.data
   const save = (body: ScreenBody) => patch.mutate(body)
 
+  /**
+   * Forget what the last write said, because the form has moved on from it.
+   *
+   * "Saved, and every rack was given it" is true of an edit that has happened,
+   * and stops being an answer to anything the moment somebody types the next
+   * one: a person who renames a panel, is told it saved, then changes their mind
+   * and edits three more boxes is looking at a reassurance about a write that no
+   * longer describes what is on the screen -- and the destructive "not every
+   * rack was given that change" is worse, because it names racks against an edit
+   * the user has already left behind. Every tab calls this before it changes
+   * anything.
+   *
+   * Guarded on the mutation being settled: `reset()` on an idle mutation still
+   * dispatches, so an unguarded call would re-render the inspector on every
+   * keystroke, and calling it on a *pending* one would throw away the result of
+   * a write that is still in flight.
+   */
+  const edited = () => {
+    if (patch.isSuccess || patch.isError) patch.reset()
+  }
+
   return (
     <Card role="region" aria-labelledby={headingId} className="gap-3">
       <CardHeader className="gap-1">
@@ -179,13 +200,13 @@ function ScreenInspector({ screen, racks }: { screen: Screen; racks: Daemon[] })
             <TabsTrigger value="sleep">Sleep</TabsTrigger>
           </TabsList>
           <TabsContent value="config">
-            <ConfigTab screen={screen} save={save} saving={patch.isPending} />
+            <ConfigTab screen={screen} save={save} saving={patch.isPending} edited={edited} />
           </TabsContent>
           <TabsContent value="data">
-            <DataTab screen={screen} save={save} saving={patch.isPending} />
+            <DataTab screen={screen} save={save} saving={patch.isPending} edited={edited} />
           </TabsContent>
           <TabsContent value="sleep">
-            <SleepTab screen={screen} save={save} saving={patch.isPending} />
+            <SleepTab screen={screen} save={save} saving={patch.isPending} edited={edited} />
           </TabsContent>
         </Tabs>
 

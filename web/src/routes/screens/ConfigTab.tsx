@@ -76,6 +76,25 @@ function readWiring(display: Screen["display"]): Wiring {
   }
 }
 
+/**
+ * The position the box asks for, or `null` because it asks for none.
+ *
+ * `Number("")` is `0` and `Number.isFinite(0)` is true, which is the third time
+ * this project has been bitten by that pair: an emptied box read as a number is
+ * a request to move the panel to position 0, which `ScreenBody.position`
+ * (`ge=1`) refuses. An empty box is not an edit -- exactly as an empty pin box
+ * is "not set" rather than GPIO 0 -- and neither is a box holding something a
+ * `type="number"` input normalises to nothing (`e`, `-`, `1.5e`).
+ *
+ * Integers only, for the same reason: `Number("2.5")` is finite and is not a
+ * position, and the server would answer 422 for it.
+ */
+function positionOf(text: string): number | null {
+  if (text.trim() === "") return null
+  const value = Number(text)
+  return Number.isInteger(value) ? value : null
+}
+
 /** An empty box means the schema's own default, and never zero by accident. */
 function digitsOr(text: string, fallback: number): number {
   const value = Number(text)
@@ -126,10 +145,13 @@ export function ConfigTab({
   screen,
   save,
   saving,
+  edited,
 }: {
   screen: Screen
   save: (body: ScreenBody) => void
   saving: boolean
+  /** Called before every change to this form; see `Inspector`'s `edited`. */
+  edited: () => void
 }) {
   const fieldId = useId()
   const field = (part: string) => `${fieldId}-${part}`
@@ -142,6 +164,18 @@ export function ConfigTab({
   const [hflip, setHflip] = useState(screen.hflip)
   const [enabled, setEnabled] = useState(screen.enabled)
   const [wiring, setWiring] = useState(() => readWiring(screen.display))
+
+  /** A setter that first says the form has moved on from what was last saved. */
+  function changing<T>(set: (value: T) => void): (value: T) => void {
+    return (value: T) => {
+      edited()
+      set(value)
+    }
+  }
+
+  /** One field of the wiring, the rest of it as it was. */
+  const wire = <K extends keyof Wiring>(part: K, value: Wiring[K]) =>
+    changing(setWiring)({ ...wiring, [part]: value })
 
   // What the server last said, which is what "changed" is measured against.
   // Recomputed rather than remembered from the first render: after a save the
@@ -162,8 +196,9 @@ export function ConfigTab({
   function changes(): ScreenBody {
     const body: ScreenBody = {}
     if (name !== screen.name) body.name = name
-    const wanted = Number(position)
-    if (position !== String(screen.position) && Number.isFinite(wanted)) body.position = wanted
+    // An unreadable or empty box asks for nothing rather than for position 0.
+    const wanted = positionOf(position)
+    if (wanted !== null && wanted !== screen.position) body.position = wanted
     if (template !== screen.template) body.template = template
     if (rotation !== screen.rotation) body.rotation = rotation
     if (hflip !== screen.hflip) body.hflip = hflip
@@ -186,7 +221,11 @@ export function ConfigTab({
     <div className="grid gap-4 pt-4">
       <div className="grid gap-2">
         <Label htmlFor={field("name")}>Name</Label>
-        <Input id={field("name")} value={name} onChange={(event) => setName(event.target.value)} />
+        <Input
+          id={field("name")}
+          value={name}
+          onChange={(event) => changing(setName)(event.target.value)}
+        />
       </div>
 
       <div className="grid gap-2">
@@ -196,17 +235,22 @@ export function ConfigTab({
           type="number"
           min={1}
           value={position}
-          onChange={(event) => setPosition(event.target.value)}
+          onChange={(event) => changing(setPosition)(event.target.value)}
         />
         <p className="text-xs text-muted-foreground">
-          Where this panel sits from the left. The arrows under the rack renumber the whole rack at
-          once, which is the safer way to move one.
+          {positionOf(position) === null
+            ? `${
+                position.trim() === "" ? "Empty" : "Not a whole number"
+              }, so this panel keeps the position it has. The arrows under the rack renumber the ` +
+              "whole rack at once, which is the safer way to move one."
+            : "Where this panel sits from the left. The arrows under the rack renumber the whole " +
+              "rack at once, which is the safer way to move one."}
         </p>
       </div>
 
       <div className="grid gap-2">
         <Label htmlFor={field("template")}>Template</Label>
-        <Select value={template} onValueChange={setTemplate}>
+        <Select value={template} onValueChange={changing(setTemplate)}>
           <SelectTrigger id={field("template")}>
             <SelectValue />
           </SelectTrigger>
@@ -224,7 +268,7 @@ export function ConfigTab({
         <Label htmlFor={field("rotation")}>Rotation</Label>
         <Select
           value={String(rotation)}
-          onValueChange={(next) => setRotation(rotationFrom(next))}
+          onValueChange={(next) => changing(setRotation)(rotationFrom(next))}
         >
           <SelectTrigger id={field("rotation")}>
             <SelectValue />
@@ -245,12 +289,12 @@ export function ConfigTab({
 
       <div className="flex items-center justify-between gap-4">
         <Label htmlFor={field("hflip")}>Horizontal flip</Label>
-        <Switch id={field("hflip")} checked={hflip} onCheckedChange={setHflip} />
+        <Switch id={field("hflip")} checked={hflip} onCheckedChange={changing(setHflip)} />
       </div>
 
       <div className="flex items-center justify-between gap-4">
         <Label htmlFor={field("enabled")}>Enabled</Label>
-        <Switch id={field("enabled")} checked={enabled} onCheckedChange={setEnabled} />
+        <Switch id={field("enabled")} checked={enabled} onCheckedChange={changing(setEnabled)} />
       </div>
 
       <div className="grid gap-3 rounded-md border p-3">
@@ -260,9 +304,7 @@ export function ConfigTab({
           <Label htmlFor={field("backend")}>Backend</Label>
           <Select
             value={wiring.backend}
-            onValueChange={(next) =>
-              setWiring({ ...wiring, backend: next === "virtual" ? "virtual" : "gc9a01" })
-            }
+            onValueChange={(next) => wire("backend", next === "virtual" ? "virtual" : "gc9a01")}
           >
             <SelectTrigger id={field("backend")}>
               <SelectValue />
@@ -281,7 +323,7 @@ export function ConfigTab({
               id={field("bus")}
               type="number"
               value={wiring.spi_bus}
-              onChange={(event) => setWiring({ ...wiring, spi_bus: event.target.value })}
+              onChange={(event) => wire("spi_bus", event.target.value)}
             />
           </div>
           <div className="grid gap-2">
@@ -290,7 +332,7 @@ export function ConfigTab({
               id={field("cs")}
               type="number"
               value={wiring.spi_cs}
-              onChange={(event) => setWiring({ ...wiring, spi_cs: event.target.value })}
+              onChange={(event) => wire("spi_cs", event.target.value)}
             />
           </div>
           <div className="grid gap-2">
@@ -299,7 +341,7 @@ export function ConfigTab({
               id={field("dc")}
               type="number"
               value={wiring.dc}
-              onChange={(event) => setWiring({ ...wiring, dc: event.target.value })}
+              onChange={(event) => wire("dc", event.target.value)}
             />
           </div>
           <div className="grid gap-2">
@@ -308,7 +350,7 @@ export function ConfigTab({
               id={field("rst")}
               type="number"
               value={wiring.rst}
-              onChange={(event) => setWiring({ ...wiring, rst: event.target.value })}
+              onChange={(event) => wire("rst", event.target.value)}
             />
           </div>
         </div>
@@ -319,7 +361,7 @@ export function ConfigTab({
             id={field("hz")}
             type="number"
             value={wiring.hz}
-            onChange={(event) => setWiring({ ...wiring, hz: event.target.value })}
+            onChange={(event) => wire("hz", event.target.value)}
           />
         </div>
 
@@ -328,7 +370,7 @@ export function ConfigTab({
           <Input
             id={field("out")}
             value={wiring.out_dir}
-            onChange={(event) => setWiring({ ...wiring, out_dir: event.target.value })}
+            onChange={(event) => wire("out_dir", event.target.value)}
           />
         </div>
 

@@ -38,8 +38,49 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Where a validation error's `loc` starts, and what it is worth reading out.
+ *
+ * FastAPI prefixes every `loc` with the part of the request the value came from
+ * -- `["body", "display", "dc"]` -- which is true and says nothing to somebody
+ * looking at a form: every field on every page of this interface is in the body.
+ * The head is dropped so the path reads as the field, and only when there is a
+ * field left to name: a `loc` of `["body"]` alone is a refusal of the whole
+ * document, and "body" is then the most this can honestly say about where.
+ */
+const REQUEST_PARTS = new Set(["body", "query", "path", "header", "cookie"]);
+
+/**
+ * One entry of a validation report as a line a person can act on.
+ *
+ * `msg` is passed through exactly as pydantic wrote it, including its
+ * `Value error, ` prefix. Rewriting it would mean this interface deciding what
+ * the server meant, and the sentences it produces -- "a gc9a01 display needs dc
+ * and rst" -- are already the rule stated by the model that enforces it.
+ */
+function validationLine(entry: unknown): string | null {
+  if (typeof entry !== "object" || entry === null) return null;
+  const { loc, msg } = entry as { loc?: unknown; msg?: unknown };
+  if (typeof msg !== "string" || msg.length === 0) return null;
+  const parts = Array.isArray(loc)
+    ? loc
+        .filter((part): part is string | number => typeof part === "string" || typeof part === "number")
+        .map(String)
+    : [];
+  if (parts.length > 1 && REQUEST_PARTS.has(parts[0])) parts.shift();
+  const where = parts.join(".");
+  return where === "" ? msg : `${where}: ${msg}`;
+}
+
 // FastAPI's refusals are `{"detail": "..."}`; a 422 is `{"detail": [ ... ]}`,
-// which is a validation report and not a sentence, so only a string is taken.
+// which is a validation report rather than a sentence. Both are read here,
+// because every validation refusal the server gives is the list shape and a
+// caller that only understood the string one had nothing to show but a generic
+// apology -- on forms whose whole subject is which value is wrong. The report is
+// rendered as `field: message` lines, joined; anything that is neither shape --
+// a proxy's HTML, a `detail` of `null`, a list of things with no `msg` -- is
+// `null`, and the caller's own sentence stands.
+//
 // The generated types only describe 200 and 422 -- the other statuses are not in
 // the OpenAPI document -- so this reads the body defensively rather than
 // trusting a type the server never promised.
@@ -47,6 +88,12 @@ export function detailFrom(error: unknown): string | null {
   if (typeof error === "object" && error !== null && "detail" in error) {
     const detail = (error as { detail: unknown }).detail;
     if (typeof detail === "string" && detail.length > 0) return detail;
+    if (Array.isArray(detail)) {
+      const lines = detail
+        .map(validationLine)
+        .filter((line): line is string => line !== null);
+      if (lines.length > 0) return lines.join("; ");
+    }
   }
   return null;
 }

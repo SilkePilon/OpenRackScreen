@@ -496,7 +496,13 @@ describe("saving something, and being told which rack did not get it", () => {
 
     await waitFor(() => expect(result.current.rename.error).toBeInstanceOf(ApiError))
     const refusal = result.current.rename.error as ApiError
-    expect(refusal.message).toMatch(/refus|not saved/i)
+    // The field and the reason, not the generic apology this used to fall
+    // through to. A validation report is the *only* shape a schema refusal
+    // takes -- `DisplayConfig`'s two rules are a `model_validator` -- so a
+    // client that could only read a string detail answered "the server refused
+    // the change" to every one of them, on forms whose whole subject is which
+    // value is wrong.
+    expect(refusal.message).toBe("name: string too short")
     expect(refusal.message).not.toMatch(/object Object|undefined/)
   })
 

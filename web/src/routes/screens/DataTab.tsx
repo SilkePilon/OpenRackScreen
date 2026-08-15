@@ -66,10 +66,19 @@ function textOf(value: unknown): string {
  * of that integration's `fields`. A field that reduces to `top` answers
  * `{"node": ..., "value": ...}`, so its two halves are offered separately: a
  * binding to the field alone resolves to a dict, which draws as one.
+ *
+ * **A disabled integration publishes nothing.** `ors_daemon.config` builds
+ * pollers from the enabled integrations only, so nothing ever writes that name
+ * into `snapshot.data` -- a binding naming it would be left unresolved and the
+ * field would draw blank. Offering it here would be offering a reading this rack
+ * does not take, which is a worse answer than not offering it: the panel goes
+ * empty and nothing says why. Turning the integration back on is what makes it
+ * bindable, and that is a decision on the Integrations page.
  */
 function readingsOf(integrations: Integration[]): string[] {
   const readings: string[] = []
   for (const integration of integrations) {
+    if (!integration.enabled) continue
     const fields = integration.config.fields
     if (typeof fields !== "object" || fields === null) continue
     for (const [key, raw] of Object.entries(fields as Record<string, unknown>)) {
@@ -111,10 +120,13 @@ export function DataTab({
   screen,
   save,
   saving,
+  edited,
 }: {
   screen: Screen
   save: (body: ScreenBody) => void
   saving: boolean
+  /** Called before every change to this form; see `Inspector`'s `edited`. */
+  edited: () => void
 }) {
   const fieldId = useId()
   const templates = useTemplates()
@@ -135,7 +147,10 @@ export function DataTab({
     const current = effective(key, spec)
     return spec.type === "boolean" ? current === true : textOf(current)
   }
-  const set = (key: string, value: string | boolean) => setDraft({ ...draft, [key]: value })
+  const set = (key: string, value: string | boolean) => {
+    edited()
+    setDraft({ ...draft, [key]: value })
+  }
 
   /**
    * The parameters map to write, or `null` if nothing in it moved.

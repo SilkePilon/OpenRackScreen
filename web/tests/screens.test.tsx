@@ -53,7 +53,13 @@ function rack(id: number, name: string, online = true): Daemon {
   }
 }
 
-const RACKS = [rack(RACK, "pi-loft"), rack(OTHER_RACK, "pi-cellar")]
+// pi-cellar is **offline**, and that is load-bearing rather than colour. A panel
+// reads *offline* from the `daemons` cache entry and from the rack id it is
+// handed -- nothing else in the interface can say it -- so a canvas that passed
+// a constant rack id, or the first screen's, would draw every panel as live on
+// any fixture where every rack is online. One rack that has gone is what makes
+// the id the canvas passes observable at all.
+const RACKS = [rack(RACK, "pi-loft"), rack(OTHER_RACK, "pi-cellar", false)]
 
 /** One screen as `GET /api/screens` reports it: every field the page reads. */
 function panel(over: Partial<ScreenRow> & Pick<ScreenRow, "id" | "name" | "position">): ScreenRow {
@@ -168,8 +174,35 @@ const NIGHT = { enabled: true, start: "22:00", end: "08:00" }
 const SETTINGS = http.get("/api/settings", () =>
   HttpResponse.json({ timezone: "Europe/Amsterdam", night: NIGHT }),
 )
+/**
+ * A second integration on the same rack, switched off.
+ *
+ * A disabled integration is not polled -- `ors_daemon.config` builds pollers
+ * from the enabled ones -- so its name never appears in `snapshot.data` and a
+ * binding naming it resolves to nothing, which `expand_params` then blanks. The
+ * field it was bound to draws empty and nothing says why. So its readings must
+ * not be offered, and this fixture is what notices: without it every
+ * integration in the file is enabled and a tab that ignored the flag would be
+ * indistinguishable from one that respects it.
+ */
+const OFF_AIR: Integration = {
+  id: 9,
+  daemon_id: RACK,
+  type: "prometheus",
+  name: "spare",
+  poll_interval: 30,
+  enabled: false,
+  has_credential: false,
+  config: {
+    type: "prometheus",
+    name: "spare",
+    url: "http://spare.example:9090",
+    fields: { disk: { query: "node_filesystem_free", reduce: "scalar" } },
+  },
+}
+
 const TEMPLATES = http.get("/api/templates", () => HttpResponse.json([RING_GAUGE, BIG_NUMBER]))
-const INTEGRATIONS = http.get("/api/integrations", () => HttpResponse.json([PROM]))
+const INTEGRATIONS = http.get("/api/integrations", () => HttpResponse.json([PROM, OFF_AIR]))
 
 /** Every route the page reads before anything is selected. */
 function reading(screens: ScreenRow[]) {
@@ -513,6 +546,17 @@ describe("the screens page", () => {
     expect(drawn("pi-loft")).toEqual([12, 13, 11])
     expect(drawn("pi-cellar")).toEqual([27])
 
+    // Each panel is told which rack it is on, and pi-cellar's is gone. Said
+    // here because this is the only fixture with two racks in different states:
+    // a canvas handing every panel a constant rack id -- the first screen's,
+    // say -- draws Doorbell as live, and no assertion anywhere else in this
+    // file could tell the difference.
+    expect(screen.getByTestId("panel-27")).toHaveAttribute("data-state", "offline")
+    expect(within(screen.getByTestId("panel-27")).getByText("Offline")).toBeInTheDocument()
+    for (const id of [11, 12, 13]) {
+      expect(screen.getByTestId(`panel-${id}`)).not.toHaveAttribute("data-state", "offline")
+    }
+
     await userEvent.click(canvasOf("pi-loft").getByRole("button", { name: "Move Trains left" }))
 
     // Rack 8's screens, all of them, and nothing belonging to rack 42.
@@ -529,16 +573,26 @@ describe("the screens page", () => {
     // look at.
     let patched: unknown = null
     let patchedId: string | undefined
+    // The list the server would answer *after* the write, which is the state
+    // this page has to end up drawing. A PATCH that invalidated nothing leaves
+    // the canvas and the inspector heading saying "Kitchen" for ever, and --
+    // because "changed" is measured against the row the page holds -- leaves
+    // Save enabled, so every further press re-sends the same field, bumps
+    // `config_version` and pushes to the rack again.
+    let rows = [WEATHER, TRAINS, KITCHEN]
     server.use(
-      ...reading([WEATHER, TRAINS, KITCHEN]),
+      SIGNED_IN,
+      http.get("/api/daemons", () => HttpResponse.json(RACKS)),
+      http.get("/api/screens", () => HttpResponse.json(rows)),
       ...INSPECTING,
       http.patch("/api/screens/:screen_id", async ({ request, params }) => {
         patched = await request.json()
         patchedId = String(params.screen_id)
-        return HttpResponse.json(
-          { ...KITCHEN, name: "Hallway" },
-          { headers: { "X-Unservable-Daemons": `${OTHER_RACK},${UNLISTED_RACK}` } },
-        )
+        const renamed = { ...KITCHEN, name: "Hallway" }
+        rows = rows.map((row) => (row.id === KITCHEN.id ? renamed : row))
+        return HttpResponse.json(renamed, {
+          headers: { "X-Unservable-Daemons": `${OTHER_RACK},${UNLISTED_RACK}` },
+        })
       }),
     )
     const rig = mountScreens()
@@ -564,6 +618,47 @@ describe("the screens page", () => {
     // Not the rack the edited screen is on, which is the answer a page reading
     // the body instead of the header would give.
     expect(notice).not.toHaveTextContent("pi-loft")
+
+    // And the page asked the server again. The write is what makes the list
+    // stale, so the caption under the panel, the inspector's own heading and
+    // the row every tab measures "changed" against all follow the rename.
+    await waitFor(() =>
+      expect(canvasOf("pi-loft").getByRole("button", { name: "Hallway" })).toBeInTheDocument(),
+    )
+    expect(canvasOf("pi-loft").queryByRole("button", { name: "Kitchen" })).not.toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: "Hallway" })).toBeInTheDocument()
+    // The compounding half of it: with the fresh row in hand the form holds
+    // nothing unsaved, so Save goes quiet. Against a stale row it stays live and
+    // every press re-sends `{name: "Hallway"}`, bumping the rack's
+    // `config_version` and pushing a snapshot again for an edit already made.
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled()
+  })
+
+  it("stops saying an edit landed once the form has moved on from it", async () => {
+    // "Saved, and every rack was given it." is an answer about a write that has
+    // happened. Left on screen while somebody edits three more boxes and walks
+    // away, it is a reassurance about something else -- and the destructive
+    // "not every rack was given that change" is worse, because it names racks
+    // against an edit the user has since abandoned.
+    server.use(
+      ...reading([WEATHER, TRAINS, KITCHEN]),
+      ...INSPECTING,
+      http.patch("/api/screens/:screen_id", () => HttpResponse.json({ ...KITCHEN, hflip: true })),
+    )
+    const rig = mountScreens()
+    await rig.connect()
+
+    await userEvent.click(await screen.findByRole("button", { name: "Kitchen" }))
+    await userEvent.click(await screen.findByRole("switch", { name: "Horizontal flip" }))
+    await userEvent.click(screen.getByRole("button", { name: "Save changes" }))
+    expect(await screen.findByText(/every rack was given it/i)).toBeInTheDocument()
+
+    // The next edit, in another tab of the same inspector, so this is not the
+    // notice merely being scoped to the form that wrote it.
+    await userEvent.click(screen.getByRole("tab", { name: "Sleep" }))
+    await userEvent.click(await screen.findByRole("switch", { name: "Override for this panel" }))
+
+    expect(screen.queryByText(/every rack was given it/i)).not.toBeInTheDocument()
   })
 
   it("changes the template a panel draws, and sends nothing else with it", async () => {
@@ -615,6 +710,164 @@ describe("the screens page", () => {
     expect(screen.queryByText(/nothing was sent/i)).not.toBeInTheDocument()
   })
 
+  it("writes the wiring the boxes say, and an unset pin as nothing at all", async () => {
+    // The wiring is the only non-trivial logic on this page, and every part of
+    // it decides what is written to a Pi: an empty pin box is `null` -- "not
+    // set" -- and never GPIO 0. `DisplayConfig.dc` and `.rst` have no default
+    // for exactly that reason: defaulting them to 0 described a panel driving
+    // data/command and reset off GPIO0, a board that does not exist, and made
+    // `DisplayConfig(backend="gc9a01")` a valid description of nothing that
+    // failed hours later as an SPI error on the rack. An empty *clock speed*, by
+    // contrast, is the model's own 40 MHz default, because `hz` has one.
+    //
+    // Driven on the virtual backend so the document this sends is one the
+    // server accepts: `dc` and `rst` are only required by gc9a01, and this is
+    // the wiring change that legitimately clears them.
+    let patched: unknown = null
+    server.use(
+      ...reading([WEATHER, TRAINS, KITCHEN]),
+      ...INSPECTING,
+      http.patch("/api/screens/:screen_id", async ({ request }) => {
+        patched = await request.json()
+        return HttpResponse.json(TRAINS)
+      }),
+    )
+    const rig = mountScreens()
+    await rig.connect()
+
+    await userEvent.click(await screen.findByRole("button", { name: "Trains" }))
+    // The row's own wiring, narrowed out of a column the server answers as
+    // `dict[str, Any]` -- not the schema's defaults and not the panel next to it.
+    expect(await screen.findByRole("spinbutton", { name: "DC pin" })).toHaveValue(22)
+    expect(screen.getByRole("spinbutton", { name: "RST pin" })).toHaveValue(23)
+    expect(screen.getByRole("spinbutton", { name: "SPI chip select" })).toHaveValue(1)
+    expect(screen.getByRole("combobox", { name: "Backend" })).toHaveTextContent("gc9a01")
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled()
+
+    // The select first, then the text boxes: a Radix select opened immediately
+    // after an input was edited produces `act` warnings from its focus scope in
+    // this harness, which is written up in the task 8 report.
+    await userEvent.click(screen.getByRole("combobox", { name: "Backend" }))
+    await userEvent.click(screen.getByRole("option", { name: "virtual" }))
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "Output directory" }),
+      "/var/lib/ors/panels",
+    )
+    await userEvent.clear(screen.getByRole("spinbutton", { name: "DC pin" }))
+    await userEvent.clear(screen.getByRole("spinbutton", { name: "RST pin" }))
+    // Emptied, so the model's default rather than 0 Hz -- an SPI clock of zero
+    // is not a slower panel, it is a panel that never clocks a byte out.
+    await userEvent.clear(screen.getByRole("spinbutton", { name: "Clock speed" }))
+    await userEvent.clear(screen.getByRole("spinbutton", { name: "SPI bus" }))
+    await userEvent.type(screen.getByRole("spinbutton", { name: "SPI bus" }), "1")
+
+    await userEvent.click(screen.getByRole("button", { name: "Save changes" }))
+
+    // The exact document, and only it. `display` is one column and one model, so
+    // it goes whole when any part of it moves -- and nothing else the form holds
+    // goes with it.
+    await waitFor(() =>
+      expect(patched).toEqual({
+        display: {
+          backend: "virtual",
+          spi_bus: 1,
+          spi_cs: 1,
+          dc: null,
+          rst: null,
+          hz: 40_000_000,
+          out_dir: "/var/lib/ors/panels",
+        },
+      }),
+    )
+  })
+
+  it("says which wiring rule the server refused, and not that it refused", async () => {
+    // `DisplayConfig`'s two rules are a `model_validator`, so a refusal arrives
+    // as FastAPI's validation report -- `detail` is a *list*, never a sentence.
+    // A client that could only read a string detail answered "the server refused
+    // the change" here, on a form whose entire subject is which pin is soldered
+    // where. The pin numbers themselves stay unvalidated in this interface:
+    // which GPIO lines exist is a fact about the board, and the schema
+    // deliberately has no range check and no `dc != rst` rule.
+    server.use(
+      ...reading([WEATHER, TRAINS, KITCHEN]),
+      ...INSPECTING,
+      http.patch("/api/screens/:screen_id", () =>
+        HttpResponse.json(
+          {
+            detail: [
+              {
+                type: "value_error",
+                loc: ["body", "display"],
+                msg: "Value error, a gc9a01 display needs dc",
+              },
+            ],
+          },
+          { status: 422 },
+        ),
+      ),
+    )
+    const rig = mountScreens()
+    await rig.connect()
+
+    await userEvent.click(await screen.findByRole("button", { name: "Weather" }))
+    await userEvent.clear(await screen.findByRole("spinbutton", { name: "DC pin" }))
+    await userEvent.click(screen.getByRole("button", { name: "Save changes" }))
+
+    const refusal = await screen.findByRole("alert")
+    expect(refusal).toHaveTextContent("display: Value error, a gc9a01 display needs dc")
+    expect(refusal).not.toHaveTextContent(/the server refused the change/i)
+  })
+
+  it("asks for no position when the box says nothing, and for the switches it shows", async () => {
+    // `Number("")` is `0`, and `Number.isFinite(0)` is true -- the pair that has
+    // now bitten this project three times. An emptied Position box read as a
+    // number is a request to move the panel to position 0, which
+    // `ScreenBody.position` (`ge=1`) refuses with a validation report; and the
+    // `min={1}` on the input is HTML, enforced by nothing here. An empty box is
+    // not an edit.
+    let patched: unknown = null
+    server.use(
+      ...reading([WEATHER, TRAINS, KITCHEN]),
+      ...INSPECTING,
+      http.patch("/api/screens/:screen_id", async ({ request }) => {
+        patched = await request.json()
+        return HttpResponse.json({ ...WEATHER, position: 4, hflip: true, enabled: false })
+      }),
+    )
+    const rig = mountScreens()
+    await rig.connect()
+
+    await userEvent.click(await screen.findByRole("button", { name: "Weather" }))
+    const box = await screen.findByRole("spinbutton", { name: "Position" })
+    expect(box).toHaveValue(1)
+
+    await userEvent.clear(box)
+    // Nothing to save: the panel keeps the position it has, and the form says so
+    // rather than leaving somebody to find out from a 422.
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled()
+    expect(screen.getByText(/^Empty, so this panel keeps the position it has/)).toBeInTheDocument()
+
+    // And a box holding something that is not a position either. `position` is
+    // an `int` on the far end, so 2.5 is a validation report and not a place on
+    // a wall; the panel keeps the one it has and the line under the box says
+    // which of the two states it is in, because "empty" would be a lie here.
+    await userEvent.type(box, "2.5")
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled()
+    expect(
+      screen.getByText(/^Not a whole number, so this panel keeps the position it has/),
+    ).toBeInTheDocument()
+    await userEvent.clear(box)
+
+    await userEvent.type(box, "4")
+    await userEvent.click(screen.getByRole("switch", { name: "Horizontal flip" }))
+    await userEvent.click(screen.getByRole("switch", { name: "Enabled" }))
+    await userEvent.click(screen.getByRole("button", { name: "Save changes" }))
+
+    // A number, not the box's text, and the two switches as booleans.
+    await waitFor(() => expect(patched).toEqual({ position: 4, hflip: true, enabled: false }))
+  })
+
   it("gives one panel its own night window, and hands it back", async () => {
     // The Sleep tab. Turning the override off is `sleep_override: null`, which
     // is a change and not an absence: the route's `_columns` uses
@@ -647,8 +900,15 @@ describe("the screens page", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save changes" }))
     await waitFor(() => expect(bodies).toEqual([{ sleep_override: null }]))
 
-    // And a panel that overrides nothing gets a window of its own, from the
-    // schema's defaults rather than from the screen beside it.
+    // And a panel that overrides nothing gets a window of its own, starting
+    // from **the window it is already keeping** -- the server's 22:00/08:00,
+    // from `GET /api/settings` -- rather than from `NightWindow`'s own defaults
+    // of 23:00/07:00 or from the panel beside it, whose override is
+    // 22:30/06:15. All three are different in this fixture precisely so the
+    // assertion below can only be satisfied one way: turning the override on
+    // must change *when the panel is dark* by nothing at all, and a form that
+    // fell back to the schema would move it an hour each way without anybody
+    // asking.
     await userEvent.click(screen.getByRole("button", { name: "Weather" }))
     await userEvent.click(screen.getByRole("tab", { name: "Sleep" }))
     expect(
@@ -754,6 +1014,9 @@ describe("the screens page", () => {
       // separately -- `{{prom.cpu_hot}}` alone binds a dict, which draws as one.
       "{{prom.cpu_hot.node}}",
       "{{prom.cpu_hot.value}}",
+      // And nothing from `spare`, which is on this rack and switched off: it is
+      // never polled, so `{{spare.disk}}` would resolve to nothing and the field
+      // bound to it would silently draw blank.
     ])
     await userEvent.click(screen.getByRole("option", { name: "{{prom.cpu_hot.node}}" }))
     expect(screen.getByRole("textbox", { name: "Hint line" })).toHaveValue("{{prom.cpu_hot.node}}")

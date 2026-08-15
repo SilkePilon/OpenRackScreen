@@ -55,14 +55,25 @@ export function SleepTab({
   screen,
   save,
   saving,
+  edited,
 }: {
   screen: Screen
   save: (body: ScreenBody) => void
   saving: boolean
+  /** Called before every change to this form; see `Inspector`'s `edited`. */
+  edited: () => void
 }) {
   const fieldId = useId()
   const field = (part: string) => `${fieldId}-${part}`
   const settings = useSettings()
+
+  /** A setter that first says the form has moved on from what was last saved. */
+  function changing<T>(set: (value: T) => void): (value: T) => void {
+    return (value: T) => {
+      edited()
+      set(value)
+    }
+  }
 
   const held = readNight(screen.sleep_override)
   const night = settings.data?.night
@@ -97,14 +108,22 @@ export function SleepTab({
 
       <div className="flex items-center justify-between gap-4">
         <Label htmlFor={field("override")}>Override for this panel</Label>
-        <Switch id={field("override")} checked={overriding} onCheckedChange={setOverriding} />
+        <Switch
+          id={field("override")}
+          checked={overriding}
+          onCheckedChange={changing(setOverriding)}
+        />
       </div>
 
       {overriding && (
         <>
           <div className="flex items-center justify-between gap-4">
             <Label htmlFor={field("enabled")}>Sleeps at all</Label>
-            <Switch id={field("enabled")} checked={shown.enabled} onCheckedChange={setEnabled} />
+            <Switch
+              id={field("enabled")}
+              checked={shown.enabled}
+              onCheckedChange={changing(setEnabled)}
+            />
           </div>
 
           <div className="grid grid-cols-2 gap-2">
@@ -114,7 +133,7 @@ export function SleepTab({
                 id={field("start")}
                 type="time"
                 value={shown.start}
-                onChange={(event) => setStart(event.target.value)}
+                onChange={(event) => changing(setStart)(event.target.value)}
               />
             </div>
             <div className="grid gap-2">
@@ -123,7 +142,7 @@ export function SleepTab({
                 id={field("end")}
                 type="time"
                 value={shown.end}
-                onChange={(event) => setEnd(event.target.value)}
+                onChange={(event) => changing(setEnd)(event.target.value)}
               />
             </div>
           </div>
