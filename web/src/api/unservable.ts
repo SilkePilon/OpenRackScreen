@@ -11,8 +11,8 @@
  * (`changes.py` joins `str(id)` over a sorted set of rowids). A part that is
  * not that -- empty, a word, `-4`, `0x10`, `1e3` -- names no rack and is
  * dropped. The test is on the *text* rather than on the number, because
- * `Number` reads those last three as `0`, `16` and `1000` and
- * `Number.isInteger` agrees with all three: a parser that filtered on the
+ * `Number` reads empty as `0`, `0x10` as `16` and `1e3` as `1000`, and
+ * `Number.isInteger` agrees with all three (and with `-4`): a parser on the
  * number would answer "rack 16 did not get it" for a header that never
  * mentioned rack 16, and rack 0 exists in no database (SQLite's rowids begin
  * at 1). Every one of these is a rack somebody would be sent to go and look at.

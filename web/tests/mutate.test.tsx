@@ -458,10 +458,13 @@ describe("saving something, and being told which rack did not get it", () => {
         .catch((error: unknown) => error)
     })
 
-    // The error the caller must see is the one its own write produced. The
-    // failing refetch does not replace it, does not swallow it and does not
-    // surface as an unhandled rejection: `invalidateQueries` catches a query's
-    // rejection, so `onSettled` resolves and the mutation rethrows the 422.
+    // The error the caller must see is the one its own write produced. Note
+    // what these three lines can and cannot prove: query-core rethrows the
+    // original error unconditionally, so they would hold even if
+    // `invalidateQueries` re-threw. What is load-bearing here is the refetch
+    // count below, and the unhandled-rejection channel -- which vitest reports
+    // globally, not in this file. `invalidateQueries` catching a query's
+    // rejection is what keeps that channel quiet.
     expect(refusal).toBeInstanceOf(ApiError)
     expect((refusal as ApiError).status).toBe(422)
     expect((refusal as ApiError).message).toMatch(/does not have/)
