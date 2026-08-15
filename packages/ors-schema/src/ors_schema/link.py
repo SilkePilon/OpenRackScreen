@@ -201,7 +201,7 @@ inheriting a default that has nothing to do with a panel.
 """
 
 
-def not_a_flag(screen_id: object) -> object:
+def not_a_flag(value: object, *, what: str = "a screen id is a row id") -> object:
     """Refuse a JSON `true` where a row id belongs, on every message that carries one.
 
     `bool` is an `int` in Python and pydantic's lax mode takes it as one, so
@@ -226,10 +226,17 @@ def not_a_flag(screen_id: object) -> object:
     A validator and not `StrictInt`, because strictness would also refuse the
     `"7"` a JSON producer may legitimately send for an integer; what is wrong
     with `true` is that it is not a number at all.
+
+    `what` names the kind of number the field holds, because the rule is now
+    obeyed by fields that are not row ids: a `ProbeRequest.dc` refusing `true`
+    with "a screen id is a row id" would be a correct refusal carrying a false
+    reason, and the reason is the whole of what an operator reads out of a
+    `ValidationError`. The default is the original sentence, so every caller
+    that had one before this argument existed produces the same message.
     """
-    if isinstance(screen_id, bool):
-        raise ValueError("a screen id is a row id, not a flag")
-    return screen_id
+    if isinstance(value, bool):
+        raise ValueError(f"{what}, not a flag")
+    return value
 
 
 class Frame(_Message):
@@ -402,12 +409,260 @@ class FramesRequest(_Message):
     fps: float = Field(default=2.0, ge=0.0, le=MAX_REQUESTED_FPS, allow_inf_nan=False)
 
 
+MAX_REQUEST_ID = 64
+"""How long a correlation id either end will carry.
+
+The server mints these and the daemon echoes whatever it was given, which is
+what makes this a bound worth having: the id is the *key* of the server's table
+of waits, held there until the reply arrives or the wait expires, so its size is
+chosen by whatever the daemon sends back. A uuid4 is 32 hex digits, or 36 with
+its dashes; sixty-four leaves room for a prefix without ever meeting an honest
+id.
+
+Bounded below at 1 as well, on both the request and the reply. An empty id is
+not a correlation key: it either matches no wait at all, or -- if anything ever
+registers one under `""` -- matches whichever wait a bug put there, which is the
+failure this whole field exists to prevent.
+"""
+
+MAX_PANEL_CANDIDATES = 64
+"""How many SPI devices one `DetectResult` may name.
+
+The daemon builds this by listing `/dev/spidev*`, so its length is decided by
+the filesystem of a machine the server cannot see, and the interface renders one
+row per entry. A Pi exposes a handful -- `spi0.0`, `spi0.1` and whatever the
+overlays add -- and a rack is four panels. Sixty-four is the same order of
+magnitude past reality as `MAX_WATCHED_SCREENS`, and for the same reason: far
+enough past a rack nobody has built yet that a legitimate result never meets it.
+"""
+
+MAX_SCREEN_NAME = 64
+"""How long a `claimed_by` may be: the screen name, and nothing else.
+
+The same number the server bounds a screen name with when one is created
+(`ors_server.api.screens.MAX_NAME`), stated again rather than imported, because
+this package may not import the server and the two ends have to agree anyway. A
+name that could not have been created cannot honestly be a claim on a device.
+"""
+
+MAX_WIRING_NUMBER = 65_535
+"""The ceiling on `bus`, `cs`, `dc` and `rst` -- a bound on an integer, not on a board.
+
+Deliberately not a GPIO range. `DisplayConfig` does not validate pin numbers at
+all, and says why: which buses, chip selects and GPIO lines exist is a fact
+about one specific board, unknown to a schema that a server on another machine
+also parses. Nothing here knows better, and a probe that failed with "pin 47 is
+out of range" when the board has 54 of them would be a schema inventing hardware.
+
+What is left is the wire's own business: an int off a JSON socket is arbitrary
+precision in Python, so `{"dc": 1e400}` -- or a literal with twenty thousand
+digits -- is a number nobody wrote down as a pin, and it travels on into a
+`DisplayConfig` and from there into the database. Sixty-five thousand is past
+every numbering scheme any board uses (a Pi has 28 header GPIOs; Linux's global
+GPIO space is configured in the hundreds), so this refuses magnitudes rather
+than pins: everything inside it still reaches the hardware, which is the only
+thing that can give the real error.
+
+Bounded below at 0 for the same reason and no more: these are indices --
+`/dev/spidev<bus>.<cs>` and a GPIO line number -- and index-ness is not a fact
+about any particular rack's wiring.
+"""
+
+MAX_SPI_HZ = 2**32 - 1
+"""The ceiling on a probe's clock, and it is an ABI fact rather than a rack's.
+
+`max_speed_hz` is a 32-bit field in Linux's `spidev` ioctl, so a number past
+this cannot be asked of any SPI driver on any board -- it is not a slow clock or
+a fast one, it is not a clock. That makes it the one bound this schema can state
+about `hz` without guessing at hardware: what a *particular* panel will tolerate
+is the driver's business (the daemon's own default is 40 MHz), and a probe at a
+speed the glass cannot follow is exactly the thing the operator ran the probe to
+find out.
+
+Zero is refused because a probe has to name the speed it is proving; `spidev`
+reads a zero as "keep whatever was set", which would make the probe pass at a
+speed nobody chose and the wizard write that speed into a config.
+"""
+
+MAX_PROBE_HOLD_S = 30.0
+"""How long a probe may hold a panel lit, on the wire.
+
+This is not merely a picture on one panel. Per spec 6.3 a probe takes the same
+bus guard `apply` does, so for its whole duration every worker sharing that bus
+is held off the bus and every panel on it is frozen -- which is the price of not
+repeating M2's interleaved writes. The number therefore bounds a rack-wide
+stall, not a decoration.
+
+Thirty seconds because the thing being waited on is a human looking at a shelf
+and saying "that one", which takes a second or two; the daemon's `identify`
+takes `--hold` in the same units and for the same purpose. Thirty is an order of
+magnitude past that and still short enough that the server's bounded wait for
+the reply can outlast it -- ten minutes, which is what an unbounded `hold_s`
+invited, is a request whose answer nobody is left to hear.
+
+The daemon bounds it again with the number it can actually afford. Both exist on
+purpose: this end owns what the *message* may say, and the Pi owns what its own
+panels can be asked for, which is the same division `MAX_REQUESTED_FPS` and
+`ors_daemon.frames.MAX_FPS` already draw.
+"""
+
+MAX_PROBE_ERROR = 512
+"""How much of a failure a `ProbeResult` may carry back.
+
+The thing that lands here is an `OSError` from the SPI driver or a line from the
+daemon's own refusal, and it is shown to whoever pressed the button. A line or
+two is the whole of what is useful.
+
+It is bounded, and the daemon must truncate to it rather than trusting a driver
+to be brief, because of what an over-long one costs: the message fails to parse,
+the server drops it, the wait expires, and a probe that failed for a reason the
+daemon knew answers with a timeout instead. A refused reply is strictly worse
+than a shortened one.
+"""
+
+
+class DetectRequest(_Message):
+    """Ask a rack what SPI devices it has. Carries nothing else, because nothing else is asked.
+
+    Correlated rather than fire-and-forget, unlike `Command`: the point of it is
+    the answer, and an HTTP handler is waiting on one. `request_id` is what pairs
+    this with the `DetectResult` that comes back, and it is the server's to mint.
+    """
+
+    type: Literal["detect"] = "detect"
+    request_id: str = Field(min_length=1, max_length=MAX_REQUEST_ID)
+
+
+class PanelCandidate(BaseModel):
+    """One `/dev/spidev<bus>.<cs>` the daemon found, and who is already driving it.
+
+    Not a `_Message`: it is a member of one, it carries no `type`, and nothing
+    dispatches on it. It forbids extra fields all the same, and for a sharper
+    reason than the envelope's -- `claimed_by` is the field a probe consults
+    before it touches a device, so a daemon that sent `claimedBy` or `claimed`
+    would have every device read as *free*, and the wizard would offer an
+    operator a panel a live worker is mid-frame on. A misspelling has to be an
+    error naming the field, not a silent "nobody is using this".
+
+    There is no `dc` or `rst` here, and that is the whole shape of the feature:
+    a GC9A01 has no readable id over 4-wire SPI and the GPIO lines were chosen
+    with a screwdriver, so enumeration can say which devices exist and nothing
+    more. The operator supplies the wiring and `ProbeRequest` proves it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    bus: int = Field(ge=0, le=MAX_WIRING_NUMBER)
+    cs: int = Field(ge=0, le=MAX_WIRING_NUMBER)
+    claimed_by: str | None = Field(max_length=MAX_SCREEN_NAME)
+    """The name of the screen currently driving this device, or None when it is free.
+
+    A name and not a flag or an id, because it is read by a person choosing a
+    panel: "SPI0.1 -- CPU" answers the question the wizard actually raises, and
+    a screen id would send them to look it up.
+
+    Required, with no default, although None is a perfectly good value for it. A
+    default would make a daemon that forgot the field say the most dangerous of
+    the two answers -- "free" -- which is plausible enough that nothing
+    downstream would question it, and the probe would then take a device out
+    from under a running worker.
+    """
+
+    @field_validator("bus", "cs", mode="before")
+    @classmethod
+    def _wiring_is_a_number_not_a_flag(cls, value: object) -> object:
+        # The same rule as `ProbeRequest`'s, on the reply that populates the list
+        # the operator chooses a device from: `true` names device 1.x, which
+        # exists on a Pi, so the row would look like a device the daemon never
+        # found. See `not_a_flag`.
+        return not_a_flag(value, what="a bus or chip select is a number")
+
+
+class DetectResult(_Message):
+    """What the rack found. The reply half of `DetectRequest`."""
+
+    type: Literal["detect_result"] = "detect_result"
+    request_id: str = Field(min_length=1, max_length=MAX_REQUEST_ID)
+    panels: list[PanelCandidate] = Field(max_length=MAX_PANEL_CANDIDATES)
+    """Every SPI device the daemon can see, claimed or not.
+
+    Required rather than defaulted to empty, for `claimed_by`'s reason: a rack
+    with no SPI devices at all is a real answer, an absent field is a bug, and a
+    default makes the two indistinguishable -- the wizard would say "no panels
+    found" with equal confidence in both cases. An empty list is how a rack says
+    it found nothing.
+    """
+
+
+class ProbeRequest(_Message):
+    """Light one candidate panel with wiring the operator supplied, and hold it there.
+
+    The other half of detection: enumeration cannot discover `dc` and `rst`, so
+    this is the guess being tested, and the proof is a human seeing the glass
+    come on. Everything needed to open the device is here, because the device is
+    not in any configuration yet.
+
+    There is no `pattern` field, deliberately. The daemon paints one fixed
+    thing -- a large ordinal on a coloured field, the same as `identify` draws --
+    because a pattern arriving from the wire is a rendering instruction the
+    daemon would have to validate before it obeyed, and there is nothing about it
+    an operator needs to choose.
+    """
+
+    type: Literal["probe"] = "probe"
+    request_id: str = Field(min_length=1, max_length=MAX_REQUEST_ID)
+    bus: int = Field(ge=0, le=MAX_WIRING_NUMBER)
+    cs: int = Field(ge=0, le=MAX_WIRING_NUMBER)
+    dc: int = Field(ge=0, le=MAX_WIRING_NUMBER)
+    rst: int = Field(ge=0, le=MAX_WIRING_NUMBER)
+    hz: int = Field(ge=1, le=MAX_SPI_HZ)
+    # `allow_inf_nan=False` as well as the two bounds, exactly as `fps` has it
+    # and for the reason written there: either bound refuses a NaN on its own,
+    # because every comparison against one is False, but what must be rejected
+    # is the infinity and the not-a-number rather than the range -- and an edit
+    # that loosened the range, on the argument that the daemon bounds this
+    # anyway, would otherwise quietly take the other rejection with it.
+    hold_s: float = Field(ge=0.0, le=MAX_PROBE_HOLD_S, allow_inf_nan=False)
+    """Seconds to leave the pattern up. Zero is allowed: a script does not look.
+
+    See `MAX_PROBE_HOLD_S` for what the upper bound is protecting, which is every
+    other panel on that bus.
+    """
+
+    @field_validator("bus", "cs", "dc", "rst", "hz", mode="before")
+    @classmethod
+    def _wiring_is_a_number_not_a_flag(cls, value: object) -> object:
+        # Every one of these takes `true` as 1 without this, and 1 is a
+        # plausible value for all five: bus 1 and chip select 1 exist on a Pi,
+        # GPIO1 is a real line, and 1 Hz is inside the clock's range. So the
+        # probe would open some *other* device, or reset some other pin, and
+        # report honestly on whatever it lit. See `not_a_flag`.
+        return not_a_flag(value, what="a bus, chip select, pin or clock is a number")
+
+
+class ProbeResult(_Message):
+    """Whether the daemon could drive that wiring, and what stopped it if not.
+
+    `ok` is genuinely a flag here -- the one field on these messages that is --
+    and it means "the device opened and the pattern was written", never "the
+    operator saw it". Only the person in front of the rack can answer that, which
+    is why the wizard asks them afterwards rather than trusting this.
+    """
+
+    type: Literal["probe_result"] = "probe_result"
+    request_id: str = Field(min_length=1, max_length=MAX_REQUEST_ID)
+    ok: bool
+    error: str | None = Field(default=None, max_length=MAX_PROBE_ERROR)
+    """Why it failed, in the driver's words, or None. Defaulted because success has none."""
+
+
 DaemonMessage = Annotated[
-    Hello | Heartbeat | Ack | Nack | SourceStatus | Frame | LogLine,
+    Hello | Heartbeat | Ack | Nack | SourceStatus | Frame | LogLine | DetectResult | ProbeResult,
     Field(discriminator="type"),
 ]
 ServerMessage = Annotated[
-    ConfigPush | Command | FramesRequest | Paired, Field(discriminator="type")
+    ConfigPush | Command | FramesRequest | Paired | DetectRequest | ProbeRequest,
+    Field(discriminator="type"),
 ]
 
 _daemon_adapter: TypeAdapter[DaemonMessage] = TypeAdapter(DaemonMessage)

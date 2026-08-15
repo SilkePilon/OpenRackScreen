@@ -5,12 +5,21 @@ import pytest
 from ors_schema.daemon import DaemonConfig
 from ors_schema.link import (
     MAX_FRAME_BYTES,
+    MAX_PANEL_CANDIDATES,
+    MAX_PROBE_ERROR,
+    MAX_PROBE_HOLD_S,
+    MAX_REQUEST_ID,
     MAX_REQUESTED_FPS,
+    MAX_SCREEN_NAME,
+    MAX_SPI_HZ,
     MAX_WATCHED_SCREENS,
+    MAX_WIRING_NUMBER,
     PROTOCOL_VERSION,
     Ack,
     Command,
     ConfigPush,
+    DetectRequest,
+    DetectResult,
     Frame,
     FramesRequest,
     Heartbeat,
@@ -18,6 +27,9 @@ from ors_schema.link import (
     LogLine,
     Nack,
     Paired,
+    PanelCandidate,
+    ProbeRequest,
+    ProbeResult,
     SourceStatus,
     parse_daemon_message,
     parse_server_message,
@@ -300,6 +312,8 @@ DAEMON_MESSAGES = [
     SourceStatus(integration="prom", state="ok"),
     Frame(screen_id=1, seq=1, webp=REAL_WEBP),
     LogLine(level="info", message="hello"),
+    DetectResult(request_id="r-a", panels=[PanelCandidate(bus=3, cs=1, claimed_by="CPU")]),
+    ProbeResult(request_id="r-b", ok=True),
 ]
 
 
@@ -315,6 +329,8 @@ def test_every_daemon_message_parses_back_to_its_own_class(message):
         Command(command="sleep", screen_id=2),
         FramesRequest(enabled=True, screen_ids=[1], fps=1.0),
         Paired(daemon_id=3, key="a-key"),
+        DetectRequest(request_id="r-c"),
+        ProbeRequest(request_id="r-d", bus=2, cs=3, dc=25, rst=27, hz=16_000_000, hold_s=2.5),
     ],
     ids=lambda m: m.type,
 )
@@ -409,6 +425,8 @@ def test_the_link_models_are_reachable_from_the_package_root():
         "Command",
         "ConfigPush",
         "DaemonMessage",
+        "DetectRequest",
+        "DetectResult",
         "Frame",
         "FramesRequest",
         "Heartbeat",
@@ -416,6 +434,9 @@ def test_the_link_models_are_reachable_from_the_package_root():
         "LogLine",
         "Nack",
         "Paired",
+        "PanelCandidate",
+        "ProbeRequest",
+        "ProbeResult",
         "ServerMessage",
         "SourceStatus",
         "parse_daemon_message",
@@ -598,3 +619,509 @@ def test_a_screen_id_of_one_still_parses_on_both_messages():
     """The value the bug aliased to. Refusing it would be the same bug inverted."""
     assert Frame(screen_id=1, seq=1, webp=b"x").screen_id == 1
     assert Command(command="identify", screen_id=1).screen_id == 1
+
+
+def test_a_detect_result_names_what_is_already_claimed():
+    result = DetectResult(
+        request_id="r1",
+        panels=[
+            PanelCandidate(bus=0, cs=0, claimed_by="CPU"),
+            PanelCandidate(bus=1, cs=1, claimed_by=None),
+        ],
+    )
+    assert result.panels[1].claimed_by is None
+
+
+def test_a_probe_names_the_wiring_it_is_proving():
+    probe = ProbeRequest(request_id="r2", bus=1, cs=0, dc=4, rst=27, hz=16_000_000, hold_s=3.0)
+    assert probe.hold_s == 3.0
+
+
+def test_a_probe_may_not_hold_a_bus_for_ever():
+    with pytest.raises(ValidationError):
+        ProbeRequest(request_id="r3", bus=0, cs=0, dc=25, rst=27, hz=16_000_000, hold_s=600.0)
+
+
+def test_a_request_id_is_bounded_like_every_other_string_off_the_wire():
+    with pytest.raises(ValidationError):
+        DetectRequest(request_id="x" * 1000)
+
+
+def test_a_flag_is_not_a_bus():
+    # The defect this project has now fixed three times: `true` coerces to 1.
+    with pytest.raises(ValidationError):
+        ProbeRequest(request_id="r4", bus=True, cs=0, dc=25, rst=27, hz=16_000_000, hold_s=1.0)
+
+
+# Every number distinct from every other and from every list index, because the
+# whole content of these messages is which number went where: a probe built with
+# `bus=0, cs=0, dc=0` would light the right panel however badly the fields were
+# crossed. `cs=3` is not a chip select any stock Pi has, which is the point --
+# nothing here may be quietly reinterpreted as a plausible default.
+WIRING = {"bus": 2, "cs": 3, "dc": 25, "rst": 27, "hz": 16_000_000}
+
+
+def probe(**overrides: object) -> ProbeRequest:
+    return ProbeRequest(request_id="rq", **{**WIRING, "hold_s": 2.5, **overrides})
+
+
+def test_a_probe_carries_each_number_to_its_own_field():
+    """The fields are only useful if they stay apart, and nothing else checks that.
+
+    Five integers in a row, four of which the daemon hands straight to a device
+    it then writes to. A transposed `dc` and `rst` is a panel that resets on
+    every command byte; a transposed `bus` and `cs` opens a different device
+    entirely. So the fixture uses five different numbers and this asserts all
+    five, rather than trusting a constructor to be a constructor.
+    """
+    parsed = parse_server_message(probe().model_dump_json())
+
+    assert isinstance(parsed, ProbeRequest)
+    assert (parsed.bus, parsed.cs, parsed.dc, parsed.rst) == (2, 3, 25, 27)
+    assert parsed.hz == 16_000_000
+    assert parsed.hold_s == 2.5
+
+
+@pytest.mark.parametrize("field", ["bus", "cs", "dc", "rst", "hz"])
+def test_no_number_on_a_probe_may_arrive_as_a_flag(field: str):
+    """`true` is 1, and 1 is a *plausible* value for every one of these.
+
+    That is what makes this worse here than on a screen id, where the aliased row
+    at least belongs to some screen. SPI bus 1 and chip select 1 exist on a Pi,
+    GPIO1 is a real line, and 1 Hz is inside the clock's range -- so a probe
+    carrying a flag opens a real device, drives a real pin and reports success on
+    whatever it happened to light. The operator then writes that wiring down.
+    """
+    with pytest.raises(ValidationError) as refused:
+        probe(**{field: True})
+
+    assert "flag" in str(refused.value)
+    assert "screen id" not in str(refused.value), "the reason has to name the field's kind"
+    # Off the wire as well as in Python, which is how it really arrives.
+    wire = json.dumps({"type": "probe", "request_id": "rq", "hold_s": 1.0, **WIRING, field: True})
+    with pytest.raises(ValidationError):
+        parse_server_message(wire)
+
+
+@pytest.mark.parametrize("field", ["bus", "cs"])
+def test_no_number_on_a_candidate_may_arrive_as_a_flag_either(field: str):
+    """The reply half carries the same kind of number and takes the same lie.
+
+    A candidate whose `bus` arrived as `true` names device 1.x in a list the
+    wizard is about to offer, and the operator picks a row that describes a
+    device the daemon never found.
+    """
+    with pytest.raises(ValidationError):
+        PanelCandidate(**{"bus": 2, "cs": 3, "claimed_by": None, field: True})
+
+
+def test_a_screen_id_still_refuses_a_flag_in_the_words_it_always_used():
+    """The shared validator grew an argument; the message it had must not move.
+
+    `not_a_flag` is called from three places outside this module, one of them a
+    request body in the server's API, and its sentence is what an operator reads
+    out of the 422. Adding a reason for pin fields must not reword the one that
+    was already there.
+    """
+    with pytest.raises(ValidationError) as refused:
+        Frame(screen_id=True, seq=1, webp=b"x")
+
+    assert "a screen id is a row id, not a flag" in str(refused.value)
+
+
+@pytest.mark.parametrize("hold", ["NaN", "Infinity", "-Infinity"])
+def test_a_hold_that_is_not_a_number_does_not_parse_off_the_wire(hold: str):
+    """The same family as `fps: NaN`, on a field that stops a rack rather than a stream.
+
+    A `hold_s` of infinity is a probe that never ends, and per spec 6.3 a probe
+    holds every worker on that bus off the bus for its whole duration -- so it is
+    a rack frozen with one panel showing an ordinal, and nothing to time it out.
+    NaN is worse for being quiet: every `<` a timer writes against it is False.
+
+    The assertion is on the error's *type*, and that is the whole of what
+    distinguishes this from the range check sitting next to it. `ge` and `le`
+    refuse all three on their own -- every comparison against NaN is False -- so
+    a bare `pytest.raises` passes whether `allow_inf_nan=False` is there or not,
+    and dropping it changes nothing any test could see. Measured: it survives.
+    `finite_number` is the error only the explicit setting produces, and it is
+    what makes the difference visible now rather than on the day someone drops
+    `le` because the spec says the daemon bounds this anyway.
+    """
+    wire = json.dumps({"type": "probe", "request_id": "rq", **WIRING})
+    with pytest.raises(ValidationError) as refused:
+        parse_server_message(f'{wire[:-1]}, "hold_s": {hold}}}')
+
+    assert [(e["type"], e["loc"]) for e in refused.value.errors()] == [
+        ("finite_number", ("probe", "hold_s"))
+    ]
+
+
+def test_a_hold_below_nothing_is_not_a_duration():
+    with pytest.raises(ValidationError):
+        probe(hold_s=-0.5)
+
+
+def test_a_probe_may_hold_for_no_time_at_all():
+    """`--hold 0` is what the daemon's own `identify` gives a script, and this is
+    the same request from a test harness: paint it, prove the device opened, move
+    on. Refusing zero would make the schema stricter than the tool it mirrors."""
+    assert probe(hold_s=0.0).hold_s == 0.0
+
+
+def test_the_longest_hold_a_server_may_ask_for_still_parses_and_one_past_it_does_not():
+    assert probe(hold_s=MAX_PROBE_HOLD_S).hold_s == MAX_PROBE_HOLD_S
+
+    with pytest.raises(ValidationError):
+        probe(hold_s=MAX_PROBE_HOLD_S + 0.5)
+
+
+def test_the_bound_on_a_hold_is_seconds_and_not_minutes():
+    """The one absolute assertion about this number, for the reason the frame
+    bound has one: every other test spends it relatively, so it could drift to
+    ten minutes without a single failure.
+
+    It bounds a rack-wide stall, not a picture. Thirty seconds is an order of
+    magnitude past a person looking at a shelf and saying "that one", and short
+    enough that the server's bounded wait for the reply outlasts the probe -- a
+    hold longer than the wait is a question whose answer nobody is left to hear.
+    """
+    assert MAX_PROBE_HOLD_S == 30.0
+
+
+def test_the_other_numbers_these_messages_are_bounded_by_are_the_ones_they_claim():
+    """The rest of the absolute assertions, for the reason the hold bound has one.
+
+    Every other test here spends these constants relatively -- `MAX + 1` must
+    fail, `MAX` must parse -- which stays true at any value, so each of these
+    could be loosened by an order of magnitude with the suite still green.
+    Measured: raising all four in turn failed nothing before this test existed.
+
+    Each is a claim about something outside this file, which is what makes them
+    checkable at all rather than taste.
+    """
+    # 32 bits because `spidev`'s `max_speed_hz` ioctl field is 32 bits wide. Past
+    # it is not a fast clock, it is not a clock.
+    assert MAX_SPI_HZ == 2**32 - 1
+
+    # The same number the server bounds a screen name with when one is created
+    # (`ors_server.api.screens.MAX_NAME`), which this package may not import. A
+    # `claimed_by` longer than a name that can exist is not a claim.
+    assert MAX_SCREEN_NAME == 64
+
+    # An order of magnitude past a rack, like `MAX_WATCHED_SCREENS`: four panels
+    # over SPI, a handful of `/dev/spidev*` nodes even with overlays.
+    assert MAX_PANEL_CANDIDATES == 64
+
+    # Half a kilobyte: an `OSError` from a driver, shown to whoever pressed the
+    # button. The daemon truncates to it, because an over-long error is not a
+    # truncated message but a refused one -- and then a timeout with no reason.
+    assert MAX_PROBE_ERROR == 512
+
+
+@pytest.mark.parametrize("field", ["bus", "cs", "dc", "rst"])
+def test_a_wiring_number_is_bounded_as_an_integer_not_as_a_gpio(field: str):
+    """A bound on magnitude, and deliberately not a range of pins.
+
+    `DisplayConfig` refuses to validate pin numbers at all and says why: which
+    lines exist is a fact about one board, unknown to a schema parsed on another
+    machine. So the largest number a Pi could use still parses here, and the
+    daemon's driver is what gives the real error for a pin that is not wired.
+
+    What is refused is the number that is not a pin at all. An int off a JSON
+    socket is arbitrary precision, and this one travels into a `DisplayConfig`
+    and from there into the database.
+    """
+    assert getattr(probe(**{field: MAX_WIRING_NUMBER}), field) == MAX_WIRING_NUMBER
+
+    for absurd in (MAX_WIRING_NUMBER + 1, 2**64, -1):
+        with pytest.raises(ValidationError):
+            probe(**{field: absurd})
+
+
+def test_a_candidate_is_bounded_the_same_way():
+    assert PanelCandidate(bus=MAX_WIRING_NUMBER, cs=0, claimed_by=None).bus == MAX_WIRING_NUMBER
+
+    with pytest.raises(ValidationError):
+        PanelCandidate(bus=2, cs=2**64, claimed_by=None)
+
+
+def test_a_clock_is_bounded_by_what_the_kernel_can_be_asked_for():
+    """32 bits, because `spidev`'s `max_speed_hz` ioctl field is 32 bits wide.
+
+    Not a claim about what a GC9A01 tolerates -- that is exactly what running the
+    probe finds out, and a schema guessing at it would refuse a rack somebody
+    built. Zero is refused separately: `spidev` reads it as "keep whatever was
+    set", so a probe at zero passes at a speed nobody chose and the wizard writes
+    that speed into a configuration.
+    """
+    assert probe(hz=MAX_SPI_HZ).hz == MAX_SPI_HZ
+
+    for impossible in (0, -1, MAX_SPI_HZ + 1):
+        with pytest.raises(ValidationError):
+            probe(hz=impossible)
+
+
+def test_a_probe_takes_no_pattern_from_the_wire():
+    """The field the spec removed on purpose, pinned so it cannot come back quietly.
+
+    The daemon paints one fixed thing it chose. A pattern arriving from the
+    server is a rendering instruction the daemon would have to validate before
+    obeying, on a device it is opening for the first time, and there is nothing
+    about it an operator needs to choose. `extra="forbid"` is what turns an end
+    that invents one into a loud error naming the field.
+    """
+    with pytest.raises(ValidationError) as refused:
+        parse_server_message(
+            json.dumps(
+                {
+                    "type": "probe",
+                    "request_id": "rq",
+                    **WIRING,
+                    "hold_s": 1.0,
+                    "pattern": "rings",
+                }
+            )
+        )
+
+    assert "pattern" in str(refused.value)
+
+
+def test_a_candidate_that_misspells_its_claim_is_an_error_and_not_a_free_device():
+    """`extra="forbid"` on the nested model, where it is doing the most work.
+
+    `claimed_by` is what a probe consults before it touches a device. Without
+    this, a daemon sending `claimedBy` would have every candidate read as free --
+    the wizard would offer a panel a live worker is mid-frame on, which is the
+    interleaving that produced M2's pale grey rectangles, done deliberately.
+
+    The candidate is otherwise complete, and the assertion is on the error's
+    *type*. Written as `PanelCandidate(bus=2, cs=3, claimedBy="CPU")` this passes
+    against a model that ignores extras -- the required `claimed_by` is then
+    missing, and pydantic quotes the offered dict, misspelling and all, into the
+    message. It was written that way first and proved nothing.
+    """
+    with pytest.raises(ValidationError) as refused:
+        PanelCandidate(bus=2, cs=3, claimed_by=None, claimedBy="CPU")
+
+    assert [(e["type"], e["loc"]) for e in refused.value.errors()] == [
+        ("extra_forbidden", ("claimedBy",))
+    ]
+
+
+def test_a_candidate_that_says_nothing_about_its_claim_is_not_a_free_one():
+    """No default on `claimed_by`, although None is a good value for it.
+
+    A default would make "the daemon forgot the field" and "nobody is driving
+    this" the same message, and the plausible one is the dangerous one.
+    """
+    with pytest.raises(ValidationError) as refused:
+        PanelCandidate(bus=2, cs=3)
+
+    assert refused.value.errors()[0]["type"] == "missing"
+
+
+def test_a_claim_is_a_screen_name_and_is_bounded_like_one():
+    assert PanelCandidate(bus=2, cs=3, claimed_by="x" * MAX_SCREEN_NAME).claimed_by
+
+    with pytest.raises(ValidationError):
+        PanelCandidate(bus=2, cs=3, claimed_by="x" * (MAX_SCREEN_NAME + 1))
+
+
+def test_a_detect_result_keeps_every_candidate_where_the_daemon_put_it():
+    """Three devices, no number equal to its own index or to its neighbour's field.
+
+    The brief's first case uses `bus=0, cs=0`, which is the real default and
+    worth keeping -- and is also the fixture that cannot tell a crossed field
+    from a correct one. This is the case that can: the busy device is at index 0
+    with bus 3, the free one at index 1 with bus 0, and the third names a
+    different screen again, so a result that reordered, transposed or reused a
+    claim fails here.
+    """
+    result = parse_daemon_message(
+        DetectResult(
+            request_id="r5",
+            panels=[
+                PanelCandidate(bus=3, cs=1, claimed_by="CPU"),
+                PanelCandidate(bus=0, cs=2, claimed_by=None),
+                PanelCandidate(bus=1, cs=0, claimed_by="NET"),
+            ],
+        ).model_dump_json()
+    )
+
+    assert isinstance(result, DetectResult)
+    assert [(p.bus, p.cs, p.claimed_by) for p in result.panels] == [
+        (3, 1, "CPU"),
+        (0, 2, None),
+        (1, 0, "NET"),
+    ]
+
+
+def test_a_rack_with_no_spi_devices_says_so_with_an_empty_list():
+    """A real answer -- a Pi with SPI not enabled -- and it has to parse."""
+    empty = parse_daemon_message(DetectResult(request_id="r6", panels=[]).model_dump_json())
+
+    assert isinstance(empty, DetectResult)
+    assert empty.panels == []
+
+
+def test_a_detect_result_that_omits_its_panels_is_not_a_rack_with_none():
+    with pytest.raises(ValidationError):
+        parse_daemon_message('{"type": "detect_result", "request_id": "r7"}')
+
+
+def test_a_detect_result_may_not_name_more_devices_than_a_rack_could_have():
+    """The list is built from a directory listing on a machine the server cannot
+    see, and the interface renders a row per entry."""
+    at_bound = [PanelCandidate(bus=n, cs=1, claimed_by=None) for n in range(MAX_PANEL_CANDIDATES)]
+
+    assert len(DetectResult(request_id="r8", panels=at_bound).panels) == MAX_PANEL_CANDIDATES
+
+    with pytest.raises(ValidationError):
+        DetectResult(
+            request_id="r9",
+            panels=[*at_bound, PanelCandidate(bus=0, cs=0, claimed_by=None)],
+        )
+
+
+def test_a_probe_result_carries_the_reason_it_failed():
+    """A refusal with no reason in it is the failure this project has already
+    shipped once. `ok` alone would leave the wizard saying "that did not work"."""
+    failed = parse_daemon_message(
+        ProbeResult(
+            request_id="r10", ok=False, error="[Errno 2] No such file: /dev/spidev2.3"
+        ).model_dump_json()
+    )
+
+    assert isinstance(failed, ProbeResult)
+    assert failed.ok is False
+    assert "spidev2.3" in (failed.error or "")
+
+
+def test_a_probe_that_worked_carries_no_error_at_all():
+    assert ProbeResult(request_id="r11", ok=True).error is None
+
+
+def test_an_error_the_server_would_refuse_to_read_is_worse_than_a_short_one():
+    """Bounded, and the daemon truncates to it rather than trusting a driver.
+
+    An over-long error does not arrive truncated: the message fails to parse, the
+    server drops it, the wait expires, and a probe whose reason the daemon knew
+    answers with a timeout instead.
+    """
+    assert ProbeResult(request_id="r12", ok=False, error="x" * MAX_PROBE_ERROR).error
+
+    with pytest.raises(ValidationError):
+        ProbeResult(request_id="r13", ok=False, error="x" * (MAX_PROBE_ERROR + 1))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        DetectRequest,
+        DetectResult,
+        ProbeRequest,
+        ProbeResult,
+    ],
+    ids=lambda m: m.__name__,
+)
+def test_no_correlation_id_on_any_of_these_may_be_empty_or_enormous(message):
+    """An empty id correlates with nothing, and a huge one is a dictionary key
+    the server holds until its wait expires -- chosen by whatever echoed it back.
+
+    Both directions, because the request is the server's to mint and the reply is
+    the daemon's to echo, and it is the echo that is not trusted.
+    """
+    rest = {
+        DetectRequest: {},
+        DetectResult: {"panels": []},
+        ProbeRequest: {**WIRING, "hold_s": 1.0},
+        ProbeResult: {"ok": True},
+    }[message]
+
+    assert message(request_id="x" * MAX_REQUEST_ID, **rest).request_id
+    for refused in ("", "x" * (MAX_REQUEST_ID + 1)):
+        with pytest.raises(ValidationError):
+            message(request_id=refused, **rest)
+
+
+def test_a_detection_message_travels_in_exactly_one_direction():
+    """Union membership, which is the whole of what tasks 10 to 12 build on.
+
+    A request that is not in `ServerMessage` cannot be sent; a result that is not
+    in `DaemonMessage` arrives as `union_tag_invalid` and the server's wait
+    expires with the reply sitting in a log. And a daemon must not be able to
+    send a *request* -- the correlated wait is the server's, and a rack that could
+    ask for a probe could ask a server to hold one open.
+    """
+    outbound = [
+        DetectRequest(request_id="r14"),
+        probe(),
+    ]
+    inbound = [
+        DetectResult(request_id="r15", panels=[PanelCandidate(bus=3, cs=1, claimed_by="CPU")]),
+        ProbeResult(request_id="r16", ok=True),
+    ]
+
+    for message in outbound:
+        assert parse_server_message(message.model_dump_json()) == message
+        with pytest.raises(ValidationError):
+            parse_daemon_message(message.model_dump_json())
+
+    for message in inbound:
+        assert parse_daemon_message(message.model_dump_json()) == message
+        with pytest.raises(ValidationError):
+            parse_server_message(message.model_dump_json())
+
+
+def test_the_new_types_are_named_when_an_unknown_tag_is_refused():
+    """The version-skew error lists what is known, so a daemon one release behind
+    reads which side is missing the message rather than guessing."""
+    with pytest.raises(ValidationError) as caught:
+        parse_daemon_message('{"type": "detect_resutl"}')
+
+    message = caught.value.errors()[0]["msg"]
+    assert "'detect_result'" in message and "'probe_result'" in message
+
+
+def test_a_detect_result_is_not_smuggled_in_under_another_tag():
+    """`extra="forbid"` on the envelope, on the pair that has a reply for every
+    request: a `detect_result` body arriving tagged `heartbeat` would be recorded
+    as a heartbeat, and the wait it was answering would time out with nothing
+    logged."""
+    with pytest.raises(ValidationError):
+        parse_daemon_message('{"type": "heartbeat", "request_id": "r17", "panels": []}')
+
+
+@pytest.mark.parametrize(
+    ("body", "invented"),
+    [
+        ({"type": "detect", "request_id": "rq"}, "force"),
+        ({"type": "probe", "request_id": "rq", **WIRING, "hold_s": 1.0}, "rotation"),
+    ],
+    ids=["detect", "probe"],
+)
+def test_a_request_carrying_a_field_this_build_never_defined_is_a_named_error(body, invented):
+    with pytest.raises(ValidationError) as refused:
+        parse_server_message(json.dumps({**body, invented: 1}))
+
+    assert refused.value.errors()[0]["type"] == "extra_forbidden"
+    assert invented in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    ("body", "invented"),
+    [
+        ({"type": "detect_result", "request_id": "rq", "panels": []}, "spi_buses"),
+        ({"type": "probe_result", "request_id": "rq", "ok": True}, "seen"),
+    ],
+    ids=["detect_result", "probe_result"],
+)
+def test_a_reply_carrying_a_field_this_build_never_defined_is_a_named_error(body, invented):
+    """The direction that matters more: a daemon one release ahead answers with a
+    field this server does not know, and the operator must read which field
+    rather than watch a wait expire."""
+    with pytest.raises(ValidationError) as refused:
+        parse_daemon_message(json.dumps({**body, invented: 1}))
+
+    assert refused.value.errors()[0]["type"] == "extra_forbidden"
+    assert invented in str(refused.value)
