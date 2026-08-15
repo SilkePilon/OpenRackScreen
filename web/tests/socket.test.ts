@@ -1,70 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { createLiveSocket, type LiveFrame, type LiveSocket } from "../src/live/socket"
-
-// jsdom brings no WebSocket, and a real one would need a server and a wait. This
-// is the socket the client is handed instead: it does nothing on its own, and
-// every transition -- accepted, a message arrived, the link dropped -- is a line
-// in a test. Injected through `openSocket` rather than assigned over a global,
-// so nothing in this file can leak into another test file, and so the client
-// under test is character-for-character the one the browser gets.
-class FakeSocket {
-  state: "connecting" | "open" | "closed" = "connecting"
-  readonly sent: string[] = []
-  onopen: ((event: Event) => void) | null = null
-  onclose: ((event: CloseEvent) => void) | null = null
-  onmessage: ((event: MessageEvent) => void) | null = null
-
-  readonly url: string
-
-  // Spelled out rather than as a parameter property: `erasableSyntaxOnly` is on
-  // in `tsconfig.app.json`, and a parameter property is the one class syntax
-  // that cannot be erased.
-  constructor(url: string) {
-    this.url = url
-  }
-
-  send(data: string): void {
-    // A browser throws `InvalidStateError` on a send in CONNECTING, and drops
-    // one on a closed socket on the floor. Both are refused loudly here because
-    // both are the same bug -- a subscription the tab believes it made and the
-    // server never saw -- and because nothing in `socket.ts` catches around
-    // `send`, so this surfaces as a failing test rather than as a skipped one.
-    if (this.state !== "open") throw new Error(`sent on a ${this.state} socket: ${data}`)
-    this.sent.push(data)
-  }
-
-  close(): void {
-    // A browser fires `close` for a socket the page closed, too. Doing it
-    // synchronously here is what makes the deliberate-close path testable: if
-    // `close()` left the reconnect armed, this is where it would show.
-    if (this.state === "closed") return
-    this.state = "closed"
-    this.onclose?.(new CloseEvent("close", { code: 1000, wasClean: true }))
-  }
-
-  /** The server accepted the handshake. */
-  accept(): void {
-    this.state = "open"
-    this.onopen?.(new Event("open"))
-  }
-
-  /** One text frame from the server. */
-  deliver(text: string): void {
-    this.onmessage?.(new MessageEvent("message", { data: text }))
-  }
-
-  /** The link went away: a wifi blip, a restarted server, a pulled cable. */
-  drop(): void {
-    this.state = "closed"
-    this.onclose?.(new CloseEvent("close", { code: 1006, wasClean: false }))
-  }
-
-  /** What this connection said upstream, parsed. */
-  get requests(): unknown[] {
-    return this.sent.map((text) => JSON.parse(text) as unknown)
-  }
-}
+// Lifted to ./fake-socket unchanged when task 6 needed the same socket one level
+// up, in the tests for the provider that owns this client. Its docstring carries
+// the reasoning that used to be here.
+import { FakeSocket } from "./fake-socket"
 
 type Harness = {
   live: LiveSocket

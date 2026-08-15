@@ -1,6 +1,24 @@
 import "@testing-library/jest-dom/vitest"
+import { notifyManager } from "@tanstack/react-query"
 import { afterAll, afterEach } from "vitest"
 import { server } from "./msw"
+
+// React Query tells its observers on the next turn of the event loop, not on
+// the one that changed the cache: `notifyManager`'s default scheduler is
+// `systemSetTimeoutZero`, a bare `setTimeout(cb, 0)`. So a `setQueryData` --
+// the live socket's `daemons` message, an invalidation, a mutation settling --
+// reaches the DOM one macrotask after it happened, and under `vi.useFakeTimers`
+// it does not reach it at all until somebody advances a clock.
+//
+// Neither is a fact about this interface. The delay is zero milliseconds and no
+// person or component can observe it; what it is, in a test, is a macrotask
+// every assertion about rendered output has to know to wait for, and a fake
+// clock that has to be nudged for a reason that has nothing to do with the
+// staleness threshold it was installed to pin. `setScheduler` is the hook the
+// library provides for exactly this. Notifications still go through the whole
+// real observer machinery -- nothing is stubbed and no result is invented --
+// they simply land on the tick that caused them.
+notifyManager.setScheduler((notify) => notify())
 
 // jsdom brings no `Request` of its own, so the global is Node's (undici), which
 // -- unlike every browser -- refuses a relative URL: `new Request("/api/auth/me")`
@@ -45,6 +63,51 @@ if (!acceptsRelativeUrls()) {
 server.listen({ onUnhandledRequest: "error" })
 afterEach(() => server.resetHandlers())
 afterAll(() => server.close())
+
+// jsdom's `WebSocket` is not a stand-in for anything: it opens a real TCP
+// connection to whatever the URL resolves to. Every test that renders the
+// authenticated shell now builds one, because `AppShell` owns `/ws/ui`, and a
+// refused connection is worse than a slow one -- `createLiveSocket` answers a
+// close by arming a reconnect, so the timer outlives the test that provoked it
+// and fires into a torn-down environment.
+//
+// The default is therefore a socket that does nothing at all: it never opens,
+// never closes and never fires, so a test that is not about the connection
+// neither reaches the network nor leaves a timer behind. The tests that *are*
+// about it substitute their own -- `socket.test.ts` injects one through
+// `openSocket`, `panel.test.tsx` stubs the global with `collectSockets` -- and
+// `vi.unstubAllGlobals()` then restores this one rather than jsdom's.
+//
+// Installed *after* `server.listen()` on purpose, and this is the only ordering
+// that works. MSW replaces `globalThis.WebSocket` with an interceptor of its
+// own when it starts listening, and an unhandled connection is one it logs an
+// error for and then lets through to the real network -- which is both the
+// noise and the socket this is here to prevent. Assigning afterwards takes the
+// global back. There is no `ws` handler in `./msw` for the same reason there is
+// no `http` handler for a request no test makes: a live connection is
+// substituted by the tests that drive one, at the seam they drive it through.
+class InertWebSocket {
+  readonly url: string
+  onopen: ((event: Event) => void) | null = null
+  onclose: ((event: CloseEvent) => void) | null = null
+  onmessage: ((event: MessageEvent) => void) | null = null
+  onerror: ((event: Event) => void) | null = null
+
+  constructor(url: string) {
+    this.url = url
+  }
+
+  send(): void {}
+  close(): void {}
+}
+// `defineProperty` rather than an assignment: MSW installs its interceptor as a
+// non-writable property, so `globalThis.WebSocket = ...` throws in the module
+// scope of a setup file, which fails every suite at once.
+Object.defineProperty(globalThis, "WebSocket", {
+  value: InertWebSocket,
+  writable: true,
+  configurable: true,
+})
 
 // jsdom implements neither of these, and both are reached on the first render:
 // the sidebar asks matchMedia whether it is on a phone, and Radix's popper

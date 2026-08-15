@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, beforeEach } from "vitest";
@@ -8,15 +9,24 @@ import { ThemeProvider } from "../src/theme/theme-provider";
 // The sidebar's nav items are router links now, and a `Link` outside a router
 // throws. This is the shell on its own, so a memory history is enough -- the
 // whole interface at a route is `renderApp` in ./render.
+//
+// The QueryClient arrived with the rack-status strip: the shell reads the
+// racks it draws dots for out of the cache, and owns the `/ws/ui` connection
+// that keeps them true. Nothing here fetches -- the strip has no query function
+// and the socket is `setup.ts`'s inert one -- so this client stays empty and
+// the strip stays rightly blank. What it draws when it is *not* empty is
+// `panel.test.tsx`'s.
 function shell() {
   return render(
-    <ThemeProvider defaultTheme="dark" storageKey="ors-theme">
-      <MemoryRouter>
-        <AppShell>
-          <p>rack</p>
-        </AppShell>
-      </MemoryRouter>
-    </ThemeProvider>,
+    <QueryClientProvider client={new QueryClient()}>
+      <ThemeProvider defaultTheme="dark" storageKey="ors-theme">
+        <MemoryRouter>
+          <AppShell>
+            <p>rack</p>
+          </AppShell>
+        </MemoryRouter>
+      </ThemeProvider>
+    </QueryClientProvider>,
   );
 }
 

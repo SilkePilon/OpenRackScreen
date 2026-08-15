@@ -1,9 +1,38 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { skipToken, useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 
 import { ApiError, api, detailFrom } from "./client"
+import type { components } from "./schema"
 
 /** One key per resource. Everything that touches the session invalidates this. */
 export const sessionKey = ["session"] as const
+
+/** One rack, as `GET /api/daemons` reports it. Generated, never written here. */
+export type Daemon = components["schemas"]["DaemonView"]
+
+/** The racks. Fetched by the pages that list them; patched by the live socket. */
+export const daemonsKey = ["daemons"] as const
+
+/**
+ * The racks as this tab already knows them -- read from the cache, never fetched.
+ *
+ * `skipToken` rather than a query function, and that is the whole point of this
+ * hook. Two things read the racks without being the reason to ask the server
+ * for them: the header's status strip, which is on every page, and each panel,
+ * which needs to know whether its own rack is still there. Neither should turn
+ * a page that shows a panel into a page that fetches the daemon list, and
+ * `GET /api/daemons` is not free -- it assembles a snapshot per rack on the
+ * event loop, which is time the server owes to relaying frames.
+ *
+ * So this subscribes to the cache entry and nothing else. It re-renders its
+ * component when the entry changes -- which is what the `daemons` message
+ * writing through `setQueryData` is for -- and answers `undefined` until
+ * something that *does* fetch has filled it in. `undefined` means "this
+ * interface has not been told", which is deliberately not the same as "there
+ * are no racks" and must never be drawn as "the rack is gone".
+ */
+export function useCachedDaemons(): Daemon[] | undefined {
+  return useQuery<Daemon[]>({ queryKey: daemonsKey, queryFn: skipToken }).data
+}
 
 export type Session = {
   authenticated: boolean

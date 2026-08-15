@@ -35,8 +35,16 @@ export type LiveFrame = {
    * and the store that holds the stream is the only place that can act on it.
    */
   seq: number
-  /** The decoded WebP. See `decode` for why there is no substitution in it. */
-  bytes: Uint8Array
+  /**
+   * The decoded WebP. See `decode` for why there is no substitution in it.
+   *
+   * `Uint8Array<ArrayBuffer>` rather than a bare `Uint8Array`, whose buffer
+   * TypeScript types as `ArrayBufferLike` -- which includes `SharedArrayBuffer`
+   * and so is not a `BlobPart`. This one is `decode`'s own freshly allocated
+   * buffer, never shared with anything, and saying so is what lets the frame
+   * store hand it straight to a `Blob` without a copy or a cast.
+   */
+  bytes: Uint8Array<ArrayBuffer>
 }
 
 /**
@@ -206,7 +214,7 @@ export function createLiveSocket({
    * a page showing nothing with every test green: `base64.b64decode` accepts
    * either alphabet unless asked not to, so the Python end cannot see it.
    */
-  function decode(webp: string): Uint8Array {
+  function decode(webp: string): Uint8Array<ArrayBuffer> {
     const binary = atob(webp)
     const bytes = new Uint8Array(binary.length)
     for (let index = 0; index < binary.length; index += 1) {
@@ -249,7 +257,7 @@ export function createLiveSocket({
       if (typeof screenId !== "number" || typeof seq !== "number" || typeof webp !== "string") {
         return skip("a frame missing a field", data.slice(0, 120))
       }
-      let bytes: Uint8Array
+      let bytes: Uint8Array<ArrayBuffer>
       try {
         bytes = decode(webp)
       } catch {
