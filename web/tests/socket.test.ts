@@ -393,6 +393,12 @@ describe("the browser socket", () => {
     // attainable -- it is the delay `backs off, and caps` pins exactly -- and
     // 750 is not. Asserted the other way round, this test would reject the one
     // value its sibling calls canonical.
+    //
+    // One caveat if this test is ever moved to the real `Math.random`, which is
+    // the direction the rest of this file went: the delay is ROUNDED, and
+    // `Math.round(1000 - 250r)` is exactly 750 for `r` in `(0.998, 1)` -- about
+    // one draw in five hundred. `toBeGreaterThan(750)` would flake there. It
+    // cannot today, because this test pins 0.5 and 0.9.
     for (const delay of [middle, far]) {
       expect(delay).toBeLessThanOrEqual(1000)
       expect(delay).toBeGreaterThan(750)
