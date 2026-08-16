@@ -35,6 +35,7 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -198,11 +199,13 @@ def _parser() -> argparse.ArgumentParser:
     install_command.add_argument(
         "--upgrade",
         action="store_true",
-        help="reinstall into the prefix at this version and restart the service",
+        help="changes nothing: install is already idempotent, so a plain `install` "
+        "re-run is always the upgrade path. This flag exists to say so at the "
+        "command line, not to gate any different behaviour.",
     )
 
     uninstall_command = subparsers.add_parser(
-        "uninstall", help="stop the service and remove the unit and the venv"
+        "uninstall", help="stop the service and remove the systemd unit"
     )
     uninstall_command.add_argument(
         "--purge",
@@ -448,34 +451,74 @@ def _real_roots(prefix: Path) -> Roots:
     )
 
 
-def _print_install_report(report: InstallReport) -> None:
+def _print_install_report(report: InstallReport, *, no_spi: bool) -> None:
     """The short code, the SPI diff and whether a reboot is owed.
 
     The short code is the one thing a person standing at the rack reads off
     this terminal and compares against what the web interface shows before
     approving it -- if this function does not print it, that whole approval
     gesture has nothing to check against.
+
+    `no_spi` is `args.no_spi`, taken as a separate parameter rather than
+    inferred from `report`: `InstallReport` carries only `reboot_needed`,
+    which reads `False` both when SPI was already on and when `--no-spi`
+    skipped the step entirely -- two different facts to tell an operator, one
+    boolean between them.
     """
     if report.short_code:
         print(f"short code: {report.short_code}")
+    if report.failed:
+        # The early `--use-current-interpreter` refusal returns from
+        # `install()` before anything else is touched -- no directories, no
+        # user, no unit, no SPI step -- so printing those lines here would
+        # report actions that were never taken. A failure discovered mid-run
+        # (`useradd` exiting something other than 0 or 9, say) leaves state
+        # that is genuinely mixed; "see the warnings above" is the honest
+        # summary either way, and is exactly what they say.
+        if report.warnings:
+            print(report.warnings_text(), file=sys.stderr)
+        print("install did not finish cleanly; see the warnings above.", file=sys.stderr)
+        return
     print(f"unit: {report.unit_path}")
     print(f"service user: {'created' if report.created_user else 'already existed'}")
-    if report.reboot_needed:
-        print("SPI: config.txt updated; a reboot is needed for the new setting to take effect")
+    if no_spi:
+        print("SPI: skipped (--no-spi)")
+    elif report.reboot_needed:
+        print("SPI: enabled, reboot needed")
+    elif any(warning.startswith("no config.txt was found") for warning in report.warnings):
+        print("SPI: not attempted (no config.txt found under the boot partition)")
     else:
-        print("SPI: no change (already enabled, or --no-spi was passed)")
+        print("SPI: unchanged (already enabled)")
     print(f"reboot needed: {'yes' if report.reboot_needed else 'no'}")
     if report.warnings:
         print(report.warnings_text(), file=sys.stderr)
-    if report.failed:
-        print("install did not finish cleanly; see the warnings above.", file=sys.stderr)
 
 
 def _install(args: argparse.Namespace) -> int:
     """Build the real `Roots` and a real `Runner`, then run `install.install`."""
     executable = None
     if args.use_current_interpreter:
-        executable = Path(sys.argv[0])
+        if sys.argv[0].endswith(".py"):
+            # `sudo python -m ors_daemon install --use-current-interpreter`
+            # puts `.../ors_daemon/__main__.py` in `sys.argv[0]` -- a source
+            # file the service user was never going to be able to execute.
+            # `install()` would refuse it too, but with "chmod it", which is
+            # advice aimed at a real executable, not a module entry point.
+            print(
+                "--use-current-interpreter cannot be used with `python -m ors_daemon`: "
+                f"{sys.argv[0]} names a source file, not something the service user "
+                "could run. Install a console script instead (a venv, `pipx`, or "
+                "`uv tool install`), or drop the flag and let install build one.",
+                file=sys.stderr,
+            )
+            return 1
+        # `shutil.which` first: a launcher with no shebang (some wrappers, some
+        # `exec`-less shell scripts) leaves `sys.argv[0]` as the bare name it
+        # was invoked with, and `Path(name).resolve()` would join that to the
+        # current working directory instead of to wherever PATH actually found
+        # it. The common case -- a real shebang -- already gives an absolute
+        # path that `shutil.which` returns unchanged.
+        executable = Path(shutil.which(sys.argv[0]) or sys.argv[0])
     report = install(
         _real_roots(args.prefix),
         _SubprocessRunner(),
@@ -485,7 +528,7 @@ def _install(args: argparse.Namespace) -> int:
         use_current_interpreter=args.use_current_interpreter,
         executable=executable,
     )
-    _print_install_report(report)
+    _print_install_report(report, no_spi=args.no_spi)
     return 1 if report.failed else 0
 
 
@@ -495,8 +538,12 @@ def _uninstall(args: argparse.Namespace) -> int:
         _real_roots(Path("/opt/openrackscreen")), _SubprocessRunner(), purge=args.purge
     )
     if report.warnings:
-        print(report.warnings_text())
-    print("uninstalled.")
+        print(report.warnings_text(), file=sys.stderr)
+    print(
+        "uninstalled: the service is stopped, disabled and its unit removed. "
+        "The venv this installed (if any) is left on disk; remove its prefix "
+        "by hand if you want it gone too."
+    )
     return 0
 
 
