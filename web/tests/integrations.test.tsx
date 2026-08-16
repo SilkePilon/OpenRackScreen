@@ -478,6 +478,10 @@ describe("the integrations page", () => {
     // credential" option to point at -- the select offers only "No credential"
     // and "Store a credential" on a row with nothing on file.
     const warning = add.getByText(/enabling it will be refused/i)
+    // Both halves are about a row that holds nothing yet: it *would* store one,
+    // it does not hold one, and the way not to is a choice in the select.
+    expect(warning).toHaveTextContent("This would store a credential")
+    expect(warning).not.toHaveTextContent(/this holds a credential/i)
     expect(warning).toHaveTextContent("choose No credential")
     expect(warning).not.toHaveTextContent(/remove the stored credential/i)
     expect(add.queryByRole("option", { name: /remove the stored credential/i })).not.toBeInTheDocument()
