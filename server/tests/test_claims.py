@@ -205,6 +205,28 @@ def test_expiry_frees_a_slot_for_a_new_claim(tmp_path):
     assert [c.id for c in list_pending(made, now=past_lifetime)] == [accepted.id]
 
 
+def test_a_granted_claim_frees_its_slot_for_the_cap_and_is_hidden_from_the_queue(tmp_path):
+    """`MAX_PENDING` bounds the *pending* queue (design spec S6.5), not the
+    total row count -- a granted row awaiting its daemon's poll must neither
+    block a new filing at the cap nor show up in `list_pending`/
+    `count_pending`, both of which the admin's queue view relies on."""
+    made = database(tmp_path)
+    filed = [file_one(made, n=i, now=0.0) for i in range(1, MAX_PENDING + 1)]
+    assert all(c is not None for c in filed)
+    approved = approve(made, filed[0].id, now=0.0)
+    assert approved is not None
+    assert count_pending(made, now=0.0) == MAX_PENDING - 1
+
+    accepted = file_one(made, n=999, now=0.0)
+
+    assert accepted is not None
+    assert count_pending(made, now=0.0) == MAX_PENDING
+    pending_ids = {c.id for c in list_pending(made, now=0.0)}
+    assert filed[0].id not in pending_ids
+    assert accepted.id in pending_ids
+    assert len(pending_ids) == MAX_PENDING
+
+
 def test_approve_returns_a_daemon_id_and_a_key_and_creates_the_daemon_row(tmp_path):
     made = database(tmp_path)
     filed = file_one(made, n=3, now=10.0)
@@ -377,6 +399,29 @@ def test_deny_of_an_unknown_claim_returns_false(tmp_path):
     made = database(tmp_path)
 
     assert deny(made, "no-such-claim", now=0.0) is False
+
+
+def test_deny_of_an_already_granted_claim_returns_false_and_leaves_it_alone(tmp_path):
+    """A granted claim id is not `deny`'s to remove: an admin cannot un-grant
+    through this path, and a stray deny of one must not delete a row a
+    daemon's poll might still be about to collect from, nor suppress a
+    fingerprint that was just legitimately approved."""
+    made = database(tmp_path)
+    filed = file_one(made, n=12, now=0.0)
+    assert filed is not None
+    approved = approve(made, filed.id, now=0.0)
+    assert approved is not None
+
+    assert deny(made, filed.id, now=1.0) is False
+
+    row = claim_row(made, filed.id)
+    assert row is not None
+    assert row["daemon_id"] == approved[0]
+    with closing(made.connect()) as connection:
+        suppressed = connection.execute(
+            "SELECT 1 FROM denied_fingerprint WHERE fingerprint = ?", (filed.fingerprint,)
+        ).fetchone()
+    assert suppressed is None
 
 
 def test_a_denied_fingerprint_filing_again_within_the_suppression_window_gets_nothing(tmp_path):
