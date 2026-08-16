@@ -373,6 +373,9 @@ describe("the settings page", () => {
     // night is. It must be drawn as an ordinary window: no alert, nothing
     // refused, and the sentence in the order the two times were given.
     expect(card.getByText(/Dark between 22:45 and 06:20, Europe\/Amsterdam time/)).toBeInTheDocument()
+    // Said in words, because two times in that order look like a mistake to
+    // anybody who has not been told they are not one.
+    expect(card.getByText(/crosses midnight, which is the usual way round/)).toBeInTheDocument()
     expect(screen.queryByRole("alert")).not.toBeInTheDocument()
 
     const from = card.getByLabelText("Dark from")
