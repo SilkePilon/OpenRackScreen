@@ -46,13 +46,29 @@ export function AddIntegrationDialog({
   const [draft, setDraft] = useState(() => draftFrom())
   const [scrubbed, setScrubbed] = useState(false)
 
-  function change(next: boolean) {
-    setOpen(next)
-    if (!next) return
-    // A fresh form every time, which for this dialog is also the rule that any
-    // plaintext credential typed into an abandoned attempt does not survive it.
+  /**
+   * The end of a typed plaintext credential's life.
+   *
+   * It lives in `draft.secret` and nowhere else this component holds, so
+   * emptying the draft is what ends it. Called on the way *out* rather than only
+   * on the way in: nothing renders it in between either way, but "gone when the
+   * dialog closes" is a lifetime that can be stated, and "gone the next time
+   * somebody opens this form" is one that lasts until an event that may never
+   * happen.
+   */
+  function forget() {
     setDraft(draftFrom())
     setScrubbed(false)
+  }
+
+  function change(next: boolean) {
+    setOpen(next)
+    // Both directions. On the way in it is also the rule that a fresh form is
+    // fresh; on the way out it is the credential's lifetime. The last write's
+    // answer goes with it -- it is an answer about a write that has already
+    // happened, and left standing over a fresh form it reads as this one's --
+    // but only here, not on the success path below, where it is the notice.
+    forget()
     create.reset()
   }
 
@@ -78,6 +94,7 @@ export function AddIntegrationDialog({
           hasCredential={false}
           carried={[]}
           scrubbed={scrubbed}
+          unscrub={() => setScrubbed(false)}
         />
 
         {create.isError && (
@@ -98,7 +115,16 @@ export function AddIntegrationDialog({
                 // Closed on success only. A refusal stays up with the server's
                 // own sentence in it and with what was typed, rather than
                 // dismissing itself over a list that has not changed.
-                onSuccess: () => setOpen(false),
+                //
+                // `forget()` and not `change(false)`: this close must not call
+                // `create.reset()`, because what it just answered -- including
+                // the racks that did not get it -- is drawn above the list and
+                // has to outlive the dialog it was asked from. So the draft is
+                // emptied here and the mutation is left holding its answer.
+                onSuccess: () => {
+                  setOpen(false)
+                  forget()
+                },
                 onError: () => {
                   const clean = withoutUserinfo(draft.url)
                   if (clean === draft.url) return

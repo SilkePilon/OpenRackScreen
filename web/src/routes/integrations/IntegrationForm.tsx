@@ -10,6 +10,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
+import { Textarea } from "@/components/ui/textarea"
 import { parseFields, positive, type CredentialChoice, type Draft } from "@/routes/integrations/draft"
 
 /**
@@ -55,6 +56,15 @@ export function IntegrationForm({
   carried,
   /** Whether a userinfo-carrying address was just taken apart. See `withoutUserinfo`. */
   scrubbed,
+  /**
+   * Told that the address has been edited, so the scrub note stops.
+   *
+   * That note is about one address and it should not outlive it: left standing
+   * it sits in place of the ordinary "no user or password in it" hint over an
+   * address it was never about, which is the hint most worth reading while
+   * somebody is typing a fresh one.
+   */
+  unscrub,
 }: {
   draft: Draft
   setDraft: (next: Draft) => void
@@ -62,6 +72,7 @@ export function IntegrationForm({
   hasCredential: boolean
   carried: string[]
   scrubbed: boolean
+  unscrub: () => void
 }) {
   const fieldId = useId()
   const field = (part: string) => `${fieldId}-${part}`
@@ -73,7 +84,16 @@ export function IntegrationForm({
   // About the state this edit would leave behind, which is what the server's own
   // check is about: a request that only sets `enabled: true` carries no
   // credential and is still the request that puts one in front of a snapshot.
-  const wouldHoldOne = draft.credential === "set" || (hasCredential && draft.credential !== "clear")
+  //
+  // `draft.secret !== ""` because the server's test is `bool(body.credential)`
+  // and an empty string is false there -- an empty box stores nothing, so a
+  // warning for it would be this form predicting a refusal the server would not
+  // make. (That state cannot be saved at all, `halfTyped` sees to it, so this is
+  // alignment rather than a fix; two rules that disagree are worth one of them
+  // being wrong later.)
+  const wouldHoldOne =
+    (draft.credential === "set" && draft.secret !== "") ||
+    (hasCredential && draft.credential !== "clear")
 
   return (
     <div className="grid gap-4">
@@ -99,7 +119,10 @@ export function IntegrationForm({
         <Input
           id={field("url")}
           value={draft.url}
-          onChange={(event) => set("url", event.target.value)}
+          onChange={(event) => {
+            set("url", event.target.value)
+            unscrub()
+          }}
         />
         {scrubbed ? (
           <p className="max-w-prose text-xs text-destructive">
@@ -116,11 +139,11 @@ export function IntegrationForm({
 
       <div className="grid gap-2">
         <Label htmlFor={field("fields")}>Fields (JSON)</Label>
-        <textarea
+        <Textarea
           id={field("fields")}
           rows={8}
           spellCheck={false}
-          className="w-full rounded-lg border border-input bg-transparent px-2.5 py-1 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
+          className="font-mono"
           value={draft.fields}
           onChange={(event) => set("fields", event.target.value)}
           placeholder={'{"cpu": {"query": "up", "reduce": "scalar"}}'}
@@ -183,11 +206,22 @@ export function IntegrationForm({
             about to turn it on reads it *before* doing so, and a warning that
             appeared only once the switch had moved would be a refusal restated
             rather than a refusal avoided. */}
+        {/* Two wordings, because the remedy is a different control in each case.
+            A row that already holds one has a "Remove the stored credential"
+            option to point at; a row that does not has no such option at all
+            (there is nothing to remove), and telling somebody to remove a
+            credential they have not stored names a choice that is not on the
+            screen. What is on the screen there is "No credential". */}
         {wouldHoldOne && (
           <p className="max-w-prose text-xs text-destructive">
-            {"This holds a credential, so enabling it will be refused: no integration type can " +
-              "carry one to a rack yet, and an enabled row holding one would block this rack's " +
-              "whole configuration. Leave it off, or remove the credential below."}
+            {(hasCredential
+              ? "This holds a credential, so enabling it will be refused: "
+              : "This would store a credential, so enabling it will be refused: ") +
+              "no integration type can carry one to a rack yet, and an enabled row holding one " +
+              "would block this rack's whole configuration. " +
+              (hasCredential
+                ? "Leave it off, or remove the stored credential below."
+                : "Leave it off, or choose No credential below.")}
           </p>
         )}
       </div>

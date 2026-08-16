@@ -46,14 +46,32 @@ function Reachability({ report }: { report: TestReport }) {
       <p id={titleId} className="text-sm font-medium">
         Reachability check
       </p>
+      {/* `TestReport.ok`, which is `all(report.ok for report in reports)` on the
+          server, drawn rather than discarded. The per-field list carries the
+          same information and reading it is counting: the question somebody
+          clicked the button to answer is "is this thing reachable", and that is
+          one word, above a list they then only have to read if it is no. */}
+      <p className="text-sm text-muted-foreground">
+        {report.ok
+          ? "Every field answered."
+          : "Not every field answered. The ones that did not are named below."}
+      </p>
       {/* Named after its own heading, so what the check answered is addressable
           apart from the field names the card already lists above it. */}
       <ul aria-labelledby={titleId} className="grid gap-1">
         {report.fields.map((field) => (
           <li key={field.name} className="text-sm text-muted-foreground">
             <code>{field.name}</code>
+            {/* `value` is nullable even on an `ok` field -- `FieldReport.value`
+                is `str | None` and this server always sets it beside `ok: true`,
+                but the wire type is what this page is written against. `?? ""`
+                left a dangling "answered, first sample " with nothing after it,
+                which reads as a sample that came back blank rather than as one
+                the report did not carry. */}
             {field.ok
-              ? ` — answered, first sample ${field.value ?? ""}`
+              ? field.value === null || field.value === undefined
+                ? " — answered, and reported no sample"
+                : ` — answered, first sample ${field.value}`
               : ` — ${field.error ?? "no answer, and no reason given"}`}
           </li>
         ))}

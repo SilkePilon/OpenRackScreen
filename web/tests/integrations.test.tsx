@@ -4,6 +4,7 @@ import { http, HttpResponse } from "msw"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { Daemon, Integration } from "../src/api/queries"
+import { changesFrom, draftFrom, withoutUserinfo } from "../src/routes/integrations/draft"
 import { server } from "./msw"
 import { renderApp } from "./render"
 
@@ -14,18 +15,25 @@ import { renderApp } from "./render"
  * has been bitten by four times is worth spelling out again here:
  *
  *   * **Integration ids, rack ids and intervals are all disjoint.** Ids 4, 17
- *     and 29; racks 8, 42 and 63; poll intervals 12, 30 and 5; timeouts 2.5 and
- *     4. No id is a rack, no interval is an id, and no id is its own index in
- *     the list -- `GET /api/integrations` is `ORDER BY id`, so the loft's rows
- *     arrive 4 then 17 and index 0 holds id 4.
+ *     and 29; racks 8 and 42; poll intervals 12, 30 and 5; timeouts 2.5 and 4,
+ *     and one row with no timeout at all. No id is a rack, no interval is an id,
+ *     and no id is its own index in the list -- `GET /api/integrations` is
+ *     `ORDER BY id`, so the loft's rows arrive 4 then 17 and index 0 holds id 4.
  *   * **No name is a number and no name is a substring of another.** A body
  *     that sent `{name: "4"}` instead of `{name: "vault-scrape"}` is only
  *     catchable if the two are never the same string, and a field name
  *     (`sealed`, `cpu`, `disk`, `temp`) is never an integration name.
- *   * **The rack a row belongs to is not the rack the unservable header names.**
- *     Everything edited below is on rack 8; the header names 42 and 63. 63 is in
- *     no listing -- deleted in another tab between the two fetches -- and is
- *     still a rack somebody has to go and look at.
+ *   * **The unservable header names the one rack these routes can name.** Every
+ *     integrations route calls `edit.affects(<that row's daemon_id>)` and
+ *     nothing else -- `create_integration:186`, `patch_integration`,
+ *     `delete_integration` -- and `_assemble` only ever writes
+ *     `edit.unservable[daemon_id]` for a daemon in `edit.daemons()`. So the
+ *     unservable set for a write about a rack-8 row **can only be a subset of
+ *     {8}**, and a fixture naming 42 or 63 here is a response the server cannot
+ *     produce. The header is still the only thing that may be read -- what pins
+ *     that is not a rack the body could not have named, it is the *other* create
+ *     below, which sets no header at all and must therefore name nobody. A page
+ *     reading the body would name pi-loft on both.
  *   * **The two secrets are different strings.** One is typed into the
  *     credential box, the other is buried in a URL's userinfo. A page that
  *     rendered "the credential" back would otherwise be indistinguishable from
@@ -33,13 +41,20 @@ import { renderApp } from "./render"
  */
 const LOFT = 8
 const CELLAR = 42
-const UNLISTED_RACK = 63
 
 /** Typed into the credential box. Never travels back, and must never be drawn. */
 const NEW_TOKEN = "s3cr3t-bearer-9f2"
 /** Buried in a URL's userinfo. The server's refusal does not echo it; nor may this page. */
 const URL_PASSWORD = "hunter2-loft"
 const URL_WITH_CREDENTIAL = `https://admin:${URL_PASSWORD}@prom.loft:9090`
+/**
+ * The same password in an address `new URL()` cannot read: the IPv6 literal is
+ * never closed. The server refuses it too, with its "looks like a URL and cannot
+ * be parsed" 422, so it is a state this page reaches by being used -- and a
+ * scrub built on the parser hands this one straight back with the password in
+ * it.
+ */
+const UNPARSEABLE_WITH_CREDENTIAL = `https://admin:${URL_PASSWORD}@[fd00::1:9090`
 
 const SIGNED_IN = http.get("/api/auth/me", () =>
   HttpResponse.json({ authenticated: true, password_set: true }),
@@ -119,7 +134,18 @@ const METRICS: Integration = {
   has_credential: false,
 }
 
-/** On the other rack, so "which rack asked" is a question the page has to answer. */
+/**
+ * On the other rack, so "which rack asked" is a question the page has to answer
+ * -- and **with no `timeout` in its config at all**.
+ *
+ * That is not a degenerate document. `PrometheusConfig.timeout` is
+ * `Field(default=4.0, gt=0)`, so a config that never names it is one the rack
+ * polls with a four-second timeout, and `POST /api/integrations` will store
+ * exactly what it was handed. Read into a form as `""` it fails `positive()`,
+ * which makes `configFrom` answer `null`, which blocks *every* edit to this row
+ * behind a line about what the rack refuses -- of a value the rack would have
+ * supplied itself.
+ */
 const CELLAR_NODE: Integration = {
   id: 29,
   daemon_id: CELLAR,
@@ -127,7 +153,6 @@ const CELLAR_NODE: Integration = {
   name: "cellar-node",
   config: {
     url: "http://node.cellar:9100",
-    timeout: 4,
     fields: { temp: { query: "node_hwmon_temp" } },
   },
   poll_interval: 5,
@@ -235,12 +260,19 @@ describe("the integrations page", () => {
           has_credential: false,
         }
         rows = [...rows, created]
-        // 201 **and** a header naming racks that did not get it. The status code
+        // 201 **and** a header saying the rack did not get it. The status code
         // cannot stand in for the header: a create answers 201 even when nothing
         // was pushed, because the row does exist.
+        //
+        // The header names 8 and can name nothing else. `create_integration`
+        // calls `edit.affects(body.daemon_id)` and `_assemble` fills
+        // `edit.unservable` only from `edit.daemons()`, so the unservable set
+        // for this route is a subset of the one rack it was added to. A fixture
+        // naming another rack would be asserting against a response that cannot
+        // arrive.
         return HttpResponse.json(created, {
           status: 201,
-          headers: { "X-Unservable-Daemons": `${CELLAR},${UNLISTED_RACK}` },
+          headers: { "X-Unservable-Daemons": String(LOFT) },
         })
       }),
       http.patch("/api/integrations/:integration_id", async ({ request, params }) => {
@@ -323,13 +355,16 @@ describe("the integrations page", () => {
     )
     expect(Object.hasOwn(posted[0] as object, "credential")).toBe(false)
 
-    // The racks that did not get it, from the header and from nothing else --
-    // not the rack it was added to, which is what a page reading the body would
-    // have said.
+    // The rack that did not get it, by name. A create on rack 8 that reached
+    // nobody is the only unservable answer this route can give, so this is the
+    // whole realistic contract: the row exists, the glass does not show it, and
+    // the sentence names pi-loft.
     const notice = await screen.findByText(/was saved, but nothing was sent/i)
-    expect(notice).toHaveTextContent("pi-cellar")
-    expect(notice).toHaveTextContent("rack 63")
-    expect(notice).not.toHaveTextContent("pi-loft")
+    expect(notice).toHaveTextContent("pi-loft")
+    // What separates "read the header" from "read the rack it was written
+    // about" is not this fixture -- both name pi-loft here -- it is the create
+    // in the credential test below, which sets no header and must therefore say
+    // nothing at all.
     // And the row on the page is the one the server answered with, after a
     // refetch: there are no optimistic updates here.
     expect(await screen.findByRole("region", { name: "loki-tail on pi-loft" })).toBeInTheDocument()
@@ -432,7 +467,21 @@ describe("the integrations page", () => {
     await userEvent.click(add.getByRole("switch", { name: "Enabled" }))
     await userEvent.click(add.getByRole("combobox", { name: "Credential" }))
     await userEvent.click(screen.getByRole("option", { name: "Store a credential" }))
+    // Nothing typed yet, so nothing would be stored: the server's own test is
+    // `bool(body.credential)` and an empty string is false there, so a warning
+    // now would be this form predicting a refusal that would not happen.
+    expect(add.queryByText(/enabling it will be refused/i)).not.toBeInTheDocument()
+
     await userEvent.type(add.getByLabelText("Credential to store"), NEW_TOKEN)
+    // And now it would. The remedy it names is a choice that is **on this
+    // screen**: a create holds no credential, so there is no "Remove the stored
+    // credential" option to point at -- the select offers only "No credential"
+    // and "Store a credential" on a row with nothing on file.
+    const warning = add.getByText(/enabling it will be refused/i)
+    expect(warning).toHaveTextContent("choose No credential")
+    expect(warning).not.toHaveTextContent(/remove the stored credential/i)
+    expect(add.queryByRole("option", { name: /remove the stored credential/i })).not.toBeInTheDocument()
+
     await userEvent.click(add.getByRole("button", { name: "Add the integration" }))
 
     // It went in, once, in its own field -- not inside `config`, which is
@@ -447,6 +496,12 @@ describe("the integrations page", () => {
     expect(within(created).getByText(/a credential is stored/i)).toBeInTheDocument()
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
     expect(screen.getByText("loki-tail was added.")).toBeInTheDocument()
+    // This create set **no** `X-Unservable-Daemons`, so no rack is named -- and
+    // that is what says the notice is read out of the header rather than out of
+    // the rack the write was about. A page that named `daemon_id` would say
+    // pi-loft here and in the create test above alike, and only one of the two
+    // would catch it.
+    expect(screen.queryByText(/was saved, but nothing was sent/i)).not.toBeInTheDocument()
     appearsNowhere(NEW_TOKEN, said)
 
     // Opening the form again starts from an empty one, and here that is a rule
@@ -613,11 +668,19 @@ describe("the integrations page", () => {
       ...reading(() => INTEGRATIONS),
       http.post("/api/integrations/:integration_id/test", ({ params }) => {
         tested.push(String(params.integration_id))
+        // `TestReport.ok` is `all(report.ok for report in reports)`, so this one
+        // is false. The third field is the shape `FieldReport` permits and this
+        // server does not currently produce: `ok: true` with a null `value`.
+        // `value` is `str | None` on the wire and this page is written against
+        // the wire, and `${field.value ?? ""}` rendered it as a sentence that
+        // stops mid-word -- "answered, first sample " -- which reads as a sample
+        // that came back blank rather than as one that was not reported.
         return HttpResponse.json({
           ok: false,
           fields: [
             { name: "cpu", ok: true, value: "0.41", error: null },
             { name: "disk", ok: false, value: null, error: "the query matched no series" },
+            { name: "temp", ok: true, value: null, error: null },
           ],
         })
       }),
@@ -640,7 +703,17 @@ describe("the integrations page", () => {
     const reported = within(card.getByRole("list", { name: "Reachability check" }))
     expect(
       reported.getAllByRole("listitem").map((item) => item.textContent),
-    ).toEqual(["cpu — answered, first sample 0.41", "disk — the query matched no series"])
+    ).toEqual([
+      "cpu — answered, first sample 0.41",
+      "disk — the query matched no series",
+      // Not "answered, first sample " with nothing after it.
+      "temp — answered, and reported no sample",
+    ])
+    // The server's own summary, drawn rather than discarded. `TestReport.ok` is
+    // the answer to the question the button asks -- is this thing reachable --
+    // and the per-field list is that answer only after somebody has counted it.
+    expect(card.getByText(/Not every field answered/i)).toBeInTheDocument()
+    expect(card.queryByText("Every field answered.")).not.toBeInTheDocument()
     // And the sentence that stops it being read as a preview, naming the three
     // things the rack applies and this does not.
     const caveat = card.getByText(/not a preview/i)
@@ -698,10 +771,12 @@ describe("the integrations page", () => {
       },
     })
 
-    // The address is kept, minus the part that must not be in it, and the form
-    // says what happened rather than leaving the change to be noticed.
+    // The address is kept **exactly as typed** minus the part that must not be
+    // in it -- no trailing slash appears and no port is normalised away, because
+    // nothing re-serialises it -- and the form says what happened rather than
+    // leaving the change to be noticed.
     await waitFor(() => expect(dialog.getByRole("textbox", { name: "URL" })).toHaveValue(
-      "https://prom.loft:9090/",
+      "https://prom.loft:9090",
     ))
     expect(dialog.getByText(/taken out of the address/i)).toBeInTheDocument()
 
@@ -709,6 +784,14 @@ describe("the integrations page", () => {
     // no console line, and in no attribute of the document.
     appearsNowhere(URL_PASSWORD, said)
     appearsNowhere(URL_WITH_CREDENTIAL, said)
+
+    // The note is about *that* address, so editing the address ends it: left
+    // standing it replaces the ordinary "no user or password in it" hint over an
+    // address it was never about, which is the hint most worth having in front
+    // of somebody who is typing a new one.
+    await userEvent.type(dialog.getByRole("textbox", { name: "URL" }), "/")
+    expect(dialog.queryByText(/taken out of the address/i)).not.toBeInTheDocument()
+    expect(dialog.getByText(/no user or password in it/i)).toBeInTheDocument()
 
     // And again for the shape with no user in it, which is how a bearer token
     // ends up in an address: `https://:token@host`. It is userinfo all the same,
@@ -721,9 +804,30 @@ describe("the integrations page", () => {
 
     await waitFor(() => expect(patched).toHaveLength(2))
     await waitFor(() =>
-      expect(dialog.getByRole("textbox", { name: "URL" })).toHaveValue("https://prom.loft:9090/"),
+      expect(dialog.getByRole("textbox", { name: "URL" })).toHaveValue("https://prom.loft:9090"),
     )
     appearsNowhere(URL_PASSWORD, said)
+
+    // **And the shape no parser will read.** `new URL("https://admin:pw@[fd00::1:9090")`
+    // throws -- the IPv6 literal is never closed -- and the server refuses it
+    // too, with its "looks like a URL and cannot be parsed" 422. A scrub written
+    // on the parser returns this one *unchanged*, the caller sees nothing to do
+    // and leaves the note off, and the password then sits in the box as a
+    // `value` attribute under a hint that reads "no user or password in it".
+    // That is the one branch where this page's own guarantee did not hold, so it
+    // is asserted rather than reasoned about.
+    await retype(dialog.getByRole("textbox", { name: "URL" }), UNPARSEABLE_WITH_CREDENTIAL)
+    await userEvent.click(dialog.getByRole("button", { name: "Save the integration" }))
+
+    await waitFor(() => expect(patched).toHaveLength(3))
+    await waitFor(() =>
+      expect(dialog.getByRole("textbox", { name: "URL" })).toHaveValue("https://[fd00::1:9090"),
+    )
+    // Said, not silently done: the same note fires here as on an address that
+    // parsed, because one rule covers both.
+    expect(dialog.getByText(/taken out of the address/i)).toBeInTheDocument()
+    appearsNowhere(URL_PASSWORD, said)
+    appearsNowhere(UNPARSEABLE_WITH_CREDENTIAL, said)
   })
 
   it("deletes the integration it named, and says which racks did not get the removal", async () => {
@@ -735,9 +839,12 @@ describe("the integrations page", () => {
         deleted.push(String(params.integration_id))
         rows = rows.filter((row) => String(row.id) !== String(params.integration_id))
         // The default 200 carrying the id it removed. No M3a route answers 204.
+        // `delete_integration` calls `edit.affects(row["daemon_id"])` and
+        // nothing else, so 8 is the only id this header can carry here, for the
+        // same reason the create's can carry only 8.
         return HttpResponse.json(
           { deleted: Number(params.integration_id) },
-          { headers: { "X-Unservable-Daemons": String(UNLISTED_RACK) } },
+          { headers: { "X-Unservable-Daemons": String(LOFT) } },
         )
       }),
     )
@@ -764,8 +871,8 @@ describe("the integrations page", () => {
     // The answer outlives the card it removed, which is why it is drawn above
     // the list rather than on the row.
     const notice = screen.getByText(/was saved, but nothing was sent/i)
-    expect(notice).toHaveTextContent("rack 63")
-    expect(notice).not.toHaveTextContent("pi-loft")
+    expect(notice).toHaveTextContent("pi-loft")
+    expect(notice).not.toHaveTextContent("pi-cellar")
 
     // Setting up the next delete clears what the last one said. "Not every rack
     // was given that change" names racks against a delete that has happened, and
@@ -774,6 +881,64 @@ describe("the integrations page", () => {
     await userEvent.click(screen.getByRole("button", { name: "Delete metrics-prom" }))
     await screen.findByRole("dialog")
     expect(screen.queryByText(/was saved, but nothing was sent/i)).not.toBeInTheDocument()
+  })
+
+  it("edits a row whose stored config never named a timeout", async () => {
+    // `PrometheusConfig.timeout` is `Field(default=4.0, gt=0)`, so a stored
+    // config is allowed not to have the key -- and `POST /api/integrations`
+    // stores the document it was handed, so this is a row anything but this form
+    // can create. Read into the form as `""` it fails `positive()`, which makes
+    // `configFrom` answer `null`, which disables Save for **any** edit to the
+    // row -- a URL, a query, a rename -- under "both must be above zero; the
+    // rack refuses anything else". The rack refuses no such thing: it would have
+    // polled with four seconds.
+    const patched: unknown[] = []
+    let rows = INTEGRATIONS
+    server.use(
+      ...reading(() => rows),
+      http.patch("/api/integrations/:integration_id", async ({ request, params }) => {
+        const body = (await request.json()) as Record<string, unknown>
+        patched.push({ id: params.integration_id, body })
+        const current = rows.find((row) => String(row.id) === String(params.integration_id))
+        const edited = { ...(current ?? CELLAR_NODE), ...body } as Integration
+        rows = rows.map((row) => (row.id === CELLAR_NODE.id ? edited : row))
+        return HttpResponse.json(edited)
+      }),
+    )
+    renderApp({ at: "/integrations" })
+
+    await screen.findByRole("region", { name: "cellar-node on pi-cellar" })
+    await userEvent.click(screen.getByRole("button", { name: "Edit cellar-node" }))
+    const dialog = within(await screen.findByRole("dialog"))
+
+    // The box opens on the number the rack would have used, which is the only
+    // defensible thing to put in it: any other value would be this interface
+    // quietly disagreeing with the model it is filling in.
+    expect(dialog.getByRole("spinbutton", { name: "Query timeout (seconds)" })).toHaveValue(4)
+    expect(dialog.queryByText(/must be above zero/i)).not.toBeInTheDocument()
+
+    const url = dialog.getByRole("textbox", { name: "URL" })
+    await userEvent.clear(url)
+    await userEvent.type(url, "http://node.cellar:9101")
+    // The edit that was blocked. Nothing about the timeout was touched.
+    expect(dialog.getByRole("button", { name: "Save the integration" })).toBeEnabled()
+    await userEvent.click(dialog.getByRole("button", { name: "Save the integration" }))
+
+    // `config` is one column, so the whole document goes -- and it names the
+    // timeout the rack was already using, which leaves the document meaning what
+    // it meant.
+    await waitFor(() => expect(patched).toEqual([
+      {
+        id: "29",
+        body: {
+          config: {
+            url: "http://node.cellar:9101",
+            timeout: 4,
+            fields: { temp: { query: "node_hwmon_temp" } },
+          },
+        },
+      },
+    ]))
   })
 
   it("does not say a server has no racks while it is still asking", async () => {
@@ -848,5 +1013,64 @@ describe("the integrations page", () => {
     )
     // And a request that failed is still not an empty rack.
     expect(screen.queryByText(/pi-loft polls nothing yet/i)).not.toBeInTheDocument()
+  })
+})
+
+/**
+ * The two decisions that cannot be driven through the page.
+ *
+ * `changesFrom` is asked about a row that moved *while a dialog was open*, and
+ * nothing in this interface can make that happen on demand: a Radix dialog is
+ * modal, so no button behind it can be clicked to provoke a refetch, and the
+ * query client these tests build has no window-focus refetch to fire. Left as a
+ * component test the divergence would be reasoned about and not asserted.
+ *
+ * `withoutUserinfo` is exercised through the page as well -- three shapes, in
+ * the refusal test above -- and it is also the one function on this page whose
+ * job is a security property, so its own table is worth the lines.
+ */
+describe("what the form decides before it sends anything", () => {
+  it("compares against the draft it opened with, not the row as it now stands", () => {
+    // The state that differs: a refetch lands under an open dialog and moves the
+    // row. `initial` is the snapshot this form was filled from and every other
+    // comparison in `changesFrom` is against it; `poll_interval` and `enabled`
+    // were against the live prop, so the moment the two disagree an interval
+    // nobody typed and a switch nobody touched go on the wire -- and the wire is
+    // where they win, because a PATCH names what it writes.
+    const initial = draftFrom(METRICS)
+    const moved: Integration = { ...METRICS, poll_interval: 300, enabled: false }
+    const typed = { ...initial, name: "metrics-relay" }
+
+    expect(changesFrom(moved, initial, typed)).toEqual({ name: "metrics-relay" })
+    // And it still sends one that *was* typed, so this is not "never send them".
+    expect(changesFrom(moved, initial, { ...initial, pollInterval: "90" })).toEqual({
+      poll_interval: 90,
+    })
+  })
+
+  it("takes userinfo out of an address whether or not a parser will read it", () => {
+    // One textual rule and no parser branch. The third row is the one the
+    // parser-based version got wrong: `new URL()` throws on the unclosed IPv6
+    // literal, so it handed the string back with the password still in it.
+    expect(withoutUserinfo("http://prom.loft:9090")).toBe("http://prom.loft:9090")
+    expect(withoutUserinfo(`https://admin:${URL_PASSWORD}@prom.loft:9090`)).toBe(
+      "https://prom.loft:9090",
+    )
+    expect(withoutUserinfo(UNPARSEABLE_WITH_CREDENTIAL)).toBe("https://[fd00::1:9090")
+    // No username, which is how a bearer token ends up in an address.
+    expect(withoutUserinfo(`https://:${URL_PASSWORD}@prom.loft:9090`)).toBe(
+      "https://prom.loft:9090",
+    )
+    // Not the whole authority: an `@` after the authority ends is not userinfo,
+    // and eating up to it would delete the host. `[^/?#]*` is what stops it, and
+    // `/`, `?` and `#` are the three delimiters RFC 3986 ends an authority on.
+    expect(withoutUserinfo("https://prom.loft:9090/api/v1/@scope")).toBe(
+      "https://prom.loft:9090/api/v1/@scope",
+    )
+    expect(withoutUserinfo("https://prom.loft:9090/q?to=ops@loft")).toBe(
+      "https://prom.loft:9090/q?to=ops@loft",
+    )
+    // And a string with no authority at all is not an address this can improve.
+    expect(withoutUserinfo("prom.loft:9090")).toBe("prom.loft:9090")
   })
 })

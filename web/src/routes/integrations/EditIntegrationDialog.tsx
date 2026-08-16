@@ -60,19 +60,31 @@ export function EditIntegrationDialog({
   const [draft, setDraft] = useState(initial)
   const [scrubbed, setScrubbed] = useState(false)
 
-  function change(next: boolean) {
-    setOpen(next)
-    if (!next) return
-    // Opening starts from the row as it is *now* -- another tab moves it under
-    // this dialog -- and drops whatever was typed and abandoned last time,
-    // including any plaintext credential, which must not outlive the form that
-    // asked for it. The last write's answer is cleared for the same reason the
-    // Templates page clears it: it is on the card, and left standing it reads as
-    // this edit's.
+  /**
+   * Back to the row as it stands, dropping whatever was typed over it.
+   *
+   * Both the draft and the `initial` it is compared against, together: they are
+   * one snapshot of one row and a reset that moved only one of them would make
+   * "changed" mean nothing.
+   */
+  function forget() {
     const fresh = draftFrom(integration)
     setInitial(fresh)
     setDraft(fresh)
     setScrubbed(false)
+  }
+
+  function change(next: boolean) {
+    setOpen(next)
+    // Both directions. Opening starts from the row as it is *now*, because
+    // another tab moves it under this dialog. Closing is what ends the life of
+    // any plaintext credential typed into it -- nothing renders `draft.secret`
+    // once the dialog is shut either way, but "gone when it closes" is a
+    // lifetime that can be stated and "gone the next time somebody opens this"
+    // is one that waits on an event that may never come. The last write's answer
+    // is cleared for the same reason the Templates page clears it: it is on the
+    // card, and left standing it reads as this edit's.
+    forget()
     save.reset()
   }
 
@@ -104,6 +116,7 @@ export function EditIntegrationDialog({
           hasCredential={integration.has_credential}
           carried={carriedKeys(integration.config)}
           scrubbed={scrubbed}
+          unscrub={() => setScrubbed(false)}
         />
 
         {save.isError && (
@@ -121,7 +134,14 @@ export function EditIntegrationDialog({
             onClick={() => {
               if (body === null) return
               save.mutate(body, {
-                onSuccess: () => setOpen(false),
+                // `forget()` and not `change(false)`: this close must not call
+                // `save.reset()`, because what the write answered -- including
+                // the racks that did not get it -- is drawn on the card and has
+                // to outlive the dialog it was asked from.
+                onSuccess: () => {
+                  setOpen(false)
+                  forget()
+                },
                 onError: () => {
                   const clean = withoutUserinfo(draft.url)
                   if (clean === draft.url) return

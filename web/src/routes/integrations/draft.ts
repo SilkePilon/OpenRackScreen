@@ -68,10 +68,18 @@ function textOf(value: unknown): string {
  */
 export function draftFrom(integration?: Integration): Draft {
   const config = (integration?.config ?? {}) as Record<string, unknown>
+  // An absent `timeout` is not an empty one. `PrometheusConfig.timeout` has its
+  // own default of `4.0`, so a stored config is allowed not to name it at all --
+  // and read as `""` that box fails `positive()`, `configFrom` answers `null`,
+  // and *every* edit to that row is blocked behind "the rack refuses anything
+  // else", which is untrue of a timeout the rack would have defaulted. So the
+  // number the server would have used is what the box opens on, on an existing
+  // row exactly as on a new one.
+  const timeout = textOf(config.timeout)
   return {
     name: integration?.name ?? "",
     url: textOf(config.url),
-    timeout: integration === undefined ? String(DEFAULT_TIMEOUT) : textOf(config.timeout),
+    timeout: timeout === "" ? String(DEFAULT_TIMEOUT) : timeout,
     fields: config.fields === undefined ? "" : JSON.stringify(config.fields, null, 2),
     pollInterval: String(integration?.poll_interval ?? DEFAULT_POLL_INTERVAL),
     // `create_integration` reads a missing `enabled` as true, so a new row starts
@@ -127,6 +135,11 @@ export function positive(text: string): number | null {
  * -- `tunnel` today, and whatever M4's integrations carry. A tunnelled
  * integration takes its base URL from the tunnel at poll time, so dropping that
  * block does not merely lose a setting: it moves where the rack polls.
+ *
+ * `timeout` is always named in the result, even for a document that did not have
+ * the key. That is not this form inventing a setting: `draftFrom` opens that box
+ * on `PrometheusConfig.timeout`'s own default, so the number written back is the
+ * one the rack was already using and the document means what it meant.
  */
 export function configFrom(
   base: Record<string, unknown>,
@@ -171,6 +184,14 @@ function halfTyped(draft: Draft): boolean {
  * documents: a re-serialised `fields` map differs from the server's by key order
  * and whitespace alone, and a deep comparison written here would be a second
  * definition of "changed" that this form's own controls could disagree with.
+ *
+ * **Every comparison is against `initial`, and none against `integration`.**
+ * They agree the instant the dialog opens and they are not the same thing
+ * afterwards: `integration` is the live row and a refetch moves it under an open
+ * dialog, at which point "changed" measured against it means "differs from what
+ * somebody else just saved" and an interval nobody touched goes on the wire.
+ * `integration` is still read for `config`, because a base document to build
+ * over is not a comparison and the newest one is the right one to carry through.
  */
 export function changesFrom(
   integration: Integration,
@@ -192,8 +213,8 @@ export function changesFrom(
     if (config === null) return null
     body.config = config
   }
-  if (interval !== integration.poll_interval) body.poll_interval = interval
-  if (draft.enabled !== integration.enabled) body.enabled = draft.enabled
+  if (interval !== positive(initial.pollInterval)) body.poll_interval = interval
+  if (draft.enabled !== initial.enabled) body.enabled = draft.enabled
   return { ...body, ...credentialFor(draft) }
 }
 
@@ -240,19 +261,22 @@ export function newBodyFrom(daemonId: number, draft: Draft): NewIntegration | nu
  * as an attribute and would then sit in the page for as long as the dialog is
  * open.
  *
- * A string the parser refuses is returned untouched. There is nothing safe to be
- * done with it here, and the server refuses that shape too, with its own
- * sentence.
+ * **Textual, and deliberately not `new URL()`.** This ran through the parser
+ * once, and a parser has a branch this must not have: it throws. `new URL()`
+ * refuses `https://admin:hunter2@[fd00::1:9090` -- an unclosed IPv6 literal, and
+ * exactly the kind of typo somebody makes while pasting an address they were
+ * given -- so the version built on it returned that string *unchanged*, the
+ * caller saw nothing to do and left the note off, and the password sat in the
+ * box as a `value` attribute with the hint underneath still reading "no user or
+ * password in it". The server refuses that shape too, with its own "cannot be
+ * parsed" 422, so it is a state the page reaches by being used normally. One
+ * textual rule has no such branch: everything between `//` and the first `@`
+ * that is still inside the authority goes, whether or not the rest parses.
+ *
+ * `[^/?#]*` is what keeps it inside the authority -- an `@` in a path or a query
+ * is not userinfo and is left alone -- and it is the same delimiter set RFC 3986
+ * ends an authority on.
  */
 export function withoutUserinfo(value: string): string {
-  let parsed: URL
-  try {
-    parsed = new URL(value)
-  } catch {
-    return value
-  }
-  if (parsed.username === "" && parsed.password === "") return value
-  parsed.password = ""
-  parsed.username = ""
-  return parsed.toString()
+  return value.replace(/(\/\/)[^/?#]*@/, "$1")
 }
