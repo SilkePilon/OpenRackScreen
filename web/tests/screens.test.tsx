@@ -4,6 +4,7 @@ import { http, HttpResponse } from "msw"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { Daemon, Integration, Screen as ScreenRow, Template } from "../src/api/queries"
+import { PANEL_SIZE } from "../src/routes/screens/RackCanvas"
 import { collectSockets, type FakeSocket } from "./fake-socket"
 import { server } from "./msw"
 import { recordCanvas, stubDecoder, type BitmapDecoder, type CanvasRecorder } from "./paint"
@@ -467,9 +468,20 @@ describe("the screens page", () => {
     act(() => rig.live().deliver(frameMessage(13, 104, bytesFor(13))))
     await act(() => rig.decoder.settleAll())
 
+    // How big the rack draws a panel, pinned where the rack decides it. `width`
+    // and `height` on a canvas are the drawing surface rather than a style, so
+    // this is the number that decides whether a 240x240 frame arrives sharp or
+    // stretched -- and it is the rack's choice, not `<Panel>`'s, which draws at
+    // whatever it is handed. `panel.test.tsx` deliberately exercises a
+    // different size and declares its own constant, so until this assertion
+    // existed nothing read the production one at all and `PANEL_SIZE = 17`
+    // passed the whole suite.
+    expect(PANEL_SIZE).toBe(160)
     for (const item of canvasOf("pi-loft").getAllByRole("listitem")) {
       const glass = item.querySelector("canvas")
       expect(glass).not.toBeNull()
+      expect(glass).toHaveAttribute("width", String(PANEL_SIZE))
+      expect(glass).toHaveAttribute("height", String(PANEL_SIZE))
       // Every element from the canvas up to the rack item it sits in.
       for (let node: HTMLElement | null = glass; node !== null; node = node.parentElement) {
         expect(node.style.transform).toBe("")
@@ -817,6 +829,15 @@ describe("the screens page", () => {
     await waitFor(() => expect(patched).toEqual([{ hflip: true }]))
     // Still on the wire: nothing has been said about it yet.
     expect(screen.queryByText(/every rack was given it/i)).not.toBeInTheDocument()
+    // And Save is shut for the length of that window. This is the `saving ||`
+    // half of `disabled`, which nothing pinned: the form still differs from the
+    // row here -- the switch is on, the row is not -- so `!nothingToSave` is
+    // false and the write in flight is the only thing that can be disabling
+    // this button. Without it, a second click sends the same edit again, for a
+    // second `config_version` bump and a second push to every rack.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled(),
+    )
 
     // Changed their mind while it was in flight -- the switch goes back, so the
     // form matches the row again -- and then typed. That second edit is the one
@@ -1250,5 +1271,118 @@ describe("the screens page", () => {
         params: { title: "Kitchen", hint: "{{prom.cpu_hot.node}}", dimmed: true },
       }),
     )
+  })
+
+  it("shuts the Data and Sleep tabs' Save for as long as their write is in flight", async () => {
+    // The `saving ||` half of `disabled`, on the two tabs that did not have it.
+    // The Config tab's copy is in "forgets a write once the form has moved past
+    // it, even mid-flight"; all three needed one, because `saving` is shared --
+    // it is the one `useSaveScreen` mutation behind all three forms -- but the
+    // other half of the condition is each tab's own. A tab nobody edited is
+    // disabled by `!moved` whatever `saving` says, so only the tab that made
+    // the edit can tell the two halves apart, and each has to make its own.
+    const bodies: unknown[] = []
+    // Reassigned between the two halves. The handler reads it when it runs, so
+    // the second write waits on a fresh promise rather than an already-resolved
+    // one.
+    let flight = held()
+    server.use(
+      ...reading([WEATHER, TRAINS, KITCHEN]),
+      ...INSPECTING,
+      http.patch("/api/screens/:screen_id", async ({ request }) => {
+        bodies.push(await request.json())
+        await flight.promise
+        // The row comes back unchanged, so both forms still disagree with it
+        // afterwards and stay enabled. That is what makes the assertion during
+        // the flight mean something: the button is not simply disabled from
+        // here on.
+        return HttpResponse.json(KITCHEN)
+      }),
+    )
+    const rig = mountScreens()
+    await rig.connect()
+
+    await userEvent.click(await screen.findByRole("button", { name: "Kitchen" }))
+
+    await userEvent.click(screen.getByRole("tab", { name: "Data" }))
+    await userEvent.click(await screen.findByRole("switch", { name: "Dimmed" }))
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled()
+    await userEvent.click(screen.getByRole("button", { name: "Save changes" }))
+    await waitFor(() => expect(bodies).toHaveLength(1))
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled(),
+    )
+    await act(async () => {
+      flight.release()
+    })
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled(),
+    )
+
+    flight = held()
+    await userEvent.click(screen.getByRole("tab", { name: "Sleep" }))
+    // Kitchen overrides, so turning the switch off is the edit: `sleep_override`
+    // goes from a window to `null`, which is a change and not an absence.
+    await userEvent.click(
+      await screen.findByRole("switch", { name: "Override for this panel" }),
+    )
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled()
+    await userEvent.click(screen.getByRole("button", { name: "Save changes" }))
+    await waitFor(() => expect(bodies).toHaveLength(2))
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled(),
+    )
+    await act(async () => {
+      flight.release()
+    })
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled(),
+    )
+
+    expect(bodies[1]).toEqual({ sleep_override: null })
+  })
+
+  it("says whose clock a panel's night is on before the settings have answered", async () => {
+    // `?? "server"` in `SleepTab`, and the only place it is reachable: the
+    // sentence above the switch is drawn only once `night` is known, and
+    // settings that carry a night carry a timezone. The note *under* the editor
+    // is drawn as soon as a panel that already overrides is selected, which can
+    // be before `GET /api/settings` has answered -- and with nothing standing
+    // in that window, a fallback that named no clock at all, or named the
+    // browser's, would read the same.
+    const settled = held()
+    server.use(
+      ...reading([WEATHER, TRAINS, KITCHEN]),
+      TEMPLATES,
+      INTEGRATIONS,
+      http.get("/api/settings", async () => {
+        await settled.promise
+        return HttpResponse.json({ timezone: "Europe/Amsterdam", night: NIGHT })
+      }),
+    )
+    const rig = mountScreens()
+    await rig.connect()
+
+    await userEvent.click(await screen.findByRole("button", { name: "Kitchen" }))
+    await userEvent.click(screen.getByRole("tab", { name: "Sleep" }))
+
+    // The rack's own window is not known yet and the tab says so rather than
+    // guessing one.
+    expect(await screen.findByText(/night window is still being read/)).toBeInTheDocument()
+    // But this panel's own window is on the row, so it is drawn -- against the
+    // server's clock, whichever that turns out to be.
+    expect(
+      screen.getByText(/This panel: Dark between 22:30 and 06:15, server time\./),
+    ).toBeInTheDocument()
+
+    // And it is really the settings that were missing: the same sentence names
+    // the zone once they arrive, so the assertion above cannot be passing
+    // because the note is stuck.
+    await act(async () => {
+      settled.release()
+    })
+    expect(
+      await screen.findByText(/This panel: Dark between 22:30 and 06:15, Europe\/Amsterdam time\./),
+    ).toBeInTheDocument()
   })
 })

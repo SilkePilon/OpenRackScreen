@@ -77,6 +77,14 @@ export function SleepTab({
 
   const held = readNight(screen.sleep_override)
   const night = settings.data?.night
+  // One binding, read in two places, because only one of those places could
+  // ever take the fallback. The sentence above the switch is behind
+  // `night === undefined`, and settings that carry a night carry a timezone --
+  // `SettingsView.timezone` is a required `str` -- so the `?? "server"` that
+  // used to sit there was a branch nothing could reach, and the one under the
+  // editor is reachable and was untested: a panel that already overrides draws
+  // its own window before `GET /api/settings` has answered.
+  const timezone = settings.data?.timezone ?? "server"
   // `null` is "nobody has touched this switch" here too, and for the same
   // reason as the three states below plus one more: `screen` moves under this
   // form -- a save refetches the list, another tab edits the row -- and a
@@ -112,7 +120,7 @@ export function SleepTab({
       <p className="text-sm text-muted-foreground">
         {night === undefined
           ? "The rack's own night window is still being read."
-          : `Every panel on this server: ${describeNight(night, settings.data?.timezone ?? "server")}`}
+          : `Every panel on this server: ${describeNight(night, timezone)}`}
       </p>
 
       <div className="flex items-center justify-between gap-4">
@@ -130,7 +138,7 @@ export function SleepTab({
           />
 
           <p className="text-xs text-muted-foreground">
-            {`This panel: ${describeNightEdit(shown, settings.data?.timezone ?? "server")}`}
+            {`This panel: ${describeNightEdit(shown, timezone)}`}
           </p>
         </>
       )}

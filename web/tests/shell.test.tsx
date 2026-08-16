@@ -19,7 +19,7 @@ import { ThemeProvider } from "../src/theme/theme-provider";
 function shell() {
   return render(
     <QueryClientProvider client={new QueryClient()}>
-      <ThemeProvider defaultTheme="dark" storageKey="ors-theme">
+      <ThemeProvider>
         <MemoryRouter>
           <AppShell>
             <p>rack</p>
@@ -43,6 +43,11 @@ describe("the shell", () => {
     }
   });
 
+  // The two literals below -- "dark" as a class, "ors-theme" as a key -- are
+  // deliberately written out rather than imported from the provider. They are
+  // the only assertion either constant has: reading them from the module under
+  // test would say the constant equals itself, and that is exactly how both
+  // values came to be unpinned while four call sites restated them.
   it("starts dark, because that is what the design chose", () => {
     shell();
     expect(document.documentElement).toHaveClass("dark");

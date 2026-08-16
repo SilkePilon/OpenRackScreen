@@ -38,7 +38,7 @@ export function renderApp({ at = "/" }: { at?: string } = {}) {
   const view = render(
     <StrictMode>
       <QueryClientProvider client={queryClient}>
-        <ThemeProvider defaultTheme="dark" storageKey="ors-theme">
+        <ThemeProvider>
           <BrowserRouter>
             <App />
           </BrowserRouter>

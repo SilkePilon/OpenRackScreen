@@ -23,6 +23,13 @@ import { recordCanvas, stubDecoder, type BitmapDecoder, type CanvasRecorder } fr
 // with rack 7 ahead of it. It is not claimed of the whole file, and it is not
 // true there: `puts the racks the socket names online` has its panel on rack 7,
 // which is first, and asserts the cache rather than anything the panel read.
+// Deliberately **not** `RackCanvas`'s exported `PANEL_SIZE`, and deliberately a
+// different number from it. `<Panel>` takes `size` as a prop and has to draw at
+// whatever it is handed; a file that tested it at the one value the rack happens
+// to pass could not tell a panel that honours the prop from one that hardcodes
+// 160. What the rack passes is a decision of the rack's, and it is pinned where
+// that decision is made -- `screens.test.tsx`, on the canvas element's own
+// `width`.
 const PANEL_SIZE = 120
 
 /** One rack as `GET /api/daemons` reports it, with only the fields this task reads. */
@@ -697,7 +704,7 @@ describe("the rack status strip", () => {
     // gone, and it is fed by the same `daemons` message and the same cache
     // entry -- not by a second fetch and not by a second rule.
     const rig = mount(
-      <ThemeProvider defaultTheme="dark" storageKey="ors-theme">
+      <ThemeProvider>
         <MemoryRouter>
           <AppShell>
             <p>rack</p>

@@ -2,10 +2,33 @@ import { createContext, useContext, useEffect, useState } from "react"
 
 type Theme = "dark" | "light" | "system"
 
+/**
+ * What the interface starts as, and the key it remembers a change under.
+ *
+ * Constants here rather than optional props defaulted here and passed there.
+ * They used to be `defaultTheme = "system"` and `storageKey = "vite-ui-theme"`,
+ * and all four call sites -- `main.tsx` and three test harnesses -- passed the
+ * same two values, which is an option no mutant can see. Worse: `main.tsx` is
+ * imported by no test and no e2e spec, and the harnesses restated the literals
+ * rather than importing them, so each was asserting its own copy. A `main.tsx`
+ * mutated to `defaultTheme="light" storageKey="wrong-key"` passed all 159
+ * tests, and the interface it describes starts light with every stored theme
+ * orphaned.
+ *
+ * With one place for each value, `shell.test.tsx`'s "starts dark" and its
+ * `localStorage.getItem("ors-theme")` are pins rather than restatements. Those
+ * two literals in that file are deliberately literals: reading them from here
+ * would assert only that the constant equals itself.
+ *
+ * Dark because that is what the design chose -- this hangs in a rack room. The
+ * key is namespaced because `vite-ui-theme` is the scaffold's, and any other
+ * Vite app served from this origin would share it.
+ */
+export const DEFAULT_THEME: Theme = "dark"
+export const THEME_STORAGE_KEY = "ors-theme"
+
 type ThemeProviderProps = {
   children: React.ReactNode
-  defaultTheme?: Theme
-  storageKey?: string
 }
 
 type ThemeProviderState = {
@@ -20,14 +43,9 @@ const initialState: ThemeProviderState = {
 
 const ThemeProviderContext = createContext<ThemeProviderState>(initialState)
 
-export function ThemeProvider({
-  children,
-  defaultTheme = "system",
-  storageKey = "vite-ui-theme",
-  ...props
-}: ThemeProviderProps) {
+export function ThemeProvider({ children }: ThemeProviderProps) {
   const [theme, setTheme] = useState<Theme>(
-    () => (localStorage.getItem(storageKey) as Theme) || defaultTheme
+    () => (localStorage.getItem(THEME_STORAGE_KEY) as Theme) || DEFAULT_THEME
   )
 
   useEffect(() => {
@@ -49,15 +67,13 @@ export function ThemeProvider({
   const value = {
     theme,
     setTheme: (theme: Theme) => {
-      localStorage.setItem(storageKey, theme)
+      localStorage.setItem(THEME_STORAGE_KEY, theme)
       setTheme(theme)
     },
   }
 
   return (
-    <ThemeProviderContext.Provider {...props} value={value}>
-      {children}
-    </ThemeProviderContext.Provider>
+    <ThemeProviderContext.Provider value={value}>{children}</ThemeProviderContext.Provider>
   )
 }
 
