@@ -748,6 +748,48 @@ describe("the integrations page", () => {
     const notice = screen.getByText(/was saved, but nothing was sent/i)
     expect(notice).toHaveTextContent("rack 63")
     expect(notice).not.toHaveTextContent("pi-loft")
+
+    // Setting up the next delete clears what the last one said. "Not every rack
+    // was given that change" names racks against a delete that has happened, and
+    // left standing over the dialog for the next one it reads as an answer about
+    // that one instead.
+    await userEvent.click(screen.getByRole("button", { name: "Delete metrics-prom" }))
+    await screen.findByRole("dialog")
+    expect(screen.queryByText(/was saved, but nothing was sent/i)).not.toBeInTheDocument()
+  })
+
+  it("does not say a server has no racks while it is still asking", async () => {
+    // The page-level half of the same rule. "No racks are paired yet" is a claim
+    // about `GET /api/daemons`, and this page consumes that list as
+    // `racks.data ?? []` -- which is also what a fetch in flight and a fetch
+    // that failed both look like. Left ungated it is the *only* thing on the
+    // page for a server whose daemon table 500s, sitting under an alert saying
+    // the list could not be read.
+    server.use(
+      SIGNED_IN,
+      http.get("/api/daemons", () =>
+        HttpResponse.json({ detail: "the daemon table could not be read" }, { status: 500 }),
+      ),
+    )
+    renderApp({ at: "/integrations" })
+
+    expect(await screen.findByText("The racks could not be read")).toBeInTheDocument()
+    expect(screen.getByText("the daemon table could not be read")).toBeInTheDocument()
+    expect(screen.queryByText(/No racks are paired yet/i)).not.toBeInTheDocument()
+    // And no section asked for a rack's integrations, which is why there is no
+    // handler for that route here: `onUnhandledRequest: "error"` would say so.
+    expect(screen.queryByRole("region")).not.toBeInTheDocument()
+  })
+
+  it("says a server has no racks once it has been told so", async () => {
+    server.use(SIGNED_IN, http.get("/api/daemons", () => HttpResponse.json([])))
+    renderApp({ at: "/integrations" })
+
+    expect(await screen.findByText(/No racks are paired yet/i)).toBeInTheDocument()
+    // The remedy names a page that exists. There is no pairing anywhere on this
+    // one, so "add a rack" would send the reader hunting for a button nobody
+    // has built here.
+    expect(screen.getByText(/Pair one on the Daemons page/i)).toBeInTheDocument()
   })
 
   it("says nothing about a rack's integrations until they have been read", async () => {
