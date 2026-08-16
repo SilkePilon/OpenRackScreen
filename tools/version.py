@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import re
 import sys
+import tomllib
 from pathlib import Path
+
+from packaging.version import InvalidVersion, Version
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -23,8 +26,23 @@ PACKAGES = {
     "openrackscreen": ROOT / "packages/openrackscreen/pyproject.toml",
 }
 
+VERSION_MODULES = {
+    "ors-schema": ROOT / "packages/ors-schema/src/ors_schema/__init__.py",
+    "ors-render": ROOT / "packages/ors-render/src/ors_render/__init__.py",
+    "ors-daemon": ROOT / "daemon/src/ors_daemon/__init__.py",
+    "ors-server": ROOT / "server/src/ors_server/__init__.py",
+}
+"""Every `__version__` constant that has to move in lockstep with the
+distribution it lives in. `openrackscreen` has no module of its own (its
+`pyproject.toml` says so: "Deliberately empty of modules"), so it has no entry
+here. These are user-visible independently of the wheel's own metadata: the
+server hands its `__version__` back from `/api/health`, and the daemon sends
+its `__version__` as `daemon_version` in the link's `Hello` -- the server's
+only record of what the daemon on the other end thinks it is running."""
+
 _VERSION = re.compile(r'^version = "[^"]*"$', re.MULTILINE)
 _NAME = re.compile(r'^name = "[^"]*"$', re.MULTILINE)
+_DUNDER_VERSION = re.compile(r'^__version__ = "[^"]*"$', re.MULTILINE)
 
 
 def _pin(name: str) -> re.Pattern[str]:
@@ -55,12 +73,16 @@ def rewrite(version: str) -> list[Path]:
         if updated != text:
             path.write_text(updated)
             changed.append(path)
+    for path in VERSION_MODULES.values():
+        text = path.read_text()
+        updated = _DUNDER_VERSION.sub(f'__version__ = "{version}"', text, count=1)
+        if updated != text:
+            path.write_text(updated)
+            changed.append(path)
     return changed
 
 
 def read_versions() -> dict[str, str]:
-    import tomllib
-
     return {
         name: tomllib.loads(path.read_text())["project"]["version"]
         for name, path in PACKAGES.items()
@@ -71,6 +93,11 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) != 1:
         print("usage: python tools/version.py <version>", file=sys.stderr)
+        return 2
+    try:
+        Version(argv[0])
+    except InvalidVersion as exc:
+        print(f"invalid version {argv[0]!r}: {exc}", file=sys.stderr)
         return 2
     for path in rewrite(argv[0]):
         print(f"updated {path.relative_to(ROOT)}")

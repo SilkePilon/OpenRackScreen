@@ -5,6 +5,12 @@
 # published -- so its own name is nominal; it exists only so the workspace has
 # a root to resolve against.
 name = "openrackscreen-workspace"
+# Deliberately not governed by `tools/version.py` / `tests/test_packaging.py`:
+# this project is `package = false` below -- virtual, never built, never
+# published, never installed as a dependency of anything -- so it has no
+# `Requires-Dist` for a pin to protect and no wheel to carry a stale number.
+# `uv lock --check` requires *a* value here regardless, so this stays nominal
+# rather than tracking the five published distributions' version.
 version = "0.1.0"
 description = "Configurable monitoring displays for server racks"
 requires-python = ">=3.11"
@@ -48,6 +54,12 @@ ors-server = { workspace = true }
 # through a dependency of a package it does not depend on, breaks the day the
 # daemon stops parsing YAML. `ors-server` itself does not, and the image does
 # not ship it.
+# `packaging` is here for `tests/test_packaging.py`, which parses requirement
+# strings with `packaging.requirements.Requirement` rather than
+# `str.startswith` -- a raw prefix match accepts `"ors-schema[extra]==0.2.0"`
+# rejected and wrongly matches `"ors-schema-extra==1.0"`. It is already
+# resolved transitively (pytest depends on it), named explicitly so a test
+# that imports it directly does not rely on that staying true by accident.
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.0,<2",
@@ -55,6 +67,7 @@ dev = [
     "ruff>=0.6",
     "httpx2>=2.10",
     "pyyaml>=6",
+    "packaging>=24",
 ]
 
 [tool.pytest.ini_options]
@@ -75,6 +88,13 @@ testpaths = [
 # make itself distinct. There is no ini key for it -- `--import-mode` is
 # command-line only.
 addopts = "-q --import-mode=importlib"
+# `--import-mode=importlib` does not put the repository root on `sys.path` the
+# way the default `prepend` mode would, so `import tools.version` from
+# `tests/test_packaging.py` / `tests/test_version_tool.py` raised
+# `ModuleNotFoundError` until this was added. `pythonpath` is the ini key that
+# fixes that without reintroducing the basename collisions `importlib` mode
+# was chosen to avoid (see the comment on `testpaths` above).
+pythonpath = ["."]
 # Without this every `async def test_` is collected, skipped and reported as a
 # warning -- a green run that ran none of them. `auto` rather than a
 # `@pytest.mark.asyncio` on each: a forgotten mark is exactly that silent skip,

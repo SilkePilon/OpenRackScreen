@@ -28,7 +28,7 @@ from ors_render.geometry import Geometry
 from ors_render.render import render_scene, render_screen, select_scene
 from ors_render.templates import load_builtin_templates
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Geometry",

@@ -64,6 +64,7 @@ WORKDIR /build
 COPY uv.lock pyproject.toml ./
 COPY packages/ors-schema/pyproject.toml packages/ors-schema/
 COPY packages/ors-render/pyproject.toml packages/ors-render/
+COPY packages/openrackscreen/pyproject.toml packages/openrackscreen/
 COPY daemon/pyproject.toml daemon/
 COPY server/pyproject.toml server/
 RUN --mount=type=cache,target=/root/.cache/uv \

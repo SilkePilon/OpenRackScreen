@@ -589,6 +589,31 @@ def test_the_workspace_is_installed_into_the_image_and_not_referenced_from_it(do
         )
 
 
+def test_every_workspace_members_pyproject_is_copied_into_the_builder(dockerfile):
+    """`uv sync` loads the whole workspace to resolve `workspace = true`
+    sources, so every member's `pyproject.toml` has to be visible to it --
+    including members this image never installs, like `daemon` and the
+    `openrackscreen` meta-package (see the comment on the `COPY` block
+    itself). Missing one is not a loud failure: `uv sync` inside the builder
+    simply cannot resolve that member's `workspace = true` source, and the
+    build fails on a resolution error naming none of the files actually at
+    fault.
+    """
+    members = sorted((ROOT / "packages").glob("*/pyproject.toml"))
+    members += [ROOT / "daemon" / "pyproject.toml", ROOT / "server" / "pyproject.toml"]
+    assert len(members) >= 5, (
+        "the workspace member glob found suspiciously few pyproject.toml files"
+    )
+
+    builder = copies(stages(dockerfile)[0])
+    copied_sources = {source for copy in builder for source in copy.sources}
+    for member in members:
+        relative = member.relative_to(ROOT).as_posix()
+        assert relative in copied_sources, (
+            f"{relative} is a workspace member's manifest but the builder stage never COPYs it in"
+        )
+
+
 def test_the_image_does_not_ship_a_compiler(dockerfile):
     final = instructions(stages(dockerfile)[-1])
 
