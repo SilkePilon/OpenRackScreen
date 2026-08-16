@@ -39,6 +39,7 @@ SHELL = '<!doctype html><title>OpenRackScreen</title><div id="root">the shell</d
 BUNDLE = 'console.log("the bundle, which is not the shell")'
 STYLESHEET = ":root { --the-stylesheet: 1 }"
 OUTSIDE = "the file one directory above the build, which no request may reach"
+NOT_FOUND_PAGE = "<!doctype html><title>404</title>the page a public/ directory left behind"
 
 # vite's own layout: hashed file names under `assets/`, and the entry document
 # at the top. The hash here is invented -- what matters is that it *is* one, so
@@ -142,6 +143,84 @@ def test_an_unknown_api_path_under_a_real_router_is_404_too(client):
     assert client.post("/api/daemosn", json={"name": "pi-rack"}).status_code == 404
 
 
+def test_the_wrong_method_on_a_real_api_route_is_still_405_and_not_404(client, tmp_path):
+    """The contract the mount quietly rewrote across the *whole* API until it
+    declined instead of answering.
+
+    A method mismatch is a `Match.PARTIAL` in starlette and a partial match only
+    wins if nothing claims the path outright -- so a mount at `/` beat it, and
+    every wrong-method request to a route that really exists came back 404
+    "there is no such thing" instead of 405 "not like that". Asserted against
+    the same app without an interface, because the number alone is only half the
+    claim: what is being pinned is that mounting the interface changed *nothing*
+    about what the API answers.
+    """
+    alone = TestClient(create_app(AppSettings(data_dir=tmp_path / "data-alone")))
+
+    mounted = client.post("/api/health")
+
+    assert mounted.status_code == 405
+    assert mounted.status_code == alone.post("/api/health").status_code
+    assert mounted.json() == {"detail": "Method Not Allowed"}
+
+
+def test_a_reserved_path_is_refused_after_normalisation_not_by_its_first_letters(client):
+    """`/x/../api/nope` is `api/nope` by the time anything is served.
+
+    Which is why the mount asks `StaticFiles.get_path` what the path *is* before
+    deciding it is not its own, rather than reading the segment off the URL: a
+    raw first-segment check sees `x`, hands the request to the interface, and
+    the interface serves the shell for an API path.
+    """
+    assert client.get("/x/%2e%2e/api/nope").status_code == 404
+    assert SHELL not in client.get("/x/%2e%2e/api/nope").text
+
+
+def test_a_page_whose_name_merely_starts_with_a_reserved_word_is_still_a_page(client):
+    """`api` and `ws` are whole first segments, not prefixes.
+
+    `/api-keys` is a perfectly ordinary name for a settings page, and a
+    `startswith` check turns a reload of it into 404 JSON. `/wsl` is the same
+    trap one letter along.
+    """
+    assert client.get("/api-keys").text == SHELL
+    assert client.get("/apidocs").text == SHELL
+    assert client.get("/wsl").text == SHELL
+
+
+def test_a_reserved_path_in_the_wrong_case_is_not_a_page_either(client):
+    """`/API/nope` reaches no route -- starlette's routing is case-sensitive, so
+    it was a 404 before the interface existed -- and it must not become a 200
+    page now. Nothing emits it; the point is that the reserved namespace covers
+    what it says it covers, and that the mount changed nothing here."""
+    refused = client.get("/API/nope")
+
+    assert refused.status_code == 404
+    assert refused.json() == {"detail": "Not Found"}
+
+
+def test_a_handshake_to_a_path_no_socket_owns_closes_rather_than_tracebacking(client, tmp_path):
+    """A `Mount` matches a websocket scope, and `StaticFiles` asserts it does not.
+
+    `/nope` is no `WebSocketRoute`, so the mount is the only thing that claims
+    it, and the first statement of `StaticFiles.__call__` is `assert
+    scope["type"] == "http"` -- one uncaught `AssertionError` and one uvicorn
+    traceback per attempt, from any unauthenticated stranger, forever. Pinned
+    against the same app with no interface, because "closes cleanly" is not the
+    interesting half: the interesting half is that it closes *the same way*.
+    """
+    alone = TestClient(create_app(AppSettings(data_dir=tmp_path / "data-alone")))
+
+    with pytest.raises(WebSocketDisconnect) as mounted:
+        with client.websocket_connect("/nope"):
+            pass  # pragma: no cover -- the connection never opens
+    with pytest.raises(WebSocketDisconnect) as unmounted:
+        with alone.websocket_connect("/nope"):
+            pass  # pragma: no cover -- the connection never opens
+
+    assert mounted.value.code == unmounted.value.code == 1000
+
+
 def test_a_socket_path_is_not_answered_with_the_spa_either(client):
     """A plain GET to `/ws/ui` matches no route -- a `WebSocketRoute` only
     matches a websocket scope -- so it reaches the mount exactly as `/api/nope`
@@ -159,7 +238,10 @@ def test_the_sockets_are_not_shadowed(client):
     A `Mount` matches a websocket scope as readily as an HTTP one, so a mount
     registered before these routers does not 404 the sockets -- it hands the
     handshake to `StaticFiles`, which asserts the scope is HTTP and dies inside
-    the connect.
+    the connect. That mechanism is not hypothetical and it is not only about
+    ordering: it fired on *every* unrouted path until the mount learned to
+    decline a websocket, which is
+    `test_a_handshake_to_a_path_no_socket_owns_closes_rather_than_tracebacking`.
     """
     signed_in(client)
 
@@ -267,6 +349,43 @@ def test_a_missing_asset_is_not_answered_with_the_shell(client):
 
     assert stale.status_code == 404
     assert SHELL not in stale.text
+
+
+def test_a_404_page_in_the_build_does_not_defeat_the_fallback(tmp_path, built):
+    """The one file that would turn every deep link back into a 404, silently.
+
+    `StaticFiles(html=True)` answers with `404.html` *before* it raises, so the
+    fallback's `except` never runs -- and `404.html` is not an exotic thing to
+    find in a build, it is whatever somebody dropped in `web/public/`. Measured:
+    with HTML mode on and this file present, `GET /screens` was 404 and the 404
+    page. HTML mode is off, and this is what says so.
+    """
+    (built / "404.html").write_text(NOT_FOUND_PAGE)
+    client = TestClient(create_app(AppSettings(data_dir=tmp_path / "data", web_dir=built)))
+
+    reloaded = client.get("/screens")
+
+    assert reloaded.status_code == 200
+    assert reloaded.text == SHELL
+    assert NOT_FOUND_PAGE not in reloaded.text
+
+
+def test_an_interface_that_is_there_says_nothing_at_all(client, caplog):
+    """The other half of the missing-build warning, and the reason it is worth
+    anything: a log line per served page is a log line nobody reads, and this
+    mount answers every request a browser makes. Not `pnpm build` warnings --
+    *any* warning, because a chatty fallback is the same defect wherever the
+    line is written."""
+    caplog.set_level(logging.WARNING)
+
+    client.get("/")
+    client.get("/screens")
+    client.get(f"/assets/{BUNDLE_NAME}")
+    client.get("/api/nope")
+
+    said = [record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING]
+
+    assert said == []
 
 
 @pytest.mark.parametrize(

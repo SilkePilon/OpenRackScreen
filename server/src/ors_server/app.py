@@ -10,6 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 from starlette.responses import Response
+from starlette.routing import Match, Mount
 from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
@@ -96,28 +97,31 @@ class SinglePageApp(StaticFiles):
     disk, comes back 404 and a reload of the page somebody is looking at loses
     the interface. Read from starlette 1.6.0's `staticfiles.py`, not assumed.
 
-    So the fallback is here, and there are exactly two namespaces it declines.
+    So the fallback is here, and **HTML mode is off**, which is not merely
+    redundant with it but actively defeats it: the `404.html` branch answers
+    *before* raising, so a build that happens to contain a `404.html` -- one
+    file somebody drops in `web/public/` -- turns `/screens` back into a 404 and
+    the `except` below never runs. Measured, on a build with one. Off, HTML mode
+    would have contributed only that and a 307 to `some-dir/` for a nested
+    directory holding its own `index.html`, and a vite build has neither.
 
-    A path under one of `RESERVED_PREFIXES` is the API's, and it is refused
-    before the disk is even looked at: answering it with a page turns a typo'd
-    fetch into a JSON parse error pointing at the parser, and refusing it *here*
-    rather than in the `except` below is what keeps `POST /api/daemosn` a 404
-    rather than the 405 `StaticFiles` answers every non-GET with.
+    The one namespace the fallback declines is `IMMUTABLE_DIRECTORY`: a missing
+    file there stays a 404, because nothing in there is ever a client-side route
+    -- it is vite's own directory of hashed files. A stale bundle URL, from a
+    cached document or a half-copied deploy, otherwise comes back as an HTML
+    page with a 200 that the browser reports as a JavaScript syntax error on
+    line 1.
 
-    And a missing file under `IMMUTABLE_DIRECTORY` stays a 404, because nothing
-    in there is ever a client-side route -- it is vite's own directory of hashed
-    files. A stale bundle URL, from a cached document or a half-copied deploy,
-    otherwise comes back as an HTML page with a 200 that the browser reports as
-    a JavaScript syntax error on line 1.
+    What this class does *not* do is refuse the API's own paths. That is
+    `InterfaceMount`'s job, one level up, and the difference is a real one --
+    see its docstring.
     """
 
     def __init__(self, *, directory: Path, reserved: tuple[str, ...]) -> None:
-        super().__init__(directory=directory, html=True)
+        super().__init__(directory=directory)
         self.reserved = reserved
 
     async def get_response(self, path: str, scope: Scope) -> Response:
-        if self.belongs_to_the_api(path):
-            raise HTTPException(status_code=404)
         try:
             response = await super().get_response(path, scope)
         except HTTPException as refusal:
@@ -131,14 +135,24 @@ class SinglePageApp(StaticFiles):
         return response
 
     def belongs_to_the_api(self, path: str) -> bool:
-        """Whether this path is one the server answers itself, and so must 404.
+        """Whether this path is one the server answers itself, and so is not ours.
 
         `path` is what `StaticFiles.get_path` made of the URL: relative, and
-        with `.` and `..` already normalised away -- so `/api/../api/nope` is
-        `api/nope` here and cannot sneak past a first-segment check.
+        with `.` and `..` already normalised away -- so `/x/../api/nope` is
+        `api/nope` here and cannot sneak past a first-segment check. Taking the
+        normalised path rather than the raw one is the whole reason this lives
+        on the app and is *called* by the mount instead of living there.
+
+        Case-folded, so `/API/nope` is refused too. Starlette's own routing is
+        case-sensitive and `/API/health` was a 404 before this mount existed, so
+        this is not about reaching a route -- it is about the reserved namespace
+        meaning what it says, and about the mount changing nothing an API path
+        used to do. The cost is that a page named `/API` or `/WS` could not
+        exist, and there is none; a page named `/api-keys` is untouched, because
+        this compares a whole first segment and not a prefix.
         """
         first = Path(path).parts[:1]
-        return bool(first) and first[0] in self.reserved
+        return bool(first) and first[0].lower() in self.reserved
 
     def is_a_hashed_asset(self, path: str) -> bool:
         """Whether this path is vite's own directory, where every name is a hash.
@@ -164,6 +178,52 @@ class SinglePageApp(StaticFiles):
         return IMMUTABLE if self.is_a_hashed_asset(path) else REVALIDATE
 
 
+class InterfaceMount(Mount):
+    """The mount at `/`, declining what it has no business claiming.
+
+    A plain `Mount` at `/` matches *every* path and *both* scope types, and
+    starlette's router stops at the first full match -- so it takes two things
+    that are not the interface's, both of which were measured against this app
+    and neither of which any test would have noticed.
+
+    **A websocket handshake to a path no `WebSocketRoute` claims.** `/nope` is
+    not `/ws/ui`, so nothing matches it and the mount does -- and the first
+    statement of `StaticFiles.__call__` is `assert scope["type"] == "http"`. An
+    unauthenticated stranger gets one uncaught `AssertionError` and one uvicorn
+    traceback per connection attempt. Declining the scope hands the handshake
+    back to the router's own `not_found`, which closes it cleanly: exactly what
+    the API answered before an interface was mounted under it.
+
+    **Every wrong-method request to a route the API really has.** A method
+    mismatch is a `Match.PARTIAL` in starlette, and a partial match only wins if
+    nothing else claims the path -- so this mount's full match beat it and
+    `POST /api/health` turned from 405 into 404, on every route in the server,
+    silently. Declining the path leaves the partial match the only one, and the
+    405 comes back.
+
+    So the rule is one rule: *this mount claims HTTP requests for paths the
+    server does not own*. It declines rather than answering, because "not mine"
+    is what a catch-all under an existing app means -- answering would mean
+    reimplementing the router's 404, its 405 and its websocket close here, and
+    getting a different answer than the API alone gives is the entire defect
+    above.
+    """
+
+    def __init__(self, interface: SinglePageApp) -> None:
+        super().__init__("/", app=interface, name="interface")
+        self.interface = interface
+
+    def matches(self, scope: Scope) -> tuple[Match, Scope]:
+        if scope["type"] != "http":
+            return Match.NONE, {}
+        # `get_path` is the same normalisation `StaticFiles.__call__` will do,
+        # and the mount is at the root so the child scope's route path is this
+        # one: what is tested here is what would have been served.
+        if self.interface.belongs_to_the_api(self.interface.get_path(scope)):
+            return Match.NONE, {}
+        return super().matches(scope)
+
+
 def mount_interface(app: FastAPI, directory: Path) -> None:
     """Put the built interface under everything the app already routes.
 
@@ -185,7 +245,11 @@ def mount_interface(app: FastAPI, directory: Path) -> None:
             directory,
         )
         return
-    app.mount("/", SinglePageApp(directory=directory, reserved=RESERVED_PREFIXES), name="interface")
+    # `app.router.routes.append` rather than `app.mount`, which is that line
+    # with a plain `Mount` hard-coded; everything else about it is the same.
+    app.router.routes.append(
+        InterfaceMount(SinglePageApp(directory=directory, reserved=RESERVED_PREFIXES))
+    )
 
 
 async def validation_error_without_the_body(

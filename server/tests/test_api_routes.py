@@ -11,6 +11,12 @@ find it, so a sweep that stopped looking fails rather than passing quietly. A
 planted violation has to be a real one: a route containing no write at all
 proves the sweep is live and nothing more, and "live" was never the question.
 
+Every app built here has no `web_dir`, so **no interface is mounted** and the
+sweeps see the API alone. Stated because it is otherwise invisible: a `Mount`
+has neither `.methods` nor `.endpoint`, and both sweeps below narrow to `/api`
+paths, so the mount would drop out of them even if it were there. What the mount
+does to the API is `test_spa.py`'s subject, not this file's.
+
 Every sweep here parses. None of them greps, and the two are not
 interchangeable: all five router files *discuss* these rules in their prose, so
 a substring search over their source is a check each of them passes by talking

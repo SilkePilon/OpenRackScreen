@@ -47,6 +47,14 @@ OPEN_SOCKETS = {"/ws/daemon"}
 
 
 def app_and_client(tmp_path) -> tuple[FastAPI, TestClient]:
+    # No `web_dir`, so there is **no interface mount on this app** and the
+    # sweeps below see the API and the sockets alone. Deliberate, and stated
+    # because it is otherwise invisible: the mount is at `/`, under neither
+    # `/api` nor a `WebSocketRoute`, so it would be filtered out of both sweeps
+    # anyway -- and it must be, because the shell is served to a visitor with no
+    # session on purpose (the login form is inside it). The property that
+    # matters when it *is* mounted, that `/api/screens` still answers 401 with
+    # the SPA under it, is pinned in `test_spa.py`.
     app = create_app(AppSettings(data_dir=tmp_path))
 
     @app.get("/api/guarded")
