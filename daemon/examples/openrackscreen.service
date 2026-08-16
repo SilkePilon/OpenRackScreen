@@ -53,7 +53,13 @@ ExecStart=/opt/openrackscreen/bin/ors-daemon run \
           --status /run/openrackscreen/status.json
 
 # `always`, not `on-failure`: a clean exit is not something this program is
-# supposed to do, so exiting 0 is as much a reason to come back as crashing.
+# supposed to do, so exiting 0 is as much a reason to come back as crashing --
+# and a push that changes this rack's timezone deliberately stops it to be
+# re-clocked on the way back up, exiting 10 rather than 0 so that a caller
+# which does read exit codes (this line does not; Restart=always recovers
+# both the same way) can tell that apart from a clean stop. A push naming a
+# timezone this host cannot resolve at all does not stop the rack -- it is
+# refused with a Nack back to the server instead, and nothing here restarts.
 Restart=always
 RestartSec=5
 

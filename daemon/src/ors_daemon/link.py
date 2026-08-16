@@ -898,6 +898,38 @@ class LinkClient(threading.Thread):
             self._nack(connection, push.version, f"{type(exc).__name__}: {exc}")
             return
 
+        if self._stop_event.is_set():
+            # `on_snapshot` did not apply this push in place -- it stopped the
+            # supervisor instead, which is exactly what `_snapshot_handler`'s
+            # mismatch branch does for a timezone change, the only thing under
+            # this daemon that calls `supervisor.stop()` from inside
+            # `on_snapshot`. (The early return above this method's docstring
+            # names -- a push arriving while a stop was already in flight --
+            # cannot be this: it returns before `_on_snapshot` is ever called,
+            # so reaching here with the event set means this call is what set
+            # it.)
+            #
+            # That makes the cache write below this push's *only* way to reach
+            # the next boot: `run` is on its way out for a restart, and there
+            # is no other copy of this configuration on disk. Acking anyway --
+            # the ordinary rule for a push that keeps the rack running, three
+            # lines down -- would have the next boot read the stale cache
+            # under a version the server already believes is confirmed, so it
+            # never re-pushes and the rack is stuck re-clocking against its
+            # old zone on every restart, forever. Nacked instead: nothing here
+            # believes this push landed, so the server's own retry on the next
+            # connect is what actually recovers it.
+            if not self._write_cache(push):
+                self._nack(
+                    connection,
+                    push.version,
+                    "could not cache this push before restarting to re-clock; will retry",
+                )
+                return
+            self.config_version = push.version
+            self._send(connection, Ack(config_version=push.version))
+            return
+
         self.config_version = push.version
         self._write_cache(push)
         self._send(connection, Ack(config_version=push.version))
@@ -1091,16 +1123,23 @@ class LinkClient(threading.Thread):
             with self._deadline():
                 connection.send(message.model_dump_json())
 
-    def _write_cache(self, push: ConfigPush) -> None:
+    def _write_cache(self, push: ConfigPush) -> bool:
         """Save what to boot from when the server is unreachable. Raises nothing.
 
         Atomic for the reason `write_status` is: a reader landing inside a plain
         write gets an empty file, and the reader here is the next boot of the
-        rack. Failures are logged rather than raised because the configuration
-        is already *running* by the time this is called -- losing the ack over a
-        read-only disk would have the server re-push on every connect, which is
-        a full repaint of the rack each time, to fix a problem the next boot has
-        and this moment does not.
+        rack. Failures are logged rather than raised, because for most callers
+        the configuration is already *running* by the time this returns --
+        losing the ack over a read-only disk would have the server re-push on
+        every connect, which is a full repaint of the rack each time, to fix a
+        problem the next boot has and this moment does not.
+
+        Returns whether the write actually landed, rather than leaving that to
+        a log line: `_config`'s re-clock branch is the one caller for which the
+        configuration is *not* already running and this write is the only copy
+        of the push that will exist once the process exits -- it has to know,
+        not just log, so it can nack instead of acking a push it never
+        durably kept.
         """
         path = Path(self.settings.cache_path)
         try:
@@ -1122,6 +1161,8 @@ class LinkClient(threading.Thread):
                 "could not cache the snapshot; this rack boots from its config file",
                 extra={"path": str(path), "error": str(exc)},
             )
+            return False
+        return True
 
     def _refused(self, closed: LinkClosed) -> bool:
         """Log a close the server put a code on, and say whether to stop trying hard.

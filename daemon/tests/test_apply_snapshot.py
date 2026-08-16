@@ -14,6 +14,7 @@ wires them, not what they do once wired.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -23,6 +24,7 @@ import pytest
 import yaml
 from ors_daemon.__main__ import (
     _RECLOCK_EXIT,
+    _USAGE_EXIT,
     DEFAULT_LINK_PATH,
     _command_handler,
     _frame_pump,
@@ -129,6 +131,20 @@ class _Flag:
 
     def is_set(self) -> bool:
         return self.value
+
+
+class _RecordingHandler(logging.Handler):
+    """Appends every record it sees. See `test_prometheus.py`'s
+    `recorded_warnings` for why this attaches straight to a module's own
+    logger instead of using `caplog`: `setup_logging` sets `propagate = False`
+    on the `ors_daemon` logger, and `caplog`'s handler lives on the root."""
+
+    def __init__(self, records: list[logging.LogRecord]) -> None:
+        super().__init__()
+        self._records = records
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._records.append(record)
 
 
 class FakeLink:
@@ -614,12 +630,21 @@ def test_join_a_server_returning_unpaired_fails_cleanly_not_with_an_assert(
     silently vanishes under `python -O` into an unrequested row-3 boot.
     Neither is a message a person over SSH can act on; `_run` has to check
     this itself, explicitly, right after the re-read.
+
+    Round 3, LOW 7: the message named no remedy ("nothing to run") for the
+    SSH audience this module keeps invoking, and the assertion only checked
+    that a traceback was absent -- deleting the whole `print` while keeping
+    `return 1` (a silent exit 1, the very shape HIGH 1 was raised about) still
+    passed. Now asserts the message names the way out.
     """
     monkeypatch.setattr("ors_daemon.__main__.join_a_server", lambda args: None)
 
     assert run_no_config(tmp_path) == 1
     error = capsys.readouterr().err
     assert "Traceback" not in error
+    assert "ors-daemon connect" in error, "the message has to name a remedy, not just say no"
+    assert "--server" in error
+    assert "--token" in error
     assert RecordingSupervisor.instances == [], "nothing was ever started"
 
 
@@ -645,6 +670,22 @@ def test_an_unreadable_pairing_still_boots_from_a_good_cached_snapshot(
     reworded `--no-discovery` help text and the README both claim the cache
     gate applies to row 5 as well, and nothing before this exercised the two
     together.
+
+    Round 3, LOW 8: also pins `_link`'s `version is not None` branch, which
+    the round-1 report claimed was "covered incidentally by every existing
+    test" with nothing actually asserted about it -- collapsing both of
+    `_link`'s log branches onto the plain "no pairing" message (`if version is
+    not None:` -> `if False:`) passed the whole suite. This scenario -- an
+    unreadable pairing with a usable cache beside it -- is exactly the one the
+    `version is not None` branch exists for, so the pin belongs here rather
+    than in a new test.
+
+    Attached straight to `ors_daemon.__main__`'s own logger rather than using
+    `caplog`: `main()` calls `setup_logging`, which sets `propagate = False`
+    on the `ors_daemon` logger the moment this test runs, and `caplog`'s own
+    handler lives on the root logger -- see `test_prometheus.py`'s
+    `recorded_warnings` for the same workaround, already established in this
+    suite for the same reason.
     """
     link = tmp_path / "link.json"
     link.write_text("{ not valid json")  # load_link_settings returns None for this
@@ -653,11 +694,29 @@ def test_an_unreadable_pairing_still_boots_from_a_good_cached_snapshot(
     joined: list[Any] = []
     monkeypatch.setattr("ors_daemon.__main__.join_a_server", lambda *a, **k: joined.append(True))
 
-    assert run_no_config(tmp_path, *extra_args) == 0
+    records: list[logging.LogRecord] = []
+    logger = logging.getLogger("ors_daemon.__main__")
+    handler = _RecordingHandler(records)
+    logger.addHandler(handler)
+    previous_level = logger.level
+    logger.setLevel(logging.INFO)
+    try:
+        assert run_no_config(tmp_path, *extra_args) == 0
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
     assert joined == [], "a usable cached snapshot must be tried before giving up on this rack"
     assert [
         screen.config.name for screen in RecordingSupervisor.instances[-1].kwargs["screens"]
     ] == ["CPU"]
+
+    cache_records = [r for r in records if "cached snapshot beside" in r.getMessage()]
+    assert len(cache_records) == 1, (
+        "the pairing-unreadable-but-cache-usable branch has to log its own message, "
+        "not the plain no-pairing one"
+    )
+    assert cache_records[0].config_version == 12, "and it has to name the version it is running"
 
 
 def test_discovery_off_with_no_server_and_no_config_names_every_way_to_fix_it(
@@ -917,7 +976,9 @@ def test_a_push_with_an_unresolvable_timezone_is_refused_not_boot_looped(tmp_pat
     assert supervisor.stops == 0, "a stop only helps if the next boot could rebuild the clock"
 
 
-def test_a_timezone_reclock_stop_exits_nonzero_not_like_a_clean_stop(tmp_path: Path) -> None:
+def test_a_timezone_reclock_stop_exits_nonzero_not_like_a_clean_stop(
+    tmp_path: Path, capsys: Any
+) -> None:
     """MEDIUM-A. `run` used to return 0 unconditionally, so a stop caused by a
     timezone-changing push was indistinguishable from a clean SIGTERM. Only
     `Restart=always` recovers a rack that exits that way; `Restart=on-failure`,
@@ -929,6 +990,20 @@ def test_a_timezone_reclock_stop_exits_nonzero_not_like_a_clean_stop(tmp_path: P
     returned -- `run_forever_hook` is what lets this fake simulate that,
     calling the link's `on_snapshot` from inside the call `_run` is blocked on
     in a real process.
+
+    Round 3, HIGH 1: this used to assert `run(tmp_path) == _RECLOCK_EXIT`,
+    importing and comparing against the very constant it was meant to pin --
+    tautological in the value, so `_RECLOCK_EXIT = 0` passed this test (and
+    all 847 others) even though 0 is a clean stop, the one thing this exit
+    code exists to be told apart from. Asserted on the literal below instead,
+    plus a standing guarantee this constant can never again collide with 0,
+    with `_USAGE_EXIT`, or with the plain `1` every other failure in this
+    module returns.
+
+    Round 3, HIGH 2: the stderr line is the entire deliverable for a rack run
+    by hand, and used to be unpinned -- deleting the whole `print` while
+    keeping `return _RECLOCK_EXIT` passed the suite. Asserted below that the
+    message names both the timezone and the restart.
     """
 
     def push_a_mismatched_timezone(supervisor: RecordingSupervisor) -> None:
@@ -939,18 +1014,40 @@ def test_a_timezone_reclock_stop_exits_nonzero_not_like_a_clean_stop(tmp_path: P
     (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
     RecordingSupervisor.run_forever_hook = push_a_mismatched_timezone
 
-    assert run(tmp_path) == _RECLOCK_EXIT
+    assert run(tmp_path) == 10, "the literal value, not the constant that names it"
+    assert _RECLOCK_EXIT not in (0, 1, _USAGE_EXIT), (
+        "reserved: 0 is a clean stop, 1 is every plain failure in this module, "
+        "and _USAGE_EXIT is argparse's own -- none may ever also mean "
+        "'restart to re-clock'"
+    )
     assert RecordingSupervisor.instances[-1].stops == 1
 
+    error = capsys.readouterr().err
+    assert "timezone" in error, "names what changed"
+    assert "restart" in error, "names the remedy"
 
-def test_a_clean_stop_still_exits_zero(tmp_path: Path) -> None:
+
+def test_a_clean_stop_still_exits_zero(tmp_path: Path, capsys: Any) -> None:
     """The pin for the test above: `_RECLOCK_EXIT` must be reserved for a
     re-clock, not handed out for an ordinary stop that never touched a push at
-    all."""
+    all.
+
+    Round 3, HIGH 2: also pins that the re-clock stderr line is not printed
+    unconditionally -- an ordinary stop must say nothing on stderr at all. The
+    pairing is written 0600 and a cache is provided, unlike this file's other
+    fixtures, precisely so that stderr is otherwise silent: `link.json` at the
+    default `write_text` mode logs a "readable by more than their owner"
+    warning, and no cache logs one of its own, both unrelated to the thing
+    this test pins and both loud enough to swamp the assertion below.
+    """
     write_config(tmp_path)
-    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+    link = tmp_path / "link.json"
+    link.write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+    link.chmod(0o600)
+    write_cache(tmp_path / "snapshot.json")
 
     assert run(tmp_path) == 0
+    assert capsys.readouterr().err == ""
 
 
 def test_the_link_claims_the_version_the_rack_is_actually_running(tmp_path: Path) -> None:

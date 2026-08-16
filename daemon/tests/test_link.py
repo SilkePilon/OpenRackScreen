@@ -409,6 +409,71 @@ def test_a_cache_that_cannot_be_written_still_leaves_the_push_acked(tmp_path: Pa
     assert [ack.config_version for ack in only(socket, Ack)] == [7]
 
 
+def test_a_reclock_stops_cache_write_failure_is_nacked_not_acked(tmp_path: Path) -> None:
+    """MEDIUM 4, round 3. `_snapshot_handler`'s mismatch branch does not apply
+    a timezone-changing push in place -- it stops the supervisor instead
+    (`supervisor.stop()`, which sets the same event this client parks its
+    `_stop_event` on) and lets `Restart=always` bring the process back
+    re-clocked. That makes the cache write below this push's *only* way to
+    reach the next boot: the process is on its way out, and nothing else on
+    disk holds it.
+
+    Acking anyway -- the ordinary rule the test above pins, for a push that
+    keeps the rack running -- would have the next boot read the *stale* cache
+    under a version the server already believes is confirmed, so it never
+    re-pushes and the rack is stuck re-clocking against its old zone on every
+    restart, forever: round 2's MEDIUM-B loop with one of its two doors still
+    open. Nacked instead, so the server's own retry on the next connect is
+    what actually recovers it -- and `config_version` has to stay at whatever
+    it was, not the version of a push that was never durably kept.
+    """
+    (tmp_path / "wall").write_text("not a directory")
+    settings = LinkSettings(
+        server_url="http://server:8080",
+        cache_path=tmp_path / "wall" / "cache.json",
+        token="tok",
+    )
+    stop = threading.Event()
+
+    def reclock(snapshot: DaemonConfig, version: int) -> None:
+        # What _snapshot_handler's mismatch branch does: stop instead of
+        # apply, without raising.
+        stop.set()
+
+    client, socket = make(
+        tmp_path, [push(7)], settings=settings, applied=reclock, stop=stop, config_version=3
+    )
+
+    client.tick_once()
+
+    assert not only(socket, Ack), "must not claim a version that was never safely cached"
+    nacks = only(socket, Nack)
+    assert [nack.config_version for nack in nacks] == [7]
+    assert client.config_version == 3, "left at what it was; the push never durably landed"
+
+
+def test_a_reclock_stops_successful_cache_write_is_still_acked(tmp_path: Path) -> None:
+    """The converse of the test above, and the other half of the same mutant:
+    a reclock stop whose cache write *succeeds* must still ack and claim the
+    new version -- a fix that nacked every reclock stop regardless of whether
+    the write worked would pass the test above and fail this one.
+    """
+    stop = threading.Event()
+
+    def reclock(snapshot: DaemonConfig, version: int) -> None:
+        stop.set()
+
+    client, socket = make(tmp_path, [push(7)], applied=reclock, stop=stop, config_version=3)
+
+    client.tick_once()
+
+    assert not only(socket, Nack)
+    assert [ack.config_version for ack in only(socket, Ack)] == [7]
+    assert client.config_version == 7
+    cached = json.loads((tmp_path / "cache.json").read_text())
+    assert cached["version"] == 7
+
+
 # --- the version skip -------------------------------------------------------
 
 

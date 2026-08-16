@@ -132,7 +132,7 @@ error the moment the unit was written."""
 _USAGE_EXIT = 2
 """The conventional shell exit code for "you typed it wrong", and argparse's."""
 
-_RECLOCK_EXIT = 3
+_RECLOCK_EXIT = 10
 """`run` returns this, not 0, when a push changed the timezone and stopped the
 rack instead of applying it against a stale clock (see `_snapshot_handler`).
 
@@ -143,6 +143,18 @@ is not systemd, or nobody at all -- had no way to tell "stopped on purpose" from
 recovery on the shipped unit; this is for every caller that is not it, most of
 all a rack run by hand, which used to print nothing and sit dark with an exit
 code that claimed success.
+
+Not 3, which this used to be. `systemd.exec(5)`'s "Process Exit Codes" table
+(checked against systemd 259) reserves 1-7 for the LSB convention systemd
+itself follows: 1 `EXIT_FAILURE`, 2 `EXIT_INVALIDARGUMENT`, 3
+`EXIT_NOTIMPLEMENTED` ("Unimplemented feature"), 4-7 the rest of it, 200+
+systemd's own. `systemctl status` and `journalctl` would have rendered a
+re-clock stop as `status=3/NOTIMPLEMENTED` -- which in this module reads as
+`join_a_server`'s own `NotImplementedError` stub having fired, the one other
+thing here that is literally "not implemented". Nothing in this repo used 3;
+the collision was with the platform, not with this code. 10 sits in the range
+systemd leaves free for a program's own use (9-63 and 79-199; 64-78 is
+`sysexits.h`'s own range, also worth staying out of).
 """
 
 _STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
@@ -722,7 +734,9 @@ def _run(args: argparse.Namespace) -> int:
                 # `python -O` into a row-3 boot nobody asked for -- neither is
                 # a message a person over SSH can act on.
                 print(
-                    f"{args.link}: still not paired after the join flow returned; nothing to run",
+                    f"{args.link}: still not paired after the join flow returned; nothing to "
+                    "run. Pair it by hand instead: `ors-daemon connect --server ... "
+                    "--token ...`, then run this again.",
                     file=sys.stderr,
                 )
                 return 1

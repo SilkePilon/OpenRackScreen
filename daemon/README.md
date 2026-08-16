@@ -148,10 +148,26 @@ adds is polled from that moment, one it drops is taken down on a thread of its
 own so that a `kubectl port-forward` teardown does not hold up the panels, and
 one whose configuration moved is replaced. What a push cannot change on a
 running rack is the `timezone` — the clock is built once, at boot, from
-whatever configuration the rack booted with — so a push naming a different one
-stops the rack instead of running it against the wrong clock; the shipped
-unit's `Restart=always` is what brings it back, clocked correctly, from the
-same snapshot the push just cached.
+whatever configuration the rack booted with — and what happens next splits on
+whether the pushed name is even one this host can resolve:
+
+- **Unresolvable** (a typo minted server-side, most often — `Europe/Amsterdaam`
+  parses exactly as easily as the real zone does, since nothing validates a
+  pushed timezone against any particular rack's tzdata): refused outright. A
+  `Nack` naming the reason goes back to the server, the person who pushed it
+  sees why in the interface, and the rack keeps running the configuration it
+  already had. Nothing stops, and nothing needs to.
+- **Resolvable, but different from the one this rack booted with**: cannot be
+  picked up in place — `NightWindow` is evaluated in whatever zone the clock
+  was built in, and swapping it under a running rack is not a change
+  `Supervisor.apply` can make — so the rack stops instead of running against
+  the wrong clock. `run` exits `10`, not `0`, and prints a line to stderr
+  naming the restart before it does. The shipped unit's `Restart=always`
+  reads neither the exit code nor the message and restarts on any exit either
+  way, clocked correctly from the same snapshot the push just cached; the
+  code and the line are for every caller that is *not* it — `Restart=on-failure`,
+  a different supervisor, or a person running `ors-daemon run` at a terminal —
+  which used to read exit `0` as a clean stop and never re-clock at all.
 
 The pairing and the cached snapshot live in `/var/lib/openrackscreen`, which the
 shipped unit's `StateDirectory=` creates. `--link` moves them; the cache follows
@@ -179,9 +195,11 @@ One thing `run` does *not* pick up from a push while it keeps running: the
 integrations (a poller and its `kubectl port-forward` cannot be replaced inside
 the apply's budget, and the daemon logs a warning naming the change) — that
 needs a restart, `systemctl restart openrackscreen`. The timezone is different:
-a push that changes it stops the rack itself rather than running against a
-clock built for the old zone (see above), and the shipped unit's
-`Restart=always` is what brings it back — nothing to run by hand.
+a resolvable one that changes stops the rack itself rather than running
+against a clock built for the old zone (see above, and its exit code `10`),
+and the shipped unit's `Restart=always` is what brings it back — nothing to
+run by hand. One that does not resolve at all is refused instead of applied —
+also see above — and needs nothing run by hand either.
 
 ## Run it under systemd
 
