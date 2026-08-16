@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,17 +63,47 @@ def load_or_create(path: Path) -> Identity:
     pending claim an admin is looking at would quietly stop being this
     daemon's -- so they would be approving something that no longer exists,
     and this rack would file a third claim behind it.
+
+    Also refuses a file readable by more than its owner, matching
+    `server/src/ors_server/secrets.py`'s precedent for the same reason: anyone
+    who can read this secret recomputes the fingerprint and the short code,
+    and can file a claim matching what the Pi's screen printed -- which is the
+    whole of what the admin checks. A `chmod -R`, a restore, or a
+    config-management default can loosen the mode with nothing else ever
+    breaking, so nothing else would ever tell.
     """
     if path.exists():
+        mode = stat.S_IMODE(path.stat().st_mode)
+        if mode & 0o077:
+            raise PermissionError(
+                f"{path} is mode {mode:o} and readable by more than its owner;"
+                " it is the entire proof that this rack is this rack. chmod 600 it."
+            )
         try:
             document = json.loads(path.read_text())
+            # `["secret"]` before `.get("version")`: a document that is valid
+            # JSON but not an object (a list, a number) has no `.get`, and
+            # indexing it raises `TypeError` -- inside the caught set below --
+            # instead of an `AttributeError` that would escape it.
             raw = document["secret"]
-        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            version = document.get("version")
+            if version != _VERSION:
+                raise ValueError(f"unsupported identity version {version!r}, expected {_VERSION}")
+            # `validate=True`: the default silently discards any character
+            # outside the base64 alphabet instead of raising, which turns
+            # garbage input into a short, wrong secret rather than an error.
+            secret = base64.b64decode(raw, validate=True)
+            if len(secret) != IDENTITY_BYTES:
+                raise ValueError(
+                    f"secret is {len(secret)} bytes, not {IDENTITY_BYTES} -- "
+                    "an empty or truncated secret is a publicly computable identity"
+                )
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as error:
             raise ValueError(
                 f"{path} is not a readable identity: {error}. "
                 "Delete it to mint a new one, which costs a re-approval."
             ) from error
-        return _derive(base64.b64decode(raw))
+        return _derive(secret)
 
     secret = secrets.token_bytes(IDENTITY_BYTES)
     path.parent.mkdir(parents=True, exist_ok=True)
