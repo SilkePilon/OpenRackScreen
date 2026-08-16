@@ -135,11 +135,35 @@ def test_an_identity_with_a_non_string_secret_is_an_error(tmp_path):
 
 
 def test_an_identity_with_unparseable_base64_is_an_error(tmp_path):
-    """`validate=True`: the default decoder discards non-alphabet characters
-    instead of raising, which turns garbage into a short, wrong secret rather
-    than an error."""
+    """Malformed padding, which fails under any decoder setting."""
     path = tmp_path / "identity.json"
     path.write_text(json.dumps({"version": 1, "secret": "!!!not base64!!!"}))
+    path.chmod(0o600)
+    with pytest.raises(ValueError, match="identity"):
+        load_or_create(path)
+
+
+def test_junk_between_valid_base64_characters_is_an_error(tmp_path):
+    """What pins `validate=True`, and the reason the test above cannot.
+
+    `base64.b64decode`'s default **silently discards** every character outside
+    the alphabet. So a secret that is a real 32-byte value with junk
+    interleaved -- padding intact, length arithmetic still working out --
+    decodes cleanly to those same 32 bytes and passes both the decode and the
+    length check. The file has been tampered with and nothing says so.
+
+    The test above cannot see this: `"!!!not base64!!!"` fails on *padding*,
+    which raises whatever `validate` says, so it passed identically with the
+    flag on and off. Dropping `validate=True` left all twenty tests in this
+    file green until this one existed.
+    """
+    interleaved = "!".join(base64.b64encode(bytes(IDENTITY_BYTES)).decode())
+    assert base64.b64decode(interleaved) == bytes(IDENTITY_BYTES), (
+        "this fixture only means something while the lax decoder accepts it"
+    )
+
+    path = tmp_path / "identity.json"
+    path.write_text(json.dumps({"version": 1, "secret": interleaved}))
     path.chmod(0o600)
     with pytest.raises(ValueError, match="identity"):
         load_or_create(path)
