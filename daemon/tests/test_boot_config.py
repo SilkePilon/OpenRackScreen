@@ -8,6 +8,7 @@ recovery is another computer and the card in your hand.
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -74,6 +75,11 @@ def test_it_backs_the_file_up_before_touching_it(tmp_path):
 
     assert result.backup == path.parent / f"config.txt.ors-{NOW}"
     assert result.backup.read_text() == "# original\n"
+    # Pinned as a behaviour: `_create_backup` opens with an explicit `0o600`
+    # rather than inheriting whatever `shutil.copy2` would have preserved
+    # from the source. `stat.S_IMODE` masks off the file-type bits `st_mode`
+    # also carries, so this compares only the permission bits.
+    assert stat.S_IMODE(result.backup.stat().st_mode) == 0o600
 
 
 def test_a_second_run_changes_nothing_and_takes_no_backup(tmp_path):
@@ -110,7 +116,13 @@ def test_an_existing_line_that_differs_is_left_exactly_as_written(tmp_path):
         ("# dtparam=spi=on", "dtparam=spi=on"),
         ("  #dtparam=spi=on", "dtparam=spi=on"),
         ("#dtoverlay=spi1-2cs", "dtoverlay=spi1-2cs"),
-        ("#", "dtparam=spi=on"),
+        # No bare "#" case: a line containing only "#" has no "=" in it at
+        # all, so `_already_has` excludes it via the `"=" not in stripped`
+        # clause alone, before the comment guard or the name comparison ever
+        # come into play -- the same code path an *empty* file takes. Every
+        # case kept here contains a real "key=value" shape under the "#" so
+        # the exclusion is actually forced through the name comparison, the
+        # thing this test exists to pin.
     ],
 )
 def test_a_commented_out_line_does_not_count_as_present(tmp_path, commented, expected):
@@ -217,6 +229,21 @@ def test_a_line_under_an_explicit_all_counts_as_present(tmp_path):
     assert result.added == ()
 
 
+def test_a_line_under_an_uppercase_all_header_counts_as_present(tmp_path):
+    """`_already_has` lowercases the filter name before comparing it to
+    `"all"`, so `[ALL]`/`[All]`/... must be recognised the same as `[all]`.
+
+    This assumes the Pi firmware's own `config.txt` parser is itself
+    case-insensitive about `[all]` -- an assumption this test cannot check,
+    since nothing here runs on real firmware. If that assumption is ever
+    wrong, this test and the `.lower()` it pins would both need to change
+    together.
+    """
+    _boot(tmp_path, "firmware/config.txt", "[ALL]\ndtparam=spi=on\ndtoverlay=spi1-2cs\n")
+    result = enable_spi(tmp_path, NOW)
+    assert result.added == ()
+
+
 def test_a_second_run_after_the_all_reset_finds_nothing_to_do(tmp_path):
     """HIGH 1 and HIGH 2 combined: a run that adds lines under a fresh
     `[all]` must be recognised as already-present by the very next run, or
@@ -276,6 +303,10 @@ def test_the_diff_does_not_claim_untouched_lines_changed(tmp_path):
     path = _boot_bytes(tmp_path, "firmware/config.txt", original)
     result = enable_spi(tmp_path, NOW)
     assert "-dtparam=audio=on" not in result.diff
+    # An empty diff would also satisfy the assertion above, without proving
+    # the diff says anything at all -- this pins that it actually names what
+    # was added.
+    assert "+dtparam=spi=on" in result.diff
     assert path.read_bytes().startswith(original)
 
 
@@ -294,6 +325,28 @@ def test_a_backup_that_already_exists_is_not_overwritten(tmp_path):
     assert existing_backup.read_text() == "# do not touch\n"
     assert result.backup == path.parent / f"config.txt.ors-{NOW}.1"
     assert result.backup.read_text() == "# original\n"
+
+
+def test_a_backup_path_that_is_a_symlink_is_not_followed(tmp_path):
+    """The other half of the finding above: a symlink planted at the backup
+    path, not just a plain file. `O_EXCL` refuses to open a path that
+    already exists at all -- symlink included -- so the symlink's target
+    must come out untouched, exactly like the plain-file case, and the real
+    backup must still land under the counter-suffixed name.
+    """
+    path = _boot(tmp_path, "firmware/config.txt", "# original\n")
+    target = tmp_path / "elsewhere.txt"
+    target.write_text("do not touch\n")
+    planted = path.parent / f"config.txt.ors-{NOW}"
+    planted.symlink_to(target)
+
+    result = enable_spi(tmp_path, NOW)
+
+    assert target.read_text() == "do not touch\n", "the symlink's target must be untouched"
+    assert planted.is_symlink(), "the planted symlink itself must be untouched"
+    assert result.backup == path.parent / f"config.txt.ors-{NOW}.1"
+    assert result.backup.read_text() == "# original\n"
+    assert not result.backup.is_symlink()
 
 
 # --- MEDIUM 6: the file must be read and written with a fixed encoding -----

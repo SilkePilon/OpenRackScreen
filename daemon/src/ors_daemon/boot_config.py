@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -127,11 +128,17 @@ def _create_backup(path: Path, now: str, data: bytes) -> Path:
     the pristine file in two ways: a second `install` run inside the same
     `now` string finds the backup path already occupied by the *previous*
     backup and clobbers it, and a symlink planted at the backup path gets
-    followed and overwritten too. `O_EXCL` refuses to open a path that exists
-    at all (a plain file or a symlink), `O_NOFOLLOW` refuses to follow a
-    symlink even so, and on `FileExistsError` a counter suffix is tried
-    instead of giving up, so re-running `install` twice in the same second
-    still produces a backup rather than silently skipping it.
+    followed and overwritten too. `O_EXCL` is what enforces both of those --
+    it refuses to open a path that exists at all, plain file or symlink, so
+    a planted symlink is never opened in the first place. `O_NOFOLLOW` is a
+    deliberately redundant second gate: for every input tried, dropping it
+    changes nothing, because `O_EXCL` already turns an existing symlink into
+    `FileExistsError` before `O_NOFOLLOW` would ever get a chance to matter.
+    It is kept anyway as defense-in-depth against a future edit that loosens
+    or removes `O_EXCL` and would otherwise silently start following
+    symlinks. On `FileExistsError` a counter suffix is tried instead of
+    giving up, so re-running `install` twice in the same second still
+    produces a backup rather than silently skipping it.
     """
     base = f"{path.name}.ors-{now}"
     suffix = 0
@@ -174,11 +181,36 @@ def _write_config(path: Path, text: str) -> None:
     """
     temporary = path.with_name(f".{path.name}.tmp")
     try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        # `O_NOFOLLOW`, matching `_create_backup`: without it, a symlink
+        # planted at the temp path (root-only on a real `/boot`, and vfat has
+        # no symlinks at all, but the asymmetry between two sibling functions
+        # in one module has no other justification) gets written *through*,
+        # and the `os.replace` below then installs that symlink over `path`
+        # -- the live boot file becomes a symlink to whatever the attacker
+        # chose. `O_TRUNC` stays: unlike the backup path, a stale temp file
+        # left over from a previous crash is expected and safe to reuse
+        # rather than treat as `O_EXCL` would, as an error.
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            0o644,
+        )
         with os.fdopen(descriptor, "w", encoding="utf-8", errors="surrogateescape") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
+        # `os.replace` installs the *new* file's mode, not `path`'s -- a
+        # `config.txt` whose owner had loosened permissions (unusual, but not
+        # impossible: some images ship it group-writable) would silently end
+        # up back at 0o644 after the very first `install` run. `config.txt`
+        # lives on vfat, where Unix permission bits are not enforced at all,
+        # so this has no practical effect on the file this function actually
+        # writes -- but `path` here is the live boot file, not a disposable
+        # copy, so the mode is preserved anyway rather than assumed
+        # irrelevant. `path` is guaranteed to already exist: the only caller,
+        # `enable_spi`, gets here through `find_config`, which only ever
+        # returns a path that passed `Path.is_file()`.
+        os.chmod(temporary, stat.S_IMODE(path.stat().st_mode))
         os.replace(temporary, path)
     except OSError:
         # `path` is untouched -- that is the whole point of writing beside it
