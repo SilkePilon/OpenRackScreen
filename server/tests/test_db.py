@@ -4,7 +4,17 @@ import sqlite3
 import pytest
 from ors_server.db import SCHEMA_VERSION, Database
 
-TABLES = {"daemon", "screen", "template", "integration", "secret", "setting", "daemon_event"}
+TABLES = {
+    "daemon",
+    "screen",
+    "template",
+    "integration",
+    "secret",
+    "setting",
+    "daemon_event",
+    "claim",
+    "denied_fingerprint",
+}
 TABLE_NAMES = "SELECT name FROM sqlite_master WHERE type='table'"
 SET_TIMEZONE = "INSERT INTO setting (key, value) VALUES ('timezone', 'Europe/Amsterdam')"
 GET_TIMEZONE = "SELECT value FROM setting WHERE key='timezone'"

@@ -108,22 +108,45 @@ CREATE TABLE IF NOT EXISTS claim (
     id           TEXT PRIMARY KEY,
     hostname     TEXT NOT NULL,
     address      TEXT NOT NULL,
-    fingerprint  TEXT NOT NULL UNIQUE,
+    fingerprint  TEXT NOT NULL,
     short_code   TEXT NOT NULL,
     version      TEXT NOT NULL,
     public_key   TEXT NOT NULL,
     first_seen   REAL NOT NULL,
-    -- Reserved for a later task's poll-and-deliver route, not written by
-    -- anything in this schema version. `claims.approve` hands its key back
-    -- to its own caller and deletes the row in the same statement instead of
-    -- parking it here: `fingerprint` above is UNIQUE across every row this
-    -- table has ever held, so a completed claim left in place would go on
-    -- occupying that rack's only slot, and a rack that ever needed to file
-    -- again -- a database rebuilt out from under a paired daemon, say --
-    -- could not. See `claims.approve`'s docstring for the full argument.
+    -- Ciphertext for a later task's poll-and-deliver route, still not written
+    -- by anything in this schema version. `claims.approve` leaves this NULL
+    -- and hands the plaintext key back to its own caller instead of parking
+    -- it here -- writing a live credential in the clear would be the one
+    -- thing every other credential path in this schema (`token_hash`,
+    -- `key_hash`) goes out of its way not to do. What this round changes is
+    -- that the *row* now survives approval (`granted_at` set, `daemon_id`
+    -- filled in, nothing deleted), with `public_key` and `fingerprint` still
+    -- on it -- which is what a future poll route needs on hand to encrypt
+    -- the key to the daemon's ephemeral key and store *that* here, safely,
+    -- for a repeat poll to re-send. See `claims.approve`'s docstring.
     granted_key  TEXT,
+    -- NULL means still pending. Set, atomically, by the one guarded UPDATE
+    -- that decides an approval race (`claims.approve`'s docstring) -- this
+    -- column, not `daemon_id`, is what "no longer pending" means everywhere
+    -- in `claims.py`, because it is set in that same guarded statement and
+    -- `daemon_id` necessarily follows a moment later (the new `daemon` row
+    -- does not exist yet when the guard fires). Also the clock a granted
+    -- row's own retention counts from -- see `claims._expire`.
+    granted_at   REAL,
     daemon_id    INTEGER REFERENCES daemon(id) ON DELETE CASCADE
 );
+
+-- `fingerprint` is unique only among still-pending claims, not across the
+-- whole table's history. A completed claim's row now survives its own
+-- approval (see the `granted_at` comment above), so a plain UNIQUE column
+-- would let it go on occupying its fingerprint's only slot forever -- and the
+-- one rack it belongs to could never file again through this path if it ever
+-- needed to (a database rebuilt out from under a paired daemon, for one).
+-- Qualifying the index by `granted_at IS NULL` instead means a granted row
+-- steps out of the way the moment it is granted, and a re-file lands a fresh
+-- pending row rather than colliding with the row it replaces.
+CREATE UNIQUE INDEX IF NOT EXISTS claim_pending_fingerprint
+    ON claim(fingerprint) WHERE granted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS denied_fingerprint (
     fingerprint  TEXT PRIMARY KEY,
