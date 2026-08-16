@@ -11,7 +11,9 @@ Nothing here touches SPI, sleeps to wait for time to pass, binds a port or reads
 `/dev`. The panels are fakes handed in through the display factory,
 `enumerate_panels` takes its root so a test can make up a device tree, and the
 probe's hold is an injected sleeper that records the number it was asked for
-instead of spending it.
+instead of spending it -- except in the one test that is *about* the default
+hold, which asks for a minute and then ends it with the stop event rather than
+by waiting for it.
 
 **The fixture is deliberately non-identical.** Every number differs from every
 other and from its own list index -- two buses, three chip selects, six GPIO
@@ -27,18 +29,21 @@ entirely would land there and pass.
 from __future__ import annotations
 
 import argparse
+import os
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from ors_daemon import __main__ as entry
 from ors_daemon import supervisor
 from ors_daemon.__main__ import _link
 from ors_daemon.clock import FakeClock
 from ors_daemon.config import resolve_screens, system_scenes
 from ors_daemon.displays import DisplayError
 from ors_daemon.frames import FrameStream
-from ors_daemon.hardware import detect_handler, enumerate_panels, probe_handler
+from ors_daemon.hardware import SPI_ROOT, detect_handler, enumerate_panels, probe_handler
 from ors_daemon.link import LinkSettings
 from ors_daemon.screen import ScreenWorker
 from ors_daemon.snapshot import SnapshotStore
@@ -59,6 +64,7 @@ from ors_schema.link import (
     parse_daemon_message,
 )
 from PIL import Image
+from pydantic import ValidationError
 
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
 
@@ -74,6 +80,13 @@ PROBE_HZ = 32_000_000
 the operator chose opens a device this test can see is wrong."""
 HOLD_S = 2.5
 """Shorter than `PROBE_HOLD_BUDGET`, so an honoured hold and a capped one differ."""
+A_MINUTE = 60.0
+"""Longer than any hold this rack will give, so a wait that ends inside a test
+run is one the stop event ended and never one that ran out."""
+WAIT = 5.0
+"""How long a handshake between two threads may take before it is a failure. Not
+time this file spends: every wait on it is on an event that is already set, or
+about to be."""
 REQUEST_ID = "detect-7f3c"
 SCREEN_NAMES = ("CPU", "MEM")
 
@@ -233,6 +246,7 @@ class Rack:
         on_probe_show: Any = None,
         on_open: Any = None,
         will_not_open: str | None = None,
+        real_hold: bool = False,
     ) -> None:
         self.raw = raw if raw is not None else config_dict()
         config = DaemonConfig.model_validate(self.raw)
@@ -273,7 +287,11 @@ class Rack:
             clock=FakeClock(NOW),
             status_path=tmp_path / "status.json",
             display_factory=self._open,
-            sleeper=self._hold,
+            # `None` is not "no hold": it is what the supervisor's own default
+            # answers to, which is the thing a real rack holds the glass up with
+            # and the one this file otherwise never exercises. See
+            # `test_the_hold_a_probe_takes_by_default_is_a_wait_a_stop_can_end`.
+            sleeper=None if real_hold else self._hold,
             **extra,
         )
 
@@ -736,6 +754,34 @@ def test_a_probe_paints_the_pattern_identify_paints(tmp_path: Path) -> None:
         rack.supervisor.stop()
 
 
+def test_the_screen_a_probe_invents_names_a_scene_this_rack_has() -> None:
+    """The two fields on that screen nothing reads, and what makes them right anyway.
+
+    `template` paints no pixel today: `_paint` goes through
+    `ScreenWorker.identify`, which reaches for `system_scenes()["identify"]`
+    itself, so the test above passes unchanged with any template at all. It is
+    not free to be wrong for that reason -- it is what a reader of
+    `_probe_screen` is told is going on the glass, and the day `_paint` renders
+    the configured template instead it becomes the thing that really is. A name
+    no system template carries would then be a `KeyError` raised inside the bus
+    guard, with four panels held off the wire behind it.
+
+    `position` is the schema's floor and not a claim about the rack: a candidate
+    has no place in it, and the ordinal on the glass is the device. Asserted as
+    the floor rather than as 1, because 1 is only right for as long as the schema
+    says so.
+    """
+    screen = supervisor._probe_screen(PROBE_BUS, PROBE_CS, PROBE_DC, PROBE_RST, PROBE_HZ)
+    config = screen.config
+
+    assert config.template in system_scenes(), (
+        "a probe would name a pattern this daemon cannot render"
+    )
+    below_the_floor = {**config.model_dump(), "position": config.position - 1}
+    with pytest.raises(ValidationError):
+        ScreenConfig.model_validate(below_the_floor)
+
+
 def test_a_probe_that_lit_the_panel_says_so_and_carries_no_reason(tmp_path: Path) -> None:
     """`error` is commentary on a failure. A success that carried one would have
     every reader deciding for itself which of the two fields to believe."""
@@ -824,6 +870,64 @@ def test_a_hold_that_is_not_a_duration_is_not_waited_out(
         rack.probe(hold_s=asked)
 
         assert rack.holds == [held]
+    finally:
+        rack.supervisor.stop()
+
+
+def test_the_hold_a_probe_takes_by_default_is_a_wait_a_stop_can_end(tmp_path: Path) -> None:
+    """Every probe above injects the sleeper, so the *default* -- what a rack on a
+    shelf really holds the glass up with -- is exercised by none of them.
+
+    Two properties, and a rack loses something different for each. A default that
+    does not wait at all shows the operator the pattern for one frame and takes
+    it down before they have looked up, which is the whole of what a probe is
+    for; the reply still says `ok`, so the wizard asks "did it light?" about a
+    panel that did, for a fortieth of a second. A default that waits *without*
+    watching the stop event -- a plain `time.sleep` -- blocks a SIGTERM that
+    lands mid-probe for the rest of the hold, and the hold is taken under
+    `_shutdown_lock`, so the `stop` on the link thread is parked behind it and
+    cannot even set the event. Past `TimeoutStopSec` that is four GC9A01s still
+    lit until somebody pulls the power.
+
+    Both are read off one call, and `Event.wait` is what makes that possible: it
+    answers True only when the event was set inside the timeout. So a minute that
+    ends in milliseconds carrying True is a wait that was really waiting and was
+    really released; a `None` is a default that never waited; a thread still
+    alive is one that ignored the stop.
+
+    Called directly rather than through `probe`, which is not laziness: `probe`
+    spends the hold holding `_shutdown_lock`, so a `stop` sent from this thread
+    to end it would park on that lock and deadlock the pair for the whole hold --
+    which is exactly what `probe`'s docstring says happens, and is the reason the
+    ceiling is small. What every test above pins is the other half: that `probe`
+    calls `self._sleeper` with the capped hold.
+
+    Nothing here spends wall clock. The waits are on events, and the minute is
+    never spent by any build that passes.
+    """
+    rack = Rack(tmp_path, real_hold=True)
+    rack.supervisor.start()
+    waiting = threading.Event()
+    answered: list[object] = []
+
+    def hold() -> None:
+        waiting.set()
+        answered.append(rack.supervisor._sleeper(A_MINUTE))
+
+    # A daemon thread, so a build that ignores the stop leaves a failed test
+    # rather than a suite that sits out a minute at interpreter exit.
+    holder = threading.Thread(target=hold, name="probe-hold", daemon=True)
+    holder.start()
+    try:
+        assert waiting.wait(timeout=WAIT), "the hold never started"
+
+        rack.supervisor.stop()
+        holder.join(timeout=WAIT)
+
+        assert not holder.is_alive(), "a stop must end a probe's hold, not wait it out"
+        assert answered == [True], (
+            "the hold must be a wait the stop event ended, not a call that returned at once"
+        )
     finally:
         rack.supervisor.stop()
 
@@ -953,3 +1057,30 @@ def test_the_detect_and_probe_handlers_are_wired_into_the_link(
     finally:
         frames.close()
         rack.supervisor.stop()
+
+
+def test_a_rack_looks_for_its_panels_where_linux_keeps_its_device_nodes() -> None:
+    """The one line in this module that no test in this repo reads, and the one
+    that decides what every real Pi answers.
+
+    Everything above hands `enumerate_panels` a directory it made, the test above
+    monkeypatches the constant, and the e2e rack overrides it from the
+    environment -- so `SPI_ROOT` itself is read by nothing here. Pointed at a
+    path that does not exist, this whole suite passes and every rack in the world
+    answers detect with an empty panel list: `enumerate_panels` turns a root it
+    cannot list into "no panels found" *on purpose*, so the mistake reaches the
+    operator as an honest-looking answer rather than as an error, and the
+    add-screen wizard simply has nothing to offer, on every rack, with nothing
+    anywhere saying why.
+
+    Derived rather than restated. `os.devnull` is the standard library's own
+    statement of where this platform keeps its device nodes, and a `spidev` node
+    is one of those; a constant naming any other directory fails here instead of
+    on a rack. It is compared and not listed, because reading the real `/dev` is
+    the thing this module is arranged never to do.
+    """
+    assert SPI_ROOT == Path(os.devnull).parent
+    assert entry.SPI_ROOT is SPI_ROOT, (
+        "the test above patches `__main__`'s name, so a second copy declared "
+        "there would be the one a rack really reads"
+    )

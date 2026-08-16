@@ -436,9 +436,23 @@ def _probe_screen(bus: int, cs: int, dc: int, rst: int, hz: int) -> ResolvedScre
     Built rather than looked up, because the whole point of a probe is that this
     panel is in no configuration yet: the operator is finding out whether it can
     be. It is never resolved, never diffed and never recorded in `_slots`, so
-    `template` names the system scene that will be painted and nothing looks it
-    up, and `position` is the schema's floor rather than a claim -- the ordinal
-    on the glass is the device, since a candidate has no position in the rack.
+    `template` and `position` describe the candidate rather than instruct
+    anything.
+
+    **`template` is inert as this is written, and named correctly anyway.** The
+    paint goes through `_paint`, which builds a `ScreenWorker` purely for its
+    `identify` -- and that method reaches for `system_scenes()["identify"]`
+    itself, so this field decides no pixel and a wrong name here would change
+    nothing on the glass. It is what a reader of this function is told is being
+    painted, and it is what would *become* the pattern the day `_paint` renders
+    the configured template instead; a name no system template carries would then
+    raise inside the bus guard, with every kept panel held off the wire behind
+    it. `test_the_screen_a_probe_invents_names_a_scene_this_rack_has` asserts
+    that much, and the pattern itself is pinned against `identify`'s own render
+    by `test_a_probe_paints_the_pattern_identify_paints`.
+
+    `position` is the schema's floor rather than a claim -- the ordinal on the
+    glass is the device, since a candidate has no position in the rack.
 
     `rotation` and `hflip` are left at their defaults on purpose. How a panel is
     bolted in is something the operator tells the server *after* they have seen
