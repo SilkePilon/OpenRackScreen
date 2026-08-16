@@ -88,7 +88,11 @@ class InstallReport:
     short_code: str
     reboot_needed: bool
     failed: bool
-    warnings: list[str] = field(default_factory=list)
+    # `tuple`, not `list`: `frozen=True` makes a dataclass hashable by
+    # default, and a `list` field breaks that silently -- the class
+    # statement succeeds either way, and only calling `hash()` on an
+    # instance raises `TypeError`.
+    warnings: tuple[str, ...] = field(default_factory=tuple)
 
     def warnings_text(self) -> str:
         return "\n".join(self.warnings)
@@ -101,7 +105,7 @@ class UninstallReport:
     that was already gone, or a service that was already stopped, is exactly
     the state `uninstall` is trying to reach."""
 
-    warnings: list[str] = field(default_factory=list)
+    warnings: tuple[str, ...] = field(default_factory=tuple)
 
     def warnings_text(self) -> str:
         return "\n".join(self.warnings)
@@ -110,11 +114,10 @@ class UninstallReport:
 # The unit template, copied verbatim from `daemon/examples/openrackscreen.service`
 # -- comments included, because each one records something learned in front of
 # a rack, not something worth re-deriving or paraphrasing here. The only
-# changes from that file: `ExecStart` collapsed to the one parameterised line
-# `unit_text` fills in (the example spells it across two lines with a shell
-# continuation for a human editing it by hand; a generated file has no reader
-# to wrap it for), and no `--config` -- M3c made it optional, and a unit
-# naming a file would make every rack need one.
+# structural change from that file is `ExecStart`, collapsed to the one
+# parameterised line `unit_text` fills in: the example spells it across two
+# lines with a shell continuation for a human editing it by hand, and a
+# generated file has no reader to wrap it for.
 #
 # `daemon/tests/test_install.py::test_the_generated_unit_and_the_example_do_not_drift`
 # asserts every non-comment, non-path setting in the example also appears
@@ -168,9 +171,8 @@ SupplementaryGroups=spi gpio
 # .venv this line used to name was a `uv sync` in a checkout, which is not how
 # anyone installs this any more.
 #
-# No config flag. A paired rack's configuration comes from the server, and
-# naming a file here would make every rack need one -- the flag became
-# optional in M3c for exactly this reason.
+# No --config. A paired rack's configuration comes from the server; the flag is
+# optional since M3c and a unit naming a file would make every rack need one.
 ExecStart=__EXEC_START__
 
 # `always`, not `on-failure`: a clean exit is not something this program is
@@ -230,9 +232,9 @@ TimeoutStopSec=30
 # systemd sets from User= (and which the daemon resolves itself if it does not).
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# Modest hardening. Deliberately without device isolation: it would hide
-# /dev/spidev* and /dev/gpiochip*, and the daemon would come up reporting four
-# unavailable screens with a permission error nobody would connect to this line.
+# Modest hardening. Deliberately NOT PrivateDevices=yes: it hides /dev/spidev*
+# and /dev/gpiochip*, and the daemon would come up reporting four unavailable
+# screens with a permission error nobody would connect to this line.
 NoNewPrivileges=yes
 # `full` leaves /dev alone while making /usr, /boot and /etc read-only. The
 # config is read, never written.
@@ -280,8 +282,28 @@ def _executable_by_service_user(executable: Path, trusted_root: Path) -> tuple[b
     required: `tmp_path` itself is created mode 0700 (`pytest-of-<user>` and
     its children, a security default pytest ships), so climbing further would
     fail the very test that expects success, on every machine.
+
+    Resolved first: `/usr/local/bin/x -> /opt/...` and pipx/uv-tool shims are
+    exactly this shape, and it is exactly the `/root/.local/share/uv/tools/...`
+    case this check exists for. `Path.stat()` already follows a symlink to
+    check the *target's* mode, but climbing `executable.parent` without
+    resolving first walks the *link's* lexical parents -- which can be
+    world-traversable even when the target's real directory is not, letting a
+    private target through unrefused.
+
+    A typo'd path or a broken symlink makes `executable.stat()` raise
+    `FileNotFoundError` rather than answer with a mode -- caught here and
+    turned into the same refusal `install` already has, rather than a
+    traceback in place of it.
     """
-    mode = stat.S_IMODE(executable.stat().st_mode)
+    executable = executable.resolve()
+    try:
+        mode = stat.S_IMODE(executable.stat().st_mode)
+    except FileNotFoundError:
+        return False, (
+            f"{executable} does not exist. Point --use-current-interpreter at a "
+            "real executable, or drop it and let install build a venv instead."
+        )
     if not (mode & stat.S_IROTH and mode & stat.S_IXOTH):
         return False, (
             f"{executable} is mode {mode:04o} and not readable+executable by "
@@ -327,11 +349,24 @@ def install(
     # forgot to seed with `9` -- can answer `0` again. `etc` is what
     # `install` itself creates and nothing else touches, so its presence
     # beforehand is this rack's own record of "installed before".
+    #
+    # This is a fallback, not the real signal -- `useradd` exiting `9`
+    # (below) is what actually means "already exists", on a real machine as
+    # much as under test. This directory check only distinguishes a re-run
+    # from a first run when `useradd` itself answers `0` either way, and
+    # nothing downstream branches on it besides this report field, so an
+    # unsound guess here only costs a wrong `created_user` in the printed
+    # report, never a wrong action.
     already_installed = (roots.etc / SERVICE_NAME).is_dir()
 
     if use_current_interpreter:
         if executable is None:
             raise ValueError("use_current_interpreter=True requires executable")
+        # Resolved before naming it anywhere: a symlinked interpreter (a
+        # pipx/uv-tool shim, `/usr/local/bin/x -> /opt/...`) must be checked
+        # and named at its real target, not at the link's own location -- see
+        # `_executable_by_service_user`.
+        executable = executable.resolve()
         ok, reason = _executable_by_service_user(executable, roots.etc)
         if not ok:
             warnings.append(reason)
@@ -341,7 +376,7 @@ def install(
                 short_code="",
                 reboot_needed=False,
                 failed=True,
-                warnings=warnings,
+                warnings=tuple(warnings),
             )
         bin_path = str(executable)
     else:
@@ -420,12 +455,29 @@ def install(
     # -- enable and start ----------------------------------------------------
     runner.run(["systemctl", "daemon-reload"])
     runner.run(["systemctl", "enable", "--now", f"{SERVICE_NAME}.service"])
+    # `enable --now` is a no-op on a unit that is already active, so on an
+    # upgrade -- where the venv step above just replaced the interpreter and
+    # packages underneath a running daemon -- nothing here would make the new
+    # version take effect before someone reboots the rack by hand.
+    # `try-restart` is exactly enable --now's complement: it restarts the
+    # unit if it is running, and does nothing (does not start it) if it is
+    # not, so a first install is unaffected.
+    runner.run(["systemctl", "try-restart", f"{SERVICE_NAME}.service"])
 
     # -- SPI ------------------------------------------------------------------
     reboot_needed = False
     if enable_spi_step:
         spi_result = boot_config.enable_spi(roots.boot, now)
         reboot_needed = bool(spi_result.added)
+        if spi_result.path is None:
+            # No config.txt found anywhere under roots.boot -- not the machine
+            # this install expects. Saying nothing here would leave an
+            # operator who did not pass --no-spi believing SPI was handled
+            # when it was never touched.
+            warnings.append(
+                "no config.txt was found under the boot partition; SPI was not "
+                "enabled. Pass --no-spi to silence this, or enable SPI by hand."
+            )
 
     # -- the install identity ---------------------------------------------
     ident = identity.load_or_create(state_dir / "identity.json")
@@ -436,7 +488,7 @@ def install(
         short_code=ident.short_code,
         reboot_needed=reboot_needed,
         failed=failed,
-        warnings=warnings,
+        warnings=tuple(warnings),
     )
 
 
@@ -450,8 +502,8 @@ def uninstall(roots: Roots, runner: Runner, *, purge: bool = False) -> Uninstall
     warnings: list[str] = []
     unit_path = roots.systemd / f"{SERVICE_NAME}.service"
 
-    runner.run(["systemctl", "stop", SERVICE_NAME])
-    runner.run(["systemctl", "disable", SERVICE_NAME])
+    runner.run(["systemctl", "stop", f"{SERVICE_NAME}.service"])
+    runner.run(["systemctl", "disable", f"{SERVICE_NAME}.service"])
     unit_path.unlink(missing_ok=True)
     runner.run(["systemctl", "daemon-reload"])
 
@@ -465,4 +517,4 @@ def uninstall(roots: Roots, runner: Runner, *, purge: bool = False) -> Uninstall
             "installed."
         )
 
-    return UninstallReport(warnings=warnings)
+    return UninstallReport(warnings=tuple(warnings))

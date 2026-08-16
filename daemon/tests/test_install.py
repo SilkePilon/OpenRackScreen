@@ -68,6 +68,18 @@ def _install(roots: Roots, runner: FakeRunner, **kwargs):
     return install(roots, runner, **kwargs)
 
 
+def _non_comment_lines(text: str) -> str:
+    """`text` with every `#`-comment line removed, joined back with newlines.
+
+    A comment is free to name a setting it explains the *absence* of --
+    "Deliberately NOT PrivateDevices=yes" and "No --config." are both
+    exactly that -- so an assertion that a setting is absent has to check
+    the real `key=value` lines only, or a verbatim-copied explanatory
+    comment would trip it.
+    """
+    return "\n".join(line for line in text.splitlines() if not line.strip().startswith("#"))
+
+
 # --- directories -----------------------------------------------------------
 
 
@@ -90,6 +102,7 @@ def test_running_it_twice_changes_nothing_the_second_time(roots):
     first = _install(roots, FakeRunner())
     second = _install(roots, FakeRunner())
     assert first.unit_path.read_text() == second.unit_path.read_text()
+    assert first.created_user is True
     assert second.created_user is False
 
 
@@ -134,6 +147,10 @@ def test_a_missing_group_is_reported_and_not_created(roots):
     report = _install(roots, runner)
     assert "gpio" in report.warnings_text() or "spi" in report.warnings_text()
     assert "groupadd" not in runner.programs()
+    # Exit 6 means "no such group" -- a warning, not a failure. Falling
+    # through to the generic-failure branch would make a rack whose udev
+    # rules have not landed yet report a failed install.
+    assert report.failed is False
 
 
 # --- the venv --------------------------------------------------------------
@@ -171,6 +188,30 @@ def test_the_current_interpreter_can_be_used_instead(roots):
     assert f"ExecStart={interpreter} run" in report.unit_path.read_text()
 
 
+def test_a_symlinked_interpreter_is_checked_at_its_target(roots):
+    """`/usr/local/bin/x -> /opt/...` and pipx/uv-tool shims are exactly this
+    shape -- and it is exactly the `/root/.local/share/uv/tools/...` case the
+    whole check exists for. `executable.stat()` follows the link to a
+    world-readable target, but climbing the *link's* lexical parents skips
+    the target's actually-private directory entirely."""
+    runner = FakeRunner()
+    target = roots.etc / "private" / "bin" / "ors-daemon"
+    target.parent.mkdir(parents=True)
+    target.write_text("#!/bin/sh\n")
+    target.chmod(0o755)
+    target.parent.chmod(0o700)
+
+    link_dir = roots.etc / "usr" / "local" / "bin"
+    link_dir.mkdir(parents=True)
+    link = link_dir / "ors-daemon"
+    link.symlink_to(target)
+
+    report = _install(roots, runner, use_current_interpreter=True, executable=link)
+
+    assert report.failed is True
+    assert not (roots.systemd / f"{SERVICE_NAME}.service").exists()
+
+
 def test_an_unreadable_interpreter_is_refused_before_the_unit_is_written(roots):
     """Refusing after writing the unit leaves a machine that is configured to
     fail at every boot, and `systemctl status` blames the executable rather
@@ -180,12 +221,24 @@ def test_an_unreadable_interpreter_is_refused_before_the_unit_is_written(roots):
     interpreter.parent.mkdir(parents=True)
     interpreter.write_text("#!/bin/sh\n")
     interpreter.chmod(0o700)
-    interpreter.parent.chmod(0o700)
 
     report = _install(roots, runner, use_current_interpreter=True, executable=interpreter)
 
     assert report.failed is True
     assert "0700" in report.warnings_text() or "readable" in report.warnings_text()
+    assert not (roots.systemd / f"{SERVICE_NAME}.service").exists()
+
+
+def test_a_nonexistent_interpreter_is_refused_not_crashed(roots):
+    """A typo'd path or a broken symlink must produce the same refusal as an
+    unreadable one, not a traceback -- `executable.stat()` raises
+    `FileNotFoundError` on either."""
+    runner = FakeRunner()
+    interpreter = roots.etc / "nope" / "bin" / "ors-daemon"
+
+    report = _install(roots, runner, use_current_interpreter=True, executable=interpreter)
+
+    assert report.failed is True
     assert not (roots.systemd / f"{SERVICE_NAME}.service").exists()
 
 
@@ -196,15 +249,16 @@ def test_the_unit_keeps_every_line_that_is_load_bearing(roots):
     """Each of these was learned in front of a rack, and each has a comment in
     `daemon/examples/openrackscreen.service` saying what it costs to drop."""
     report = _install(roots, FakeRunner())
-    text = report.unit_path.read_text()
+    text = _non_comment_lines(report.unit_path.read_text())
     assert "StartLimitIntervalSec=0" in text
     assert "SupplementaryGroups=spi gpio" in text
     assert "TimeoutStopSec=30" in text
     assert "RuntimeDirectory=openrackscreen" in text
     assert "StateDirectory=openrackscreen" in text
     assert f"User={SERVICE_USER}" in text
-    # Deliberately absent: it hides /dev/spidev* and /dev/gpiochip*, and every
-    # screen comes up unavailable with a permission error nobody connects to it.
+    # Deliberately absent as a *setting*. The hardening comment right above it
+    # in the real file names it too, to explain why -- which is exactly what
+    # `_non_comment_lines` excludes before this checks.
     assert "PrivateDevices=yes" not in text
 
 
@@ -212,7 +266,8 @@ def test_the_unit_does_not_pass_a_config_file(roots):
     """M3c made --config optional: a paired rack's configuration comes from the
     server, and a unit naming a file would make every rack need one."""
     report = _install(roots, FakeRunner())
-    assert "--config" not in report.unit_path.read_text()
+    text = _non_comment_lines(report.unit_path.read_text())
+    assert "--config" not in text
 
 
 def test_the_generated_unit_and_the_example_do_not_drift(roots):
@@ -231,9 +286,8 @@ def test_the_generated_unit_and_the_example_do_not_drift(roots):
     def settings(text: str) -> set[str]:
         return {
             line.strip()
-            for line in text.splitlines()
+            for line in _non_comment_lines(text).splitlines()
             if "=" in line
-            and not line.strip().startswith("#")
             # Paths differ by construction: the example names /opt and the test
             # names a tmp_path.
             and not line.strip().startswith(("ExecStart=", "Documentation="))
@@ -248,6 +302,17 @@ def test_it_enables_and_starts_the_service(roots):
     systemctl = [" ".join(argv) for argv in runner.argv_for("systemctl")]
     assert any("daemon-reload" in call for call in systemctl)
     assert any("enable" in call and "--now" in call for call in systemctl)
+
+
+def test_a_second_install_restarts_the_running_service(roots):
+    """`enable --now` is a no-op on a unit that is already active, so on an
+    upgrade -- where `install` has just replaced the venv underneath a
+    running daemon -- nothing short of an explicit restart makes the new
+    version take effect before the next reboot."""
+    runner = FakeRunner()
+    _install(roots, runner)
+    systemctl = [" ".join(argv) for argv in runner.argv_for("systemctl")]
+    assert any("try-restart" in call and SERVICE_NAME in call for call in systemctl)
 
 
 # --- SPI -------------------------------------------------------------------
@@ -277,6 +342,17 @@ def test_no_reboot_is_claimed_when_spi_was_already_on(roots):
     (roots.boot / "firmware" / "config.txt").write_text("dtparam=spi=on\ndtoverlay=spi1-2cs\n")
     report = _install(roots, FakeRunner())
     assert report.reboot_needed is False
+
+
+def test_a_missing_config_txt_is_reported_not_silent(roots):
+    """`enable_spi` returns `path=None` when the machine has no `config.txt`
+    at all. Without `--no-spi`, saying nothing here tells the operator SPI
+    is handled when it was never touched."""
+    # roots.boot has no config.txt anywhere under it (the fixture only makes
+    # the directory), so boot_config.find_config finds nothing.
+    report = _install(roots, FakeRunner())
+    assert report.reboot_needed is False
+    assert "config.txt" in report.warnings_text()
 
 
 # --- the identity ----------------------------------------------------------
@@ -325,6 +401,16 @@ def test_purge_removes_it_and_says_so(roots):
     report = uninstall(roots, FakeRunner(), purge=True)
     assert not (roots.state / "openrackscreen").exists()
     assert "re-approv" in report.warnings_text().lower()
+
+
+def test_the_reports_are_actually_hashable(roots):
+    """Both report dataclasses are `frozen=True`, which makes a dataclass
+    hashable by default -- but a `list` field breaks that promise at
+    `hash()` time rather than at the class statement, so nothing before this
+    test would have noticed a `TypeError` there."""
+    report = _install(roots, FakeRunner())
+    hash(report)
+    hash(uninstall(roots, FakeRunner(), purge=True))
 
 
 def test_uninstall_never_reverts_config_txt(roots):
