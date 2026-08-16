@@ -357,4 +357,48 @@ describe("a refused handshake", () => {
     expect(screen.queryByRole("heading", { name: /sign in/i })).not.toBeInTheDocument()
     expect(screen.getByRole("heading", { name: "Daemons" })).toBeInTheDocument()
   })
+
+  it("asks again when the server comes back, because the outage happens first", async () => {
+    // **The real order of events, which is what makes "ask once" the wrong
+    // rule.** The server goes away first -- nothing, or a proxy, answers -- and
+    // comes back second having forgotten this browser's session. A client that
+    // spent its one question on the outage would never notice the refusal that
+    // followed, which is the defect with an extra step in it.
+    const sockets = collectSockets()
+    const asked: number[] = []
+    let meCalls = 0
+    server.use(
+      http.get("/api/auth/me", () => {
+        meCalls += 1
+        return HttpResponse.json({ authenticated: meCalls === 1, password_set: true })
+      }),
+      http.get("/api/daemons", () => HttpResponse.json([])),
+      http.get("/api/settings", () => {
+        // A 502 first: a reverse proxy in front of a server that is not
+        // running. It is an HTTP status and it is **not an answer** -- nothing
+        // that knows what a session is has said anything yet.
+        const status = asked.length === 0 ? 502 : 401
+        asked.push(status)
+        return HttpResponse.json({ detail: "no" }, { status })
+      }),
+    )
+    const { path } = renderApp({ at: "/daemons" })
+    expect(await screen.findByRole("heading", { name: "Daemons" })).toBeInTheDocument()
+    const dialled = sockets.length
+
+    act(() => held(sockets).drop())
+    await waitFor(() => expect(asked).toEqual([502]))
+    expect(path()).toBe("/daemons")
+
+    // The client goes on dialling on its own backoff -- 750-1000 ms for the
+    // first one -- and this time the server is there to refuse it properly.
+    await waitFor(() => expect(sockets).toHaveLength(dialled + 1), { timeout: 3000 })
+    act(() => held(sockets).drop())
+
+    expect(await screen.findByRole("heading", { name: /sign in/i })).toBeInTheDocument()
+    expect(path()).toBe("/login")
+    // Twice in total: once per outage-shaped non-answer, and then once for the
+    // answer. Not once per dial.
+    expect(asked).toEqual([502, 401])
+  })
 })
