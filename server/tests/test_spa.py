@@ -154,14 +154,23 @@ def test_the_wrong_method_on_a_real_api_route_is_still_405_and_not_404(client, t
     the same app without an interface, because the number alone is only half the
     claim: what is being pinned is that mounting the interface changed *nothing*
     about what the API answers.
+
+    Both directions, because one of them proves nothing on its own: `StaticFiles`
+    answers *every* non-GET with a 405 of its own, so a mount that swallowed
+    `POST /api/health` would still hand back 405 by coincidence. `GET
+    /api/auth/login` is the mismatch the other way round -- a route that exists
+    for POST, asked for with a verb `StaticFiles` is delighted to serve -- and a
+    mount that answered it would return the shell with a 200.
     """
     alone = TestClient(create_app(AppSettings(data_dir=tmp_path / "data-alone")))
 
-    mounted = client.post("/api/health")
+    for method, path in (("POST", "/api/health"), ("GET", "/api/auth/login")):
+        mounted = client.request(method, path)
 
-    assert mounted.status_code == 405
-    assert mounted.status_code == alone.post("/api/health").status_code
-    assert mounted.json() == {"detail": "Method Not Allowed"}
+        assert mounted.status_code == 405, f"{method} {path}"
+        assert mounted.status_code == alone.request(method, path).status_code
+        assert mounted.json() == {"detail": "Method Not Allowed"}
+        assert SHELL not in mounted.text
 
 
 def test_a_reserved_path_is_refused_after_normalisation_not_by_its_first_letters(client):
