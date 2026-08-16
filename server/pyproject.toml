@@ -1,11 +1,11 @@
 [project]
 name = "ors-server"
-version = "0.1.0"
+version = "0.2.0"
 description = "OpenRackScreen server: owns the rack's config and pushes it to daemons"
 requires-python = ">=3.11"
 dependencies = [
-    "ors-schema",
-    "ors-render",
+    "ors-schema==0.2.0",
+    "ors-render==0.2.0",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "pydantic>=2.7",

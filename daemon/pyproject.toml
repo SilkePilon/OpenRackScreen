@@ -1,11 +1,11 @@
 [project]
 name = "ors-daemon"
-version = "0.1.0"
+version = "0.2.0"
 description = "OpenRackScreen daemon: drives rack panels from a local config"
 requires-python = ">=3.11"
 dependencies = [
-    "ors-schema",
-    "ors-render",
+    "ors-schema==0.2.0",
+    "ors-render==0.2.0",
     "pydantic>=2.7",
     "pyyaml>=6.0",
     "requests>=2.32",

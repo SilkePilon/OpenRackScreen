@@ -10,6 +10,7 @@ resolution-markers = [
 [manifest]
 members = [
     "openrackscreen",
+    "openrackscreen-workspace",
     "ors-daemon",
     "ors-render",
     "ors-schema",
@@ -708,6 +709,21 @@ wheels = [
 
 [[package]]
 name = "openrackscreen"
+version = "0.2.0"
+source = { editable = "packages/openrackscreen" }
+dependencies = [
+    { name = "ors-daemon" },
+    { name = "ors-server" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "ors-daemon", editable = "daemon" },
+    { name = "ors-server", editable = "server" },
+]
+
+[[package]]
+name = "openrackscreen-workspace"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
@@ -747,7 +763,7 @@ dev = [
 
 [[package]]
 name = "ors-daemon"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "daemon" }
 dependencies = [
     { name = "ors-render" },
@@ -784,7 +800,7 @@ provides-extras = ["hardware"]
 
 [[package]]
 name = "ors-render"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "packages/ors-render" }
 dependencies = [
     { name = "ors-schema" },
@@ -799,7 +815,7 @@ requires-dist = [
 
 [[package]]
 name = "ors-schema"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "packages/ors-schema" }
 dependencies = [
     { name = "pydantic" },
@@ -810,7 +826,7 @@ requires-dist = [{ name = "pydantic", specifier = ">=2.7" }]
 
 [[package]]
 name = "ors-server"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "server" }
 dependencies = [
     { name = "argon2-cffi" },

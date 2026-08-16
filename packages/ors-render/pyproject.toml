@@ -1,6 +1,6 @@
 [project]
 name = "ors-render"
-version = "0.1.0"
+version = "0.2.0"
 description = "Scene JSON to image renderer for OpenRackScreen"
 requires-python = ">=3.11"
 # The Pillow floor is a *security* floor, not a feature one: 10.3.0 is the
@@ -14,7 +14,7 @@ requires-python = ">=3.11"
 # under 10.3.0-12.2.0 the two take different paths (ellipse vs joined halves) and
 # differ by a few pixels. `render_rect` therefore caps the radius itself, and its
 # output for those radii is byte-identical on 10.3.0, 11.0.0, 12.0.0 and 12.3.0.
-dependencies = ["ors-schema", "pillow>=10.3"]
+dependencies = ["ors-schema==0.2.0", "pillow>=10.3"]
 
 [build-system]
 requires = ["hatchling"]

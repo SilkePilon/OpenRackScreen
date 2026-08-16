@@ -1,5 +1,10 @@
 [project]
-name = "openrackscreen"
+# Not `openrackscreen`: that name now belongs to the published meta-package at
+# `packages/openrackscreen`, and uv workspace members must have distinct names.
+# This root project is `package = false` -- virtual, never built, never
+# published -- so its own name is nominal; it exists only so the workspace has
+# a root to resolve against.
+name = "openrackscreen-workspace"
 version = "0.1.0"
 description = "Configurable monitoring displays for server racks"
 requires-python = ">=3.11"
@@ -54,6 +59,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = [
+    "tests",
     "packages/ors-schema/tests",
     "packages/ors-render/tests",
     "daemon/tests",

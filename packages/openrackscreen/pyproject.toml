@@ -1,0 +1,22 @@
+[project]
+name = "openrackscreen"
+version = "0.2.0"
+description = "OpenRackScreen: configurable monitoring displays for server racks"
+readme = "README.md"
+requires-python = ">=3.11"
+# Deliberately empty of modules. This distribution exists so the project's own
+# name on PyPI belongs to the project, and so that `pip install openrackscreen`
+# gets somebody the two things they actually wanted rather than a 404.
+dependencies = ["ors-daemon==0.2.0", "ors-server==0.2.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# No package to include; hatchling needs telling that on purpose.
+bypass-selection = true
+
+[tool.uv.sources]
+ors-daemon = { workspace = true }
+ors-server = { workspace = true }
