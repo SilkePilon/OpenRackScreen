@@ -17,6 +17,28 @@
  * mentioned rack 16, and rack 0 exists in no database (SQLite's rowids begin
  * at 1). Every one of these is a rack somebody would be sent to go and look at.
  */
+/**
+ * The racks an edit could not be given to, by name, for a sentence.
+ *
+ * Here rather than on each page because three pages now say it and the rule is
+ * the same one every time: the ids come from `X-Unservable-Daemons` and from
+ * nothing else. The body of a write describes what was written, and the rack it
+ * was written *about* is not the same set as the racks that did not get it -- a
+ * template edit reaches every rack there is, and `PATCH /api/settings` does too.
+ *
+ * An id with no row is named as an id. It is a rack the caller's listing does
+ * not have -- deleted in another tab between the fetch and the write, most
+ * plainly -- and drawing nothing for it would quietly shorten the list of racks
+ * somebody has to go and look at.
+ *
+ * Structural in `racks` on purpose: this module is below `queries` in the import
+ * graph (`mutate` imports it), and the two fields it reads are the two fields
+ * every listing of a rack has.
+ */
+export function nameDaemons(ids: number[], racks: readonly { id: number; name: string }[]): string {
+  return ids.map((id) => racks.find((rack) => rack.id === id)?.name ?? `daemon ${id}`).join(", ")
+}
+
 export function parseUnservable(headers: Headers): number[] {
   const raw = headers.get("X-Unservable-Daemons")
   if (!raw) return []

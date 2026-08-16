@@ -10,6 +10,7 @@ import { DaemonsPage } from "@/routes/daemons/DaemonsPage"
 import { LoginPage } from "@/routes/login/LoginPage"
 import { ScreensPage } from "@/routes/screens/ScreensPage"
 import { SetupPage } from "@/routes/setup/SetupPage"
+import { TemplatesPage } from "@/routes/templates/TemplatesPage"
 
 // The pages themselves arrive in later tasks; the routes exist now so the guard
 // has something to guard and the sidebar has somewhere to link.
@@ -91,7 +92,7 @@ function App() {
         <Route index element={<Navigate to="/daemons" replace />} />
         <Route path="/daemons" element={<DaemonsPage />} />
         <Route path="/screens" element={<ScreensPage />} />
-        <Route path="/templates" element={<Placeholder title="Templates" />} />
+        <Route path="/templates" element={<TemplatesPage />} />
         <Route path="/integrations" element={<Placeholder title="Integrations" />} />
         <Route path="/settings" element={<Placeholder title="Settings" />} />
         <Route path="*" element={<Placeholder title="No such page" />} />

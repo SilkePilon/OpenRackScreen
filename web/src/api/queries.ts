@@ -138,6 +138,44 @@ export function useScreens() {
   })
 }
 
+/** Every field of a screen, all optional, and `extra="forbid"` on the far end. */
+export type ScreenBody = components["schemas"]["ScreenBody"]
+
+/** Which screen a PATCH is about, and the fields it changes. */
+export type ScreenEdit = {
+  id: number
+  body: ScreenBody
+}
+
+/**
+ * The one PATCH of a screen row, wherever the edit was made.
+ *
+ * **One hook and not one per page, because the invalidation is the part that
+ * gets forgotten.** Two places in this interface assign a template -- the
+ * Screens inspector's Config tab and the Templates page -- and they write the
+ * same field through the same route; the failure that follows from two copies is
+ * not a wrong request but a right one whose result is never re-read, so the page
+ * that made the edit goes on drawing the row it had before. That seam has bitten
+ * this project three times, so there is one place to change and nowhere for the
+ * two to disagree.
+ *
+ * The screen list and nothing else. The edit does bump the rack's
+ * `config_version`, but no page that draws a version fails to ask for the racks
+ * when it mounts.
+ *
+ * The id travels in the variables rather than in a closure because one of the
+ * callers does not know it when the hook is mounted: the Templates page's assign
+ * dialog is opened first and the panel chosen afterwards, and a hook per
+ * candidate row would be a hook count that changes with a select.
+ */
+export function useSaveScreen() {
+  return useMutate<Screen, ScreenEdit>({
+    send: ({ id, body }) =>
+      api.PATCH("/api/screens/{screen_id}", { params: { path: { screen_id: id } }, body }),
+    invalidates: [screensKey],
+  })
+}
+
 /** One `/dev/spidev<bus>.<cs>` a rack has, and the screen already driving it. */
 export type PanelCandidate = components["schemas"]["PanelCandidate"]
 
@@ -218,6 +256,63 @@ export function useTemplates() {
       }
       return data
     },
+  })
+}
+
+/** What a template amendment may carry. Every field optional, `extra="forbid"`. */
+export type TemplateBody = components["schemas"]["TemplateBody"]
+
+/**
+ * Amend one template, built-in rows included.
+ *
+ * `seed_builtin_templates` inserts `ON CONFLICT DO NOTHING` precisely so
+ * re-seeding cannot revert an edit, "so there is nothing to refuse here" -- the
+ * route amends a built-in like any other row, and this interface offers it.
+ *
+ * **`invalidates` names the templates and not the screens, and that is not an
+ * oversight about how far this edit reaches.** A template edit is rack-wide: the
+ * route never calls `affects`, so `Change` reads the affected set as every rack
+ * there is, and every one of them is pushed a fresh snapshot. What it does not
+ * do is move a *row* in any other table -- a screen names a template by name,
+ * and a rename that left a screen naming nothing is refused by the snapshot
+ * before it is committed. So the templates are what went stale.
+ */
+export function useAmendTemplate(templateId: number) {
+  return useMutate<Template, TemplateBody>({
+    send: (body) =>
+      api.PATCH("/api/templates/{template_id}", {
+        params: { path: { template_id: templateId } },
+        body,
+      }),
+    invalidates: [templatesKey],
+  })
+}
+
+/**
+ * Delete a template the editor made.
+ *
+ * A built-in is refused 409 -- it is re-seeded at every start, so a delete
+ * button that undoes itself overnight is worse than one that refuses -- and this
+ * interface does not offer the button at all. A template still named by an
+ * enabled screen is refused later and elsewhere: `build_snapshot` will not
+ * assemble a configuration whose screen names a template that is not defined, so
+ * `changes.change` rolls the delete back with a message naming the screen. Both
+ * refusals arrive as an `ApiError` carrying the server's own sentence.
+ *
+ * **Mounted once for the whole list, and the template travels in the variables.**
+ * A delete that lands takes its own card off the page -- the invalidation is
+ * awaited before the mutation settles, so the row is gone by the time anything
+ * could be drawn about it -- and a mutation living on that card would take the
+ * answer with it. `X-Unservable-Daemons` is on a delete like any other write,
+ * because a template delete is rack-wide too, and it is the only thing that
+ * names a rack that missed one. The name is carried alongside the id so what is
+ * said afterwards can name the template that is no longer in the list.
+ */
+export function useDeleteTemplate() {
+  return useMutate<Deleted, { id: number; name: string }>({
+    send: ({ id }) =>
+      api.DELETE("/api/templates/{template_id}", { params: { path: { template_id: id } } }),
+    invalidates: [templatesKey],
   })
 }
 

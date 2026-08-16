@@ -9,6 +9,7 @@ import {
   type Daemon,
   type Pushed,
 } from "@/api/queries"
+import { nameDaemons } from "@/api/unservable"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardFooter, CardHeader } from "@/components/ui/card"
@@ -41,25 +42,6 @@ function pushOutcome(saved: Saved<Pushed>, name: string): string {
   }
   if (answer.delivered) return `Version ${answer.version} was delivered to ${name}.`
   return `Version ${answer.version} was minted, but nothing was sent to ${name}.`
-}
-
-/**
- * The racks an edit could not be given to, by name, from the header.
- *
- * From `X-Unservable-Daemons` and from nothing else. The body of a write
- * describes what was written -- for a push, a version and whether it left --
- * and the rack it was written *about* is not the same set as the racks that
- * did not get it. Naming the rack the button was pressed on would be right by
- * coincidence for this one route and wrong for every edit that touches more
- * than one rack.
- *
- * An id with no row is named as an id. It is a rack this listing does not have:
- * deleted in another tab between the fetch and the write, most plainly. Drawing
- * nothing for it would quietly shorten the list of racks somebody has to go and
- * look at.
- */
-function nameThem(ids: number[], racks: Daemon[]): string {
-  return ids.map((id) => racks.find((rack) => rack.id === id)?.name ?? `daemon ${id}`).join(", ")
 }
 
 /**
@@ -144,7 +126,7 @@ function RackCard({ rack, racks }: { rack: Daemon; racks: Daemon[] }) {
           <Alert variant="destructive">
             <AlertTitle>Not every rack was given that change</AlertTitle>
             <AlertDescription>
-              {`${nameThem(pushed.unservable, racks)}: no configuration that can be sent, so nothing was sent.`}
+              {`${nameDaemons(pushed.unservable, racks)}: no configuration that can be sent, so nothing was sent.`}
             </AlertDescription>
           </Alert>
         )}

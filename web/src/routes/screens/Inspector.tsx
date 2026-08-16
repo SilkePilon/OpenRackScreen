@@ -2,8 +2,15 @@ import { useId, useState } from "react"
 
 import { api } from "@/api/client"
 import { useMutate } from "@/api/mutate"
-import { screensKey, type Daemon, type Deleted, type Screen } from "@/api/queries"
-import type { components } from "@/api/schema"
+import {
+  screensKey,
+  useSaveScreen,
+  type Daemon,
+  type Deleted,
+  type Screen,
+  type ScreenBody,
+} from "@/api/queries"
+import { nameDaemons } from "@/api/unservable"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
@@ -21,28 +28,6 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ConfigTab } from "@/routes/screens/ConfigTab"
 import { DataTab } from "@/routes/screens/DataTab"
 import { SleepTab } from "@/routes/screens/SleepTab"
-
-/** Every field of a screen, all optional, and `extra="forbid"` on the far end. */
-type ScreenBody = components["schemas"]["ScreenBody"]
-
-/**
- * The racks an edit could not be given to, by name, from the header.
- *
- * From `X-Unservable-Daemons` and from nothing else. A screen belongs to one
- * rack, so naming `screen.daemon_id` would look right on every response the
- * server realistically gives and would still be the interface answering a
- * question it was not asked: the header is the server's account of which racks
- * did not receive the push this edit caused, and a screen's own rack is not
- * that set -- a template edit reaches every rack that names it.
- *
- * An id with no row is named as an id. It is a rack this page's listing does
- * not have -- deleted in another tab between the fetch and the write, most
- * plainly -- and drawing nothing for it would quietly shorten the list of racks
- * somebody has to go and look at.
- */
-function nameThem(ids: number[], racks: Daemon[]): string {
-  return ids.map((id) => racks.find((rack) => rack.id === id)?.name ?? `daemon ${id}`).join(", ")
-}
 
 /**
  * Delete one panel, having said what that costs.
@@ -125,19 +110,14 @@ function DeleteScreenDialog({ screen }: { screen: Screen }) {
 function ScreenInspector({ screen, racks }: { screen: Screen; racks: Daemon[] }) {
   const headingId = useId()
 
-  const patch = useMutate<Screen, ScreenBody>({
-    send: (body) =>
-      api.PATCH("/api/screens/{screen_id}", {
-        params: { path: { screen_id: screen.id } },
-        body,
-      }),
-    // The screen list and nothing else. The edit does bump the rack's
-    // `config_version`, but no version is drawn on this page, and every page
-    // that draws one asks for the racks when it mounts.
-    invalidates: [screensKey],
-  })
+  // The one screen PATCH this interface has, shared with the Templates page --
+  // which assigns and detaches through the same route and the same field. Two
+  // copies of it drifted apart in what they made stale is the seam that has
+  // bitten this project three times, so there is one hook and no second set of
+  // invalidations to forget.
+  const patch = useSaveScreen()
   const saved = patch.data
-  const save = (body: ScreenBody) => patch.mutate(body)
+  const save = (body: ScreenBody) => patch.mutate({ id: screen.id, body })
 
   /**
    * Forget what the last write said, because a form has moved on from it.
@@ -197,7 +177,7 @@ function ScreenInspector({ screen, racks }: { screen: Screen; racks: Daemon[] })
           <Alert variant="destructive">
             <AlertTitle>Not every rack was given that change</AlertTitle>
             <AlertDescription>
-              {`${nameThem(saved.unservable, racks)}: the change was saved, but nothing was sent. ` +
+              {`${nameDaemons(saved.unservable, racks)}: the change was saved, but nothing was sent. ` +
                 "Each of those racks has a reason on the Daemons page, and the usual recovery is " +
                 "the next edit plus a push."}
             </AlertDescription>
