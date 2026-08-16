@@ -60,6 +60,16 @@ ors-server = { workspace = true }
 # rejected and wrongly matches `"ors-schema-extra==1.0"`. It is already
 # resolved transitively (pytest depends on it), named explicitly so a test
 # that imports it directly does not rely on that staying true by accident.
+# `hatchling` is here for `server/tests/test_packaging.py`, which asks
+# `hatchling.builders.wheel.WheelBuilder`'s own config object whether
+# `server/pyproject.toml` would select the built interface into the wheel --
+# the same predicate a real `uv build` calls per file, at none of the cost, so
+# a config edit that stops shipping the interface fails a test in ten
+# milliseconds instead of failing silently the day someone runs
+# `uv tool install ors-server`. It is already resolved transitively, into the
+# isolated environment `uv build` assembles from `[build-system] requires` --
+# named here so the *workspace* venv `pytest` runs in has it too, which that
+# isolated one never shares.
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.0,<2",
@@ -68,6 +78,7 @@ dev = [
     "httpx2>=2.10",
     "pyyaml>=6",
     "packaging>=24",
+    "hatchling>=1.27",
 ]
 
 [tool.pytest.ini_options]
