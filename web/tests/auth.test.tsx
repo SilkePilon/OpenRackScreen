@@ -358,12 +358,24 @@ describe("a refused handshake", () => {
     expect(screen.getByRole("heading", { name: "Daemons" })).toBeInTheDocument()
   })
 
-  it("asks again when the server comes back, because the outage happens first", async () => {
-    // **The real order of events, which is what makes "ask once" the wrong
-    // rule.** The server goes away first -- nothing, or a proxy, answers -- and
-    // comes back second having forgotten this browser's session. A client that
-    // spent its one question on the outage would never notice the refusal that
-    // followed, which is the defect with an extra step in it.
+  /**
+   * The real order of events, with one thing varied: what the first question got.
+   *
+   * **This is what makes "ask once" the wrong rule.** The server goes away
+   * first, and comes back second having forgotten this browser's session -- so a
+   * client that spent its one question on the outage would never notice the
+   * refusal that follows, which is the original defect with an extra step in it.
+   * The two callers below are the same event in different clothes: `fetch`
+   * rejecting because nothing accepted the connection at all, and a proxy's 502
+   * because something did and the server behind it is not running. Neither
+   * answers "does this browser still have a session", and either taken for an
+   * answer leaves the tab refused forever with nothing saying why.
+   *
+   * Drives the client's own backoff rather than a fake clock: the second dial is
+   * the one the client makes on its own, 750-1000 ms later, which is also the
+   * only way this test can be sure the refusal did not stop it dialling.
+   */
+  async function outageThenRefusal(firstAnswer: () => Response) {
     const sockets = collectSockets()
     const asked: number[] = []
     let meCalls = 0
@@ -374,12 +386,10 @@ describe("a refused handshake", () => {
       }),
       http.get("/api/daemons", () => HttpResponse.json([])),
       http.get("/api/settings", () => {
-        // A 502 first: a reverse proxy in front of a server that is not
-        // running. It is an HTTP status and it is **not an answer** -- nothing
-        // that knows what a session is has said anything yet.
-        const status = asked.length === 0 ? 502 : 401
-        asked.push(status)
-        return HttpResponse.json({ detail: "no" }, { status })
+        asked.push(asked.length)
+        return asked.length === 1
+          ? firstAnswer()
+          : HttpResponse.json({ detail: "not authenticated" }, { status: 401 })
       }),
     )
     const { path } = renderApp({ at: "/daemons" })
@@ -387,18 +397,37 @@ describe("a refused handshake", () => {
     const dialled = sockets.length
 
     act(() => held(sockets).drop())
-    await waitFor(() => expect(asked).toEqual([502]))
+    await waitFor(() => expect(asked).toHaveLength(1))
+    // Nothing has been concluded yet, because nothing has said anything yet.
     expect(path()).toBe("/daemons")
 
-    // The client goes on dialling on its own backoff -- 750-1000 ms for the
-    // first one -- and this time the server is there to refuse it properly.
     await waitFor(() => expect(sockets).toHaveLength(dialled + 1), { timeout: 3000 })
     act(() => held(sockets).drop())
+    return { asked, path }
+  }
+
+  it("asks again when the server comes back, because the outage happens first", async () => {
+    const { asked, path } = await outageThenRefusal(() => HttpResponse.error())
 
     expect(await screen.findByRole("heading", { name: /sign in/i })).toBeInTheDocument()
     expect(path()).toBe("/login")
-    // Twice in total: once per outage-shaped non-answer, and then once for the
-    // answer. Not once per dial.
-    expect(asked).toEqual([502, 401])
+    // Twice in total: once for the outage that answered nothing, once for the
+    // refusal that did. Not once per dial, and not only ever once.
+    expect(asked).toHaveLength(2)
+  })
+
+  it("does not take a proxy's 502 for an answer either", async () => {
+    // The same story with something at the other end of the socket that speaks
+    // HTTP without knowing what a session is. A client that latched on "some
+    // status came back" would be refused forever behind any reverse proxy --
+    // which is how this rule would have been reintroduced by a deployment
+    // nobody tested.
+    const { asked, path } = await outageThenRefusal(() =>
+      HttpResponse.json({ detail: "bad gateway" }, { status: 502 }),
+    )
+
+    expect(await screen.findByRole("heading", { name: /sign in/i })).toBeInTheDocument()
+    expect(path()).toBe("/login")
+    expect(asked).toHaveLength(2)
   })
 })
