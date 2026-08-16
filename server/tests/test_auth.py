@@ -521,7 +521,13 @@ def test_a_burst_of_wrong_current_passwords_counts_against_the_login_too(tmp_pat
 def test_proving_the_current_password_clears_the_count_it_had_to_get_past(tmp_path, monkeypatch):
     """`login` clears its count on success and this must too, or the admin who
     just proved they know the password is one typo from a lockout. It cannot
-    help an attacker: the branch that clears is the branch where they knew it."""
+    help an attacker: the branch that clears is the branch where they knew it.
+
+    Nine, right, one slip, right -- `login`'s own shape, and it has to be that
+    shape. Nine and then one slip leaves the count at ten either way, and it is
+    the *next* request that is refused, so a test that stopped at the slip passes
+    against a route that never clears anything. Measured: it did.
+    """
     _, client = signed_in(tmp_path)
     monkeypatch.setattr(
         "ors_server.api.auth.verify_password", verify_that_counts([], "correct horse")
@@ -531,6 +537,7 @@ def test_proving_the_current_password_clears_the_count_it_had_to_get_past(tmp_pa
 
     assert change_password(client, "correct horse", NEW_PASSWORD).status_code == 200
     assert change_password(client, WRONG_GUESS, NEW_PASSWORD).status_code == 403
+    assert change_password(client, "correct horse", NEW_PASSWORD).status_code == 200
 
 
 def test_neither_password_reaches_a_repr():
