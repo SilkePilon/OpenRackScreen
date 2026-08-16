@@ -83,12 +83,32 @@ export function ScreensPage() {
           <AlertDescription>{screens.error.message}</AlertDescription>
         </Alert>
       )}
-      {rackRows.length === 0 && rows.length === 0 && !screens.isPending && (
-        <p className="text-sm text-muted-foreground">
-          No racks are paired yet. Pair one on the Daemons page; its panels are added from its own
-          row here.
-        </p>
+      {racks.isError && (
+        <Alert variant="destructive">
+          <AlertTitle>The racks could not be read</AlertTitle>
+          <AlertDescription>{racks.error.message}</AlertDescription>
+        </Alert>
       )}
+      {/* **A definite claim, so it waits until it has been checked.** "No racks
+          are paired yet" is a statement about `GET /api/daemons`, and this page
+          consumes that list as `racks.data ?? []` -- which is also what a fetch
+          still in flight and a fetch that failed both look like. Gated on the
+          screens alone, a fresh load where the panels resolve first says it for
+          a moment on a rack wall that is fully paired, and a daemons fetch that
+          404s or times out says it permanently, underneath an alert saying the
+          list could not be read. The old copy ("No panels yet") was true in both
+          of those; this one is more useful and is not, so it is the one that has
+          to wait. */}
+      {rackRows.length === 0 &&
+        rows.length === 0 &&
+        !screens.isPending &&
+        !racks.isPending &&
+        !racks.isError && (
+          <p className="text-sm text-muted-foreground">
+            No racks are paired yet. Pair one on the Daemons page; its panels are added from its
+            own row here.
+          </p>
+        )}
 
       <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_24rem]">
         <div className="grid gap-4">

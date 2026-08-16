@@ -1,4 +1,4 @@
-import { useId, useState } from "react"
+import { useEffect, useId, useRef, useState } from "react"
 
 import { ApiError, api } from "@/api/client"
 import { useMutate } from "@/api/mutate"
@@ -80,6 +80,45 @@ type Pinout = {
   hz: number
 }
 
+/**
+ * How a panel is bolted into the rack -- and **not** a transform this page applies.
+ *
+ * `rotation` and `hflip` are the mount correction: the daemon applies them to a
+ * frame *before* it streams it, and `<Panel>` draws exactly what arrives. So
+ * nothing here rotates a picture. This is a pair of fields written to a
+ * configuration, and it is on this type only because it is one of the four
+ * bolted-in facts about a panel that nothing on the bus reports.
+ */
+type Mount = {
+  rotation: NonNullable<NewScreen["rotation"]>
+  hflip: boolean
+}
+
+const ROTATIONS = [0, 90, 180, 270] as const
+
+/**
+ * A rotation `NewScreen` will accept, from the integer a row holds.
+ *
+ * `ScreenView.rotation` is `number` and not the four-way literal, because the
+ * column is an integer and it is the *body* the server constrains -- a database
+ * somebody hand-edited can hold 45. The fallback is the value that describes a
+ * panel bolted in the way it was made, which is also what `create_screen`
+ * writes when no rotation is given, so a rack with an unreadable one copies
+ * nothing rather than copying nonsense.
+ */
+function rotationOf(value: number): Mount["rotation"] {
+  return ROTATIONS.find((each) => each === value) ?? 0
+}
+
+/** Everything one panel on this rack can lend the new one. */
+type Copied = {
+  /** The panel it all came from, or `null` because there was none. */
+  from: string | null
+  wiring: WiringDraft
+  /** `null` when there is nothing to copy: the server's own default is then right. */
+  mount: Mount | null
+}
+
 /** A whole number, or `null` because the box does not hold one. */
 function intOf(text: string): number | null {
   if (text.trim() === "") return null
@@ -100,7 +139,10 @@ function pinoutOf(draft: WiringDraft): Pinout | null {
 }
 
 /**
- * The wiring to start the operator from: the rack's own, from its last panel.
+ * What the new panel starts from: one existing panel on the same rack.
+ *
+ * The wiring **and** the mount, out of the same panel and in one walk, because
+ * two walks with the same rule are two rules waiting to disagree.
  *
  * **This is the whole reason the wizard has a wiring step.** A GC9A01 has no
  * readable id over 4-wire SPI and DC and RST are GPIO lines somebody chose with
@@ -122,20 +164,35 @@ function pinoutOf(draft: WiringDraft): Pinout | null {
  * A rack with no gc9a01 panel to copy gets **empty** pin boxes. Not 0:
  * `DisplayConfig` gives `dc` and `rst` no default for exactly this reason, and
  * an interface that offered 0 would be proposing a board nobody built.
+ *
+ * **The mount comes from the same panel, and for the same argument.** `rotation`
+ * and `hflip` describe how a panel is bolted in; nothing on the bus reports
+ * those either, and a rack wired in one afternoon by one person is a rack whose
+ * panels are all the same way up. Copying two of the four bolted-in facts and
+ * defaulting the other two would ship a first frame upside down on a rack whose
+ * every other panel is at 270 -- on the one page whose whole premise is that
+ * somebody just stood in front of the rack and confirmed it with their eyes. A
+ * rack with nothing to copy sends neither field and takes the server's default,
+ * which is `rotation or 0` and `hflip` false.
  */
-function prefill(screens: Screen[]): WiringDraft {
+function copyFrom(screens: Screen[]): Copied {
   for (let index = screens.length - 1; index >= 0; index -= 1) {
-    const display = screens[index].display
+    const source = screens[index]
+    const display = source.display
     if (display.backend !== "gc9a01") continue
     const { dc, rst, hz } = display
     if (typeof dc !== "number" || typeof rst !== "number") continue
     return {
-      dc: String(dc),
-      rst: String(rst),
-      hz: String(typeof hz === "number" ? hz : DEFAULT_HZ),
+      from: source.name,
+      wiring: {
+        dc: String(dc),
+        rst: String(rst),
+        hz: String(typeof hz === "number" ? hz : DEFAULT_HZ),
+      },
+      mount: { rotation: rotationOf(source.rotation), hflip: source.hflip },
     }
   }
-  return { dc: "", rst: "", hz: String(DEFAULT_HZ) }
+  return { from: null, wiring: { dc: "", rst: "", hz: String(DEFAULT_HZ) }, mount: null }
 }
 
 /**
@@ -182,11 +239,14 @@ function deviceName(candidate: PanelCandidate): string {
  * **409 does not mean this on every route.** `POST /api/daemons/{id}/command`
  * answers 409 for a rack that is *not connected*, where these two answer 503.
  * This mapping is therefore only correct for detect and probe, which is why it
- * lives beside them rather than in the shared client.
+ * lives beside them rather than in the shared client -- and why the last step's
+ * `POST /api/screens` gets `createRefusalOf` and not this.
  */
 type RefusalKind = "busy" | "refused"
 
-function refusalOf(status: number): { title: string; kind: RefusalKind; advice: string | null } {
+type Refused = { title: string; kind: RefusalKind; advice: string | null }
+
+function refusalOf(status: number): Refused {
   switch (status) {
     case 503:
       return { title: "That rack is not connected", kind: "refused", advice: null }
@@ -223,15 +283,62 @@ function refusalOf(status: number): { title: string; kind: RefusalKind; advice: 
 }
 
 /**
+ * The same job for the last step, which is a different route with a different list.
+ *
+ * `refusalOf` says of itself that it is only correct for detect and probe, and
+ * the last step does not call either of them: it calls `POST /api/screens`,
+ * which never reaches a rack at all. That route can answer **404** -- and only
+ * ever for `no daemon {id}`, since `create_screen`'s one lookup is the daemon
+ * row and the `screen` table has no foreign key or check on `template` -- and
+ * **422**, either from the body's own validation or from `_every_screen_resolves`
+ * refusing a screen that names a template somebody deleted in another tab. It
+ * cannot answer 409, 503, 504 or 502; none of those are raised anywhere on this
+ * path. Anything else with a status is a proxy or a crash, and the shared
+ * mapping would head a gateway's 503 "That rack is not connected -- start the
+ * daemon on the Pi", which is confident, findable and wrong.
+ *
+ * So: the two statuses this route really has, and the generic title for
+ * everything else. In particular no "busy" kind, because there is no bus to be
+ * busy -- nothing here holds a panel.
+ */
+function createRefusalOf(status: number): Refused {
+  switch (status) {
+    case 404:
+      return {
+        title: "There is no such rack",
+        kind: "refused",
+        advice:
+          "It is not in this server's list any more -- another tab may have removed it. " +
+          "Nothing was created. Reload the Screens page to see what is still paired.",
+      }
+    case 422:
+      return {
+        title: "The screen was not created",
+        kind: "refused",
+        advice:
+          "Nothing was saved and no panel was touched -- the wiring you proved is still in " +
+          "this dialog. If it names a template that has since been deleted, reload the " +
+          "Screens page and pick another one.",
+      }
+    default:
+      return { title: "The screen could not be created", kind: "refused", advice: null }
+  }
+}
+
+/**
  * A refusal, with the server's own words in it.
  *
  * `ApiError` carries the status; anything else that reached a mutation's `error`
  * is not an HTTP answer at all and falls to the last case, which says the least
  * and invents nothing.
+ *
+ * `mapping` because a status is not a meaning on its own: it is a meaning *on a
+ * route*. Two of this wizard's three mutations ask a rack a question and one
+ * writes a row, and they do not answer the same list.
  */
-function Refusal({ error }: { error: Error }) {
+function Refusal({ error, mapping = refusalOf }: { error: Error; mapping?: (status: number) => Refused }) {
   const status = error instanceof ApiError ? error.status : 0
-  const { title, kind, advice } = refusalOf(status)
+  const { title, kind, advice } = mapping(status)
   return (
     <Alert data-refusal={kind} variant={kind === "busy" ? "default" : "destructive"}>
       <AlertTitle>{title}</AlertTitle>
@@ -314,7 +421,13 @@ function Wizard({
 
   const [step, setStep] = useState<Step>("detect")
   const [chosen, setChosen] = useState<PanelCandidate | null>(null)
-  const [wiring, setWiring] = useState<WiringDraft>(() => prefill(screens))
+  // Read once, at the moment the dialog opened, and both halves together. The
+  // wiring has to be, because it is a form somebody is typing in and a refetch
+  // must not take their edits away -- and the mount is frozen with it so that the
+  // panel named in "started from Kitchen" is the panel the numbers on screen
+  // really came from, whatever the list does behind the dialog.
+  const [copied] = useState<Copied>(() => copyFrom(screens))
+  const [wiring, setWiring] = useState<WiringDraft>(copied.wiring)
   const [name, setName] = useState("")
   // `null` is "nobody chose", which is not the same as an empty template name --
   // the first template the server offers stands in until somebody does.
@@ -367,6 +480,28 @@ function Wizard({
   const here = STEPS[current]
   const probed = probe.data?.body
   const device = chosen === null ? "" : deviceName(chosen)
+  const stepLabel = `Step ${current + 1} of ${STEPS.length}: ${here.title}`
+
+  /**
+   * Take focus to the step that just replaced the one that was on screen.
+   *
+   * Each step's content replaces the last inside one `DialogContent`, so the
+   * button that was pressed is unmounted by the press and focus falls back to
+   * Radix's container -- somebody driving this by keyboard is then at the top of
+   * a dialog with no announcement that the question changed. The group carries
+   * the step's name, so landing on it says where they are.
+   *
+   * **Not on the first render.** Radix places focus itself when the dialog
+   * opens, and taking it back would be a second move nobody asked for; the
+   * dialog's own title and description are what get read there. `shown` is the
+   * step that was last drawn, and `null` until one has been.
+   */
+  const stepRef = useRef<HTMLDivElement | null>(null)
+  const shown = useRef<Step | null>(null)
+  useEffect(() => {
+    if (shown.current !== null && shown.current !== step) stepRef.current?.focus()
+    shown.current = step
+  }, [step])
 
   return (
     <>
@@ -377,310 +512,368 @@ function Wizard({
         </DialogDescription>
       </DialogHeader>
 
-      {step === "detect" && (
-        <div className="grid gap-3">
-          <p className="text-sm text-muted-foreground">
-            {"Only the rack knows which SPI devices it has, so this asks it. It changes " +
-              "nothing and touches no panel: it is a directory listing on the Pi."}
-          </p>
-          {detect.isError && <Refusal error={detect.error} />}
-          {detect.data?.body !== undefined && (
-            <ul
-              aria-label={`SPI devices on ${rackName}`}
-              className="grid gap-2 rounded-md border p-3"
+      {/* One group for all four steps rather than one each, because it is the
+          thing focus is taken to when the step changes and it has to survive the
+          change to be taken to. `tabIndex={-1}` makes it focusable by script and
+          leaves it out of the tab order, so nothing about tabbing through the
+          form changes; the label is read on arrival and says which step this
+          now is. */}
+      <div
+        ref={stepRef}
+        tabIndex={-1}
+        role="group"
+        aria-label={stepLabel}
+        className="grid gap-4 outline-none"
+      >
+        {step === "detect" && (
+          <div className="grid gap-3">
+            <p className="text-sm text-muted-foreground">
+              {"Only the rack knows which SPI devices it has, so this asks it. It changes " +
+                "nothing and touches no panel: it is a directory listing on the Pi."}
+            </p>
+            {detect.isError && <Refusal error={detect.error} />}
+            {detect.data?.body !== undefined && (
+              <ul
+                aria-label={`SPI devices on ${rackName}`}
+                className="grid gap-2 rounded-md border p-3"
+              >
+                {detect.data.body.panels.map((candidate) => (
+                  <li
+                    key={deviceName(candidate)}
+                    className="flex items-center justify-between gap-3"
+                  >
+                    {/* `claimed_by === null` and not `!claimed_by`, and the
+                        argument does not rest on the server. **Every** value the
+                        two disagree about -- `""`, `undefined`, `0`, `NaN`,
+                        `false` -- is one where `=== null` hides the device and
+                        `!claimed_by` offers it. The positive form therefore fails
+                        safe in all of them: it refuses to probe anything it
+                        cannot prove is free, and probing a device a live worker
+                        is mid-frame on is a second panel init on a bus that is
+                        already in use. (The schema does also forbid `""` for this
+                        reason, but that is a second lock and not the argument.)
+                        It is still *listed*, with the screen that has it, because
+                        an operator who counted three devices with a torch and is
+                        shown two has been told nothing about the third. */}
+                    {candidate.claimed_by === null ? (
+                      <>
+                        <span className="font-mono text-sm">{deviceName(candidate)}</span>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => choose(candidate)}
+                        >
+                          {`Use ${deviceName(candidate)}`}
+                        </Button>
+                      </>
+                    ) : (
+                      <span className="text-sm text-muted-foreground">
+                        {`${deviceName(candidate)} is already driving ${candidate.claimed_by}, ` +
+                          "so it cannot be probed"}
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+            <Button
+              className="justify-self-start"
+              disabled={detect.isPending}
+              onClick={() => detect.mutate()}
             >
-              {detect.data.body.panels.map((candidate) => (
-                <li
-                  key={deviceName(candidate)}
-                  className="flex items-center justify-between gap-3"
-                >
-                  {/* `claimed_by === null` and not `!claimed_by`. The name of a
-                      screen is never the empty string -- the schema forbids it,
-                      because `""` is falsy and a device would then read as free
-                      -- and a device a live worker is mid-frame on must not be
-                      offered: probing it is a second panel init on a bus that is
-                      already in use. It is still *listed*, with the screen that
-                      has it, because an operator who counted three devices with
-                      a torch and is shown two has been told nothing about the
-                      third. */}
-                  {candidate.claimed_by === null ? (
-                    <>
-                      <span className="font-mono text-sm">{deviceName(candidate)}</span>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => choose(candidate)}
-                      >
-                        {`Use ${deviceName(candidate)}`}
-                      </Button>
-                    </>
-                  ) : (
-                    <span className="text-sm text-muted-foreground">
-                      {`${deviceName(candidate)} is already driving ${candidate.claimed_by}, ` +
-                        "so it cannot be probed"}
-                    </span>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-          <Button
-            className="justify-self-start"
-            disabled={detect.isPending}
-            onClick={() => detect.mutate()}
-          >
-            Detect panels
-          </Button>
-        </div>
-      )}
-
-      {step === "wiring" && chosen !== null && (
-        <div className="grid gap-4">
-          <p className="text-sm">
-            {`The new panel is on ${device}. Which GPIO lines drive it?`}
-          </p>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div className="grid gap-2">
-              <Label htmlFor={field("dc")}>DC pin</Label>
-              <Input
-                id={field("dc")}
-                type="number"
-                value={wiring.dc}
-                onChange={(event) => setWiring({ ...wiring, dc: event.target.value })}
-              />
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor={field("rst")}>RST pin</Label>
-              <Input
-                id={field("rst")}
-                type="number"
-                value={wiring.rst}
-                onChange={(event) => setWiring({ ...wiring, rst: event.target.value })}
-              />
-            </div>
-          </div>
-
-          <div className="grid gap-2">
-            <Label htmlFor={field("hz")}>Clock speed</Label>
-            <Input
-              id={field("hz")}
-              type="number"
-              value={wiring.hz}
-              onChange={(event) => setWiring({ ...wiring, hz: event.target.value })}
-            />
-          </div>
-
-          <p className="text-xs text-muted-foreground">
-            {screens.length === 0
-              ? "This rack has no panels to copy a pinout from, so these start empty. There is " +
-                "no GPIO 0 here by default: a pin nobody named is not a pin."
-              : `Started from ${screens[screens.length - 1].name}, the panel at the ` +
-                "right-hand end of this rack. Nothing on the bus reports these, so they are a " +
-                "guess until the probe proves them."}
-          </p>
-          <p className="text-xs text-muted-foreground">
-            {"The numbers themselves are not checked here or on the server -- which GPIO lines " +
-              "exist is a fact about your board, and the rack is what finds out."}
-          </p>
-
-          <div className="flex gap-2">
-            <Button disabled={pinout === null} onClick={toProbe}>
-              Continue to the probe
-            </Button>
-            <Button variant="outline" onClick={() => setStep("detect")}>
-              Choose another device
+              Detect panels
             </Button>
           </div>
-          {pinout === null && (
-            <p className="text-xs text-muted-foreground">
-              {"Both pins and a clock speed, as whole numbers. The rack is asked for exactly " +
-                "what is in these boxes and defaults none of it."}
-            </p>
-          )}
-        </div>
-      )}
+        )}
 
-      {/* `chosen` and `pinout` are narrowing rather than guards: this step is
-          only reached from *Continue to the probe*, which is disabled until both
-          are there. TypeScript needs them said; nothing else does. */}
-      {step === "probe" && chosen !== null && pinout !== null && (
-        <div className="grid gap-4">
-          {/* Said **before** the button that does it, and this is the reason the
-              step exists as a step. Detection is a directory listing; a probe is
-              a real panel init -- roughly 160 ms of resets and register writes,
-              then a frame -- and it takes the rack's bus for the whole hold, so
-              every other panel sharing that bus stops drawing until it is done.
-              Somebody pressing a button labelled only "Probe" has not been told
-              any of that. */}
-          {probe.isIdle && (
-            <Alert>
-              <AlertTitle>{`This lights ${device} on ${rackName}`}</AlertTitle>
-              <AlertDescription className="grid gap-2">
-                <p>
-                  {`A real panel init: about 160 ms of resets and register writes, then one ` +
-                    `frame, held lit for ${PROBE_HOLD_S} seconds. Go and look at the rack ` +
-                    `before you press it.`}
-                </p>
-                <p>
-                  {`The rack's SPI bus is held for the whole of it, so every other panel ` +
-                    `sharing that bus stops drawing until it is done, and ${rackName} will ` +
-                    `refuse a second probe while this one runs.`}
-                </p>
-              </AlertDescription>
-            </Alert>
-          )}
-
-          <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
-            <dt className="text-muted-foreground">Device</dt>
-            <dd className="font-mono">{device}</dd>
-            <dt className="text-muted-foreground">DC / RST</dt>
-            <dd className="font-mono">{`${pinout.dc} / ${pinout.rst}`}</dd>
-            <dt className="text-muted-foreground">Clock</dt>
-            <dd className="font-mono">{`${pinout.hz} Hz`}</dd>
-          </dl>
-
-          {probe.isPending && (
+        {step === "wiring" && chosen !== null && (
+          <div className="grid gap-4">
             <p className="text-sm">
-              {`${device} is lit now. The rack holds it for about ${PROBE_HOLD_S} seconds and ` +
-                "then lets the bus go; this answers when it does."}
+              {`The new panel is on ${device}. Which GPIO lines drive it?`}
             </p>
-          )}
 
-          {probe.isError && <Refusal error={probe.error} />}
-
-          {probe.data !== undefined && probed?.ok === true && (
-            <div className="grid gap-3">
-              <p className="text-sm font-medium">{`Did the panel on ${device} light up?`}</p>
-              <p className="text-sm text-muted-foreground">
-                {"The rack says the device opened and took the frame. It cannot say whether " +
-                  "anything appeared on the glass, and a panel on the wrong DC line does both " +
-                  "of those things and shows nothing."}
-              </p>
-              <div className="flex gap-2">
-                <Button onClick={() => setStep("add")}>Yes, that panel lit up</Button>
-                <Button variant="outline" onClick={toWiring}>
-                  No, nothing lit up
-                </Button>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="grid gap-2">
+                <Label htmlFor={field("dc")}>DC pin</Label>
+                <Input
+                  id={field("dc")}
+                  type="number"
+                  value={wiring.dc}
+                  onChange={(event) => setWiring({ ...wiring, dc: event.target.value })}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor={field("rst")}>RST pin</Label>
+                <Input
+                  id={field("rst")}
+                  type="number"
+                  value={wiring.rst}
+                  onChange={(event) => setWiring({ ...wiring, rst: event.target.value })}
+                />
               </div>
             </div>
-          )}
 
-          {probe.data !== undefined && probed?.ok !== true && (
-            <Alert variant="destructive">
-              <AlertTitle>{`${rackName} could not drive that wiring`}</AlertTitle>
-              <AlertDescription>
-                <p>
-                  {probed?.error ??
-                    "The rack refused the wiring and said nothing more about it."}
-                </p>
-              </AlertDescription>
-            </Alert>
-          )}
+            <div className="grid gap-2">
+              <Label htmlFor={field("hz")}>Clock speed</Label>
+              <Input
+                id={field("hz")}
+                type="number"
+                value={wiring.hz}
+                onChange={(event) => setWiring({ ...wiring, hz: event.target.value })}
+              />
+            </div>
 
-          {!probe.isPending && probed?.ok !== true && (
+            <p className="text-xs text-muted-foreground">
+              {copied.from === null
+                ? "This rack has no panel to copy a pinout from, so these start empty. There is " +
+                  "no GPIO 0 here by default: a pin nobody named is not a pin."
+                : `Started from ${copied.from}, the last panel on this rack with a pinout. ` +
+                  "Nothing on the bus reports these, so they are a guess until the probe proves " +
+                  "them."}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {"The numbers themselves are not checked here or on the server -- which GPIO lines " +
+                "exist is a fact about your board, and the rack is what finds out."}
+            </p>
+
             <div className="flex gap-2">
-              {/* Every field spelled out rather than spread from `chosen`, which
-                  also carries `claimed_by`: `ProbeBody` is `extra="forbid"`, so a
-                  wizard sending a field it does not have is a 422 rather than a
-                  field quietly ignored -- which is the right refusal and not one
-                  worth provoking. `hold_s` is `PROBE_HOLD_S` and can be nothing
-                  else; see that constant. */}
-              <Button
-                onClick={() =>
-                  probe.mutate({
-                    bus: chosen.bus,
-                    cs: chosen.cs,
-                    dc: pinout.dc,
-                    rst: pinout.rst,
-                    hz: pinout.hz,
-                    hold_s: PROBE_HOLD_S,
-                  })
-                }
-              >
-                Light the panel
+              <Button disabled={pinout === null} onClick={toProbe}>
+                Continue to the probe
               </Button>
-              <Button variant="outline" onClick={toWiring}>
-                Change the wiring
+              <Button variant="outline" onClick={() => setStep("detect")}>
+                Choose another device
               </Button>
             </div>
-          )}
-        </div>
-      )}
+            {pinout === null && (
+              <p className="text-xs text-muted-foreground">
+                {"Both pins and a clock speed, as whole numbers. The rack is asked for exactly " +
+                  "what is in these boxes and defaults none of it."}
+              </p>
+            )}
+          </div>
+        )}
 
-      {step === "add" && chosen !== null && pinout !== null && (
-        <form
-          className="grid gap-4"
-          onSubmit={(event) => {
-            event.preventDefault()
-            const display: DisplayConfig = {
-              backend: "gc9a01",
-              spi_bus: chosen.bus,
-              spi_cs: chosen.cs,
-              dc: pinout.dc,
-              rst: pinout.rst,
-              hz: pinout.hz,
-            }
-            create.mutate(
-              {
+        {/* `chosen` and `pinout` are narrowing rather than guards: this step is
+            only reached from *Continue to the probe*, which is disabled until both
+            are there. TypeScript needs them said; nothing else does. */}
+        {step === "probe" && chosen !== null && pinout !== null && (
+          <div className="grid gap-4">
+            {/* Said **before** the button that does it, and this is the reason the
+                step exists as a step. Detection is a directory listing; a probe is
+                a real panel init -- roughly 160 ms of resets and register writes,
+                then a frame -- and it takes the rack's bus for the whole hold, so
+                every other panel sharing that bus stops drawing until it is done.
+                Somebody pressing a button labelled only "Probe" has not been told
+                any of that. */}
+            {probe.isIdle && (
+              <Alert>
+                <AlertTitle>{`This lights ${device} on ${rackName}`}</AlertTitle>
+                <AlertDescription className="grid gap-2">
+                  <p>
+                    {`A real panel init: about 160 ms of resets and register writes, then one ` +
+                      `frame, held lit for ${PROBE_HOLD_S} seconds. Go and look at the rack ` +
+                      `before you press it.`}
+                  </p>
+                  <p>
+                    {`The rack's SPI bus is held for the whole of it, so every other panel ` +
+                      `sharing that bus stops drawing until it is done, and ${rackName} will ` +
+                      `refuse a second probe while this one runs.`}
+                  </p>
+                </AlertDescription>
+              </Alert>
+            )}
+
+            <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
+              <dt className="text-muted-foreground">Device</dt>
+              <dd className="font-mono">{device}</dd>
+              <dt className="text-muted-foreground">DC / RST</dt>
+              <dd className="font-mono">{`${pinout.dc} / ${pinout.rst}`}</dd>
+              <dt className="text-muted-foreground">Clock</dt>
+              <dd className="font-mono">{`${pinout.hz} Hz`}</dd>
+            </dl>
+
+            {/* **The one thing on this page that changes with nobody's hand on
+                it.** The click is five seconds before the answer: the daemon
+                holds the panel lit and replies when it lets the bus go, so the
+                verdict arrives long after focus stopped moving, and the step
+                does not change when it does. Somebody who cannot see the screen
+                gets no announcement at all that the panel went dark and a
+                question is now waiting -- `DialogDescription` will not do it,
+                because `aria-describedby` is read when the dialog is described
+                and not re-read when its text changes.
+
+                So this region is live, and it is **rendered empty rather than
+                conditionally**, because a live region has to be in the accessible
+                tree before its content changes for the change to be announced.
+                The refusal and the "could not drive that wiring" alert are
+                deliberately outside it: they carry `role="alert"` and announce
+                themselves, and nesting them here would have them read twice. */}
+            <div role="status" aria-live="polite" className="grid gap-4">
+              {probe.isPending && (
+                <p className="text-sm">
+                  {`${device} is lit now. The rack holds it for about ${PROBE_HOLD_S} seconds ` +
+                    "and then lets the bus go; this answers when it does."}
+                </p>
+              )}
+
+              {probe.data !== undefined && probed?.ok === true && (
+                <div className="grid gap-3">
+                  <p className="text-sm font-medium">{`Did the panel on ${device} light up?`}</p>
+                  <p className="text-sm text-muted-foreground">
+                    {"The rack says the device opened and took the frame. It cannot say whether " +
+                      "anything appeared on the glass, and a panel on the wrong DC line does " +
+                      "both of those things and shows nothing."}
+                  </p>
+                  <div className="flex gap-2">
+                    <Button onClick={() => setStep("add")}>Yes, that panel lit up</Button>
+                    <Button variant="outline" onClick={toWiring}>
+                      No, nothing lit up
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {probe.isError && <Refusal error={probe.error} />}
+
+            {probe.data !== undefined && probed?.ok !== true && (
+              <Alert variant="destructive">
+                <AlertTitle>{`${rackName} could not drive that wiring`}</AlertTitle>
+                <AlertDescription>
+                  <p>
+                    {probed?.error ??
+                      "The rack refused the wiring and said nothing more about it."}
+                  </p>
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {!probe.isPending && probed?.ok !== true && (
+              <div className="flex gap-2">
+                {/* Every field spelled out rather than spread from `chosen`, which
+                    also carries `claimed_by`: `ProbeBody` is `extra="forbid"`, so a
+                    wizard sending a field it does not have is a 422 rather than a
+                    field quietly ignored -- which is the right refusal and not one
+                    worth provoking. `hold_s` is `PROBE_HOLD_S` and can be nothing
+                    else; see that constant. */}
+                <Button
+                  onClick={() =>
+                    probe.mutate({
+                      bus: chosen.bus,
+                      cs: chosen.cs,
+                      dc: pinout.dc,
+                      rst: pinout.rst,
+                      hz: pinout.hz,
+                      hold_s: PROBE_HOLD_S,
+                    })
+                  }
+                >
+                  Light the panel
+                </Button>
+                <Button variant="outline" onClick={toWiring}>
+                  Change the wiring
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {step === "add" && chosen !== null && pinout !== null && (
+          <form
+            className="grid gap-4"
+            onSubmit={(event) => {
+              event.preventDefault()
+              const display: DisplayConfig = {
+                backend: "gc9a01",
+                spi_bus: chosen.bus,
+                spi_cs: chosen.cs,
+                dc: pinout.dc,
+                rst: pinout.rst,
+                hz: pinout.hz,
+              }
+              const body: NewScreen = {
                 daemon_id: daemonId,
                 name: name.trim(),
                 position,
                 template: wanted,
                 display,
-              },
-              { onSuccess: onAdded },
-            )
-          }}
-        >
-          <p className="text-sm">
-            {`${device} lit up with DC ${pinout.dc} and RST ${pinout.rst}. That is the wiring ` +
-              `it will be created with.`}
-          </p>
+              }
+              // The mount, when there was a panel to copy one from -- and neither
+              // field at all when there was not, so `create_screen`'s own
+              // `rotation or 0` and false `hflip` are what decide it rather than
+              // this interface guessing at a rack it has been told nothing about.
+              if (copied.mount !== null) {
+                body.rotation = copied.mount.rotation
+                body.hflip = copied.mount.hflip
+              }
+              create.mutate(body, { onSuccess: onAdded })
+            }}
+          >
+            <p className="text-sm">
+              {`${device} lit up with DC ${pinout.dc} and RST ${pinout.rst}. That is the wiring ` +
+                `it will be created with.`}
+            </p>
 
-          <div className="grid gap-2">
-            <Label htmlFor={field("name")}>Name</Label>
-            <Input
-              id={field("name")}
-              value={name}
-              autoComplete="off"
-              onChange={(event) => setName(event.target.value)}
-            />
-          </div>
+            {/* The mount, said out loud before the 201 rather than discovered
+                afterwards on the glass. It is copied, not chosen, and this is the
+                one moment somebody is standing in front of the rack and can see
+                whether this panel really did go in the same way up as the last
+                one. Nothing here rotates a picture: the daemon applies both to
+                the frame before it streams it. */}
+            <p className="text-sm text-muted-foreground">
+              {copied.mount === null
+                ? "There is no other panel on this rack to copy a mount from, so it is created " +
+                  "the way the glass is made: not rotated and not flipped. Rotation is in the " +
+                  "inspector if it went in some other way up."
+                : `Bolted in like ${copied.from}: rotated ${copied.mount.rotation}°` +
+                  `${copied.mount.hflip ? " and flipped horizontally" : ", not flipped"}. ` +
+                  "Change it in the inspector if this one went in the other way up."}
+            </p>
 
-          <div className="grid gap-2">
-            <Label htmlFor={field("template")}>Template</Label>
-            <Select value={wanted} onValueChange={setTemplate}>
-              <SelectTrigger id={field("template")}>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {names.map((each) => (
-                  <SelectItem key={each} value={each}>
-                    {each}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
+            <div className="grid gap-2">
+              <Label htmlFor={field("name")}>Name</Label>
+              <Input
+                id={field("name")}
+                value={name}
+                autoComplete="off"
+                onChange={(event) => setName(event.target.value)}
+              />
+            </div>
 
-          <p className="text-xs text-muted-foreground">
-            {`It goes in at position ${position}, at the right-hand end of ${rackName}. The ` +
-              "arrows under the rack move it, and they renumber the whole rack at once."}
-          </p>
+            <div className="grid gap-2">
+              <Label htmlFor={field("template")}>Template</Label>
+              <Select value={wanted} onValueChange={setTemplate}>
+                <SelectTrigger id={field("template")}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {names.map((each) => (
+                    <SelectItem key={each} value={each}>
+                      {each}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
 
-          {create.isError && <Refusal error={create.error} />}
+            <p className="text-xs text-muted-foreground">
+              {`It goes in at position ${position}, at the right-hand end of ${rackName}. The ` +
+                "arrows under the rack move it, and they renumber the whole rack at once."}
+            </p>
 
-          <div className="flex gap-2">
-            <Button type="submit" disabled={create.isPending || name.trim() === "" || wanted === ""}>
-              Add the screen
-            </Button>
-            <Button type="button" variant="outline" onClick={toWiring}>
-              Change the wiring
-            </Button>
-          </div>
-        </form>
-      )}
+            {create.isError && <Refusal error={create.error} mapping={createRefusalOf} />}
+
+            <div className="flex gap-2">
+              <Button type="submit" disabled={create.isPending || name.trim() === "" || wanted === ""}>
+                Add the screen
+              </Button>
+              <Button type="button" variant="outline" onClick={toWiring}>
+                Change the wiring
+              </Button>
+            </div>
+          </form>
+        )}
+      </div>
     </>
   )
 }
