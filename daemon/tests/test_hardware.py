@@ -1036,6 +1036,7 @@ def test_the_detect_and_probe_handlers_are_wired_into_the_link(
             FakeClock(NOW),
             None,
             frames,
+            "UTC",
         )
 
         assert client is not None

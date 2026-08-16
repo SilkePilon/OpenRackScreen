@@ -228,6 +228,17 @@ def test_the_shipped_example_config_validates() -> None:
     assert main(["validate", "--config", str(EXAMPLE)]) == 0
 
 
+def test_validate_without_config_is_a_usage_error(capsys: Any) -> None:
+    """`--config` stopped being `required=True` at the argparse level in M3c --
+    `validate` has no other source, so this refusal is now `main`'s own guard.
+    `2` is argparse's own usage-error code, and the one this replaced; a guard
+    that returned `0` here would make CI green on a `validate` that checked
+    nothing at all.
+    """
+    assert main(["validate"]) == 2
+    assert "--config is required" in capsys.readouterr().err
+
+
 def test_validating_never_opens_a_panel(monkeypatch: Any) -> None:
     """The pins in the shipped config are a document, not a device."""
     monkeypatch.setattr("ors_daemon.__main__.build_display", explode)

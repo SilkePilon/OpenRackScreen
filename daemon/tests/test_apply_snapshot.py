@@ -24,6 +24,7 @@ from ors_daemon.__main__ import DEFAULT_LINK_PATH, _command_handler, _frame_pump
 from ors_daemon.clock import system_clock
 from ors_daemon.config import load_cached_snapshot, resolve_screens
 from ors_daemon.frames import FramePump, FrameStream
+from ors_daemon.link import LinkSettings, write_link_settings
 from ors_daemon.snapshot import SnapshotStore
 from ors_daemon.supervisor import Supervisor
 from ors_schema.daemon import DaemonConfig
@@ -518,6 +519,11 @@ def test_a_paired_rack_with_nothing_pushed_yet_starts_with_no_screens(tmp_path: 
     assert run_no_config(tmp_path) == 0
     supervisor = RecordingSupervisor.instances[-1]
     assert supervisor.kwargs["screens"] == []
+    # `0` is a real version -- the one an empty server counts from
+    # (`link.py:699`) -- and `_dispatch` skips a push whose version equals the
+    # claim (`link.py:869`). A row-3 rack claiming `0` instead of `None` could
+    # be left blank forever by a server that starts counting there.
+    assert FakeLink.instances[0].kwargs["config_version"] is None
 
 
 def test_a_freshly_installed_rack_enters_the_join_flow(
@@ -528,13 +534,84 @@ def test_a_freshly_installed_rack_enters_the_join_flow(
     this state could not even be booted; this also proves that mutation dead:
     `run_no_config` never passes `--config` at all, so a required flag would
     fail this in argparse before `join_a_server` was ever reached.
+
+    `join_a_server` blocks until this rack is paired and writes the pairing to
+    `args.link` -- see its docstring -- so the fake here does the same thing a
+    real implementation must, and `_run` is expected to *continue in-process*
+    from there rather than exit and trust systemd's `Restart=` to bring the
+    process back already paired: run by hand, an exit there would print
+    nothing and leave the panels dark with no explanation at all.
     """
+    joined: list[Any] = []
+
+    def fake_join(args: Any) -> None:
+        joined.append(True)
+        write_link_settings(
+            args.link,
+            LinkSettings(server_url="http://s", cache_path=tmp_path / "snapshot.json", token="t"),
+        )
+
+    monkeypatch.setattr("ors_daemon.__main__.join_a_server", fake_join)
+
+    assert run_no_config(tmp_path) == 0
+    assert joined == [True]
+    assert RecordingSupervisor.instances != [], (
+        "the caller falls through to _boot once paired, in this same process, "
+        "rather than exiting for a restart to pick it up"
+    )
+    assert RecordingSupervisor.instances[-1].kwargs["screens"] == [], (
+        "row 3: freshly paired, nothing pushed yet"
+    )
+
+
+def test_running_unpaired_without_config_fails_cleanly_not_with_a_traceback(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """Row 4 today, before Task 15 lands: `join_a_server` is a deliberate stub
+    that raises `NotImplementedError` rather than silently doing nothing (see
+    its docstring). This is the *real*, unpatched stub -- unlike every other
+    test of row 4 in this file, nothing here monkeypatches `join_a_server`.
+
+    This is exactly the state `ors-daemon install` leaves a fresh machine in:
+    both `examples/openrackscreen.service` and the unit `install.py` generates
+    run `ExecStart=... run` with no `--config`, under `Restart=always` and
+    `StartLimitIntervalSec=0`. Left uncaught, this command's `NotImplementedError`
+    was a Python traceback written to the journal every `RestartSec=5`, forever.
+    """
+    assert run_no_config(tmp_path) == 1
+    error = capsys.readouterr().err
+    assert "Traceback" not in error
+    assert "ors-daemon connect" in error, "the message has to name what to do instead"
+    assert RecordingSupervisor.instances == []
+
+
+def test_an_unreadable_pairing_still_boots_from_a_good_cached_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`load_link_settings` returns `None` for a corrupt or unreadable pairing
+    file exactly the way it does for an absent one -- its own docstring: "a
+    corrupt pairing file is not a reason to leave four panels dark" -- and the
+    common cause is `sudo ors-daemon connect`, which writes link.json
+    root-owned 0600 while the shipped unit runs the daemon as
+    `User=openrackscreen`, so every read of it there is a `PermissionError`.
+
+    Under the shipped unit there is no `--config`, so a rack in this state must
+    not fall into the join flow -- and, before Task 15, into a traceback --
+    while a perfectly good `snapshot.json` sits right beside the pairing it
+    cannot read.
+    """
+    link = tmp_path / "link.json"
+    link.write_text("{ not valid json")  # load_link_settings returns None for this
+    write_cache(tmp_path / "snapshot.json")
+
     joined: list[Any] = []
     monkeypatch.setattr("ors_daemon.__main__.join_a_server", lambda *a, **k: joined.append(True))
 
     assert run_no_config(tmp_path) == 0
-    assert joined == [True]
-    assert RecordingSupervisor.instances == [], "nothing runs before a server approves this rack"
+    assert joined == [], "a usable cached snapshot must be tried before giving up on this rack"
+    assert [
+        screen.config.name for screen in RecordingSupervisor.instances[-1].kwargs["screens"]
+    ] == ["CPU"]
 
 
 def test_discovery_off_with_no_server_and_no_config_names_every_way_to_fix_it(
@@ -561,7 +638,17 @@ def test_a_server_flag_still_enters_the_join_flow_with_discovery_off(
     names a server to dial directly, so there is still a way to get a
     configuration and this is row 4 again, not row 5."""
     joined: list[Any] = []
-    monkeypatch.setattr("ors_daemon.__main__.join_a_server", lambda *a, **k: joined.append(True))
+
+    def fake_join(args: Any) -> None:
+        joined.append(True)
+        write_link_settings(
+            args.link,
+            LinkSettings(
+                server_url="http://s:8080", cache_path=tmp_path / "snapshot.json", token="t"
+            ),
+        )
+
+    monkeypatch.setattr("ors_daemon.__main__.join_a_server", fake_join)
 
     assert run_no_config(tmp_path, "--no-discovery", "--server", "http://s:8080") == 0
     assert joined == [True]
@@ -689,6 +776,34 @@ def test_a_pushed_snapshot_reaches_the_supervisor(tmp_path: Path) -> None:
     FakeLink.instances[0].kwargs["on_snapshot"](pushed, 9)
 
     assert RecordingSupervisor.instances[-1].applied == [pushed]
+
+
+def test_a_push_that_changes_the_timezone_stops_the_rack_instead_of_running_it_mismatched(
+    tmp_path: Path,
+) -> None:
+    """`Supervisor.apply` never rebuilds the clock -- `supervisor.py`'s own
+    docstring says why: it is built once in `__main__` and handed to the
+    supervisor as a component it does not own. `NightWindow` defaults to
+    enabled, 23:00-07:00, so applying a push that changes the timezone in place
+    would leave the night window evaluated in the *old* zone for the rest of
+    the process -- a UTC+2 rack sleeping at 01:00 local and waking at 09:00
+    local, silently, until an operator restarts it by hand.
+
+    So a timezone-changing push must not be applied here at all: the
+    supervisor is stopped instead, which the shipped unit's `Restart=always`
+    turns into the restart the mismatch actually needs.
+    """
+    write_config(tmp_path)  # timezone: UTC
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+    supervisor = RecordingSupervisor.instances[-1]
+    pushed = DaemonConfig.model_validate({**SNAPSHOT, "timezone": "Europe/Amsterdam"})
+
+    FakeLink.instances[0].kwargs["on_snapshot"](pushed, 9)
+
+    assert supervisor.applied == [], "must not run against a clock built for the old zone"
+    assert supervisor.stops == 1, "left to restart, which is what re-clocks it"
 
 
 def test_the_link_claims_the_version_the_rack_is_actually_running(tmp_path: Path) -> None:

@@ -115,17 +115,43 @@ panel missing from the printed map is a panel you cannot trust the map about.
 schema does not force to be unique: two screens called `CPU` write one
 `CPU.png` between them. Give them distinct names, or read the ordinals.
 
-Once a rack is paired, the server is where its configuration comes from. `run`
-boots from the last snapshot the server pushed if it has a usable one, and from
-`--config` otherwise -- so the file is the fallback that keeps a server outage
-from darkening anything, and a rack that has never been paired runs exactly as
-it did before there was a server at all. A pushed configuration is applied to
-the running process: only the screens that actually changed are stopped and
-reopened, so a redundant push is not a rack-wide flicker. Integrations are
-diffed the same way — a source the push adds is polled from that moment, one it
-drops is taken down on a thread of its own so that a `kubectl port-forward`
-teardown does not hold up the panels, and one whose configuration moved is
-replaced. What a push cannot change without a restart is the rack's `timezone`.
+**`--config` is optional on `run`.** A paired rack's configuration is the
+server's, not a file an operator has to hand-author, and `install` leaves a
+machine paired with nothing yet. What `run` boots from is one of five states:
+
+1. `--config` was given and there is no usable pushed snapshot: boots from the
+   file.
+2. Paired, and the last pushed snapshot is usable: boots from it, `--config`
+   or not — the snapshot always outranks the file, because the server is the
+   source of truth once a rack is paired.
+3. Paired, but nothing has ever been pushed and there is no `--config` to fall
+   back to: boots with no screens at all and waits — not an error, and the
+   ordinary state of a rack the moment it finishes pairing. The panels appear
+   the moment the first push lands.
+4. Neither paired nor given `--config`, but there *is* a usable cached
+   snapshot beside the pairing (a corrupt or unreadable link.json is not a
+   reason to give up on a good `snapshot.json` next to it — see the
+   permissions note below): boots from the snapshot, same as row 2.
+5. Neither paired, given `--config`, nor sitting on a usable cache: this is
+   the state a freshly installed rack is in. `run` browses for a server to
+   join (`--no-discovery` turns that off; `--server URL` dials one directly
+   instead of browsing, and works either way) and blocks until it is paired,
+   then continues in this same process rather than needing a restart. The one
+   case with truly no way forward — `--no-discovery` with no `--server` — is a
+   message on stderr naming every way out, and a non-zero exit, not a
+   traceback.
+
+A pushed configuration is applied to the running process: only the screens
+that actually changed are stopped and reopened, so a redundant push is not a
+rack-wide flicker. Integrations are diffed the same way — a source the push
+adds is polled from that moment, one it drops is taken down on a thread of its
+own so that a `kubectl port-forward` teardown does not hold up the panels, and
+one whose configuration moved is replaced. What a push cannot change on a
+running rack is the `timezone` — the clock is built once, at boot, from
+whatever configuration the rack booted with — so a push naming a different one
+stops the rack instead of running it against the wrong clock; the shipped
+unit's `Restart=always` is what brings it back, clocked correctly, from the
+same snapshot the push just cached.
 
 The pairing and the cached snapshot live in `/var/lib/openrackscreen`, which the
 shipped unit's `StateDirectory=` creates. `--link` moves them; the cache follows
@@ -149,10 +175,13 @@ sudo chown openrackscreen: /var/lib/openrackscreen/link.json
 
 `connect` prints a note when it notices it is running as root.
 
-Two things `run` does *not* pick up from a push: the integrations (a poller and
-its `kubectl port-forward` cannot be replaced inside the apply's budget, and the
-daemon logs a warning naming the change) and the timezone. Both need a restart,
-which is `systemctl restart openrackscreen`.
+One thing `run` does *not* pick up from a push while it keeps running: the
+integrations (a poller and its `kubectl port-forward` cannot be replaced inside
+the apply's budget, and the daemon logs a warning naming the change) — that
+needs a restart, `systemctl restart openrackscreen`. The timezone is different:
+a push that changes it stops the rack itself rather than running against a
+clock built for the old zone (see above), and the shipped unit's
+`Restart=always` is what brings it back — nothing to run by hand.
 
 ## Run it under systemd
 
