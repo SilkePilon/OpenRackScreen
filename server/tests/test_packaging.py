@@ -1,4 +1,20 @@
-"""Whether the built interface actually ends up inside the wheel.
+"""Whether the wheel's config would *select* the built interface into it.
+
+**Read that title carefully, because it is narrower than it first looks, and
+the gap is the failure this milestone exists to close.** Every check here is
+answered from configuration alone. `include_path` never touches the disk, so
+each one passes unchanged when `server/src/ors_server/web/` is not there at
+all -- verified by deleting the directory and watching this file stay green
+while a real `uv build` shipped a wheel with no `web/` in it. What is pinned
+is "nothing in this config would exclude that path"; what is *not* pinned is
+"the release pipeline actually put a build at that path".
+
+That second half is a release gate, not a unit test, and it is Task 5's: the
+workflow runs `pnpm build`, copies `web/dist` into the package, and refuses to
+upload an `ors_server` wheel whose namelist lacks `ors_server/web/index.html`.
+Until that lands, nothing in this repository catches a `pnpm build` that
+failed or a copy that went to the wrong name -- so do not read a green run
+here as "the interface ships".
 
 `server/pyproject.toml`'s `[tool.hatch.build.targets.wheel]` table is the one
 piece of this server that nothing else in the suite exercises: `create_app`
