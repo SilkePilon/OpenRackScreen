@@ -112,6 +112,31 @@ class Sessions:
     def revoke(self, token: str | None) -> None:
         self._tokens.discard(token or "")
 
+    def revoke_others(self, token: str | None) -> int:
+        """End every session but this one, and answer how many that was.
+
+        For a password change: whoever else is holding a cookie issued against
+        the old password is holding one issued against a password that is being
+        replaced, most often because somebody thinks it leaked. The caller's own
+        is kept, because revoking it would sign them out of the request they are
+        making -- with the new password set and a login form to prove it at.
+
+        `token` is whatever cookie the caller sent, and it is kept only if it
+        really is a session: a token nobody issued keeps nobody, rather than
+        being added to the set on its way through.
+
+        The whole set is rebuilt rather than discarded from, so a login that
+        raced this one -- with the old password, since the new one is written a
+        line earlier -- loses its token instead of surviving the revocation.
+        That is the direction to be wrong in: the cost is one admin logging in
+        again, and the alternative is the holder this method exists to remove.
+        """
+        with self._lock:
+            keep = self._tokens & ({token} if token is not None else set())
+            ended = len(self._tokens) - len(keep)
+            self._tokens = keep
+            return ended
+
     def too_many_attempts(self, client: str, now: float) -> bool:
         with self._lock:
             # Every client is swept, not just this one: the keys are addresses

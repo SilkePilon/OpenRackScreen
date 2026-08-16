@@ -8,9 +8,11 @@ from argon2 import PasswordHasher
 from fastapi import Depends, FastAPI, WebSocket
 from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
+from ors_server.api.auth import PasswordChange
 from ors_server.app import AppSettings, create_app
 from ors_server.auth import Sessions, claim_password, require_session, verify_password
 from ors_server.db import Database
+from pydantic import BaseModel
 from starlette.routing import BaseRoute, WebSocketRoute
 from starlette.testclient import WebSocketDenialResponse
 from starlette.websockets import WebSocketDisconnect
@@ -252,6 +254,30 @@ def test_forgotten_clients_do_not_accumulate_forever():
     assert sessions._attempts.keys() <= {"10.0.1.1"}
 
 
+def test_revoking_the_others_keeps_exactly_the_one_that_asked():
+    sessions = Sessions()
+    mine = sessions.issue()
+    theirs = [sessions.issue() for _ in range(3)]
+
+    assert sessions.revoke_others(mine) == 3
+    assert sessions.valid(mine) is True
+    assert [sessions.valid(token) for token in theirs] == [False, False, False]
+
+
+def test_revoking_the_others_with_no_session_to_keep_keeps_nobody():
+    """Not reachable through the route, which is guarded and therefore always has
+    a valid cookie to keep -- and stated here because "keep the caller's" must
+    not quietly become "keep everyone" when there is no caller to keep. A token
+    that is not a session is the same case: it cannot be kept, because it is not
+    in the set to begin with."""
+    sessions = Sessions()
+    tokens = [sessions.issue(), sessions.issue()]
+
+    assert sessions.revoke_others(None) == 2
+    assert sessions.revoke_others("not a token anybody issued") == 0
+    assert [sessions.valid(token) for token in tokens] == [False, False]
+
+
 def test_the_password_is_not_stored_in_the_clear(tmp_path):
     _, client = app_and_client(tmp_path)
     setup_password(client, "correct horse")
@@ -297,6 +323,218 @@ def test_a_hash_that_is_not_a_hash_is_a_refusal_not_a_crash(tmp_path):
         )
 
     assert client.post("/api/auth/login", json={"password": "correct horse"}).status_code == 401
+
+
+# The three passwords the change tests use, all different and none a substring
+# of another -- a body that put the current password where the new one belongs,
+# or a route that stored the wrong one of the two, is only catchable if no two
+# of them are the same string. "correct horse" is `setup_password`'s default and
+# is the one already set.
+NEW_PASSWORD = "eight red lanterns"
+WRONG_GUESS = "a guess nobody set"
+
+
+def change_password(client: TestClient, current: str, new: str):
+    return client.post("/api/auth/password", json={"current": current, "new": new})
+
+
+def signed_in(tmp_path) -> tuple[FastAPI, TestClient]:
+    """An app with a password set and one browser signed in to it."""
+    app, client = app_and_client(tmp_path)
+    setup_password(client)
+    assert client.post("/api/auth/login", json={"password": "correct horse"}).status_code == 200
+    return app, client
+
+
+def verify_that_counts(calls: list[str], right: str):
+    """A stand-in for `verify_password` that records what it was asked.
+
+    Two things need it. Argon2 is 0.58s by design and the per-test budget is ten
+    seconds, so eleven real verifications do not fit in a test about counting to
+    ten. And "the limiter refuses **before** the hash" is not observable at all
+    from outside -- both orders answer 429 -- so the only way to pin it is to
+    watch whether the expensive collaborator was reached.
+
+    It answers a bool, never raises: a test that signalled through an exception
+    would be caught by `verify_password`'s own handler in production and would
+    pass against code that had stopped verifying anything.
+    """
+
+    def verify(database, password: str) -> bool:  # noqa: ANN001 - the real one's `Database`
+        calls.append(password)
+        return password == right
+
+    return verify
+
+
+def test_the_password_can_be_changed_and_the_new_one_is_what_logs_in(tmp_path):
+    app, client = signed_in(tmp_path)
+
+    changed = change_password(client, "correct horse", NEW_PASSWORD)
+
+    assert changed.status_code == 200
+    assert changed.json() == {"ok": True, "other_sessions_ended": 0}
+    assert verify_password(app.state.database, NEW_PASSWORD) is True
+    assert verify_password(app.state.database, "correct horse") is False
+    client.post("/api/auth/logout")
+    assert client.post("/api/auth/login", json={"password": NEW_PASSWORD}).status_code == 200
+
+
+def test_a_change_without_the_current_password_is_refused_and_changes_nothing(tmp_path):
+    """The half that makes the field worth asking for. A route that wrote the new
+    password whatever the old one was would pass every other test in this block."""
+    app, client = signed_in(tmp_path)
+
+    refused = change_password(client, WRONG_GUESS, NEW_PASSWORD)
+
+    assert refused.status_code == 403
+    assert verify_password(app.state.database, "correct horse") is True
+    assert verify_password(app.state.database, NEW_PASSWORD) is False
+
+
+def test_a_wrong_current_password_is_not_a_401_because_that_means_the_session_ended(tmp_path):
+    """401 is the interface's word for "you have been signed out".
+
+    The SPA hangs one handler off every response and sends every 401 to /login,
+    keyed on the endpoint that refused -- `POST /api/auth/login` is the single
+    exemption, because a wrong password there is not an expiry. A change route
+    answering 401 for a mistyped *current* password would therefore throw the
+    admin out of the settings page mid-form and lose the new password they had
+    just typed, and the only fix would be a second URL exemption that stops
+    matching silently the day the interface is served under a sub-path.
+
+    So the refusal is 403: this caller **is** authenticated, and what is being
+    refused is the request.
+    """
+    _, client = signed_in(tmp_path)
+
+    refused = change_password(client, WRONG_GUESS, NEW_PASSWORD)
+
+    assert refused.status_code == 403
+    assert refused.json()["detail"] == "the current password is wrong"
+    assert client.get("/api/guarded").status_code == 200, "the session must survive a typo"
+
+
+def test_changing_the_password_ends_every_other_session_and_keeps_this_one(tmp_path):
+    """The decision this route had to make, stated as behaviour.
+
+    Somebody changes the password because they think it leaked, so the other
+    holder has to be logged out -- a password change that left a stolen cookie
+    working changes nothing about the thing it was done for. Revoking the
+    caller's own cookie as well would sign *them* out mid-request, which reads
+    as a failure and sends them back to a login form to prove the password they
+    have just this moment set.
+    """
+    app, first = signed_in(tmp_path)
+    second = TestClient(app)
+    assert second.post("/api/auth/login", json={"password": "correct horse"}).status_code == 200
+
+    changed = change_password(first, "correct horse", NEW_PASSWORD)
+
+    assert changed.json()["other_sessions_ended"] == 1
+    assert first.get("/api/guarded").status_code == 200, "the caller must not be signed out"
+    assert second.get("/api/guarded").status_code == 401, "the other holder must be"
+
+
+def test_a_refused_change_ends_nobody(tmp_path):
+    """The other half: a wrong current password must not log the rest of the
+    building out. Otherwise anyone holding one session has a logout button for
+    everybody else's, without knowing the password at all."""
+    app, first = signed_in(tmp_path)
+    second = TestClient(app)
+    second.post("/api/auth/login", json={"password": "correct horse"})
+
+    change_password(first, WRONG_GUESS, NEW_PASSWORD)
+
+    assert second.get("/api/guarded").status_code == 200
+
+
+def test_the_change_is_refused_before_the_hash_the_way_login_is(tmp_path, monkeypatch):
+    """Verifying is expensive on purpose, so a limiter that pays for it first is
+    a CPU exhaustion endpoint -- ten guesses a minute per address, each costing
+    0.58s of a server that is relaying frames for four panels.
+
+    Both orders answer 429, so the ordering is only visible as whether the
+    collaborator was reached at all.
+    """
+    _, client = signed_in(tmp_path)
+    asked: list[str] = []
+    monkeypatch.setattr(
+        "ors_server.api.auth.verify_password", verify_that_counts(asked, "correct horse")
+    )
+    codes = [change_password(client, WRONG_GUESS, NEW_PASSWORD).status_code for _ in range(11)]
+    assert codes[-1] == 429, "an unlimited password endpoint is an offline attack with extra steps"
+
+    before = len(asked)
+    refused = change_password(client, WRONG_GUESS, NEW_PASSWORD)
+
+    assert refused.status_code == 429
+    assert asked[before:] == [], "the hash was computed for a request the limiter had refused"
+
+
+def test_a_burst_of_wrong_current_passwords_counts_against_the_login_too(tmp_path, monkeypatch):
+    """One secret, one budget.
+
+    The two routes verify the same password, so separate counters would hand an
+    attacker with a session twice the guessing rate for it -- and the rate is
+    the whole of what the limiter buys. The cost is that an admin who fumbles
+    the old password ten times waits out the same sixty seconds at the login
+    form, which is a rolling window and the same wait the login route already
+    imposes on itself.
+    """
+    _, client = signed_in(tmp_path)
+    monkeypatch.setattr(
+        "ors_server.api.auth.verify_password", verify_that_counts([], "correct horse")
+    )
+    for _ in range(10):
+        change_password(client, WRONG_GUESS, NEW_PASSWORD)
+
+    assert client.post("/api/auth/login", json={"password": "correct horse"}).status_code == 429
+
+
+def test_proving_the_current_password_clears_the_count_it_had_to_get_past(tmp_path, monkeypatch):
+    """`login` clears its count on success and this must too, or the admin who
+    just proved they know the password is one typo from a lockout. It cannot
+    help an attacker: the branch that clears is the branch where they knew it."""
+    _, client = signed_in(tmp_path)
+    monkeypatch.setattr(
+        "ors_server.api.auth.verify_password", verify_that_counts([], "correct horse")
+    )
+    for _ in range(9):
+        change_password(client, WRONG_GUESS, NEW_PASSWORD)
+
+    assert change_password(client, "correct horse", NEW_PASSWORD).status_code == 200
+    assert change_password(client, WRONG_GUESS, NEW_PASSWORD).status_code == 403
+
+
+def test_neither_password_reaches_a_repr():
+    """A model's `repr` is what reaches a log the moment anybody drops one into
+    an `extra`, which is why `Hello.token` and `IntegrationBody.credential` both
+    carry `repr=False`. This body carries two secrets, not one."""
+    body = PasswordChange(current="correct horse", new=NEW_PASSWORD)
+
+    class Leaky(BaseModel):
+        secret: str
+
+    assert NEW_PASSWORD in repr(Leaky(secret=NEW_PASSWORD)), (
+        "the fixture proves nothing if a plain pydantic repr hides a field anyway"
+    )
+    assert "correct horse" not in repr(body)
+    assert NEW_PASSWORD not in repr(body)
+
+
+def test_a_password_change_never_repeats_either_password_back(tmp_path):
+    _, client = signed_in(tmp_path)
+    bodies = [
+        change_password(client, WRONG_GUESS, NEW_PASSWORD).text,
+        # A client that misspells a field hands both passwords to the validator,
+        # which is only too happy to quote the whole body back.
+        client.post("/api/auth/password", json={"currnet": WRONG_GUESS, "new": NEW_PASSWORD}).text,
+    ]
+
+    assert not any(WRONG_GUESS in body for body in bodies), bodies
+    assert not any(NEW_PASSWORD in body for body in bodies), bodies
+    assert "current" in bodies[1], "and still says which field was wrong"
 
 
 def test_health_stays_open(tmp_path):
