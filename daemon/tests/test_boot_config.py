@@ -282,6 +282,29 @@ def test_the_config_file_is_replaced_and_never_truncated(tmp_path, monkeypatch):
     )
 
 
+def test_write_does_not_follow_a_symlink_planted_at_the_temp_path(tmp_path):
+    """`_write_config`'s temp-file open needs the same `O_NOFOLLOW` guard
+    `_create_backup` already has. Without it, a symlink planted at
+    `.config.txt.tmp` gets written *through* into whatever it points at, and
+    the `os.replace` at the end -- which moves the temp path itself, not
+    its target -- then installs that symlink over `path`: the live boot
+    file becomes a symlink to an attacker-chosen path. `O_NOFOLLOW` turns
+    the open into an `OSError` (`ELOOP`) instead, before any of that can
+    happen.
+    """
+    path = _boot(tmp_path, "firmware/config.txt", "# original\n")
+    target = tmp_path / "attacker-target.txt"
+    target.write_text("untouched\n")
+    (path.parent / ".config.txt.tmp").symlink_to(target)
+
+    with pytest.raises(OSError):
+        enable_spi(tmp_path, NOW)
+
+    assert target.read_text() == "untouched\n", "the symlink's target must not be written through"
+    assert not path.is_symlink(), "config.txt must never become a symlink"
+    assert path.read_text() == "# original\n"
+
+
 # --- MEDIUM 4: the rewrite must not decompose bytes it does not understand -
 
 
