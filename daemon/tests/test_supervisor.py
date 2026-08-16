@@ -337,6 +337,32 @@ def test_start_creates_one_worker_per_enabled_screen(tmp_path: Path) -> None:
         supervisor.stop()
 
 
+def test_a_supervisor_can_start_with_no_screens_and_gain_them(tmp_path: Path) -> None:
+    """M3c's one genuinely new state: a paired rack that has not been pushed to
+    yet holds no screens at all, and the panels appear when the server's first
+    snapshot lands.
+
+    `_screens` is a list `apply` replaces wholesale, so an empty one at boot is
+    *structurally* fine -- but that was an assumption until something started
+    one. This pins it: `start()` and `tick()` over zero screens, then an
+    `apply()` that is the rack's first configuration rather than a
+    reconfiguration of one already running.
+    """
+    supervisor, _, _ = build(DaemonConfig(), tmp_path)
+    supervisor.start()
+    try:
+        supervisor.tick()
+        payload = json.loads((tmp_path / "status.json").read_text())
+        assert payload["screens"] == []
+
+        supervisor.apply(DaemonConfig.model_validate(config_dict(tmp_path, screens=2)))
+        supervisor.tick()
+        payload = json.loads((tmp_path / "status.json").read_text())
+        assert len(payload["screens"]) == 2
+    finally:
+        supervisor.stop()
+
+
 def test_a_tick_writes_the_status_file(tmp_path: Path) -> None:
     supervisor, store, _ = make(tmp_path)
     store.register("prom")

@@ -479,6 +479,94 @@ def test_connect_needs_no_config_file(tmp_path: Path) -> None:
     assert main(["connect", "--server", "http://s", "--token", "t", "--link", str(link)]) == 0
 
 
+# --- boot without --config: the five-row table's rows 2-5 -------------------
+
+
+def run_no_config(tmp_path: Path, *extra: str) -> int:
+    return main(
+        [
+            "run",
+            "--status",
+            str(tmp_path / "status.json"),
+            "--link",
+            str(tmp_path / "link.json"),
+            *extra,
+        ]
+    )
+
+
+def test_run_boots_from_the_cached_snapshot_with_no_config_file_at_all(tmp_path: Path) -> None:
+    """Row 2: a paired rack that has been pushed to never reads the YAML
+    `--config` used to force it to supply, because `--config` is not on the
+    command line at all here."""
+    link = tmp_path / "link.json"
+    main(["connect", "--server", "http://s", "--token", "t", "--link", str(link)])
+    write_cache(tmp_path / "snapshot.json")
+
+    assert run_no_config(tmp_path) == 0
+    assert [
+        screen.config.name for screen in RecordingSupervisor.instances[-1].kwargs["screens"]
+    ] == ["CPU"]
+
+
+def test_a_paired_rack_with_nothing_pushed_yet_starts_with_no_screens(tmp_path: Path) -> None:
+    """Row 3: not an error, and there is no file to fall back to either -- one
+    was never given. The panels appear when the server's first push lands."""
+    link = tmp_path / "link.json"
+    main(["connect", "--server", "http://s", "--token", "t", "--link", str(link)])
+
+    assert run_no_config(tmp_path) == 0
+    supervisor = RecordingSupervisor.instances[-1]
+    assert supervisor.kwargs["screens"] == []
+
+
+def test_a_freshly_installed_rack_enters_the_join_flow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Row 4: no pairing and no `--config` is the state `install` leaves a
+    machine in, and it is not an error. Before M3c `--config` was required, so
+    this state could not even be booted; this also proves that mutation dead:
+    `run_no_config` never passes `--config` at all, so a required flag would
+    fail this in argparse before `join_a_server` was ever reached.
+    """
+    joined: list[Any] = []
+    monkeypatch.setattr("ors_daemon.__main__.join_a_server", lambda *a, **k: joined.append(True))
+
+    assert run_no_config(tmp_path) == 0
+    assert joined == [True]
+    assert RecordingSupervisor.instances == [], "nothing runs before a server approves this rack"
+
+
+def test_discovery_off_with_no_server_and_no_config_names_every_way_to_fix_it(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """Row 5: the one case with no way to obtain a configuration at all --
+    discovery is off and nothing names a server to dial directly. A message
+    naming every way out, not a traceback: the audience is somebody over SSH,
+    and a traceback tells them about this program rather than about their
+    machine.
+    """
+    assert run_no_config(tmp_path, "--no-discovery") == 1
+    error = capsys.readouterr().err
+    assert "--config" in error
+    assert "--server" in error
+    assert "Traceback" not in error
+    assert RecordingSupervisor.instances == []
+
+
+def test_a_server_flag_still_enters_the_join_flow_with_discovery_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--server` is one of row 5's two ways out even with discovery off: it
+    names a server to dial directly, so there is still a way to get a
+    configuration and this is row 4 again, not row 5."""
+    joined: list[Any] = []
+    monkeypatch.setattr("ors_daemon.__main__.join_a_server", lambda *a, **k: joined.append(True))
+
+    assert run_no_config(tmp_path, "--no-discovery", "--server", "http://s:8080") == 0
+    assert joined == [True]
+
+
 # --- run --------------------------------------------------------------------
 
 
