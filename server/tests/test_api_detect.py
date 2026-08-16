@@ -34,7 +34,7 @@ from ors_schema import link
 from ors_schema.link import MAX_REQUEST_ID, DetectResult, PanelCandidate, ProbeResult
 from ors_server.api import daemons
 from ors_server.app import AppSettings, create_app
-from ors_server.link.hub import SEND_TIMEOUT
+from ors_server.link.hub import REQUEST_TIMEOUT, SEND_TIMEOUT
 
 # The AST checks the two rules below are read with, taken from the sweep that
 # owns them rather than copied. A second copy is a second thing to keep true:
@@ -64,6 +64,20 @@ The claimed one leads deliberately -- a route that filtered the list down to wha
 the wizard can offer would answer with one panel here, and the operator would
 never learn that SPI6.4 exists and is spoken for.
 """
+
+TURNS_LATE = 4
+"""How many turns of the event loop `LateRack` takes to answer. More than one, so
+that a wait whose deadline has already passed gives up first however the loop
+orders the two."""
+
+A_NUMBER = "a bus, chip select, pin or clock is a number"
+A_DURATION = "a hold is a duration in seconds"
+"""The two sentences `ProbeBody` refuses a flag with, and the reason there are
+two of them: a `hold_s` turned down as a chip select is a correct refusal
+carrying a false reason, and the reason is all an operator gets. Written here
+rather than imported, because what is being checked is what reaches the browser
+-- a validator that stopped passing `what=` would still satisfy a comparison
+against whatever it passes now."""
 
 CLAIMED = "SPI2.5 is already driving the screen 'CPU'; change that screen's wiring first"
 """A daemon's own refusal, flattened to `ok=False` plus a sentence -- see
@@ -200,6 +214,40 @@ class GatedRack(Rack):
         answer = self.reply(asked)
         if answer is not None:
             self.hub.deliver_reply(self.daemon_id, answer)
+
+
+class LateRack(Rack):
+    """A rack whose answer arrives some turns of the loop after the question.
+
+    `Rack` delivers from inside the send, which is a rack that had already
+    answered before `Hub.request` reached its wait -- so the timeout it was given
+    is never consulted at all, and a zero one returns the answer through
+    `asyncio.wait_for`'s fast path. This is the other rack: the one the wait is
+    for.
+
+    Turns of the loop and not seconds, because no test in this suite may spend
+    wall clock. It is enough: what decides between an answer and a 504 is whether
+    the future was done when the wait arrived, and a deadline already in the past
+    fires before the first of these turns has been taken.
+    """
+
+    def __init__(self, app: FastAPI, daemon_id: int, reply=None) -> None:
+        super().__init__(app, daemon_id, reply)
+        # Held, because the loop keeps only a weak reference to a running task
+        # and a collected one is an answer that never arrives.
+        self.answering: list[asyncio.Task] = []
+
+    async def send(self, payload: str | bytes) -> None:
+        asked = json.loads(payload)
+        self.asked.append(asked)
+        answer = self.reply(asked)
+        if answer is not None:
+            self.answering.append(asyncio.create_task(self._answer_late(answer)))
+
+    async def _answer_late(self, answer) -> None:
+        for _ in range(TURNS_LATE):
+            await asyncio.sleep(0)
+        self.hub.deliver_reply(self.daemon_id, answer)
 
 
 def caller_for(app: FastAPI) -> httpx2.AsyncClient:
@@ -550,6 +598,63 @@ def test_the_longest_hold_this_route_takes_is_the_one_the_rack_will_really_give(
     assert rack.questions("probe")[0]["hold_s"] == link.PROBE_HOLD_BUDGET
 
 
+def test_the_wait_on_a_detect_is_a_round_trip_and_not_the_default_park():
+    """`PROBE_TIMEOUT`'s pin, for the constant beside it that had none.
+
+    Nothing in this file can catch a wrong `DETECT_TIMEOUT` by asking a rack:
+    every rack here answers from *inside* the send, so the future `Hub.request`
+    hands `asyncio.wait_for` is already done and even a zero timeout returns the
+    answer through its fast path. `DETECT_TIMEOUT = 0.0` passes this suite whole
+    -- and in front of an operator it is a rack that is merely slow, mid-apply
+    and holding its bus guard, reported as one that "did not answer". The
+    wizard's first step is then permanently unusable against that rack, and the
+    504 says nothing that would explain it.
+
+    Three facts, and none of them is the literal ten. It is a *round trip* --
+    `SEND_TIMEOUT` for the question and `SEND_TIMEOUT` for the answer, which is
+    the shape `REQUEST_TIMEOUT` itself is built from, so shortening one leg
+    shortens this with it. It is longer than one leg, which a zero or a
+    five-second wait is not. And it is shorter than the wait for a probe and
+    shorter again than the default: a detect lists a directory, and it must not
+    park a request handler for as long as a rack holding a panel lit, let alone
+    for the forty seconds `Hub.request` gives a caller that names no timeout.
+    That last inequality is the whole reason the parameter exists.
+    """
+    assert daemons.DETECT_TIMEOUT == 2 * SEND_TIMEOUT
+    assert daemons.DETECT_TIMEOUT > SEND_TIMEOUT, "a wait that cannot cover the answer's own leg"
+    assert daemons.DETECT_TIMEOUT < daemons.PROBE_TIMEOUT < REQUEST_TIMEOUT
+
+
+async def test_a_rack_that_answers_a_moment_late_is_not_reported_as_silent(tmp_path):
+    """And the same constant, asked of the route rather than of the file.
+
+    A rack that has not answered by the time the wait is entered is the only kind
+    this timeout is ever consulted for, and every other rack in this file has
+    already answered by then. This one replies some turns of the loop later --
+    turns rather than seconds, because nothing here spends wall clock, and the
+    distinction that matters to `asyncio.wait_for` is only whether the future was
+    done when it arrived.
+
+    A rack the operator would describe as slow is a rack mid-apply: it is holding
+    its own bus guard through a repaint and comes back to the link a moment
+    after. Told "did not answer" about it, the wizard sends somebody to check a
+    cable on a rack that is working.
+    """
+    app = create_app(AppSettings(data_dir=tmp_path))
+    async with caller_for(app) as caller:
+        await sign_in(caller)
+        daemon_id = await a_rack_on(caller)
+        rack = LateRack(app, daemon_id)
+
+        detected = await caller.post(detect_of(daemon_id))
+
+        assert detected.status_code == 200, "a rack that answered late was called silent"
+        assert [(panel["bus"], panel["cs"]) for panel in detected.json()["panels"]] == [
+            (bus, cs) for bus, cs, _ in FOUND
+        ]
+        assert len(rack.questions("detect")) == 1
+
+
 @pytest.mark.parametrize("field", ["bus", "cs", "dc", "rst", "hz", "hold_s"])
 def test_a_probe_whose_wiring_is_a_flag_is_refused_before_it_reaches_the_rack(
     client, daemon_id, field
@@ -557,13 +662,30 @@ def test_a_probe_whose_wiring_is_a_flag_is_refused_before_it_reaches_the_rack(
     """This model is upstream of `ProbeRequest`, exactly as `CommandBody` is of
     `Command`: pydantic's lax mode takes `true` as 1 here first, and 1 is a
     plausible bus, chip select, pin and clock -- so the schema's own validator
-    would see an honest integer and the probe would light some other device."""
+    would see an honest integer and the probe would light some other device.
+
+    The *reason* is asserted and not only the status, which is the half a 422
+    alone cannot see. `not_a_flag`'s default sentence is "a screen id is a row
+    id", and these fields are not screen ids: dropping the `what=` this model
+    passes leaves a refusal that is still correct, still a 422, and carries a
+    false reason -- the exact defect the parameter was added to prevent. The
+    schema's own twins are asserted the same way in
+    `packages/ors-schema/tests/test_link.py`, and for the same reason: the
+    sentence is the whole of what the operator reads out of a 422, and a `hold_s`
+    refused as a chip select sends them looking at their wiring.
+    """
     rack = Rack(client.app, daemon_id)
 
     answer = client.post(probe_of(daemon_id), json={**WIRING, field: True})
 
     assert answer.status_code == 422
     assert rack.asked == [], "nothing was asked of the rack"
+    refused = json.dumps(answer.json()["detail"])
+    named = A_DURATION if field == "hold_s" else A_NUMBER
+    other = A_NUMBER if field == "hold_s" else A_DURATION
+    assert named in refused
+    assert other not in refused, "the reason has to name the kind of field this one is"
+    assert "screen id" not in refused, "and these are not screen ids -- `what=` says so"
 
 
 def test_a_probe_that_names_a_field_nobody_defined_is_refused(client, daemon_id):
