@@ -191,3 +191,30 @@ def test_module_version_matches_its_distributions_version(name: str):
     assert match.group(1) == version, (
         f"{module_path} __version__ is {match.group(1)!r}, expected {version!r}"
     )
+
+
+def test_the_release_workflow_refuses_a_wheel_without_the_interface():
+    """The gate that stops §2.3's failure reaching an index.
+
+    A published `ors-server` wheel with no `ors_server/web/index.html` in it
+    installs cleanly and serves no pages. That is not recoverable by yanking:
+    somebody has already installed it. The workflow has to check before it
+    uploads, and this asserts the check is there rather than trusting a
+    reviewer to notice its removal.
+    """
+    import yaml
+
+    document = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+    build = document["jobs"]["build"]
+    steps = [step.get("name", step.get("uses", "")) for step in build["steps"]]
+    check = next(i for i, name in enumerate(steps) if "no interface" in name)
+    upload = next(i for i, name in enumerate(steps) if "upload-artifact" in name)
+    # Ordering asserted on the job graph and the step list, not on a substring
+    # search of the file. A text search for "pypi.org" passes whatever the
+    # workflow does -- `pypa/gh-action-pypi-publish` does not contain that
+    # string -- which is a test that reads like a gate and is not one.
+    assert check < upload, "the interface check must run before the artifact is uploaded"
+    assert (
+        document["jobs"]["publish"]["needs"] == "build"
+        or "build" in document["jobs"]["publish"]["needs"]
+    ), "publish must not run unless build succeeded"

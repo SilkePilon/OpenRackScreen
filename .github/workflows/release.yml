@@ -1,0 +1,110 @@
+name: release
+
+# A tag, not a branch push: publishing is irreversible per version, and a
+# workflow that fired on every merge would burn version numbers on commits
+# nobody meant to ship.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v9.0.0
+
+      # pnpm before node: the store cache is this action's own, and `pnpm` has
+      # to be on PATH before anything can ask it where its store is. Mirrors
+      # the `web` job in ci.yml.
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: web/package.json
+          cache: true
+          cache_dependency_path: web/pnpm-lock.yaml
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # The interface is built first and copied into the server package, so the
+      # wheel built below contains it. Everything after this depends on it
+      # having happened.
+      - name: Build the interface
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Put the interface inside the server package
+        run: |
+          rm -rf server/src/ors_server/web
+          cp -r web/dist server/src/ors_server/web
+
+      - name: Check the tag matches the version in the tree
+        run: |
+          uv run python - <<'PY'
+          import sys
+          sys.path.insert(0, "tools")
+          import os
+          from version import read_versions
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          versions = set(read_versions().values())
+          if versions != {tag}:
+              raise SystemExit(f"tag {tag!r} does not match {versions}")
+          PY
+
+      - name: Build every distribution
+        run: uv build --all-packages --out-dir dist
+
+      # Before anything is uploaded. A wheel without the interface installs
+      # cleanly and serves no pages, and yanking does not un-install it.
+      - name: Refuse a server wheel with no interface in it
+        run: |
+          uv run python - <<'PY'
+          import pathlib, sys, zipfile
+          wheels = list(pathlib.Path("dist").glob("ors_server-*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one ors_server wheel, found {wheels}")
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          if "ors_server/web/index.html" not in names:
+              raise SystemExit("the server wheel has no interface in it")
+          print(f"{wheels[0].name} carries the interface")
+          PY
+
+      # Spec §9. `[tool.uv.sources]` is uv-only and should never reach a wheel,
+      # but "should" is how a `file://` requirement gets published and fails to
+      # install for everyone who is not in this workspace.
+      - name: Refuse a wheel whose dependencies name a local path
+        run: |
+          uv run python - <<'PY'
+          import email.parser, pathlib, zipfile
+          for wheel in pathlib.Path("dist").glob("*.whl"):
+              archive = zipfile.ZipFile(wheel)
+              [metadata] = [n for n in archive.namelist() if n.endswith(".dist-info/METADATA")]
+              parsed = email.parser.BytesParser().parsebytes(archive.read(metadata))
+              for requirement in parsed.get_all("Requires-Dist") or []:
+                  if "file://" in requirement or "@ /" in requirement:
+                      raise SystemExit(f"{wheel.name} requires a local path: {requirement}")
+          print("no wheel names a local path")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    # Trusted Publishing: PyPI verifies this workflow's OIDC identity, so no API
+    # token is stored in this repository and none can be stolen from it.
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
