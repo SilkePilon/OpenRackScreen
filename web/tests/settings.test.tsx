@@ -316,6 +316,10 @@ describe("the settings page", () => {
     expect(card.getByRole("button", { name: "Save the timezone" })).toBeDisabled()
 
     await userEvent.clear(box)
+    // An empty box is not an edit either: `timezone` is `min_length=1` on the
+    // far end, and a blank one would be refused for a reason that says nothing.
+    expect(card.getByRole("button", { name: "Save the timezone" })).toBeDisabled()
+
     await userEvent.type(box, "Mars/Olympus_Mons")
     await userEvent.click(card.getByRole("button", { name: "Save the timezone" }))
 
@@ -451,6 +455,7 @@ describe("the settings page", () => {
     renderApp({ at: "/settings" })
 
     // The password card needs nothing from that request and is up already.
+    expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument()
     await screen.findByRole("region", { name: "Admin password" })
     expect(screen.getByText(/Reading the settings/)).toBeInTheDocument()
     expect(screen.queryByLabelText("Dark from")).not.toBeInTheDocument()
