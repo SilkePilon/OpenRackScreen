@@ -106,13 +106,14 @@ export function parseFields(text: string): Record<string, unknown> | null {
 /**
  * A positive number, or `null`.
  *
- * The emptiness test is not redundant with the comparison: `Number("")` is `0`
- * and `Number("  ")` is `0`, so a box somebody cleared would otherwise arrive as
- * a real zero -- which `poll_interval` (`gt=0`) and `timeout` (`gt=0`) both
- * refuse, from the far end of a request that did not need to be made.
+ * No separate emptiness test, and that is deliberate rather than an omission:
+ * `Number("")` and `Number("  ")` are both `0`, so a cleared box fails `> 0`
+ * already, and a guard for it would be a branch no input could reach. `> 0`
+ * because `poll_interval` and `timeout` are both `gt=0` on the far end, and
+ * `Number.isFinite` because `Number("")` is not the only surprise here --
+ * `Number("abc")` is `NaN`, which is neither above nor below zero.
  */
 export function positive(text: string): number | null {
-  if (text.trim() === "") return null
   const value = Number(text)
   if (!Number.isFinite(value) || value <= 0) return null
   return value

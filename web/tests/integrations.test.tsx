@@ -273,10 +273,18 @@ describe("the integrations page", () => {
 
     await userEvent.type(add.getByRole("textbox", { name: "Name" }), "loki-tail")
     await userEvent.type(add.getByRole("textbox", { name: "URL" }), "https://loki.loft:3100")
-    await retype(
-      add.getByRole("textbox", { name: "Fields (JSON)" }),
-      '{"lines": {"query": "sum(rate(log_lines[5m]))"}}',
-    )
+
+    // `fields` is a mapping with at least one entry in it: `PrometheusConfig`
+    // declares it `min_length=1`, because an integration that queries nothing
+    // polls a server for no reason and can feed no screen. Neither of these is
+    // that, and `JSON.parse` reads both as an `object`.
+    const fields = add.getByRole("textbox", { name: "Fields (JSON)" })
+    await retype(fields, "{}")
+    expect(add.getByRole("button", { name: "Add the integration" })).toBeDisabled()
+    await retype(fields, '["cpu"]')
+    expect(add.getByRole("button", { name: "Add the integration" })).toBeDisabled()
+
+    await retype(fields, '{"lines": {"query": "sum(rate(log_lines[5m]))"}}')
     const interval = add.getByRole("spinbutton", { name: "Poll interval (seconds)" })
     await userEvent.clear(interval)
     await userEvent.type(interval, "20")
@@ -461,6 +469,16 @@ describe("the integrations page", () => {
     // Then: the clear, which is a different request and says so explicitly.
     await userEvent.click(screen.getByRole("button", { name: "Edit vault-probe" }))
     const clearing = within(await screen.findByRole("dialog"))
+
+    // The half-typed replacement, which is the same wipe wearing a different
+    // hat: "replace it" with an empty box builds `credential: ""`, which is the
+    // instruction to remove the stored secret. It is refused here rather than
+    // sent, because nothing downstream could tell the two apart.
+    await userEvent.click(clearing.getByRole("combobox", { name: "Credential" }))
+    await userEvent.click(screen.getByRole("option", { name: "Replace the stored credential" }))
+    expect(clearing.getByRole("button", { name: "Save the integration" })).toBeDisabled()
+    expect(clearing.getByText(/an empty one is the instruction to remove/i)).toBeInTheDocument()
+
     await userEvent.click(clearing.getByRole("combobox", { name: "Credential" }))
     await userEvent.click(screen.getByRole("option", { name: "Remove the stored credential" }))
     // Removing it is the only change, so there is something to save -- and what
@@ -628,6 +646,21 @@ describe("the integrations page", () => {
     // no console line, and in no attribute of the document.
     appearsNowhere(URL_PASSWORD, said)
     appearsNowhere(URL_WITH_CREDENTIAL, said)
+
+    // And again for the shape with no user in it, which is how a bearer token
+    // ends up in an address: `https://:token@host`. It is userinfo all the same,
+    // the server refuses it the same way, and a check written as "there is a
+    // username *and* a password" would let this one straight through.
+    const second = dialog.getByRole("textbox", { name: "URL" })
+    await userEvent.clear(second)
+    await userEvent.type(second, `https://:${URL_PASSWORD}@prom.loft:9090`)
+    await userEvent.click(dialog.getByRole("button", { name: "Save the integration" }))
+
+    await waitFor(() => expect(patched).toHaveLength(2))
+    await waitFor(() =>
+      expect(dialog.getByRole("textbox", { name: "URL" })).toHaveValue("https://prom.loft:9090/"),
+    )
+    appearsNowhere(URL_PASSWORD, said)
   })
 
   it("deletes the integration it named, and says which racks did not get the removal", async () => {
