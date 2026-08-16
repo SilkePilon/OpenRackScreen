@@ -75,6 +75,59 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/auth/password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Change Password
+         * @description Replace the admin password, proving the current one first.
+         *
+         *     Session-guarded, unlike `login`: the cookie says who is asking, and
+         *     `body.current` says they know what they are replacing. Both, because either
+         *     alone is a password reset for whoever has the other -- a borrowed browser,
+         *     or a guess.
+         *
+         *     **A wrong current password is 403 and not 401.** 401 is this API's word for
+         *     "there is no session here", and the interface hangs one handler off every
+         *     response that sends a 401 to the login page. A refusal that said 401 would
+         *     throw the admin out of the settings form for a typo, and the only defence
+         *     would be a second URL exemption beside the login route's -- one that stops
+         *     matching silently the day the SPA is served under a sub-path. This caller is
+         *     authenticated; what is refused is the request.
+         *
+         *     **Rate-limited on `request.client.host`, refused before the hash**, both for
+         *     `login`'s reasons: `X-Forwarded-For` is written by whoever sends it, so
+         *     trusting it would let one attacker be a new client on every request, and a
+         *     limiter that verifies first is a CPU exhaustion endpoint -- argon2 is 0.58s
+         *     by design. The counter is `login`'s own, not a second one: the two routes
+         *     verify the same secret, and separate budgets would double the guessing rate
+         *     for it.
+         *
+         *     **Every other session ends; this one does not.** The reason to change a
+         *     password is that it may have leaked, so the other holder must be logged out
+         *     -- a change that left a stolen cookie working is a change that does nothing
+         *     about the thing it was done for. Revoking the caller's own cookie as well
+         *     would sign them out mid-request, which reads as a failure and sends them
+         *     back to prove the password they have just this second set.
+         *
+         *     It opens no `change`: no rack's configuration moves, so there is no version
+         *     to bump, no snapshot to assemble and nobody to push to. See
+         *     `test_api_routes.test_the_password_change_writes_a_row_and_so_is_not_an_exemption`
+         *     for why that does not put it on `MUTATES_NOTHING`.
+         */
+        post: operations["change_password_api_auth_password_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/auth/logout": {
         parameters: {
             query?: never;
@@ -1203,6 +1256,40 @@ export interface components {
             password: string;
         };
         /**
+         * PasswordChange
+         * @description The current password and the one to replace it with.
+         *
+         *     Both fields carry `repr=False`, for the reason `Hello.token` and
+         *     `IntegrationBody.credential` do: a model's `repr` is what reaches a log the
+         *     moment anybody drops one into an `extra`, and this body holds two secrets
+         *     rather than one. `extra="forbid"` because a client that sends `password`
+         *     here -- the field the other three auth routes take -- has sent the wrong
+         *     document, and being told so is better than having half of it ignored.
+         */
+        PasswordChange: {
+            /** Current */
+            current: string;
+            /** New */
+            new: string;
+        };
+        /**
+         * PasswordChanged
+         * @description That it happened, and how many other browsers it signed out.
+         *
+         *     A model rather than the `dict[str, bool]` the other three answer with,
+         *     because `other_sessions_ended` is a number and because the generated
+         *     TypeScript for a `dict` is an index signature -- every key `boolean`,
+         *     whether the server sends it or not. The count is what lets the interface say
+         *     "two other sign-ins were ended" rather than claiming it in prose that would
+         *     still be there on a server where nothing else was signed in.
+         */
+        PasswordChanged: {
+            /** Ok */
+            ok: boolean;
+            /** Other Sessions Ended */
+            other_sessions_ended: number;
+        };
+        /**
          * ProbeBody
          * @description The wiring an operator typed in, for one candidate panel.
          *
@@ -1808,6 +1895,41 @@ export interface operations {
                     "application/json": {
                         [key: string]: boolean;
                     };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    change_password_api_auth_password_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                ors_session?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasswordChange"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PasswordChanged"];
                 };
             };
             /** @description Validation Error */
