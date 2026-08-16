@@ -246,7 +246,10 @@ describe("the integrations page", () => {
       http.patch("/api/integrations/:integration_id", async ({ request, params }) => {
         const body = (await request.json()) as Record<string, unknown>
         patched.push({ id: params.integration_id, body })
-        const edited = { ...METRICS, ...body } as Integration
+        // Over the row as it is now, so the second edit below follows the first
+        // instead of quietly reverting it.
+        const current = rows.find((row) => String(row.id) === String(params.integration_id))
+        const edited = { ...(current ?? METRICS), ...body } as Integration
         rows = rows.map((row) => (row.id === METRICS.id ? edited : row))
         return HttpResponse.json(edited)
       }),
@@ -285,7 +288,15 @@ describe("the integrations page", () => {
     expect(add.getByRole("button", { name: "Add the integration" })).toBeDisabled()
 
     await retype(fields, '{"lines": {"query": "sum(rate(log_lines[5m]))"}}')
+
     const interval = add.getByRole("spinbutton", { name: "Poll interval (seconds)" })
+    await userEvent.clear(interval)
+    // Zero seconds is not a rate. `poll_interval` and `timeout` are both `gt=0`
+    // on the far end, so a body carrying it buys a 422 for a request that never
+    // needed to be made.
+    await userEvent.type(interval, "0")
+    expect(add.getByRole("button", { name: "Add the integration" })).toBeDisabled()
+    expect(add.getByText(/must be above zero/i)).toBeInTheDocument()
     await userEvent.clear(interval)
     await userEvent.type(interval, "20")
     await userEvent.click(add.getByRole("button", { name: "Add the integration" }))
@@ -347,6 +358,30 @@ describe("the integrations page", () => {
     await waitFor(() =>
       expect(cardOf("metrics-prom on pi-loft").getByText(/every 45 seconds/)).toBeInTheDocument(),
     )
+
+    // And the other half of "only what moved": an edit that touches nothing but
+    // the field map still sends `config`, because `config` is one column and the
+    // field map lives inside it. It goes as the whole document, built over the
+    // one that was there -- so the tunnel this form cannot edit is still in it,
+    // and `poll_interval`, which was not touched this time, is not.
+    await userEvent.click(screen.getByRole("button", { name: "Edit metrics-prom" }))
+    const again = within(await screen.findByRole("dialog"))
+    await retype(
+      again.getByRole("textbox", { name: "Fields (JSON)" }),
+      '{"cpu": {"query": "node_cpu_ratio", "reduce": "top"}}',
+    )
+    await userEvent.click(again.getByRole("button", { name: "Save the integration" }))
+
+    await waitFor(() => expect(patched).toHaveLength(2))
+    expect(patched[1]).toEqual({
+      id: "17",
+      body: {
+        config: {
+          ...METRICS.config,
+          fields: { cpu: { query: "node_cpu_ratio", reduce: "top" } },
+        },
+      },
+    })
   })
 
   it("sends a credential once and can never show it again", async () => {
@@ -481,6 +516,11 @@ describe("the integrations page", () => {
 
     await userEvent.click(clearing.getByRole("combobox", { name: "Credential" }))
     await userEvent.click(screen.getByRole("option", { name: "Remove the stored credential" }))
+    // Once it is being removed, this edit leaves no credential behind, so
+    // enabling it is no longer the thing that would be refused. The warning is
+    // about the state the edit leaves and it goes when that state does; a
+    // warning that stayed would be telling somebody a legal edit will fail.
+    expect(clearing.queryByText(/enabling it will be refused/i)).not.toBeInTheDocument()
     // Removing it is the only change, so there is something to save -- and what
     // goes on the wire is the empty string and nothing else.
     await userEvent.click(clearing.getByRole("button", { name: "Save the integration" }))
@@ -530,11 +570,13 @@ describe("the integrations page", () => {
     await waitFor(() => expect(patched).toEqual([{ enabled: true }]))
 
     const refusal = await screen.findByRole("alert")
-    expect(refusal).toHaveTextContent(REFUSAL)
     // The server's own sentence, which is the one that carries the remedy --
-    // not the generic apology `useMutate` falls back to when there is no detail.
+    // not the generic apology `useMutate` falls back to when there is no detail
+    // -- and *only* that sentence: `toBe` rather than `toHaveTextContent`,
+    // because anything this page appended would be this page explaining a
+    // refusal it did not make.
+    expect(refusal.textContent).toBe(REFUSAL)
     expect(refusal).toHaveTextContent("Store it on a disabled integration, or leave it out.")
-    expect(refusal).not.toHaveTextContent(/the server refused the change/i)
 
     // The dialog stays up holding what was set, so the remedy is one click away
     // rather than a form to fill in again.
@@ -618,9 +660,12 @@ describe("the integrations page", () => {
     await userEvent.type(url, URL_WITH_CREDENTIAL)
     await userEvent.click(dialog.getByRole("button", { name: "Save the integration" }))
 
+    // Exactly the server's sentence and nothing else. `toBe` and not
+    // `toHaveTextContent`: what a page appends to a refusal about an address is
+    // most naturally the address, and the address is the thing holding the
+    // password.
     const refusal = await screen.findByRole("alert")
-    expect(refusal).toHaveTextContent(REFUSAL)
-    expect(refusal).not.toHaveTextContent(/the server refused the change/i)
+    expect(refusal.textContent).toBe(REFUSAL)
 
     // `config` is one column and a PATCH replaces all of it, so the body carries
     // the whole document -- built over the one that was there, not out of the
