@@ -24,6 +24,12 @@ def test_the_window_rolls():
     limiter = Limiter(max_attempts=1, window_seconds=60)
     limiter.record("10.0.0.1", 0)
     assert limiter.too_many("10.0.0.1", 59) is True
+    # Exactly `window_seconds` old is **out**, and this is the case that has to
+    # be stated rather than implied: 59 and 61 are both satisfied by `<` and by
+    # `<=`, so a suite that checks only those two pins the window's width and
+    # not which end it is open at. Swapping the comparison passed all five
+    # tests until this line existed.
+    assert limiter.too_many("10.0.0.1", 60) is False
     assert limiter.too_many("10.0.0.1", 61) is False
 
 
