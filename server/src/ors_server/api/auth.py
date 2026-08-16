@@ -21,7 +21,16 @@ SessionCookie = Annotated[str | None, Cookie(alias=SESSION_COOKIE)]
 
 
 class PasswordBody(BaseModel):
-    password: str = Field(min_length=1)
+    """The one password `setup` claims and `login` proves.
+
+    `repr=False` for the reason `Hello.token` and `IntegrationBody.credential`
+    carry it, and `PasswordChange` below: a model's `repr` is what reaches a log
+    the moment anybody drops one into an `extra`, and the field this holds is a
+    plaintext admin password. There is nothing about being the *login* body that
+    makes it safer to log than the change body two screens down.
+    """
+
+    password: str = Field(min_length=1, repr=False)
 
 
 @router.get("/me")
@@ -111,7 +120,21 @@ class PasswordChanged(BaseModel):
     other_sessions_ended: int
 
 
-@router.post("/password", dependencies=[Depends(require_session)])
+@router.post(
+    "/password",
+    dependencies=[Depends(require_session)],
+    # The two statuses the interface branches on, in the document CI regenerates
+    # `web/src/api/schema.d.ts` from -- `PasswordCard.refusal()` tells a 429 from
+    # a 403 by number, and a status that is only in the source is a status the
+    # drift check cannot notice going away. No `model`: these are FastAPI's own
+    # `{"detail": "..."}`, which no route in this server declares a schema for,
+    # and inventing one here would put a shape in the artefact that the app's
+    # validation handler does not produce for a 422 beside it.
+    responses={
+        403: {"description": "the current password is wrong"},
+        429: {"description": "too many password attempts from this client; see login"},
+    },
+)
 def change_password(
     request: Request, body: PasswordChange, token: SessionCookie = None
 ) -> PasswordChanged:

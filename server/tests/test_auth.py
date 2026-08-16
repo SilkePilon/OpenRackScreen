@@ -8,7 +8,7 @@ from argon2 import PasswordHasher
 from fastapi import Depends, FastAPI, WebSocket
 from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
-from ors_server.api.auth import PasswordChange
+from ors_server.api.auth import PasswordBody, PasswordChange
 from ors_server.app import AppSettings, create_app
 from ors_server.auth import Sessions, claim_password, require_session, verify_password
 from ors_server.db import Database
@@ -543,8 +543,16 @@ def test_proving_the_current_password_clears_the_count_it_had_to_get_past(tmp_pa
 def test_neither_password_reaches_a_repr():
     """A model's `repr` is what reaches a log the moment anybody drops one into
     an `extra`, which is why `Hello.token` and `IntegrationBody.credential` both
-    carry `repr=False`. This body carries two secrets, not one."""
-    body = PasswordChange(current="correct horse", new=NEW_PASSWORD)
+    carry `repr=False`.
+
+    All three of this module's password fields, not just the change body's two.
+    `PasswordBody` is what `setup` and `login` take, and the plaintext in it is
+    the same admin password by another route -- one model in this file carrying
+    the flag and its neighbour not is what reads to a later editor as "the login
+    body is safe to log".
+    """
+    change = PasswordChange(current="correct horse", new=NEW_PASSWORD)
+    login = PasswordBody(password="correct horse")
 
     class Leaky(BaseModel):
         secret: str
@@ -552,8 +560,28 @@ def test_neither_password_reaches_a_repr():
     assert NEW_PASSWORD in repr(Leaky(secret=NEW_PASSWORD)), (
         "the fixture proves nothing if a plain pydantic repr hides a field anyway"
     )
-    assert "correct horse" not in repr(body)
-    assert NEW_PASSWORD not in repr(body)
+    assert "correct horse" not in repr(change)
+    assert NEW_PASSWORD not in repr(change)
+    assert "correct horse" not in repr(login)
+
+
+def test_the_two_refusals_the_interface_branches_on_are_documented(tmp_path):
+    """`PasswordCard.refusal()` tells a 429 from a 403 by number, and the only
+    artefact CI compares against the server is `web/src/api/schema.d.ts`, which
+    is generated from this document. A status that lives only in the source is a
+    status the drift check cannot notice being taken away.
+
+    Bodies are not declared, here or anywhere in this server: the refusals are
+    FastAPI's own `{"detail": "..."}`, and a schema invented for them would be a
+    promise the 422 beside them does not keep.
+    """
+    _, client = app_and_client(tmp_path)
+
+    answers = client.get("/api/openapi.json").json()["paths"]["/api/auth/password"]["post"][
+        "responses"
+    ]
+
+    assert {"200", "403", "429"} <= set(answers), answers
 
 
 def test_a_password_change_never_repeats_either_password_back(tmp_path):
