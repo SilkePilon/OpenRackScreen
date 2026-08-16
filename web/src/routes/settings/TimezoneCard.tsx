@@ -25,6 +25,15 @@ import { Label } from "@/components/ui/label"
  * "necessary rather than sufficient", and a page that implied otherwise would
  * send somebody looking for the wrong fault when the rack nacks hours later.
  *
+ * **What was sent is quoted, and it is sent exactly as typed.** Nothing here
+ * trims: the value belongs to the server, `SettingsBody` is what decides what a
+ * timezone is, and a page that quietly stripped a space would be inventing a
+ * rule about somebody else's column -- and hiding, rather than reporting, a
+ * paste that carried one. But `no such timezone: ' Europe/Amsterdam'` is a
+ * refusal nobody can act on, because the space that caused it is invisible. So
+ * the refused value is drawn back inside quotes, where a leading or trailing
+ * space is something to see rather than something to suspect.
+ *
  * The box follows the server while nobody is typing in it -- `null` is
  * untouched, not a value -- so an edit made in another tab arrives here, and the
  * value that is drawn after a save is the one that came back rather than the one
@@ -68,7 +77,15 @@ export function TimezoneCard({ settings, racks }: { settings: Settings; racks: D
               value={shown}
               placeholder="Europe/Amsterdam"
               onChange={(event) => {
-                if (save.isError) save.reset()
+                // The last write's notice is not an answer about a form that
+                // has moved on from it -- the success sentence as much as the
+                // refusal, and the alert naming a rack that did not get the
+                // change most of all. `PasswordCard` wraps every setter this
+                // way and `SleepTab` reports the same rule through `useUnsaved`.
+                // It is also what keeps the quoted value in the refusal below
+                // equal to the value that was actually sent: nothing can have
+                // been typed since, because typing is what clears it.
+                if (save.isSuccess || save.isError) save.reset()
                 setTyped(event.target.value)
               }}
             />
@@ -82,10 +99,10 @@ export function TimezoneCard({ settings, racks }: { settings: Settings; racks: D
             <Alert variant="destructive">
               <AlertTitle>The timezone was not saved</AlertTitle>
               <AlertDescription>
-                {`${save.error.message}. Give it an IANA zone name — Europe/Amsterdam, ` +
-                  "America/New_York, UTC. This server checks against its own tzdata, so a name " +
-                  "it accepts can still be one the Pi does not know; that arrives later as a " +
-                  "refusal on the Daemons page."}
+                {`${save.error.message}. What was sent, quoted: "${shown}". ` +
+                  "Give it an IANA zone name — Europe/Amsterdam, America/New_York, UTC. This " +
+                  "server checks against its own tzdata, so a name it accepts can still be one " +
+                  "the Pi does not know; that arrives later as a refusal on the Daemons page."}
               </AlertDescription>
             </Alert>
           )}

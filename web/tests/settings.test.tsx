@@ -278,12 +278,16 @@ describe("the settings page", () => {
   it("sends the timezone on its own, and says what to do about one that is refused", async () => {
     const bodies: unknown[] = []
     let stored = SETTINGS
+    // What this stand-in server can resolve, as `SettingsBody._resolvable`
+    // decides on the real one: anything else is refused, including a name that
+    // is only unresolvable because of a space somebody pasted with it.
+    const RESOLVABLE = new Set(["Europe/Amsterdam", "Pacific/Auckland", "Pacific/Chatham"])
     server.use(
       ...reading(() => stored),
       http.patch("/api/settings", async ({ request }) => {
         const body = (await request.json()) as Record<string, unknown>
         bodies.push(body)
-        if (body.timezone === "Mars/Olympus_Mons") {
+        if (!RESOLVABLE.has(String(body.timezone))) {
           // The server's own 422, list-shaped, as `SettingsBody._resolvable`
           // raises it and `validation_error_without_the_body` strips it.
           return HttpResponse.json(
@@ -291,7 +295,7 @@ describe("the settings page", () => {
               detail: [
                 {
                   loc: ["body", "timezone"],
-                  msg: "Value error, no such timezone: 'No time zone found with key Mars/Olympus_Mons'",
+                  msg: `Value error, no such timezone: 'No time zone found with key ${String(body.timezone)}'`,
                   type: "value_error",
                 },
               ],
@@ -331,6 +335,24 @@ describe("the settings page", () => {
     expect(refusal).toHaveTextContent(/IANA/i)
     expect(refusal).toHaveTextContent("Europe/Amsterdam")
 
+    // A zone with a space in front of it, which is what a paste out of a wiki
+    // gives you. Nothing here trims -- the value is the server's to judge -- so
+    // what has to be true is that the refusal shows the space. `no such
+    // timezone: ' Europe/Amsterdam'` is a refusal nobody can act on: the name
+    // reads as correct and the character that broke it is invisible.
+    await userEvent.clear(box)
+    await userEvent.type(box, " Europe/Amsterdam")
+    await userEvent.click(card.getByRole("button", { name: "Save the timezone" }))
+
+    await waitFor(() => expect(bodies).toHaveLength(2))
+    // Sent exactly as typed, space and all.
+    expect(bodies[1]).toEqual({ timezone: " Europe/Amsterdam" })
+    // And drawn back inside quotes, where the space is something to see.
+    // `textContent` rather than `toHaveTextContent`, which normalises runs of
+    // whitespace away -- and the space is the whole assertion.
+    const spaced = await screen.findByRole("alert")
+    expect(spaced.textContent ?? "").toContain('" Europe/Amsterdam"')
+
     await userEvent.clear(box)
     await userEvent.type(box, "Pacific/Auckland")
     await userEvent.click(card.getByRole("button", { name: "Save the timezone" }))
@@ -340,11 +362,21 @@ describe("the settings page", () => {
     // and `PATCH /api/settings` takes its PATCH semantics from `exclude_unset`
     // precisely so it need not be sent.
     await waitFor(() =>
-      expect(bodies).toEqual([{ timezone: "Mars/Olympus_Mons" }, { timezone: "Pacific/Auckland" }]),
+      expect(bodies).toEqual([
+        { timezone: "Mars/Olympus_Mons" },
+        { timezone: " Europe/Amsterdam" },
+        { timezone: "Pacific/Auckland" },
+      ]),
     )
     // And what is drawn afterwards came back from the server, not from the box.
     await waitFor(() => expect(card.getByLabelText("Timezone")).toHaveValue("Pacific/Chatham"))
     expect(screen.getByText("The timezone was saved.")).toBeInTheDocument()
+
+    // The last write's notice is not an answer about a form that has moved on
+    // from it: "The timezone was saved." under a box somebody is retyping reads
+    // as a report on what is in the box now.
+    await userEvent.type(card.getByLabelText("Timezone"), "x")
+    expect(screen.queryByText("The timezone was saved.")).not.toBeInTheDocument()
   })
 
   it("sends the night window on its own, and draws a window that wraps midnight as normal", async () => {
@@ -382,6 +414,17 @@ describe("the settings page", () => {
     expect(card.getByText(/crosses midnight, which is the usual way round/)).toBeInTheDocument()
     expect(screen.queryByRole("alert")).not.toBeInTheDocument()
 
+    // And *not* said when nothing sleeps. "Never sleeps. A start later than the
+    // end means the window crosses midnight" is a rule about two boxes nothing
+    // is reading -- prose that says nothing in the state it appears in, which is
+    // how people learn to stop reading the prose that does.
+    const sleeps = card.getByLabelText("Sleeps at all")
+    await userEvent.click(sleeps)
+    expect(card.getByText(/Never sleeps\./)).toBeInTheDocument()
+    expect(card.queryByText(/crosses midnight/)).not.toBeInTheDocument()
+    await userEvent.click(sleeps)
+    expect(card.getByText(/crosses midnight, which is the usual way round/)).toBeInTheDocument()
+
     const from = card.getByLabelText("Dark from")
     await userEvent.clear(from)
     await userEvent.type(from, "21:15")
@@ -400,6 +443,13 @@ describe("the settings page", () => {
     await waitFor(() => expect(card.getByLabelText("Dark from")).toHaveValue("23:30"))
     expect(card.getByLabelText("Light again at")).toHaveValue("05:05")
     expect(screen.getByText("The night window was saved.")).toBeInTheDocument()
+
+    // The last write's notice is not an answer about a form that has moved on
+    // from it: "The night window was saved." under a window somebody is in the
+    // middle of retyping reads as a report on the one in front of them.
+    await userEvent.clear(card.getByLabelText("Light again at"))
+    await userEvent.type(card.getByLabelText("Light again at"), "04:40")
+    expect(screen.queryByText("The night window was saved.")).not.toBeInTheDocument()
   })
 
   it("names the one rack of four that did not get the change, and not the three that did", async () => {
@@ -430,6 +480,13 @@ describe("the settings page", () => {
     for (const name of ["pi-loft", "pi-cellar", "pi-shed"]) {
       expect(notice).not.toHaveTextContent(name)
     }
+
+    // And it goes when the form moves on. This is the notice it matters most
+    // for: "Not every rack was given that change / pi-attic" left standing over
+    // a zone somebody is now retyping names a rack about an edit that has not
+    // been made yet, and the next thing they do is go looking at pi-attic.
+    await userEvent.type(box, "x")
+    expect(screen.queryByText(/was saved, but nothing was sent/i)).not.toBeInTheDocument()
   })
 
   it("draws no form until the settings have been read", async () => {

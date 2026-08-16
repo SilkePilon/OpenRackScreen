@@ -3,7 +3,7 @@ import { useId, useState } from "react"
 import { useSaveSettings, type Daemon, type Settings } from "@/api/queries"
 import { Landed } from "@/components/Landed"
 import { NightWindowFields } from "@/components/NightWindowFields"
-import { WRAP_NOTE, describeNight, sameNight, type NightWindow } from "@/components/night"
+import { describeNightEdit, sameNight, type NightWindow } from "@/components/night"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
@@ -41,6 +41,22 @@ export function NightWindowCard({ settings, racks }: { settings: Settings; racks
   }
   const moved = !sameNight(shown, held)
 
+  /**
+   * The last write's notice is not an answer about a form that has moved on.
+   *
+   * `PasswordCard` wraps its setters the same way and `SleepTab` reports the
+   * same rule through `useUnsaved`: "The night window was saved." -- or, worse,
+   * the alert naming the rack that did not get it -- left standing while
+   * somebody types a *different* window reads as a report on the edit in front
+   * of them. It is a report on the one before it.
+   */
+  function edit<T>(set: (value: T) => void): (value: T) => void {
+    return (value) => {
+      if (save.isSuccess || save.isError) save.reset()
+      set(value)
+    }
+  }
+
   const submit = (event: React.FormEvent) => {
     event.preventDefault()
     if (!moved) return
@@ -74,13 +90,13 @@ export function NightWindowCard({ settings, racks }: { settings: Settings; racks
         <form className="grid max-w-sm gap-4" onSubmit={submit}>
           <NightWindowFields
             value={shown}
-            onEnabled={setEnabled}
-            onStart={setStart}
-            onEnd={setEnd}
+            onEnabled={edit(setEnabled)}
+            onStart={edit(setStart)}
+            onEnd={edit(setEnd)}
           />
 
           <p className="text-xs text-muted-foreground">
-            {`Every panel on this server: ${describeNight(shown, settings.timezone)} ${WRAP_NOTE}`}
+            {`Every panel on this server: ${describeNightEdit(shown, settings.timezone)}`}
           </p>
 
           <Button type="submit" className="justify-self-start" disabled={!moved || save.isPending}>

@@ -1090,6 +1090,18 @@ describe("the screens page", () => {
     )
     expect(screen.getByLabelText("Dark from")).toHaveValue("22:30")
     expect(screen.getByLabelText("Light again at")).toHaveValue("06:15")
+    // The note about the wrap is said where there is a wrap to have and not
+    // otherwise: "Never sleeps. A start later than the end means the window
+    // crosses midnight" is a rule about two boxes nothing is reading. Shared
+    // with the settings page's window through `components/night`, and asserted
+    // here as well because two call sites are two places to start appending it
+    // unconditionally again.
+    expect(screen.getByText(/crosses midnight, which is the usual way round/)).toBeInTheDocument()
+    const sleeps = screen.getByRole("switch", { name: "Sleeps at all" })
+    await userEvent.click(sleeps)
+    expect(screen.queryByText(/crosses midnight/)).not.toBeInTheDocument()
+    await userEvent.click(sleeps)
+    expect(screen.getByText(/crosses midnight, which is the usual way round/)).toBeInTheDocument()
     // And nothing to save until one of them moves: writing the window a panel
     // already keeps is an edit nobody made, with a push to the rack behind it.
     expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled()

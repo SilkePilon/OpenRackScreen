@@ -3,7 +3,7 @@ import { useId, useState } from "react"
 import { useSettings, type Screen } from "@/api/queries"
 import type { components } from "@/api/schema"
 import { NightWindowFields } from "@/components/NightWindowFields"
-import { WRAP_NOTE, describeNight, sameNight, type NightWindow } from "@/components/night"
+import { describeNight, describeNightEdit, sameNight, type NightWindow } from "@/components/night"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
@@ -130,7 +130,7 @@ export function SleepTab({
           />
 
           <p className="text-xs text-muted-foreground">
-            {`This panel: ${describeNight(shown, settings.data?.timezone ?? "server")} ${WRAP_NOTE}`}
+            {`This panel: ${describeNightEdit(shown, settings.data?.timezone ?? "server")}`}
           </p>
         </>
       )}
