@@ -229,13 +229,21 @@ def enable_spi(boot_root: Path, now: str) -> EnableResult:
     # block without this would add lines a Pi 4/5 never reads while `install`
     # still reports success and every panel comes up `unavailable`. `[all]`
     # is the documented reset and a no-op on a file with no sections at all.
-    suffix = "" if original.endswith("\n") or not original else "\n"
+    if not original or original.endswith("\n\n"):
+        suffix = ""
+    elif original.endswith("\n"):
+        # One more newline is a blank-line spacer, matching the style the
+        # original code always produced.
+        suffix = "\n"
+    else:
+        # Two: the first terminates the original's dangling last line, the
+        # second is the same blank-line spacer. This is the only thing that
+        # separates the original's last line from `[all]` below -- drop it
+        # and `dtparam=audio=on` merges into `dtparam=audio=on[all]`, one
+        # broken line the firmware cannot parse as either.
+        suffix = "\n\n"
     text = (
-        original
-        + suffix
-        + "\n[all]\n# Added by `ors-daemon install`.\n"
-        + "\n".join(missing)
-        + "\n"
+        original + suffix + "[all]\n# Added by `ors-daemon install`.\n" + "\n".join(missing) + "\n"
     )
 
     backup = _create_backup(path, now, original_bytes)
