@@ -58,6 +58,20 @@ export function ScreensPage() {
   const nameOf = (daemonId: number) =>
     rackRows.find((rack) => rack.id === daemonId)?.name ?? `rack ${daemonId}`
 
+  /**
+   * One row per rack, and a paired rack with no panels gets one too.
+   *
+   * Task 8 built this list out of the screens alone, which drew nothing at all
+   * for a rack that had none -- so the one rack that most needs an add-screen
+   * affordance was the one rack with nowhere to put it. The racks come first and
+   * in the order `GET /api/daemons` gives them, so the page does not reshuffle
+   * itself as panels are added; a rack that has screens but is in no listing --
+   * deleted in another tab between the two fetches -- still gets its row, because
+   * dropping it would silently hide panels that exist.
+   */
+  const grouped = byRack(rows)
+  const rackIds = [...new Set([...rackRows.map((rack) => rack.id), ...grouped.keys()])]
+
   return (
     <>
       <h1 className="text-2xl font-semibold">Screens</h1>
@@ -69,19 +83,21 @@ export function ScreensPage() {
           <AlertDescription>{screens.error.message}</AlertDescription>
         </Alert>
       )}
-      {screens.data?.length === 0 && (
+      {rackRows.length === 0 && rows.length === 0 && !screens.isPending && (
         <p className="text-sm text-muted-foreground">
-          No panels yet. A screen is added from its own rack, once the rack is paired.
+          No racks are paired yet. Pair one on the Daemons page; its panels are added from its own
+          row here.
         </p>
       )}
 
       <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_24rem]">
         <div className="grid gap-4">
-          {[...byRack(rows)].map(([daemonId, panels]) => (
+          {rackIds.map((daemonId) => (
             <RackCanvas
               key={daemonId}
+              daemonId={daemonId}
               rackName={nameOf(daemonId)}
-              screens={panels}
+              screens={grouped.get(daemonId) ?? []}
               selectedId={selectedId}
               onSelect={setSelectedId}
             />

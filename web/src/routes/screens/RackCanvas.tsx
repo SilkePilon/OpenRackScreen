@@ -8,6 +8,7 @@ import { Panel } from "@/components/Panel"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
 import { cn } from "@/lib/utils"
+import { AddScreenWizard } from "@/routes/screens/AddScreenWizard"
 
 /**
  * How big a panel is drawn, in CSS pixels.
@@ -38,11 +39,18 @@ export const PANEL_SIZE = 160
  * twice for as long as the pointer was over it.
  */
 export function RackCanvas({
+  daemonId,
   rackName,
   screens,
   selectedId,
   onSelect,
 }: {
+  /**
+   * The rack this row is. Passed rather than read off the first screen, because
+   * a rack with no screens has no first screen -- and that is exactly the rack
+   * the add-screen wizard exists for.
+   */
+  daemonId: number
   rackName: string
   screens: Screen[]
   selectedId: number | null
@@ -90,13 +98,28 @@ export function RackCanvas({
   return (
     <Card role="region" aria-labelledby={headingId} className="gap-3">
       <CardHeader className="gap-1">
-        <h2 id={headingId} className="text-base font-medium">
-          {rackName}
-        </h2>
-        <p className="text-sm text-muted-foreground">
-          {screens.length === 1 ? "One panel" : `${screens.length} panels`}, left to right as they
-          are wired.
-        </p>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="grid gap-1">
+            <h2 id={headingId} className="text-base font-medium">
+              {rackName}
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              {screens.length === 0
+                ? "No panels on this rack yet. The wizard asks it what it has, then proves one " +
+                  "panel before adding it."
+                : `${
+                    screens.length === 1 ? "One panel" : `${screens.length} panels`
+                  }, left to right as they are wired.`}
+            </p>
+          </div>
+          {/* Here rather than once at the top of the page, because a screen
+              belongs to a rack: the wizard asks *this* rack what it has, copies
+              *this* rack's wiring into its boxes and lights a panel on *this*
+              rack's bus. A single button somewhere else would have to start by
+              asking which rack, which is a question the row it sits on has
+              already answered. */}
+          <AddScreenWizard daemonId={daemonId} rackName={rackName} screens={screens} />
+        </div>
       </CardHeader>
 
       <CardContent className="grid gap-3">
@@ -106,6 +129,10 @@ export function RackCanvas({
           </p>
         )}
 
+        {/* No list at all for a rack with nothing on it, rather than an empty
+            labelled one: "Panels on pi-cellar" with no panels under it is a
+            landmark that leads a screen reader nowhere. */}
+        {screens.length > 0 && (
         <ol
           aria-label={`Panels on ${rackName}`}
           className="flex flex-wrap items-start gap-6 md:flex-nowrap md:overflow-x-auto"
@@ -166,6 +193,7 @@ export function RackCanvas({
             )
           })}
         </ol>
+        )}
       </CardContent>
     </Card>
   )

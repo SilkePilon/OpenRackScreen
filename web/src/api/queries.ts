@@ -1,6 +1,7 @@
 import { skipToken, useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 
 import { ApiError, api, detailFrom } from "./client"
+import { useMutate } from "./mutate"
 import type { components } from "./schema"
 
 /** One key per resource. Everything that touches the session invalidates this. */
@@ -134,6 +135,67 @@ export function useScreens() {
       }
       return data
     },
+  })
+}
+
+/** One `/dev/spidev<bus>.<cs>` a rack has, and the screen already driving it. */
+export type PanelCandidate = components["schemas"]["PanelCandidate"]
+
+/** What a rack answered a detect with. An object, so a later field is an addition. */
+export type Detected = components["schemas"]["Detected"]
+
+/** The wiring an operator typed in, for one candidate panel. Every field required. */
+export type ProbeBody = components["schemas"]["ProbeBody"]
+
+/** Whether the rack could drive that wiring, and what stopped it if not. */
+export type Probed = components["schemas"]["Probed"]
+
+/**
+ * Ask a rack which SPI devices it has, and who is already driving each.
+ *
+ * A **mutation** and not a query, and the three reasons are all real. It is a
+ * `POST`; there is nothing to cache, because the answer is a fact about a Pi's
+ * `/dev` at the moment it was asked and a stale copy of it would offer a device
+ * a worker has since taken; and it is asked when somebody presses a button
+ * rather than when a component mounts, which is what a query would make of it.
+ *
+ * `invalidates: []` deliberately. It changes nothing on the server -- it lists a
+ * directory on somebody else's machine -- so no other query it could make stale.
+ * What `useMutate` is here for is the rest of its job: turning a refusal into an
+ * `ApiError` carrying the server's own sentence, which for these two routes is
+ * the whole of what the interface has to say about a 503, a 504 or a 502.
+ */
+export function useDetect(daemonId: number) {
+  return useMutate<Detected, void>({
+    send: () =>
+      api.POST("/api/daemons/{daemon_id}/detect", {
+        params: { path: { daemon_id: daemonId } },
+      }),
+    invalidates: [],
+  })
+}
+
+/**
+ * Light one candidate panel with the wiring an operator supplied, and hold it.
+ *
+ * `invalidates: []` for `useDetect`'s reason, and the stronger one: a probe
+ * writes nothing anywhere. It borrows a rack's bus for a few seconds and gives
+ * it back.
+ *
+ * **There is no second bound in the browser.** One probe at a time per rack is
+ * `one_probe_at_a_time` on the server, which answers a 409 with a sentence
+ * naming the wait. A guard here would refuse a probe this tab did not start --
+ * another operator's, another tab's -- and would let through the one it did,
+ * which is the wrong half of the rule in both directions.
+ */
+export function useProbe(daemonId: number) {
+  return useMutate<Probed, ProbeBody>({
+    send: (body) =>
+      api.POST("/api/daemons/{daemon_id}/probe", {
+        params: { path: { daemon_id: daemonId } },
+        body,
+      }),
+    invalidates: [],
   })
 }
 
