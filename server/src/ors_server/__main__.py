@@ -43,6 +43,16 @@ def main() -> int:
     settings = AppSettings(
         data_dir=Path(os.environ.get("ORS_DATA_DIR", "/var/lib/openrackscreen")),
         secret_key=os.environ.get("ORS_SECRET_KEY"),
+        # Where the built interface is, defaulting to where the image puts it --
+        # the same shape as `ORS_DATA_DIR` above, whose default is a container
+        # path too. `/app/web` and not somewhere inside `/app/.venv`, because
+        # the venv's own layout carries the interpreter version in it
+        # (`lib/python3.12/site-packages/...`) and a `COPY` naming that path is
+        # a Dockerfile that breaks on a Python bump with a blank page and no
+        # error. A checkout wanting to serve its own build sets this to
+        # `web/dist`; `create_app` warns once and serves the API alone when the
+        # directory holds no build, which is the ordinary developer state.
+        web_dir=Path(os.environ.get("ORS_WEB_DIR", "/app/web")),
     )
     uvicorn.run(
         create_app(settings),

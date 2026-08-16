@@ -32,6 +32,17 @@ FROM ghcr.io/astral-sh/uv:0.12-python3.12-trixie-slim AS builder
 # nothing ships; do not move it into the runtime stage to save it.
 # `test_the_reason_the_builder_carries_a_compiler_is_still_true` reads the lock
 # and fails the day an armv7l wheel appears, which is when this can go.
+#
+# This layer has been unreachable in practice since the `FROM` directly below it,
+# and *not* since the interface stage further down: the tag
+# `ghcr.io/astral-sh/uv:0.12-python3.12-trixie-slim` publishes linux/amd64 and
+# linux/arm64 and **no linux/arm/v7**. So `buildx --platform linux/arm/v7` fails
+# at the first `FROM` in this file -- this stage's own -- and has done since that
+# tag was pinned, in the commit that created this Dockerfile. `node:24` publishes
+# no armv7 either, so the interface stage is a second wall behind the first one;
+# it is not what closed 32-bit ARM. arm64 has always been the only ARM target
+# here. Kept rather than deleted, and honestly labelled: reopening 32-bit starts
+# at the uv base image, not at Node. See server/README.md.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -76,6 +87,77 @@ COPY server/ server/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-editable --package ors-server
 
+# The interface, built in a stage of its own and thrown away. What ships out of
+# here is `dist` -- static HTML, JS and CSS -- and nothing else: no Node, no
+# pnpm, no `node_modules`. The server mounts that directory with `StaticFiles`,
+# which has no opinion about what built it.
+#
+# Node 24 because that is the major CI runs `pnpm build` on
+# (`.github/workflows/ci.yml`), and building the shipped assets on a Node nobody
+# tested on is how the artefact that ships becomes the one nothing checked.
+# `test_the_interface_is_built_on_the_node_ci_tests_it_on` is what notices when
+# the two drift.
+#
+# Not the final stage, and the position in this file is the whole guard: a stage
+# appended at the bottom -- which is where one appends things -- becomes the
+# image, and `docker build` would then ship a Node base with no Python in it.
+#
+# `--platform=$BUILDPLATFORM` -- the machine doing the building, not the machine
+# being built for. What leaves this stage is `dist`: HTML, JS and CSS, which are
+# the same bytes whatever CPU emitted them. Without this pin the documented Pi
+# cross-build (`buildx --platform linux/arm64`, server/README.md) runs `pnpm
+# install`, `tsc -b` and `vite build` under qemu-arm64 -- the slowest and by far
+# the most fragile part of any cross-build, for an artefact with no architecture
+# in it. The uv builder above is the opposite case and is deliberately *not*
+# pinned this way: it resolves and installs wheels *for* the target, and an
+# amd64 `.venv` copied into an arm64 runtime is a broken image.
+# `$BUILDPLATFORM` is a BuildKit built-in, which the `# syntax=` line at the top
+# of this file guarantees is in play.
+FROM --platform=$BUILDPLATFORM node:24-trixie-slim AS interface
+
+WORKDIR /build/web
+
+# The manifest, the lock and the workspace file before the sources, so that
+# editing a component reuses the install layer instead of resolving 700 packages
+# again.
+#
+# `pnpm-workspace.yaml` is not optional and it is not a workspace declaration:
+# pnpm 11 refuses to run any dependency's install script until somebody has
+# approved it in writing, and until then *every* pnpm command exits 1 with
+# `ERR_PNPM_IGNORED_BUILDS`. This project's answer -- msw's `postinstall` writes
+# a browser service worker nothing here uses -- lives in that file because
+# pnpm 11 reads `allowBuilds` from there and not from `package.json`. Leave it
+# out and the build fails at `pnpm install`, loudly, which is at least the good
+# kind of failure.
+COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
+
+# corepack rather than `npm i -g pnpm@11.1.2`, so that the version is named once
+# in the repository -- `packageManager` in `web/package.json`, which is also
+# what `pnpm/action-setup` reads in CI. A literal here would be a second place
+# for it to drift from, and a pnpm major that disagrees with `pnpm-lock.yaml`
+# makes `--frozen-lockfile` fail over a lockfile that is perfectly current.
+# `--activate` with no argument is what reads that field.
+RUN corepack enable pnpm && corepack prepare --activate
+
+# `--frozen-lockfile` and not a bare install: without it the image resolves
+# afresh, so one commit can be built twice and ship two different React minors,
+# and the symptom is a rendering bug in a container that cannot be reproduced
+# from the lockfile in the repository. With it, a lockfile that disagrees with
+# `package.json` is a build failure instead.
+RUN pnpm install --frozen-lockfile
+
+# Then the sources. `web/node_modules` and `web/dist` are excluded in
+# `.dockerignore`, so this cannot drop the host's install on top of the one
+# above -- which on a `buildx --platform linux/arm64` would be a tree of x86
+# rollup and esbuild binaries.
+COPY web/ ./
+
+# `tsc -b && vite build`, writing `dist` beside this file. There is no `outDir`
+# in `web/vite.config.ts`, so `dist` is vite's default rather than a choice made
+# twice; `test_what_is_copied_out_is_the_directory_vite_actually_writes` fails
+# the day one is added.
+RUN pnpm build
+
 FROM python:3.12-slim-trixie
 
 # A named volume inherits the ownership of the image path it shadows, which is
@@ -93,6 +175,21 @@ RUN useradd --system --create-home --uid 10001 ors \
     && chown ors:ors /var/lib/openrackscreen
 
 COPY --from=builder --chown=ors:ors /app/.venv /app/.venv
+
+# `/app/web` because that is the default `ORS_WEB_DIR` in `__main__.py`, and
+# deliberately not a path inside `/app/.venv`: the venv's layout carries the
+# interpreter version in it (`lib/python3.12/site-packages/...`), so a `COPY`
+# naming that path is a Dockerfile that breaks on a Python bump with a blank
+# page and no error.
+#
+# Getting this destination wrong has no loud failure at all. `mount_interface`
+# treats a missing build as the ordinary developer state -- a checkout that has
+# never run `pnpm build` -- so it logs one warning and serves the API alone. The
+# container comes up, the HEALTHCHECK passes, `/api/health` answers JSON, and
+# every page is a 404.
+# `test_the_built_interface_lands_where_the_server_looks_for_it` reads that
+# default out of the running entry point rather than out of this comment.
+COPY --from=interface --chown=ors:ors /build/web/dist /app/web
 
 # `ORS_HOST=0.0.0.0` and not the loopback default a bare uvicorn would take:
 # `127.0.0.1` inside a container is the container and nothing else, so a

@@ -58,6 +58,21 @@ from ors_schema.daemon import (
     ScreenConfig,
     TunnelConfig,
 )
+
+# `PROBE_HOLD_BUDGET` is what a probe really holds a panel lit for, and this
+# module is one of its two ends: `_capped_hold` cuts a longer request down to it
+# and `ProbeResult` says nothing about having done so, so the server has to
+# refuse a longer `hold_s` at its edge -- and the two ends may not each write the
+# number down. It lives in `ors_schema.link` beside `MAX_PROBE_HOLD_S`, the wire
+# bound, which is the only place both `ors-daemon` and `ors-server` can import.
+#
+# **Its value is load-bearing here and the argument is in its docstring.** `probe`
+# holds `_shutdown_lock` for the whole hold, so the budget is additive with
+# `SHUTDOWN_BUDGET`'s ten and the CLI's `LINK_JOIN_TIMEOUT` of three against the
+# shipped unit's `TimeoutStopSec=30` -- about nineteen seconds at five, and about
+# forty-four at the wire's thirty, which is a SIGKILL with four panels still lit.
+# Whoever raises it reads that docstring first.
+from ors_schema.link import PROBE_HOLD_BUDGET
 from PIL import Image
 
 from ors_daemon.clock import Clock
@@ -255,6 +270,37 @@ thread that will not leave.
 """
 
 
+class ProbeRefused(Exception):
+    """A probe this rack would not run, and the reason a person reads.
+
+    Refusing is a *result* here rather than an error: the whole point of the
+    endpoint is to answer, and "SPI0.1 is driving the screen CPU" is as useful an
+    answer as a panel lighting up. It is an exception rather than a return value
+    because everything else `probe` can fail with -- a driver's `OSError`, a
+    backend that will not build -- arrives that way too, and one path back means
+    one place that has to remember to fill `ProbeResult.error` in.
+
+    Its message is the whole reason, with nothing prefixed: see
+    `ors_daemon.hardware._reason`, which puts a class name in front of an
+    exception that carries no text of its own and leaves this one alone.
+
+    *Two operator actions, deliberately flattened into one type.* "SPI0.2 is
+    driving the screen CPU" is a refusal and asks somebody to edit a
+    configuration; "SPI0.2 opened but would not take a frame" is not a refusal at
+    all -- the probe ran -- and asks somebody to reseat a ribbon. They are raised
+    as the same class on purpose, because the only consumer is
+    `hardware.probe_handler`, and the only thing it can carry back is
+    `ProbeResult(ok=False, error=<str>)`: the schema has no field for a category,
+    and adding one belongs to `packages/ors-schema` rather than here. A second
+    exception class today would be a distinction this daemon draws carefully and
+    the wire discards one frame later, and it would read as a promise that
+    somewhere downstream branches on it. So the distinction lives in the prose,
+    which is the thing that actually reaches the person -- and the moment a
+    caller needs to branch (a wizard that offers "check the ribbon" as a next
+    step), the split and the schema field are one change, made together.
+    """
+
+
 def _deadline(budget: float, monotonic: Callable[[], float]) -> Callable[[], float]:
     """A function answering how much of `budget` is left. Never negative.
 
@@ -382,6 +428,63 @@ def _bus_of(display: DisplayConfig) -> tuple[str, int]:
     if display.backend == "gc9a01":
         return ("gc9a01", display.spi_bus)
     return (display.backend, 0)
+
+
+def _probe_screen(bus: int, cs: int, dc: int, rst: int, hz: int) -> ResolvedScreen:
+    """A screen that exists for one paint, describing a device nothing is driving.
+
+    Built rather than looked up, because the whole point of a probe is that this
+    panel is in no configuration yet: the operator is finding out whether it can
+    be. It is never resolved, never diffed and never recorded in `_slots`, so
+    `template` and `position` describe the candidate rather than instruct
+    anything.
+
+    **`template` is inert as this is written, and named correctly anyway.** The
+    paint goes through `_paint`, which builds a `ScreenWorker` purely for its
+    `identify` -- and that method reaches for `system_scenes()["identify"]`
+    itself, so this field decides no pixel and a wrong name here would change
+    nothing on the glass. It is what a reader of this function is told is being
+    painted, and it is what would *become* the pattern the day `_paint` renders
+    the configured template instead; a name no system template carries would then
+    raise inside the bus guard, with every kept panel held off the wire behind
+    it. `test_the_screen_a_probe_invents_names_a_scene_this_rack_has` asserts
+    that much, and the pattern itself is pinned against `identify`'s own render
+    by `test_a_probe_paints_the_pattern_identify_paints`.
+
+    `position` is the schema's floor rather than a claim -- the ordinal on the
+    glass is the device, since a candidate has no position in the rack.
+
+    `rotation` and `hflip` are left at their defaults on purpose. How a panel is
+    bolted in is something the operator tells the server *after* they have seen
+    it light up, and correcting for a mount nobody has described yet would turn
+    "which way up was it" into a second question this cannot answer.
+    """
+    return ResolvedScreen(
+        config=ScreenConfig(
+            name=f"probe SPI{bus}.{cs}",
+            position=1,
+            display=DisplayConfig(backend="gc9a01", spi_bus=bus, spi_cs=cs, dc=dc, rst=rst, hz=hz),
+            template="identify",
+        ),
+        scenes=[],
+        params={},
+        depends_on=frozenset(),
+    )
+
+
+def _capped_hold(hold_s: float) -> float:
+    """What this rack will actually hold a probe up for. See `PROBE_HOLD_BUDGET`.
+
+    Written as a test rather than as `min(max(...))` for `frames._capped`'s
+    reason: NaN compares False against everything, so `min` hands it straight
+    back and `Event.wait(nan)` is a wait this module has no answer for. It cannot
+    arrive off the wire -- `ProbeRequest.hold_s` refuses one -- and it is
+    answered here as well, because `probe` is a public method and a guard that
+    depends on a peer having validated its input is not a guard.
+    """
+    if not hold_s > 0.0:
+        return 0.0
+    return min(hold_s, PROBE_HOLD_BUDGET)
 
 
 def _url_of(tunnel: Tunnel) -> UrlProvider:
@@ -623,6 +726,7 @@ class Supervisor:
         apply_budget: float = APPLY_BUDGET,
         shutdown_clock: Callable[[], float] = time.monotonic,
         frames: FrameStream | None = None,
+        sleeper: Callable[[float], object] | None = None,
     ) -> None:
         if watchdog_timeout <= _NIGHT_PARK_CHUNK:
             raise ValueError(
@@ -659,6 +763,14 @@ class Supervisor:
         # calls, and this event is handed to three classes that are threads.
         # They would each have to rename it back, so it is named right here.
         self._stop_event = threading.Event()
+        # How a probe waits out its hold, and the only wait in this class that is
+        # spent on purpose rather than endured. The stop event by default, so
+        # that the one interleaving it *can* be released by -- a stop that landed
+        # after this probe read `_stopped` -- costs nothing to honour; `probe`
+        # says why that is the exception rather than the rule. Injectable for the
+        # reason `shutdown_clock` is: a test can prove the bound without spending
+        # it, and no test in this repo may sleep to wait for time to pass.
+        self._sleeper: Callable[[float], object] = sleeper or self._stop_event.wait
         self._slots: list[_Slot] = []
         self._sources: list[_Source] = []
         self._reaper: _Reaper | None = None
@@ -948,6 +1060,181 @@ class Supervisor:
                 ):
                     painted += 1
             return painted
+
+    def claimed_devices(self) -> dict[tuple[int, int], str]:
+        """Which SPI devices this rack's configuration is driving, and by whom.
+
+        Keyed by `(bus, chip select)` -- the two numbers `/dev/spidev<bus>.<cs>`
+        is named by -- and valued by the *screen's name*, because the answer is
+        read by a person choosing a panel in the setup wizard: "SPI0.1 -- CPU"
+        says why that row is unavailable, where a screen id would send them to
+        look it up.
+
+        *The running configuration, not the open panels.* `_screens` is a
+        superset of what `_slots` holds: a screen whose backend would not open
+        has no slot, and this still reports its device as claimed. That is the
+        conservative direction and it is chosen deliberately -- the device
+        belongs to a screen either way, the next push will try to open it again
+        (`_diff` retries every one of them), and a wizard that offered it as free
+        would be inviting an operator to give a second screen a device the first
+        one is about to take back. It costs the ability to probe a screen's own
+        wiring while that screen is configured, which is what `identify` is for.
+
+        *Only backends that have a device.* A virtual panel is a directory of
+        PNGs; claiming SPI0.0 for one -- which is what its unset `spi_bus` and
+        `spi_cs` default to -- would hide a real device behind a screen that is
+        not on the bus at all.
+
+        *First claim wins.* Two screens may name one device: the schema does not
+        forbid it, because which panels exist is not a fact a schema on another
+        machine holds. Either name is an honest answer to "this is not free",
+        and refusing to answer at all would make the wizard offer the device.
+
+        Under `_shutdown_lock` like everything else that walks the rack's own
+        state, because an apply is swapping `_screens` and the panels behind it.
+        """
+        with self._shutdown_lock:
+            claimed: dict[tuple[int, int], str] = {}
+            for screen in self._screens:
+                display = screen.config.display
+                if display.backend != "gc9a01":
+                    continue
+                claimed.setdefault((display.spi_bus, display.spi_cs), screen.config.name)
+            return claimed
+
+    def probe(self, bus: int, cs: int, dc: int, rst: int, hz: int, hold_s: float) -> None:
+        """Light one candidate panel with the wiring an operator supplied, and hold it.
+
+        The other half of detection. Enumeration can say which SPI devices exist
+        and nothing more -- a GC9A01 has no readable id over 4-wire SPI, and DC
+        and RST are GPIO lines somebody chose with a screwdriver -- so this is
+        the guess being tested, and the proof is a human seeing the glass come on.
+        It returns nothing: "it lit" is this returning at all, and every other
+        outcome is the exception that says which.
+
+        **It takes the same bus guard `apply` takes, and that is the whole of
+        spec 6.3.** Lighting a candidate while a bus-mate is mid-frame is exactly
+        the interleaving that produced M2's pale grey rectangles -- the failure
+        that cost this project the most debugging -- except that here the daemon
+        would be doing it *deliberately*, on a device nothing has ever opened, at
+        a clock nobody has proved. So:
+
+        - a device the running configuration already claims is refused rather
+          than fought over. There is a live worker on it, and taking it is a torn
+          frame at best and a wedged bus at worst;
+        - every kept worker comes off the bus for the whole of it, with the same
+          per-screen bound (`_BUS_GUARD_PER_SCREEN`) `_off_the_bus` promises;
+        - a bus the guard could not hold refuses the probe. `_off_the_bus` yields
+          exactly that set, and `apply` reads it to decide not to open a fresh
+          screen; a probe is that decision made on purpose, so it reads the same
+          answer. Better a refused probe than a corrupted panel -- an init
+          sequence clocked out underneath a drawing bus-mate does not lose a
+          frame, it leaves the panel showing unconfigured RAM until something
+          re-runs the init, and nothing does;
+        - the device is closed on the way out, on every path including a paint
+          that raises. A probed panel that stays claimed is one the next apply
+          cannot open, so a probe would cost the rack the screen it was run to
+          add.
+
+        *It paints what `identify` paints, through the thing that paints it.* A
+        never-started `ScreenWorker` over the candidate backend, exactly as
+        `__main__._identify` does it -- so there is one painter rather than two,
+        and the person at the rack sees the pattern they have already seen. The
+        ordinal is the device: `identify` numbers configured panels by
+        `position`, and a candidate has none, so `0.2` names the thing being
+        proved.
+
+        *The hold is bounded here as well as on the wire.* See
+        `PROBE_HOLD_BUDGET`. It is spent inside `_shutdown_lock` and inside the
+        guard, so it is a rack-wide stall and time a SIGTERM waits out: the wait
+        is on the stop event, but a `stop` running on another thread is parked on
+        the lock this call holds and cannot set it, so the ceiling is what bounds
+        this rather than the event. That is the reason the ceiling is small.
+
+        *This widens a risk `_off_the_bus` accepted, and by whom.* Read that
+        function's residual-risk note: an open performed inside the guard has no
+        deadline on it, so a `spidev` open that blocks for ever freezes every kept
+        panel on its last frame for the life of the process, out of the watchdog's
+        reach. Until this existed, the only way to reach that open with wiring
+        nobody had proved was an administrator pushing a configuration. A probe
+        reaches it with a `dc`, an `rst` and an `hz` that are *by construction* a
+        guess typed into a wizard -- the likeliest input there is to make an open
+        misbehave -- from any session-guarded operator. The risk is unchanged in
+        kind and the same argument still holds against bounding it here (a
+        bounded open whose thread returns late leaks the device); what changed is
+        who can reach it, and that is worth knowing before this is exposed to a
+        rate limit rather than a review. It is on the hardware checklist: on a
+        real Pi, does an open with the wrong `dc`/`rst` raise, or block?
+
+        Under `_shutdown_lock` like `tick`, `apply` and `identify`, because it
+        walks `_slots` and `_screens` and pauses workers -- and the lock ordering
+        is the one `_off_the_bus` already establishes: this lock first, then a
+        worker's tick lock, never the other way.
+        """
+        with self._shutdown_lock:
+            if self._stopped:
+                # The panels are being slept and their serial devices closed, and
+                # opening another one now is a device this shutdown has already
+                # walked past and will never close. The same check `apply` makes.
+                raise ProbeRefused("this daemon is stopping; not probing a panel")
+            claimed = self.claimed_devices().get((bus, cs))
+            if claimed is not None:
+                # Before the guard, not after: refusing costs the rack nothing,
+                # and freezing four panels to find out is a stall for an answer
+                # this already has.
+                raise ProbeRefused(
+                    f"SPI{bus}.{cs} is already driving the screen {claimed!r}; "
+                    "it cannot be probed while it is configured"
+                )
+
+            screen = _probe_screen(bus, cs, dc, rst, hz)
+            name = screen.config.name
+            log.info(
+                "proving one panel",
+                extra={"device": f"SPI{bus}.{cs}", "dc": dc, "rst": rst, "hz": hz},
+            )
+            with self._off_the_bus(self._slots) as unguarded:
+                if _bus_of(screen.config.display) in unguarded:
+                    raise ProbeRefused(
+                        f"a screen sharing the bus SPI{bus} would not stop drawing; "
+                        "probing it now would corrupt both panels"
+                    )
+                backend = self._display_factory(screen.config, name)
+                try:
+                    if not self._paint(screen, backend):
+                        # `ScreenWorker._show` absorbs a backend that refuses a
+                        # frame, because a render loop has to survive one. Here
+                        # it is the answer: the device opened and the glass took
+                        # nothing, which is a ribbon seated well enough to
+                        # enumerate and not well enough to clock a frame out of.
+                        raise ProbeRefused(f"SPI{bus}.{cs} opened but would not take a frame")
+                    self._sleeper(_capped_hold(hold_s))
+                finally:
+                    # Whatever happened above, including a raise. A serial device
+                    # left open is a panel the next apply cannot have.
+                    self._shut_down_panel(backend, name)
+
+    def _paint(self, screen: ResolvedScreen, backend: DisplayBackend) -> bool:
+        """Draw `identify`'s pattern on a panel no worker owns. True if it landed.
+
+        A `ScreenWorker` that is never started, for `__main__._identify`'s
+        reason: it is used purely for its `identify`, which is the one painter of
+        this pattern in the daemon. Its stop event is its own and its store is
+        the rack's -- neither is read, because nothing here runs a tick -- and the
+        timeout is None because there is no loop to interleave with. It cannot
+        block on a lock nobody else can hold.
+        """
+        worker = ScreenWorker(
+            screen=screen,
+            store=self._store,
+            display=backend,
+            system=system_scenes(),
+            night=self._config.night,
+            stop=threading.Event(),
+            clock=self._clock,
+        )
+        display = screen.config.display
+        return worker.identify(f"{display.spi_bus}.{display.spi_cs}")
 
     def _skip_open(self, screen: ResolvedScreen) -> None:
         """Record a panel that was not opened because its bus was not guarded.

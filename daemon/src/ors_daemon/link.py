@@ -66,11 +66,15 @@ from ors_schema.link import (
     Command,
     ConfigPush,
     DaemonMessage,
+    DetectRequest,
+    DetectResult,
     FramesRequest,
     Heartbeat,
     Hello,
     Nack,
     Paired,
+    ProbeRequest,
+    ProbeResult,
     parse_server_message,
 )
 from pydantic import ValidationError
@@ -104,6 +108,23 @@ and an ack that says it does not.
 """
 CommandHandler = Callable[[Command], None]
 FramesHandler = Callable[[FramesRequest], None]
+DetectHandler = Callable[[DetectRequest], DetectResult]
+ProbeHandler = Callable[[ProbeRequest], ProbeResult]
+"""The two handlers that *answer*, which is what makes them a different shape.
+
+`on_command` and `on_frames_request` are told something; these two are asked, and
+an HTTP handler on the server is holding a request open waiting for the reply.
+So they return the message rather than sending it, and `_answer` puts it on the
+socket the question arrived on -- which is this end's only way of being sure the
+reply goes back down the connection that asked, rather than whichever one happens
+to be current by the time a handler that held a bus for five seconds returns.
+
+The obligations that go with them are the producer's, in `ors_daemon.hardware`:
+answer every request, fill `ProbeResult.error` whenever `ok` is false, and keep
+every field inside the bounds the schema will refuse. A reply that fails to parse
+is answered by the server's wait expiring, so a daemon that knew the reason
+reports a timeout instead.
+"""
 
 DAEMON_PATH = "/ws/daemon"
 """The route `ors_server.link.ws_daemon` mounts. Appended to the server URL."""
@@ -501,6 +522,8 @@ class LinkClient(threading.Thread):
         config_version: int | None = None,
         on_command: CommandHandler | None = None,
         on_frames_request: FramesHandler | None = None,
+        on_detect: DetectHandler | None = None,
+        on_probe: ProbeHandler | None = None,
         on_link_down: Callable[[], None] | None = None,
         heartbeat: float = HEARTBEAT_INTERVAL_S,
         backoff_floor: float = BACKOFF_FLOOR_S,
@@ -535,6 +558,8 @@ class LinkClient(threading.Thread):
         self._on_snapshot = on_snapshot
         self._on_command = on_command
         self._on_frames_request = on_frames_request
+        self._on_detect = on_detect
+        self._on_probe = on_probe
         # The other half of `on_frames_request`: a subscription arrives on a
         # socket and has to end with it. See `_dispatch_link_down`.
         self._on_link_down = on_link_down
@@ -812,6 +837,10 @@ class LinkClient(threading.Thread):
             self._dispatch("command", self._on_command, message)
         elif isinstance(message, FramesRequest):
             self._dispatch("frames", self._on_frames_request, message)
+        elif isinstance(message, DetectRequest):
+            self._answer(connection, "detect", self._on_detect, message)
+        elif isinstance(message, ProbeRequest):
+            self._answer(connection, "probe", self._on_probe, message)
 
     def _config(self, connection: Any, push: ConfigPush) -> None:
         """Apply a pushed configuration, or say why not. Always answers.
@@ -977,6 +1006,41 @@ class LinkClient(threading.Thread):
             handler(message)
         except Exception:
             log.exception("a link handler raised", extra={"said": what})
+
+    def _answer(
+        self, connection: Any, what: str, handler: Callable[[Any], Any] | None, message: Any
+    ) -> None:
+        """Hand over a request that expects a reply, and send whatever comes back.
+
+        `_dispatch`'s sibling, and the difference is that silence here has a
+        cost: somebody is waiting. A correlated request nothing answers is a
+        wait that expires at the far end, which the operator reads as "this rack
+        did not respond" -- for a rack that is perfectly healthy and simply was
+        not wired to its own handler. That is the M3a defect exactly (`_link`
+        built the client without `on_command`, and a route reported
+        `delivered: true` for a message no supervisor ever saw), so the missing
+        handler is a warning naming the request rather than the debug line
+        `_dispatch` gets away with.
+
+        A handler that raises is logged and stepped over, for `_dispatch`'s
+        reason: this socket is how the rack is reconfigured, and one bad request
+        must not be what costs it. The handlers this end passes are written to
+        turn every failure into a reply instead -- see `ors_daemon.hardware` --
+        so reaching this branch is a bug in the daemon rather than a probe that
+        did not work.
+        """
+        if handler is None:
+            log.warning(
+                "nothing here can answer this; the server's request will time out",
+                extra={"said": what, "request": getattr(message, "request_id", None)},
+            )
+            return
+        try:
+            reply = handler(message)
+        except Exception:
+            log.exception("a link handler raised", extra={"said": what})
+            return
+        self._send(connection, reply)
 
     def _dispatch_link_down(self) -> None:
         """Tell whoever is listening that this connection has ended. Raises nothing.

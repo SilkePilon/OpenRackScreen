@@ -17,16 +17,18 @@ particular deployment has ever broken.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 import uvicorn
 import yaml
 from fastapi.testclient import TestClient
+from ors_server import __main__ as entrypoint
 from ors_server.__main__ import main
 from ors_server.app import AppSettings, create_app
 from ors_server.secrets import load_or_create_key
@@ -103,6 +105,113 @@ def dockerfile_env(text: str) -> dict[str, str]:
     return found
 
 
+def the_servers_own(environment: dict[str, str]) -> dict[str, str]:
+    """The `ORS_*` half of an image environment, which is all `main` reads.
+
+    `dockerfile_env` also returns `PATH`, whose value in the Dockerfile is the
+    literal `/app/.venv/bin:$PATH` -- unexpanded, because it is the image that
+    expands it. Exporting that verbatim into this process puts a directory that
+    does not exist and a literal `$PATH` on the front of the test runner's own
+    `PATH`. It is inert today (`main` shells out to nothing, and `monkeypatch`
+    puts it back either way) and it is a live trap for the first person who adds
+    a subprocess anywhere on the startup path, so it never gets exported at all.
+    """
+    return {key: value for key, value in environment.items() if key.startswith("ORS_")}
+
+
+class Copy(NamedTuple):
+    """One `COPY`, split into the three things an assertion ever asks about."""
+
+    flags: set[str]
+    sources: list[str]
+    destination: str
+
+
+def copies(text: str) -> list[Copy]:
+    """Every `COPY` in a chunk of Dockerfile, continuations joined.
+
+    A parser rather than a regex per test because the interesting questions --
+    *where does this land*, *which stage did it come from* -- are about the last
+    token and the flags, and a regex that gets `--chown` and `--from` in either
+    order right is longer than this.
+    """
+    found: list[Copy] = []
+    for line in re.sub(r"\\\n\s*", " ", instructions(text)).splitlines():
+        if not line.startswith("COPY "):
+            continue
+        tokens = line.split()[1:]
+        paths = [token for token in tokens if not token.startswith("--")]
+        found.append(Copy({t for t in tokens if t.startswith("--")}, paths[:-1], paths[-1]))
+    return found
+
+
+class Stage(NamedTuple):
+    index: int
+    alias: str
+    body: str
+
+
+def from_arguments(header: str) -> str:
+    """A `FROM` line with its flags removed, leaving `<image> [AS <alias>]`.
+
+    `FROM --platform=$BUILDPLATFORM node:24-trixie-slim AS interface` is a
+    perfectly ordinary `FROM`, and a reader that starts matching at the first
+    token sees a flag where the image should be -- so it finds no Node stage at
+    all and every assertion below it disappears rather than fails.
+    """
+    return " ".join(token for token in header.split() if not token.startswith("--"))
+
+
+def node_stage(text: str) -> Stage:
+    """The stage that builds the interface, found by its base image.
+
+    By the image and not by the alias: the alias is a label somebody chooses and
+    can rename to anything, while `FROM node:` is what makes a stage a Node
+    stage. A test that went looking for a stage called `interface` would pass on
+    a Dockerfile that renamed it and failed to build one at all.
+    """
+    found = [
+        (index, stage)
+        for index, stage in enumerate(stages(text))
+        if re.match(r"(?:[\w.\-/]+/)?node:", from_arguments(stage.splitlines()[0]))
+    ]
+    assert len(found) == 1, (
+        f"expected exactly one Node stage in the Dockerfile, found {len(found)};"
+        " the interface has to be built somewhere and it has to be built once"
+    )
+    index, body = found[0]
+    alias = re.match(r"\S+\s+AS\s+(\S+)", from_arguments(body.splitlines()[0]), flags=re.IGNORECASE)
+    assert alias, "the Node stage has no `AS <name>`, so no later stage can copy out of it"
+    return Stage(index, alias[1], body)
+
+
+def configured(monkeypatch, tmp_path, environment: dict[str, str]) -> AppSettings:
+    """The `AppSettings` `main` builds under a given environment.
+
+    The sibling of `served` below, which captures what goes to uvicorn; this
+    captures what goes to `create_app`, because the directory the interface is
+    served out of is settled there and never reaches uvicorn at all. Both exist
+    so that a Dockerfile assertion can be made against a path production code
+    computed rather than against one this test remembered.
+    """
+    captured: list[AppSettings] = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: None)
+    monkeypatch.setattr(entrypoint, "create_app", lambda settings: captured.append(settings))
+    for key in ("ORS_DATA_DIR", "ORS_HOST", "ORS_PORT", "ORS_SECRET_KEY", "ORS_LOG_LEVEL"):
+        monkeypatch.delenv(key, raising=False)
+    # Deleted separately and deliberately *not* re-set below: a developer with
+    # `ORS_WEB_DIR=web/dist` exported would otherwise have this test assert the
+    # Dockerfile copies to their checkout.
+    monkeypatch.delenv("ORS_WEB_DIR", raising=False)
+    for key, value in the_servers_own(environment).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("ORS_DATA_DIR", str(tmp_path))
+
+    assert main() == 0
+
+    return captured[0]
+
+
 @pytest.fixture(autouse=True)
 def restore_logging():
     """`main` calls `setup_logging`, which is global and outlives the test.
@@ -135,7 +244,7 @@ def served(monkeypatch, tmp_path, environment: dict[str, str]) -> dict[str, Any]
     monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: captured.append(kwargs))
     for key in ("ORS_DATA_DIR", "ORS_HOST", "ORS_PORT", "ORS_SECRET_KEY", "ORS_LOG_LEVEL"):
         monkeypatch.delenv(key, raising=False)
-    for key, value in environment.items():
+    for key, value in the_servers_own(environment).items():
         monkeypatch.setenv(key, value)
     # After the image's own variables, so the database lands somewhere writable
     # rather than in the container's `/var/lib`, which this test cannot create.
@@ -610,6 +719,439 @@ def test_the_two_stages_agree_about_which_debian_they_are(dockerfile):
     )
     assert "python3.12" in builder.split("\n")[0]
     assert "python:3.12" in final.split("\n")[0]
+
+
+# --------------------------------------------------------------------------
+# The interface in the image
+#
+# What every one of these is guarding: `create_app` mounts the interface only
+# when the directory it is given holds an `index.html`, and when it does not it
+# logs one warning and serves the API alone. So a Dockerfile that builds the SPA
+# and puts it a directory to the left produces a container that starts, passes
+# its own healthcheck, answers `/api/health` -- and returns 404 for every page.
+# These are documents, not Docker: they read the Dockerfile as text and they
+# cannot tell you the build succeeds. What they can do is fail the moment the
+# file stops saying the thing the running image was checked to do.
+# --------------------------------------------------------------------------
+
+
+def test_the_interface_is_built_in_a_stage_that_is_not_the_one_shipped(dockerfile):
+    """A Node toolchain is a build dependency, and this is where that is decided.
+
+    `FROM node:` as the last stage would work -- it has a Python in it about as
+    much as `python:3.12-slim` has a Node in it, which is to say not at all, so
+    it would in fact not work; but the shape the mistake takes is subtler than
+    that. It is appending a Node stage and then having the `CMD` end up in it
+    because the new stage was added at the bottom of the file, which is where
+    one adds things.
+    """
+    stage = node_stage(dockerfile)
+    last = len(stages(dockerfile)) - 1
+
+    assert stage.index != last, (
+        "the Node stage is the last stage, so it is the image: `docker build` ships"
+        " a Node base with a package manager, a node_modules and no Python in it"
+    )
+
+
+def test_the_shipped_stage_carries_no_node_and_no_package_manager(dockerfile):
+    """The point of a build stage is that the tools stay in it.
+
+    Read against `instructions` rather than the raw text, so that the comment
+    above explaining *why* there is no pnpm down here does not itself fail the
+    assertion that there is no pnpm down here.
+
+    And with `--from=<alias>` removed, for the mirror-image reason. That flag
+    names a *build stage*, not anything that ships, and the alias is a label
+    somebody picks. Rename `AS interface` to `AS nodejs-assets` and the
+    `COPY --from=nodejs-assets` in this stage matches `\\bnodejs\\b`; rename it
+    to `AS npm-cache` and it matches the substring check above. Both fail a
+    Dockerfile that is entirely correct, and the usual fix for a false alarm is
+    to weaken the test.
+
+    Measured, because the obvious rename is *not* one of them: `\\bnodejs?\\b`
+    is `nodej` with an optional `s`, so `AS node-build` -- the first name anyone
+    reaches for -- never tripped it. The hazard is narrower than it looks and it
+    is real. What is copied *out* of that stage is asserted separately, by
+    `test_nothing_copied_out_of_the_node_stage_is_a_node_modules`.
+    """
+    final = re.sub(r"--from=\S+", "", instructions(stages(dockerfile)[-1]))
+
+    for tool in ("node_modules", "pnpm", "npm", "yarn", "corepack"):
+        assert tool not in final, f"{tool} in the final stage; it belongs in the build stage"
+    assert not re.search(r"\bnodejs?\b", final), "a Node runtime in an image that serves Python"
+
+
+def test_nothing_copied_out_of_the_node_stage_is_a_node_modules(dockerfile):
+    """The other half, and the one `pnpm not in the final stage` does not cover.
+
+    `COPY --from=interface /build/web/node_modules /app/node_modules` contains
+    neither the word `pnpm` nor the word `node` as a token the test above looks
+    for -- it is one path -- and it would put three hundred megabytes of
+    development dependencies into the shipped image while every assertion stayed
+    green.
+    """
+    stage = node_stage(dockerfile)
+    final = stages(dockerfile)[-1]
+
+    from_node = [copy for copy in copies(final) if f"--from={stage.alias}" in copy.flags]
+    assert from_node, f"the final stage copies nothing out of {stage.alias}; the build is discarded"
+    for copy in from_node:
+        for source in copy.sources:
+            assert "node_modules" not in source, (
+                f"{source} is copied into the shipped image; the whole point of the build"
+                " stage is that its dependencies stay in it"
+            )
+
+
+def test_the_built_interface_lands_where_the_server_looks_for_it(dockerfile, monkeypatch, tmp_path):
+    """The one assertion this task exists for, and it crosses two files.
+
+    The destination is not a string this test remembers. It is what `main`
+    hands `create_app` as `web_dir` under the image's own `ENV` -- so the day
+    that default moves and the `COPY` does not, or the `COPY` moves and the
+    default does not, this fails. Both edited together is a decision.
+
+    What the mismatch costs is worth being precise about, because it has no
+    other symptom: `mount_interface` finds no `index.html`, logs one warning
+    into a stream nobody reads on a deployment that came up fine, and does not
+    mount. The container starts, the healthcheck passes, `/api/health` answers
+    JSON, and every page in the interface is a 404.
+    """
+    web_dir = configured(monkeypatch, tmp_path, dockerfile_env(dockerfile)).web_dir
+    assert web_dir is not None, "the image serves no interface at all"
+    stage = node_stage(dockerfile)
+
+    landing = [copy for copy in copies(stages(dockerfile)[-1]) if copy.destination == str(web_dir)]
+    assert landing, (
+        f"nothing is copied to {web_dir}, which is where this image's own environment"
+        " makes the server look; it would start, answer /api/health, and 404 every page"
+    )
+    for copy in landing:
+        assert f"--from={stage.alias}" in copy.flags, (
+            f"{web_dir} is filled from {copy.flags or 'the build context'} rather than from"
+            f" the {stage.alias} stage, so it is not the build that was just made"
+        )
+
+
+def test_reading_the_images_environment_does_not_export_it_into_this_process(
+    dockerfile, monkeypatch, tmp_path
+):
+    """The Dockerfile's `PATH` is not a `PATH`, and it must not become one here.
+
+    `ENV PATH="/app/.venv/bin:$PATH"` is expanded by the *image*, so what
+    `dockerfile_env` reads back is the literal string with a `$PATH` in it. The
+    tests above hand that whole dictionary to `main`, and exporting it verbatim
+    would put a directory that does not exist and an unexpanded `$PATH` on the
+    front of the test runner's own.
+
+    Inert today -- `main` shells out to nothing, `uvicorn.run` and `create_app`
+    are both stubbed, and `monkeypatch` puts it back at teardown regardless --
+    and precisely the sort of inert that stops being inert the first time
+    anything on the startup path spawns a subprocess. So it is asserted rather
+    than left to be noticed then.
+    """
+    import os
+
+    before = os.environ.get("PATH")
+    assert "PATH" in dockerfile_env(dockerfile), "the image no longer sets a PATH at all"
+
+    configured(monkeypatch, tmp_path, dockerfile_env(dockerfile))
+
+    assert os.environ.get("PATH") == before, (
+        "reading the image's environment changed this process's PATH; the Dockerfile's"
+        " value is the unexpanded literal `/app/.venv/bin:$PATH`"
+    )
+
+
+def test_what_is_copied_out_is_the_directory_vite_actually_writes(dockerfile):
+    """`dist` is a default, not a promise, and the `COPY` spells it out.
+
+    `web/vite.config.ts` sets no `build.outDir`, so the build lands in `dist`
+    beside the config. Setting one is a normal-looking edit -- and it would move
+    the assets out from under a `COPY` that still names `dist`, which builds
+    fine and copies an empty directory. This is what fails then.
+    """
+    config = (ROOT / "web" / "vite.config.ts").read_text()
+    assert not re.search(r"\boutDir\b", config), (
+        "vite.config.ts now names an outDir; the Dockerfile's COPY still says dist"
+    )
+
+    stage = node_stage(dockerfile)
+    workdir = re.findall(r"^WORKDIR (\S+)", stage.body, flags=re.MULTILINE)
+    assert workdir, "the Node stage sets no WORKDIR, so the COPY out of it is a guess"
+
+    out_of_the_stage = [
+        source
+        for copy in copies(stages(dockerfile)[-1])
+        if f"--from={stage.alias}" in copy.flags
+        for source in copy.sources
+    ]
+    assert out_of_the_stage, f"nothing is copied out of {stage.alias}"
+    for source in out_of_the_stage:
+        assert source.startswith(workdir[-1]), (
+            f"{source} is outside the Node stage's WORKDIR {workdir[-1]}; `pnpm build`"
+            " writes under the working directory and nowhere else"
+        )
+        assert source.rstrip("/").endswith("/dist"), f"{source} is not what `vite build` writes"
+
+
+def test_the_node_stage_runs_the_build_the_repository_defines(dockerfile):
+    """The step that produces the only thing this stage exists to produce.
+
+    Every other assertion here is about *arrangement* -- what is copied before
+    what, what lands where, which stage ships. Delete `RUN pnpm build` and the
+    arrangement is all still perfect: a stage that installs 700 packages, copies
+    the sources in and produces nothing, and a `COPY --from=interface
+    /build/web/dist` that then fails the build. Loud, but the test that caught
+    it was the one about layer caching, naming a step it does not own.
+
+    Cross-checked against `web/package.json` rather than asserted as a string,
+    because `pnpm build` in the Dockerfile means nothing on its own: it is a
+    script name, and it is defined over there.
+    """
+    scripts = json.loads((ROOT / "web" / "package.json").read_text())["scripts"]
+    assert "build" in scripts, "web/package.json has no `build` script for the image to run"
+    assert "vite build" in scripts["build"], (
+        "the `build` script no longer runs vite; the Dockerfile copies out vite's `dist`"
+    )
+
+    stage = instructions(node_stage(dockerfile).body)
+    assert re.search(r"^RUN .*\bpnpm (?:run )?build\b", stage, flags=re.MULTILINE), (
+        "the Node stage never runs `pnpm build`, so it installs the dependencies of an"
+        " interface it does not build and the COPY out of it has nothing to copy"
+    )
+
+
+def test_the_interface_is_built_on_the_machine_doing_the_building(dockerfile):
+    """`--platform=$BUILDPLATFORM`, or the documented Pi build emulates all of Node.
+
+    `server/README.md` tells an operator to cross-build for the Pi with `buildx
+    --platform linux/arm64`. Without this flag on the Node stage, that runs
+    `pnpm install`, `tsc -b` *and* `vite build` under qemu-arm64 -- which is the
+    slowest and by a distance the most fragile part of any cross-build -- to
+    produce `dist`, which is HTML, JS and CSS and has no architecture in it at
+    all. The builder stage above is the opposite case and must **not** carry
+    this flag: it resolves and installs wheels for the target, and an amd64
+    `.venv` copied into an arm64 runtime is an image that does not start.
+    """
+    assert re.match(r"#\s*syntax=", dockerfile), (
+        "the `# syntax=` line is gone; $BUILDPLATFORM is a BuildKit built-in and that"
+        " line is what guarantees BuildKit is parsing this file"
+    )
+
+    header = node_stage(dockerfile).body.splitlines()[0]
+    assert "--platform=$BUILDPLATFORM" in header, (
+        "the Node stage is not pinned to the build platform, so `buildx --platform"
+        " linux/arm64` runs pnpm, tsc and vite under qemu to emit architecture-"
+        "independent HTML and JS"
+    )
+
+    builder = stages(dockerfile)[0].splitlines()[0]
+    assert "--platform" not in builder, (
+        "the uv builder is pinned to the build platform too; it installs wheels for the"
+        " target, and an amd64 .venv copied into an arm64 runtime does not start"
+    )
+
+
+def test_the_interface_is_installed_from_the_lock_file(dockerfile):
+    """`pnpm install` without `--frozen-lockfile` resolves afresh, in the image.
+
+    Which means the image can be built twice from one commit and get two
+    different React minors -- and the failure surfaces as a rendering bug in a
+    container nobody can reproduce, because the lockfile in the repository says
+    something the image never installed. `--frozen-lockfile` makes a lockfile
+    that disagrees with `package.json` a build failure instead.
+    """
+    stage = instructions(node_stage(dockerfile).body)
+
+    installs = re.findall(r"pnpm (?:install|i|add)\b[^\n&|;]*", stage)
+    assert installs, "the Node stage never installs anything"
+    for install in installs:
+        assert "--frozen-lockfile" in install, (
+            f"`{install.strip()}` resolves dependencies afresh inside the image, so two"
+            " builds of one commit can ship different code"
+        )
+    assert any(
+        "pnpm-lock.yaml" in copy.destination or "pnpm-lock.yaml" in " ".join(copy.sources)
+        for copy in copies(stage)
+    ), "--frozen-lockfile with no lockfile copied in is a build that fails at install"
+
+
+def test_the_lock_file_is_copied_before_the_sources(dockerfile):
+    """Otherwise every edit to a component reinstalls every dependency.
+
+    The same layer-caching argument the uv builder above is arranged around, and
+    it is worth a test rather than a comment because the arrangement is the only
+    thing that expresses it: a `COPY web/ web/` moved above the install is a
+    one-line edit that changes nothing about what the image contains and several
+    minutes about what it costs to rebuild.
+    """
+    stage = node_stage(dockerfile)
+    lines = instructions(stage.body).splitlines()
+
+    def first(what: str, predicate) -> int:
+        for index, line in enumerate(lines):
+            if predicate(line):
+                return index
+        # Named, because this test is about *order* and it is the one that
+        # happens to look up every step: without the name, deleting `RUN pnpm
+        # build` fails a test called "the lock file is copied before the
+        # sources" over a missing build step, which sends the next person to
+        # read the caching arrangement.
+        raise AssertionError(f"the Node stage has no {what}")
+
+    def copies_the_lock(line: str) -> bool:
+        return line.startswith("COPY ") and "pnpm-lock.yaml" in line
+
+    lock = first("COPY of pnpm-lock.yaml", copies_the_lock)
+    install = first("`pnpm install`", lambda line: "pnpm install" in line)
+    build = first("`pnpm build`", lambda line: "pnpm build" in line or "pnpm run build" in line)
+
+    assert lock < install, "the lockfile is copied after the install that reads it"
+    assert install < build, "the build runs before the dependencies are installed"
+    sources = [
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("COPY ") and "pnpm-lock.yaml" not in line and "package.json" not in line
+    ]
+    assert sources, "the Node stage copies no sources, so it builds the previous build"
+    assert min(sources) > install, (
+        "the sources are copied before the install, so editing one component"
+        " reinstalls every dependency"
+    )
+
+
+def test_the_stage_carries_the_answer_pnpm_11_demands_before_it_will_install(dockerfile):
+    """`pnpm-workspace.yaml` is not optional here; without it the build exits 1.
+
+    pnpm 11 refuses to run a dependency's install scripts until somebody has
+    said so in writing, and until then every pnpm command fails with
+    `ERR_PNPM_IGNORED_BUILDS`. The answer this project gives -- msw's
+    `postinstall` writes a browser service worker nothing here uses -- lives in
+    `web/pnpm-workspace.yaml`, because pnpm 11 reads it from there and not from
+    `package.json`. Leave that file out of the build context and the image does
+    not build; leave it out of the `COPY` and the image does not build either,
+    which is at least the loud failure.
+    """
+    workspace = (ROOT / "web" / "pnpm-workspace.yaml").read_text()
+    assert "allowBuilds" in workspace, (
+        "the gate answer moved out of pnpm-workspace.yaml; the Dockerfile copies that file"
+    )
+
+    stage = instructions(node_stage(dockerfile).body)
+    assert "pnpm-workspace.yaml" in stage, (
+        "pnpm-workspace.yaml is never copied into the Node stage, so `pnpm install`"
+        " exits 1 with ERR_PNPM_IGNORED_BUILDS over msw's postinstall"
+    )
+
+
+def test_the_image_builds_the_interface_with_the_pnpm_this_project_pins(dockerfile):
+    """One version of pnpm, named in one place, which is `web/package.json`.
+
+    CI resolves it with `pnpm/action-setup`, which reads `packageManager`; the
+    image should get it from the same field rather than from a second literal
+    that drifts. A literal is allowed if it agrees -- what is refused is a
+    Dockerfile pinning a pnpm the repository does not use, because a different
+    pnpm major reads `pnpm-lock.yaml` differently and `--frozen-lockfile` then
+    fails on a lockfile that is perfectly current.
+    """
+    manifest = json.loads((ROOT / "web" / "package.json").read_text())
+    name, _, version = manifest["packageManager"].partition("@")
+    assert name == "pnpm", f"web/ is a {name} project now"
+
+    stage = instructions(node_stage(dockerfile).body)
+    literals = set(re.findall(r"pnpm@(\S+)", stage))
+    if literals:
+        assert literals == {version}, (
+            f"the Dockerfile pins pnpm {literals} and web/package.json pins {version}"
+        )
+    else:
+        assert "corepack" in stage, (
+            "the stage neither pins a pnpm version nor uses corepack, so whichever pnpm"
+            " the base image happens to carry builds the interface"
+        )
+
+
+def test_the_interface_is_built_on_the_node_ci_tests_it_on(dockerfile):
+    """A major apart is a build that passes here and fails there, or worse.
+
+    Vite and its plugins gate on the Node major; building the shipped assets on
+    one and running the whole test suite on another means the artefact nobody
+    tested is the one that ships.
+    """
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    versions = {
+        str(step["with"]["node-version"])
+        for job in workflow["jobs"].values()
+        for step in job["steps"]
+        if "setup-node" in str(step.get("uses", "")) and "node-version" in (step.get("with") or {})
+    }
+    assert versions, "CI no longer pins a node-version; the assertion below has nothing to hold to"
+
+    header = node_stage(dockerfile).body.splitlines()[0]
+    major = re.search(r"node:(\d+)", header)
+    assert major, f"`FROM {header}` does not pin a Node major"
+    assert {major[1]} == versions, (
+        f"the image builds the interface on Node {major[1]} and CI tests it on {versions}"
+    )
+
+
+def test_the_build_context_carries_the_interface_but_not_its_node_modules():
+    """`.dockerignore`, which is the other file the Node stage depends on.
+
+    Two failures, opposite in temperament. Excluding `web/` makes the build fail
+    at the `COPY`, which is fine -- it is loud. Failing to exclude
+    `node_modules` is the quiet one: the host's three hundred megabytes are sent
+    to the daemon on every build and then copied *over* the ones `pnpm install`
+    just made, so a cross-build for the Pi gets a tree of x86 binaries and the
+    developer who has never run `pnpm install` gets a different image from the
+    one who has.
+    """
+    patterns = [
+        line.strip()
+        for line in (ROOT / ".dockerignore").read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+    assert not any(pattern.rstrip("/") == "web" for pattern in patterns), (
+        "web/ is excluded from the build context; the Node stage has nothing to build"
+    )
+    assert any(re.fullmatch(r"(\*\*/|web/)?node_modules/?", pattern) for pattern in patterns), (
+        "node_modules is not excluded; the host's copy is shipped to the daemon on every"
+        " build and lands on top of the one the image installed"
+    )
+
+
+def test_the_build_context_leaves_the_previous_local_build_behind():
+    """`web/dist`, the third line of `.dockerignore` the Node stage depends on.
+
+    Small on purpose, and worth saying how small: vite's `emptyOutDir` defaults
+    true for an `outDir` inside the project root, so `pnpm build` in the stage
+    wipes a host `dist` copied in over it anyway. What this exclusion actually
+    buys is that the host's build never enters the context at all -- it is not
+    sent to the daemon, and it cannot be what ships if the stage ever stops
+    rebuilding it. Untested until now, alongside two exclusions that were.
+    """
+    patterns = [
+        line.strip()
+        for line in (ROOT / ".dockerignore").read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+    assert any(re.fullmatch(r"(\*\*/|web/)dist/?", pattern) for pattern in patterns), (
+        "web/dist is not excluded from the build context; a local `pnpm build` is sent to"
+        " the daemon on every build and lands on top of the one the image just made"
+    )
+
+
+def test_the_readme_says_where_the_interface_lives_in_the_image(dockerfile, monkeypatch, tmp_path):
+    """An operator debugging a blank page needs the path, not the reasoning."""
+    web_dir = configured(monkeypatch, tmp_path, dockerfile_env(dockerfile)).web_dir
+    readme = (ROOT / "server" / "README.md").read_text()
+
+    assert "ORS_WEB_DIR" in readme, "the variable that decides whether there is an interface"
+    assert str(web_dir) in readme, f"the README never names {web_dir}"
 
 
 # --------------------------------------------------------------------------

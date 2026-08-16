@@ -11,6 +11,12 @@ find it, so a sweep that stopped looking fails rather than passing quietly. A
 planted violation has to be a real one: a route containing no write at all
 proves the sweep is live and nothing more, and "live" was never the question.
 
+Every app built here has no `web_dir`, so **no interface is mounted** and the
+sweeps see the API alone. Stated because it is otherwise invisible: a `Mount`
+has neither `.methods` nor `.endpoint`, and both sweeps below narrow to `/api`
+paths, so the mount would drop out of them even if it were there. What the mount
+does to the API is `test_spa.py`'s subject, not this file's.
+
 Every sweep here parses. None of them greps, and the two are not
 interchangeable: all five router files *discuss* these rules in their prose, so
 a substring search over their source is a check each of them passes by talking
@@ -33,8 +39,10 @@ from fastapi import Depends, FastAPI, Request, Response
 from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 from ors_server import api
+from ors_server.api.auth import change_password
 from ors_server.api.changes import change
 from ors_server.app import AppSettings, create_app
+from ors_server.auth import set_password
 from starlette.routing import WebSocketRoute
 
 API_PACKAGE = Path(api.__file__).parent
@@ -42,13 +50,18 @@ API_PACKAGE = Path(api.__file__).parent
 MAY_RUN_IN_A_THREADPOOL = {
     "/api/health",
     # argon2 is 0.58s by design, and a hash on the event loop stops every frame
-    # the server is relaying for that long. None of these four touches the hub,
+    # the server is relaying for that long. None of these five touches the hub,
     # which is the only reason a threadpool is safe for them -- so this is the
     # list, and anything not on it is a route that has to be `async def`.
     "/api/auth/me",
     "/api/auth/setup",
     "/api/auth/login",
     "/api/auth/logout",
+    # A verify and a hash, one each, and no rack to tell: it changes a
+    # credential, not a configuration. See
+    # `test_the_password_change_writes_a_row_and_so_is_not_an_exemption` for why
+    # it is on this list only and not on `MUTATES_NOTHING` as well.
+    "/api/auth/password",
 }
 
 MUTATES_NOTHING = {
@@ -57,6 +70,13 @@ MUTATES_NOTHING = {
     # dry-runs an integration's queries and answers with what came back.
     "POST /api/daemons/{daemon_id}/command",
     "POST /api/integrations/{integration_id}/test",
+    # The two questions the add-screen wizard asks a rack. Both read the `daemon`
+    # row to answer 404 for a rack nobody created, and then ask the Pi: `detect`
+    # lists its SPI devices, `probe` lights one panel with wiring an operator
+    # typed. Neither writes anything -- what they are about is hardware this
+    # server has no row for yet, which is the whole reason they exist.
+    "POST /api/daemons/{daemon_id}/detect",
+    "POST /api/daemons/{daemon_id}/probe",
 }
 
 
@@ -369,6 +389,28 @@ def test_the_routes_exempted_from_the_change_rule_really_write_nothing(tmp_path)
 
     assert len(exempted) == len(MUTATES_NOTHING), "an exemption naming a route nobody has written"
     assert [route for route in exempted if writes(route.endpoint)] == []
+
+
+def test_the_password_change_writes_a_row_and_so_is_not_an_exemption():
+    """Why `POST /api/auth/password` is on one list and not the other.
+
+    It opens no `change`, and rightly: it edits a credential, no rack's
+    configuration moves, and there is no version to bump or snapshot to push.
+    That makes `MUTATES_NOTHING` look like where it belongs -- but the companion
+    sweep above holds everything on that list to **writing nothing at all**, and
+    this route writes the `setting` row that holds the password hash. It would
+    pass only because `writes` reads one function's own source and the write is
+    one call deeper, which is a documented blind spot rather than a licence, and
+    an exemption that is true only because the checker cannot see is worse than
+    no exemption.
+
+    So the threadpool list carries it alone -- exactly as `POST /api/auth/setup`
+    is carried, which writes the same row through the same kind of helper -- and
+    `unmanaged_mutations` skips it there, as a route whose subject is not a rack.
+    """
+    assert "POST /api/auth/password" not in MUTATES_NOTHING
+    assert writes(change_password) is False, "the blind spot this decision turns on"
+    assert writes(set_password) is True, "and what it is blind to"
 
 
 def test_the_write_check_reads_the_statement_rather_than_the_method(tmp_path):

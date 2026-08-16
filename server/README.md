@@ -152,6 +152,44 @@ the host directory — but replacing that named volume with a bind mount of
 `/var/lib/openrackscreen` would drop the server's `ors.db` into a directory its
 uid cannot enter, on top of the one file the rack cannot be given again.
 
+## The interface is inside the image
+
+There is no second container and no separate web server. The image builds the
+SPA in a Node stage, copies the built `web/dist` to `/app/web`, and the server
+mounts that directory under everything it already routes — so the interface and
+the API answer on one port, from one origin, and no CORS or proxy configuration
+exists to get wrong.
+
+The Node stage is discarded. The shipped image has no Node, no pnpm and no
+`node_modules`; `/app/web` is static HTML, JS and CSS.
+
+`ORS_WEB_DIR` is where the server looks, and `/app/web` is its default, so
+neither compose file sets it. Two things follow:
+
+- **A missing build is not an error.** The server logs
+  `no interface to serve: … holds no index.html` once at startup and serves the
+  API alone. That is the right behaviour for a checkout that has never run
+  `pnpm build` — and it is also what a wrong `COPY` in the Dockerfile looks
+  like: a container that starts, passes its healthcheck, answers
+  `/api/health`, and returns 404 for every page. **If every page is a 404 and
+  the API works, that warning is in the log and it names the directory.**
+- **Working on the interface locally** means running the server against your own
+  build instead of the image's:
+
+  ```bash
+  ORS_WEB_DIR=web/dist uv run ors-server
+  ```
+
+  Or don't — `pnpm dev` in `web/` proxies `/api` and `/ws` to `127.0.0.1:8080`,
+  which is the better loop while editing.
+
+The API keeps its paths. Everything this server answers for itself is under
+`/api` or `/ws` — the docs are at `/api/docs`, the schema at
+`/api/openapi.json` — and the mount declines both prefixes rather than
+shadowing them. So an unknown `/api/...` is still a JSON `404` and not the index
+page, which matters most for the requests that *do not* exist: a client
+misspelling a route gets an error it can read instead of a page.
+
 ## Outbound network
 
 The server makes exactly one outbound HTTP call of its own: the **Test** button
@@ -173,6 +211,7 @@ nothing else.
 | `ORS_HOST` | `0.0.0.0` in the image | `127.0.0.1` inside a container is the container and nothing else. |
 | `ORS_PORT` | `8080` | must match the container side of the published port. |
 | `ORS_SECRET_KEY` | generated | see above. Unrecoverable. |
+| `ORS_WEB_DIR` | `/app/web` | where the built interface is. See [The interface is inside the image](#the-interface-is-inside-the-image). |
 | `ORS_LOG_LEVEL` | `INFO` | one JSON object per line, on stdout. |
 | `FORWARDED_ALLOW_IPS` | `127.0.0.1` | which proxies' `X-Forwarded-For` to believe. |
 
@@ -200,7 +239,15 @@ docker build -f deploy/Dockerfile -t openrackscreen .
 
 The build context is the repository root, not `server/` — the server is one
 member of a uv workspace and the build needs the lock file and the shared
-`ors-schema` and `ors-render` packages.
+`ors-schema` and `ors-render` packages. It also needs `web/`, because the image
+builds the interface: three stages, `uv` → `node` → `python:3.12-slim-trixie`,
+of which only the last one ships.
+
+Nothing has to be installed or built beforehand. `web/node_modules` and
+`web/dist` are excluded from the context in `.dockerignore` on purpose, so the
+image is the same whether or not you have ever run `pnpm install` — and a
+cross-build for the Pi cannot pick up a tree of x86 `rollup` and `esbuild`
+binaries from the host.
 
 For a 64-bit Pi from another machine:
 
@@ -208,6 +255,28 @@ For a 64-bit Pi from another machine:
 docker buildx build --platform linux/arm64 -f deploy/Dockerfile -t openrackscreen .
 ```
 
-`arm64` is the supported target. 32-bit builds work but are slow: `argon2-cffi-bindings`
-publishes no `armv7l` wheel, so Argon2 compiles from C — which is why the builder
-stage installs `gcc`, and why the runtime stage must not.
+Only the Python half of that is emulated. The Node stage is pinned to
+`--platform=$BUILDPLATFORM`, so `pnpm install`, `tsc -b` and `vite build` run
+natively on the machine you are building on: `dist` is HTML, JS and CSS, and it
+is the same bytes whatever CPU emitted them. The uv builder is not pinned that
+way on purpose — it installs wheels *for* the target.
+
+`arm64` is the supported target, and it is the **only** ARM target. It has been
+since this image first existed, which is older than the interface being in it:
+the first `FROM` in `deploy/Dockerfile` is
+`ghcr.io/astral-sh/uv:0.12-python3.12-trixie-slim`, and that tag publishes
+`linux/amd64` and `linux/arm64` and no `linux/arm/v7`. A
+`--platform linux/arm/v7` build therefore fails on that line — before any
+Python, and before the Node stage is even reached. `node:24` publishes no
+`linux/arm/v7` either, so the interface stage is a second wall behind the first
+one rather than the thing that closed 32-bit ARM. Use the 64-bit Raspberry Pi
+OS.
+
+The builder stage still installs `gcc` and `libc6-dev` for a 32-bit reason —
+`argon2-cffi-bindings` publishes no `armv7l` wheel, so Argon2 would compile from
+C there, while `cryptography` does ship one. That layer has been dead in
+practice since the uv tag was pinned, and is kept because it is cheap (one apt
+layer in a stage nothing ships), because the wheel situation is what would have
+to change first, and because the runtime stage must still not have a compiler in
+it either way. Anyone reopening 32-bit ARM starts at the uv base image, not at
+Node.

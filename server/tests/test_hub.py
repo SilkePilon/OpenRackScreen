@@ -2,16 +2,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from inspect import signature
 
+import pytest
 from ors_schema.daemon import DaemonConfig
 from ors_schema.link import (
+    MAX_PROBE_HOLD_S,
     MAX_WATCHED_SCREENS,
     Command,
     ConfigPush,
+    DetectRequest,
+    DetectResult,
     Frame,
     FramesRequest,
+    PanelCandidate,
+    ProbeRequest,
+    ProbeResult,
 )
-from ors_server.link.hub import Connection, DaemonsOnline, Hub
+from ors_server.link.hub import (
+    REQUEST_TIMEOUT,
+    SEND_TIMEOUT,
+    Connection,
+    DaemonsOnline,
+    Hub,
+)
 
 
 class FakeSocket:
@@ -790,3 +804,390 @@ async def test_the_bound_counts_one_rack_s_screens_and_not_every_rack_s(caplog):
 
     assert request.screen_ids == mine
     assert caplog.records == [], "a rack at the bound is not a rack over it"
+
+
+# --- asking a rack something, and waiting for the answer ---------------------
+
+# Correlation ids that look like nothing else in this file: not a daemon id, not
+# a screen id, not a position in any list, and not each other. The failure they
+# are chosen against is the one the whole table exists to prevent -- an answer
+# handed to the wrong caller -- and an id that coincides with an index or with
+# the rack it was sent to is an id that cannot show it.
+DETECTING = "detect-9f3a"
+PROBING = "probe-4c7b"
+ELSEWHERE = "detect-1d05"
+NEVER_ASKED = "probe-0000ffff"
+
+# Two racks, neither of them numbered 1, so that "the first daemon registered"
+# and "daemon 1" cannot stand in for each other.
+RACK = 7
+OTHER_RACK = 12
+
+# bus, cs and the index of this candidate in the list are three different
+# numbers, for the reason above.
+PANEL = PanelCandidate(bus=1, cs=2, claimed_by="CPU")
+
+
+def detect(request_id: str = DETECTING) -> DetectRequest:
+    return DetectRequest(request_id=request_id)
+
+
+def probe(request_id: str = PROBING) -> ProbeRequest:
+    return ProbeRequest(
+        request_id=request_id, bus=1, cs=2, dc=23, rst=24, hz=40_000_000, hold_s=3.0
+    )
+
+
+async def until_sent(socket: FakeSocket, count: int) -> None:
+    """Step the loop until the hub has put `count` messages on this socket.
+
+    Steps rather than sleeps: `asyncio.sleep(0)` gives the loop one turn and
+    comes straight back, so this costs no wall-clock time and cannot pass
+    because a machine happened to be quick. The bound is what makes a failure
+    legible -- a request that never leaves stops here, saying so, instead of at
+    whichever assertion came next.
+    """
+    for _ in range(10):
+        if len(socket.sent) >= count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"only {len(socket.sent)} of {count} requests reached the socket")
+
+
+async def test_a_reply_reaches_the_caller_that_asked_for_it():
+    hub, socket = Hub(), FakeSocket()
+    hub.register(RACK, socket.send)
+
+    asking = asyncio.create_task(hub.request(RACK, detect()))
+    await until_sent(socket, 1)
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
+
+    reply = await asyncio.wait_for(asking, 1)
+    assert DETECTING in socket.sent[0], "the question really went to the rack"
+    assert isinstance(reply, DetectResult)
+    assert reply.request_id == DETECTING
+    assert [(panel.bus, panel.cs, panel.claimed_by) for panel in reply.panels] == [(1, 2, "CPU")]
+
+
+async def test_two_requests_in_flight_do_not_cross():
+    """Different request_ids, replies delivered out of order.
+
+    One rack, because that is where the mix-up is invisible: a table keyed by
+    the daemon rather than by the question holds one entry for both of these,
+    and a reply matched by arrival order hands each caller the other's answer.
+    Answering the second one first is what tells those apart from a table that
+    works.
+    """
+    hub, socket = Hub(), FakeSocket()
+    hub.register(RACK, socket.send)
+
+    detecting = asyncio.create_task(hub.request(RACK, detect()))
+    probing = asyncio.create_task(hub.request(RACK, probe()))
+    await until_sent(socket, 2)
+
+    hub.deliver_reply(RACK, ProbeResult(request_id=PROBING, ok=True))
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
+
+    probed = await asyncio.wait_for(probing, 1)
+    detected = await asyncio.wait_for(detecting, 1)
+    assert isinstance(probed, ProbeResult) and probed.request_id == PROBING
+    assert isinstance(detected, DetectResult) and detected.request_id == DETECTING
+    assert detected.panels == [PANEL], "and the answer arrived whole, not just the right shape"
+
+
+async def test_a_rack_that_never_answers_times_out_rather_than_holding_the_handler():
+    """The bound `SEND_TIMEOUT` exists for, one message further on: an HTTP
+    handler is parked on this call, and a rack that has stopped answering must
+    not be able to hold it open for as long as it likes.
+
+    `timeout=0` because no test here may spend wall-clock time waiting for a
+    clock: `asyncio.wait_for` takes its expired-deadline path and raises the
+    same `TimeoutError` the full forty seconds would. The one-second deadline
+    around it is the real assertion -- a wait that is not bounded at all fails
+    there rather than hanging the suite.
+    """
+    hub, socket = Hub(), FakeSocket()
+    hub.register(RACK, socket.send)
+
+    answer = await asyncio.wait_for(hub.request(RACK, probe(), timeout=0), 1)
+
+    assert answer is None
+    assert socket.sent, "the question did leave; it is the answer that never came"
+    assert hub.is_online(RACK) is True, "a rack that is slow to answer has not gone away"
+
+
+async def test_a_reply_for_a_request_nobody_is_waiting_on_is_dropped(caplog):
+    """A late reply after a timeout must not raise.
+
+    Two ways this arrives: an answer to a question whose caller gave up, and one
+    naming an id this server has no record of at all. Both come out of the
+    daemon's socket handler, which catches a disconnect and a validation error
+    and nothing else -- so a `KeyError` here closes the link and takes the whole
+    rack offline over a message it answered correctly.
+    """
+    hub, socket = Hub(), FakeSocket()
+    hub.register(RACK, socket.send)
+    assert await asyncio.wait_for(hub.request(RACK, probe(), timeout=0), 1) is None
+    # The giving-up warning is the previous test's subject and would be counted
+    # here too: `caplog.records` is the whole test, not the block below.
+    caplog.clear()
+
+    with caplog.at_level(logging.INFO, logger="ors_server.link.hub"):
+        hub.deliver_reply(RACK, ProbeResult(request_id=PROBING, ok=True))
+        hub.deliver_reply(RACK, DetectResult(request_id=NEVER_ASKED, panels=[]))
+
+    assert [record.request for record in caplog.records] == [PROBING, NEVER_ASKED]
+    assert hub.is_online(RACK) is True, "and the rack is no worse off for having answered"
+
+
+async def test_one_racks_answer_does_not_resolve_another_racks_question():
+    """A reply is matched on the id *and* on the rack it came from.
+
+    The ids are the caller's to mint and this class cannot make them unique --
+    which is why `request`'s own cleanup checks identity rather than the key.
+    Trusting them to be unique *across* racks as well is that same assumption
+    made twice and defended once: a route minting `f"detect-{n}"` per rack, or
+    reusing a per-rack counter, has rack 12 answering rack 7's question as a
+    matter of routine. The caller then gets a panel list, believes it describes
+    rack 7, and the wizard offers an operator wiring for hardware on another Pi.
+
+    The two answers differ in their panels and not only in their rack, so a
+    crossed one fails on what it *said* and not merely on where it came from.
+    """
+    hub, socket, other_socket = Hub(), FakeSocket(), FakeSocket()
+    hub.register(RACK, socket.send)
+    hub.register(OTHER_RACK, other_socket.send)
+    asking = asyncio.create_task(hub.request(RACK, detect()))
+    await until_sent(socket, 1)
+
+    hub.deliver_reply(OTHER_RACK, DetectResult(request_id=DETECTING, panels=[]))
+    await asyncio.sleep(0)
+
+    assert not asking.done(), "another rack's answer is not an answer to this question"
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
+    answer = await asyncio.wait_for(asking, 1)
+    assert answer is not None and answer.panels == [PANEL], "and the rack's own answer still lands"
+
+
+async def test_a_dropped_connection_fails_every_request_in_flight():
+    """Otherwise the handler waits out the full timeout for a rack that has gone.
+
+    Every one of them and only that rack's: the other rack below is still
+    connected, still able to answer, and its caller has nothing to do with this
+    disconnect.
+    """
+    hub, socket, other_socket = Hub(), FakeSocket(), FakeSocket()
+    connection = hub.register(RACK, socket.send)
+    hub.register(OTHER_RACK, other_socket.send)
+    detecting = asyncio.create_task(hub.request(RACK, detect()))
+    probing = asyncio.create_task(hub.request(RACK, probe()))
+    elsewhere = asyncio.create_task(hub.request(OTHER_RACK, detect(ELSEWHERE)))
+    await until_sent(socket, 2)
+    await until_sent(other_socket, 1)
+
+    hub.drop(connection)
+
+    assert await asyncio.wait_for(detecting, 1) is None
+    assert await asyncio.wait_for(probing, 1) is None, "every one of them, not the first"
+    assert not elsewhere.done(), "another rack's request is not this rack's to fail"
+    hub.deliver_reply(OTHER_RACK, DetectResult(request_id=ELSEWHERE, panels=[]))
+    answered = await asyncio.wait_for(elsewhere, 1)
+    assert answered is not None and answered.request_id == ELSEWHERE
+
+
+async def test_an_offline_rack_is_refused_immediately():
+    """There is nothing to ask, so there is nothing to wait for. Registering the
+    wait anyway would spend a whole `REQUEST_TIMEOUT` of an HTTP handler proving
+    what `is_online` already knew."""
+    hub = Hub()
+
+    async with Ticker() as ticker:
+        answer = await hub.request(99, detect())
+        assert ticker.ticks == 0, "it must not have suspended at all"
+
+    assert answer is None
+    assert hub.is_online(99) is False, "and it must not have invented the rack it could not reach"
+    assert hub.online_ids() == set()
+
+
+async def test_the_wait_outlasts_the_longest_probe_a_rack_may_be_asked_for():
+    """The one bound here that is not free to be chosen on its own.
+
+    `ProbeRequest.hold_s` is bounded by `MAX_PROBE_HOLD_S`, so a probe this
+    server will happily send can legally keep a panel lit for thirty seconds
+    before the daemon has anything to report about it. A wait shorter than that
+    is a probe that *always* times out -- reported honestly and wrong every
+    time: the panel lights, the operator watches it, and the interface says the
+    rack did not answer. Worse, the timeout is indistinguishable from a real
+    failure, so the wizard's advice would be to check the wiring that just
+    worked.
+
+    Past it by a round trip as well, because the hold is only the part the
+    daemon spends deliberately: the request still has to get there and the
+    answer still has to come back, and `SEND_TIMEOUT` is this file's own
+    statement of how long one leg of that is allowed to take.
+    """
+    assert REQUEST_TIMEOUT > MAX_PROBE_HOLD_S, "a legal probe outlives its own answer"
+    assert REQUEST_TIMEOUT - MAX_PROBE_HOLD_S > SEND_TIMEOUT, "and a round trip past it"
+    # The formula and not only the direction. The two lines above are satisfied
+    # by any number above thirty-five, so raising this one changes nothing that
+    # fails -- and nothing else would either: both callers of `request` pass
+    # their own timeout, so the default is a park no test in this suite spends.
+    # What it costs is paid by whoever omits the argument next, which is why the
+    # parameter's docstring says so and why the number is pinned to what it is
+    # built from rather than to a bound it happens to clear.
+    assert REQUEST_TIMEOUT == MAX_PROBE_HOLD_S + 2 * SEND_TIMEOUT
+    # The pin is the two lines above: they compare symbols from two packages, so
+    # a schema that raises the hold fails here rather than in front of an
+    # operator. The line below is not that and should not be read as it -- the
+    # default is *spelled* `REQUEST_TIMEOUT`, so this compares the constant with
+    # itself. What it does catch, which is the whole of its job, is somebody
+    # replacing that default with a literal and cutting the relationship loose.
+    assert signature(Hub.request).parameters["timeout"].default == REQUEST_TIMEOUT, (
+        "and that is what a caller who names no timeout gets"
+    )
+
+
+async def test_a_late_drop_from_a_replaced_connection_leaves_the_live_request_waiting():
+    """The identity guard, arriving at the waits.
+
+    A superseded handler runs its own cleanup seconds after the rack
+    reconnected, and it reaches `drop` holding a connection the hub has already
+    forgotten. Failing that rack's in-flight requests from there refuses a
+    question the *live* socket can still answer -- and when the answer does
+    land, there is nothing left waiting for it.
+    """
+    hub, second = Hub(), FakeSocket()
+    superseded = hub.register(RACK, FakeSocket().send)
+    hub.register(RACK, second.send)
+    asking = asyncio.create_task(hub.request(RACK, detect()))
+    await until_sent(second, 1)
+
+    hub.drop(superseded)
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
+
+    answer = await asyncio.wait_for(asking, 1)
+    assert answer is not None, "a superseded cleanup must not fail the live socket's waits"
+    assert answer.request_id == DETECTING
+
+
+async def test_neither_an_answer_nor_a_timeout_leaves_a_wait_behind():
+    """The table is keyed by an id minted per request, so an entry nothing
+    removes is never looked at again and never freed: one dead future and one
+    dead message per question asked, for the life of the process.
+
+    Read off the table itself, because there is nothing else to observe it by --
+    a rack that answers and a rack that does not look exactly the same from
+    outside whether the entry was cleaned up or not. The alternative is an
+    accessor no production code would ever call, which is the defect this
+    project's last review found rather than a way of avoiding one.
+    """
+    hub, socket = Hub(), FakeSocket()
+    hub.register(RACK, socket.send)
+
+    asking = asyncio.create_task(hub.request(RACK, detect()))
+    await until_sent(socket, 1)
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
+    await asyncio.wait_for(asking, 1)
+
+    assert hub._pending == {}, "an answered question is finished with"
+    assert await asyncio.wait_for(hub.request(RACK, probe(), timeout=0), 1) is None
+    assert hub._pending == {}, "and so is one that nobody answered"
+
+
+async def test_a_caller_that_gives_up_leaves_no_wait_behind():
+    """A shutdown, or a browser that closed the tab: the task holding this call
+    is cancelled while it is inside the wait. A cleanup written as
+    `except TimeoutError` misses that entirely -- a cancel carries no error of
+    its own -- which is why it is a `finally`."""
+    hub, socket = Hub(), FakeSocket()
+    hub.register(RACK, socket.send)
+    asking = asyncio.create_task(hub.request(RACK, detect()))
+    await until_sent(socket, 1)
+
+    asking.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asking
+
+    assert hub._pending == {}
+    # And the answer that arrives for it anyway is dropped rather than raising.
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
+
+
+async def test_a_request_that_never_left_the_server_is_not_waited_on():
+    """`_send` already says whether anything left, and a socket that failed is
+    not a rack that is thinking about it. Waiting the full timeout for an answer
+    to a question that was never asked is the whole of what this avoids."""
+    hub = Hub()
+    hub.register(RACK, FakeSocket(fails=True).send)
+
+    answer = await asyncio.wait_for(hub.request(RACK, detect()), 1)
+
+    assert answer is None
+    assert hub.is_online(RACK) is False, "the send that failed took the socket with it"
+    assert hub._pending == {}
+
+
+async def test_a_reply_that_beats_the_send_back_into_the_server_is_not_missed():
+    """The wait is registered before the question goes out, not after it.
+
+    `_send` awaits, and the socket is not the wire: the bytes can be on the Pi,
+    and the Pi's answer can be back and read by the daemon socket's handler,
+    while this server is still inside its own `send` waiting for flow control to
+    let go. A wait registered afterwards misses exactly that reply -- so the
+    rack that answered fastest would be the one reported as not answering.
+    """
+    hub, socket = Hub(), GatedSocket()
+    hub.register(RACK, socket.send)
+
+    asking = asyncio.create_task(hub.request(RACK, detect()))
+    await asyncio.wait_for(socket.started.wait(), 1)
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
+    socket.release.set()
+
+    answer = await asyncio.wait_for(asking, 1)
+    assert answer is not None and answer.request_id == DETECTING
+
+
+async def test_an_answer_arriving_after_the_rack_was_dropped_does_not_raise():
+    """`drop` resolves the wait; the caller has not woken up yet to remove it.
+
+    Between those two moments the entry is still in the table with a future that
+    is already finished, and another socket's handler is free to run in between
+    and deliver something for it. Resolving it twice is an `InvalidStateError`
+    out of the daemon socket handler -- not a disconnect and not a validation
+    error, so nothing catches it and the link closes -- which is why the guard
+    is "is anyone still waiting on this", not "is this key present".
+    """
+    hub, socket = Hub(), FakeSocket()
+    connection = hub.register(RACK, socket.send)
+    asking = asyncio.create_task(hub.request(RACK, detect()))
+    await until_sent(socket, 1)
+
+    hub.drop(connection)
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
+
+    assert await asyncio.wait_for(asking, 1) is None, "the rack had already gone"
+
+
+async def test_a_reused_request_id_does_not_take_the_live_wait_with_it():
+    """The hub does not mint these ids and cannot make them unique. What it can
+    do is make a collision cost one question rather than two: the second
+    registration replaces the first, and the first must not then delete the
+    second's entry on its way out -- which is `drop`'s identity guard, in the
+    one other place this class holds something on a caller's behalf."""
+    hub, socket = Hub(), FakeSocket()
+    hub.register(RACK, socket.send)
+
+    first = asyncio.create_task(hub.request(RACK, detect()))
+    await until_sent(socket, 1)
+    second = asyncio.create_task(hub.request(RACK, detect()))
+    await until_sent(socket, 2)
+
+    first.cancel()  # the first caller gives up, holding an id it no longer owns
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    hub.deliver_reply(RACK, DetectResult(request_id=DETECTING, panels=[PANEL]))
+
+    answer = await asyncio.wait_for(second, 1)
+    assert answer is not None and answer.panels == [PANEL]

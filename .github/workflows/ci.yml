@@ -14,3 +14,78 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run pytest
+
+  # A second job rather than more steps on `test`, for two reasons. The gates are
+  # independent -- nothing in `pnpm test` can be affected by `uv run pytest` --
+  # so they run in parallel, and a red interface is legible as a red interface
+  # instead of as one long job that stopped somewhere. It pays for that with a
+  # second `uv sync`, which it needs anyway: the drift check below runs the real
+  # server, so this job is the one place both toolchains have to be present.
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v9.0.0
+      # pnpm before node: the store cache is this action's own, and `pnpm` has to
+      # be on PATH before anything can ask it where its store is.
+      - uses: pnpm/action-setup@v6
+        with:
+          # No `version:` here on purpose. The version is pinned by
+          # `packageManager` in web/package.json, which this points at, so CI and
+          # a developer's shell resolve the same pnpm from one line. A bare
+          # `version: 11` would be the only unpinned link in the chain -- the
+          # action resolves it with `pnpm self-update 11` at run time, so an
+          # unrelated 11.x release could change lockfile handling and break
+          # `--frozen-lockfile` on a PR that touched nothing. This line is
+          # load-bearing, not a clarity nicety: the default is `package.json` at
+          # the repository root, which does not exist here, and with no
+          # `version:` to fall back on the action fails with "No pnpm version is
+          # specified."
+          package_json_file: web/package.json
+          cache: true
+          # The lockfile is not at the repository root -- the interface is one
+          # directory of a uv workspace -- so the default `pnpm-lock.yaml`
+          # resolves to nothing and the action throws "Some specified paths were
+          # not resolved, unable to cache dependencies."
+          cache_dependency_path: web/pnpm-lock.yaml
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: pnpm install --frozen-lockfile
+        working-directory: web
+      - run: pnpm lint
+        working-directory: web
+      - run: pnpm typecheck
+        working-directory: web
+      - run: pnpm test
+        working-directory: web
+      - run: pnpm build
+        working-directory: web
+
+      - run: uv sync --all-packages
+      # The interface's types are generated from this server's OpenAPI document
+      # and are never written by hand, so the check that they still match is a
+      # regeneration and a diff. `git diff --exit-code` is the whole point: a
+      # server change that alters the API fails here, in the server's own
+      # pipeline, rather than at runtime in somebody's browser.
+      - name: types match the server
+        env:
+          # `create_app` mkdirs this, and the default is /var/lib/openrackscreen,
+          # which the runner user cannot create. The key file lands here too and
+          # goes away with the runner.
+          ORS_DATA_DIR: ${{ runner.temp }}/ors-drift
+        run: |
+          uv run ors-server &
+          SERVER=$!
+          trap 'kill "$SERVER" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do
+            curl -sf http://127.0.0.1:8080/api/health -o /dev/null && break
+            sleep 0.25
+          done
+          # Asked again, and this time allowed to fail: if the server never came
+          # up, say so here rather than as an ECONNREFUSED stack trace out of
+          # openapi-typescript.
+          curl -sf http://127.0.0.1:8080/api/health -o /dev/null
+          cd web
+          pnpm generate:types
+          git diff --exit-code src/api/schema.d.ts

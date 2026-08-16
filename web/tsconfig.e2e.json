@@ -1,0 +1,44 @@
+{
+  /*
+   * A third project, and not a folder added to one of the two that exist.
+   *
+   * `tsconfig.app.json` covers `src` and `tests`: DOM, `vite/client`, no node
+   * types. `tsconfig.node.json` covers the build's own config files: node
+   * types, no DOM. The end-to-end code is the only thing in this repository
+   * that needs *both* -- it spawns processes, reads a temp directory and stats
+   * a PNG (node), and its `page.evaluate` bodies run in a browser and name
+   * `HTMLCanvasElement` and `window` (DOM).
+   *
+   * Folding it into `tsconfig.app.json` would hand every file under `src` the
+   * node types along with it, which is how a `node:fs` import reaches a bundle
+   * and fails in a browser instead of in the type checker. Folding it into
+   * `tsconfig.node.json` would give it no DOM at all. So it is its own, and
+   * `tsconfig.json` references it, which is what puts it inside `pnpm
+   * typecheck` (`tsc -b --force`) rather than leaving a directory nothing
+   * checks.
+   */
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.e2e.tsbuildinfo",
+    "target": "es2023",
+    "lib": ["ES2023", "DOM"],
+    "types": ["node"],
+    "skipLibCheck": true,
+
+    /* Bundler mode, as `tsconfig.app.json` has it: Playwright transpiles these
+       files itself and resolves `./fixture` without an extension, which
+       `nodenext` would refuse. */
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+
+    /* Linting */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["e2e", "playwright.config.ts"]
+}

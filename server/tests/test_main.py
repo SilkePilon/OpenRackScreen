@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import inspect
 import logging
+from pathlib import Path
 from typing import Any
 
 import pytest
 import uvicorn
 import uvicorn.config
+from fastapi import FastAPI
 from ors_schema.link import MAX_FRAME_BYTES
 from ors_server.__main__ import WS_MAX_MESSAGE_BYTES, main
+from ors_server.app import AppSettings
 
 _TOUCHED = ("ors_server", "uvicorn", "uvicorn.error", "uvicorn.access")
 
@@ -48,6 +51,52 @@ def served(monkeypatch, tmp_path) -> dict[str, Any]:
     assert main() == 0
 
     return captured[0]
+
+
+def settings_assembled(monkeypatch, tmp_path) -> AppSettings:
+    """The `AppSettings` `main` builds out of the environment, and no app at all.
+
+    `create_app` is replaced rather than run: the point of these two tests is
+    which *path* `main` chose, and building the real app against it would either
+    warn about a missing interface or, on a machine that happens to have one
+    there, serve it -- neither of which is what is being asked.
+    """
+    captured: list[AppSettings] = []
+
+    def capture(settings: AppSettings) -> FastAPI:
+        captured.append(settings)
+        return FastAPI()
+
+    monkeypatch.setattr("ors_server.__main__.create_app", capture)
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: None)
+    monkeypatch.setenv("ORS_DATA_DIR", str(tmp_path))
+
+    assert main() == 0
+
+    return captured[0]
+
+
+def test_the_interface_is_looked_for_where_the_image_puts_it(monkeypatch, tmp_path) -> None:
+    """The one path task 18's `COPY` has to agree with, pinned rather than implied.
+
+    `/app/web` and nothing inside `/app/.venv`: the venv's layout carries the
+    interpreter version (`lib/python3.12/site-packages/...`), so a `COPY` naming
+    it is a Dockerfile that breaks on a Python bump with a blank page and a
+    clean log. The default is a container path for the same reason
+    `ORS_DATA_DIR`'s is -- this is how the shipped server is configured, and a
+    checkout that wants its own build says so below.
+    """
+    monkeypatch.delenv("ORS_WEB_DIR", raising=False)
+
+    assert settings_assembled(monkeypatch, tmp_path).web_dir == Path("/app/web")
+
+
+def test_the_interface_directory_can_be_moved_by_the_environment(monkeypatch, tmp_path) -> None:
+    """`ORS_WEB_DIR=web/dist` is what a developer serving their own build sets,
+    and what an image that lays the file system out differently would."""
+    monkeypatch.setenv("ORS_WEB_DIR", str(tmp_path / "elsewhere" / "dist"))
+
+    assert settings_assembled(monkeypatch, tmp_path).web_dir == tmp_path / "elsewhere" / "dist"
 
 
 def test_the_server_bounds_a_websocket_message_rather_than_inheriting_16_mib(
