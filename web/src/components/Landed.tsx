@@ -9,13 +9,17 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
  * quietly, and one that did not names the racks -- from `X-Unservable-Daemons`
  * and from nothing else.
  *
- * The header is the *only* thing that can name them here, and this page is where
- * that matters most. A template edit affects every rack there is: the template
+ * The header is the *only* thing that can name them. On the Templates page that
+ * is starkest -- a template edit affects every rack there is, because those
  * routes never call `affects`, so `Change` reads the affected set as all of
- * them, and for the same reason the response can never be narrowed to a 202 --
- * one rack with a hand-edited column would otherwise turn every rack-wide edit
- * into a 202 forever. There is no body field, no status code and no rack id in
- * the request that says which rack missed one.
+ * them and the response can never be narrowed to a 202 -- but it is no less true
+ * of an integration write, which does call `affects` and still answers 201 on a
+ * create that reached nobody. There is no body field, no status code and no rack
+ * id in the request that says which rack missed one.
+ *
+ * In `components/` rather than beside one page for the reason `nameDaemons` was
+ * lifted out of the pages in task 14: two pages now say this sentence, and two
+ * copies of it are two chances for one of them to start reading the body.
  */
 export function Landed({
   saved,

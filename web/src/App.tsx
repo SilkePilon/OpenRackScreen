@@ -7,6 +7,7 @@ import { sessionKey } from "@/api/queries"
 import { AppShell } from "@/components/AppShell"
 import { RequireSession } from "@/routes/RequireSession"
 import { DaemonsPage } from "@/routes/daemons/DaemonsPage"
+import { IntegrationsPage } from "@/routes/integrations/IntegrationsPage"
 import { LoginPage } from "@/routes/login/LoginPage"
 import { ScreensPage } from "@/routes/screens/ScreensPage"
 import { SetupPage } from "@/routes/setup/SetupPage"
@@ -93,7 +94,7 @@ function App() {
         <Route path="/daemons" element={<DaemonsPage />} />
         <Route path="/screens" element={<ScreensPage />} />
         <Route path="/templates" element={<TemplatesPage />} />
-        <Route path="/integrations" element={<Placeholder title="Integrations" />} />
+        <Route path="/integrations" element={<IntegrationsPage />} />
         <Route path="/settings" element={<Placeholder title="Settings" />} />
         <Route path="*" element={<Placeholder title="No such page" />} />
       </Route>

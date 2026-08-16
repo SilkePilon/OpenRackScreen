@@ -6,7 +6,7 @@ import {
   type Screen,
 } from "@/api/queries"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import { Landed } from "@/routes/templates/Landed"
+import { Landed } from "@/components/Landed"
 import { TemplateCard } from "@/routes/templates/TemplateCard"
 
 /**

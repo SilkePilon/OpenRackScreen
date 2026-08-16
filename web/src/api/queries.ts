@@ -346,6 +346,107 @@ export function useIntegrations(daemonId: number) {
   })
 }
 
+/**
+ * Everything an integration edit may carry. Every field optional, `extra="forbid"`.
+ *
+ * **`credential` is write-only and has three states, not two.** Absent leaves
+ * the stored secret alone, `""` clears it, and a value replaces it -- so a form
+ * that put every field it holds into every body would send `credential: ""` on
+ * an unrelated rename and wipe a secret nobody touched. Nothing here can enforce
+ * that; it is the caller's, and `routes/integrations/draft.ts` is where this
+ * interface makes the decision once.
+ */
+export type IntegrationBody = components["schemas"]["IntegrationBody"]
+
+/** A new integration. `type` has a default and is still required by the generated type. */
+export type NewIntegration = components["schemas"]["NewIntegration"]
+
+/** What a dry-run of every field answered. Not a preview: see `useTestIntegration`. */
+export type TestReport = components["schemas"]["TestReport"]
+
+/**
+ * Add an integration to one rack.
+ *
+ * The rack is in the variables *and* in the closure, and they are two different
+ * facts: `NewIntegration.daemon_id` says which rack polls it, and
+ * `integrationsKey(daemonId)` says which cache entry went stale. They agree
+ * because one caller sets both, and the hook is mounted per rack section so
+ * neither can be forgotten.
+ */
+export function useCreateIntegration(daemonId: number) {
+  return useMutate<Integration, NewIntegration>({
+    send: (body) => api.POST("/api/integrations", { body }),
+    invalidates: [integrationsKey(daemonId)],
+  })
+}
+
+/**
+ * Edit one integration, carrying only the fields that moved.
+ *
+ * `invalidates` names this rack's integrations and nothing else. The edit does
+ * bump the rack's `config_version` -- `patch_integration` calls `affects` -- but
+ * the racks are patched by the live socket on every page that draws a version,
+ * and re-asking for them here would be a second listing fetch per keystroke-sized
+ * edit.
+ */
+export function usePatchIntegration(integrationId: number, daemonId: number) {
+  return useMutate<Integration, IntegrationBody>({
+    send: (body) =>
+      api.PATCH("/api/integrations/{integration_id}", {
+        params: { path: { integration_id: integrationId } },
+        body,
+      }),
+    invalidates: [integrationsKey(daemonId)],
+  })
+}
+
+/**
+ * Remove an integration, and the encrypted secret that only it referenced.
+ *
+ * Mounted once per rack section rather than on each card, for the reason
+ * `useDeleteTemplate` is: a delete that lands takes its own card off the page
+ * -- the invalidation is awaited before the mutation settles -- and a mutation
+ * living on that card would take the answer, including the racks that did not
+ * get it, with it. The name travels alongside the id so what is said afterwards
+ * can name a row that is no longer in the list.
+ */
+export function useDeleteIntegration(daemonId: number) {
+  return useMutate<Deleted, { id: number; name: string }>({
+    send: ({ id }) =>
+      api.DELETE("/api/integrations/{integration_id}", {
+        params: { path: { integration_id: id } },
+      }),
+    invalidates: [integrationsKey(daemonId)],
+  })
+}
+
+/**
+ * Dry-run every field's query and report what came back. **Not a preview.**
+ *
+ * `invalidates: []`, and for a stronger reason than `useDetect`'s: this route is
+ * not a `change` at all. It writes nothing, pushes nothing, and bumps no
+ * version -- it makes one outbound request per field from the server and reports
+ * the **first sample** of each result vector. The daemon's `reduce`, `label` and
+ * `strip` are deliberately not reimplemented server-side, because "a second copy
+ * of them in the server would be two answers to 'what does this screen show'
+ * that could disagree" -- so what comes back is evidence that the query reached
+ * something, and is not the number a panel will draw. Every caller of this hook
+ * has to say so.
+ *
+ * `useMutate` all the same, for the half of its job that applies: turning a
+ * refusal into an `ApiError` carrying the server's own sentence. The unservable
+ * header it also reads is always absent here, which parses to an empty list.
+ */
+export function useTestIntegration(integrationId: number) {
+  return useMutate<TestReport, void>({
+    send: () =>
+      api.POST("/api/integrations/{integration_id}/test", {
+        params: { path: { integration_id: integrationId } },
+      }),
+    invalidates: [],
+  })
+}
+
 /** The server's own settings: the timezone and the night window a screen overrides. */
 export type Settings = components["schemas"]["SettingsView"]
 

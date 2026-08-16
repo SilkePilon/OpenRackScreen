@@ -13,7 +13,7 @@ import { AmendTemplateDialog } from "@/routes/templates/AmendTemplateDialog"
 import { AssignPanelDialog } from "@/routes/templates/AssignPanelDialog"
 import { DeleteTemplateDialog } from "@/routes/templates/DeleteTemplateDialog"
 import { DetachPanelDialog } from "@/routes/templates/DetachPanelDialog"
-import { Landed } from "@/routes/templates/Landed"
+import { Landed } from "@/components/Landed"
 
 /**
  * How big the still is drawn, in CSS pixels.
