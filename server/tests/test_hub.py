@@ -1029,6 +1029,14 @@ async def test_the_wait_outlasts_the_longest_probe_a_rack_may_be_asked_for():
     """
     assert REQUEST_TIMEOUT > MAX_PROBE_HOLD_S, "a legal probe outlives its own answer"
     assert REQUEST_TIMEOUT - MAX_PROBE_HOLD_S > SEND_TIMEOUT, "and a round trip past it"
+    # The formula and not only the direction. The two lines above are satisfied
+    # by any number above thirty-five, so raising this one changes nothing that
+    # fails -- and nothing else would either: both callers of `request` pass
+    # their own timeout, so the default is a park no test in this suite spends.
+    # What it costs is paid by whoever omits the argument next, which is why the
+    # parameter's docstring says so and why the number is pinned to what it is
+    # built from rather than to a bound it happens to clear.
+    assert REQUEST_TIMEOUT == MAX_PROBE_HOLD_S + 2 * SEND_TIMEOUT
     # The pin is the two lines above: they compare symbols from two packages, so
     # a schema that raises the hold fails here rather than in front of an
     # operator. The line below is not that and should not be read as it -- the

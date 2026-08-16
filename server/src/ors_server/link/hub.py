@@ -371,6 +371,16 @@ class Hub:
         The default is the one that has to cover the worst legal case; see
         `REQUEST_TIMEOUT`.
 
+        **Both of those callers pass their own, so the default is a path nothing
+        in this server takes.** It is not dead -- it is what the *next* caller
+        gets by omitting an argument -- and that is the thing worth knowing
+        before omitting one: forty seconds is the worst legal probe, and a
+        question that is not a probe inherits a request handler parked for four
+        times as long as the answer it was waiting for could have taken, against
+        a rack that has simply gone quiet. `ors_server.api.daemons` names its two
+        waits and says what each is derived from; a third question should name
+        its own rather than take this.
+
         **Spec §6.4's "one probe at a time per rack" is not enforced here, and
         is owed by `POST /api/daemons/{id}/probe`.** Nothing below bounds how
         many waits one rack may hold, deliberately: §6.4's rule is about what a
