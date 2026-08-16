@@ -177,3 +177,40 @@ def test_the_environment_still_wins_over_the_packaged_directory(monkeypatch, tmp
 
     monkeypatch.setenv("ORS_WEB_DIR", str(tmp_path))
     assert resolve_web_dir() == tmp_path
+
+
+def test_the_data_directory_defaults_somewhere_a_normal_user_can_write(monkeypatch, tmp_path):
+    """`/var/lib/openrackscreen` needs root, and `uv tool install` is not root.
+
+    The whole point of publishing to PyPI is that `uv tool install ors-server
+    && ors-server` works. A default that raises PermissionError on the first
+    boot for anybody who has not read the environment table makes that false.
+    """
+    from ors_server.__main__ import resolve_data_dir
+
+    monkeypatch.delenv("ORS_DATA_DIR", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    assert resolve_data_dir() == tmp_path / "openrackscreen"
+
+
+def test_the_data_directory_falls_back_to_local_state_without_xdg(monkeypatch, tmp_path):
+    from ors_server.__main__ import resolve_data_dir
+
+    monkeypatch.delenv("ORS_DATA_DIR", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert resolve_data_dir() == tmp_path / ".local" / "state" / "openrackscreen"
+
+
+def test_the_environment_still_wins_for_the_data_directory(monkeypatch, tmp_path):
+    """The container and the systemd unit both set it, and both must keep winning."""
+    from ors_server.__main__ import resolve_data_dir
+
+    # XDG_STATE_HOME is set too, and deliberately not to the answer this test
+    # asserts: on a host that happens to leave it unset, checking ORS_DATA_DIR
+    # first and checking it second both land on the same path, and a reversed
+    # resolution order would pass this test by accident rather than be caught
+    # by it.
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("ORS_DATA_DIR", str(tmp_path / "explicit"))
+    assert resolve_data_dir() == tmp_path / "explicit"

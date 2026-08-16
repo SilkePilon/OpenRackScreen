@@ -21,6 +21,14 @@ services:
     ports:
       - "8080:8080"
     environment:
+      # `ors_server.__main__.resolve_data_dir` defaults to the user's own
+      # state directory as of M3c, precisely so a `uv tool install ors-server`
+      # never needs root. That default is wrong in exactly this container:
+      # without this line the database lands in the image's root home, the
+      # `ors-data` volume below stays empty, and every restart is a fresh
+      # server with no password set -- healthy-looking and silently losing
+      # everything.
+      - ORS_DATA_DIR=/var/lib/openrackscreen
       # The bare name, and not `ORS_SECRET_KEY: ${ORS_SECRET_KEY:-}`, which is
       # the obvious form and is wrong here: compose substitutes an unset
       # variable to the *empty string*, and the server refuses an empty key on

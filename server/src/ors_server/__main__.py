@@ -58,13 +58,32 @@ def resolve_web_dir() -> Path:
     return Path(from_environment) if from_environment else packaged_web_dir()
 
 
+def resolve_data_dir() -> Path:
+    """The database, the secret key and the stored credentials.
+
+    `~/.local/state/openrackscreen` and not `/var/lib/openrackscreen`, which
+    needs root: the point of publishing to an index is that `uv tool install
+    ors-server && ors-server` works, and a default only root can write makes
+    the first boot a PermissionError for everyone who has not read the
+    environment table. Both deployments that *should* use `/var/lib` -- the
+    container and the generated unit -- set `ORS_DATA_DIR` explicitly, which
+    keeps that path visible where it is chosen rather than implicit here.
+    """
+    from_environment = os.environ.get("ORS_DATA_DIR")
+    if from_environment:
+        return Path(from_environment)
+    state = os.environ.get("XDG_STATE_HOME")
+    base = Path(state) if state else Path.home() / ".local" / "state"
+    return base / "openrackscreen"
+
+
 def main() -> int:
     # First, before anything that can log: `create_app` reports a rebuilt
     # schema, and until this runs the root logger has no handler and every
     # record the server writes is discarded where nobody can see it.
     setup_logging(os.environ.get("ORS_LOG_LEVEL", "INFO"))
     settings = AppSettings(
-        data_dir=Path(os.environ.get("ORS_DATA_DIR", "/var/lib/openrackscreen")),
+        data_dir=resolve_data_dir(),
         secret_key=os.environ.get("ORS_SECRET_KEY"),
         web_dir=resolve_web_dir(),
     )

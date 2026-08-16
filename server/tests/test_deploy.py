@@ -292,6 +292,27 @@ def test_the_directory_that_is_mounted_is_the_one_the_server_writes_to(name, doc
 
 
 @pytest.mark.parametrize("name", COMPOSE_FILES)
+def test_both_compose_files_set_the_data_directory_explicitly(name):
+    """The code default moved to the user's state directory in M3c.
+
+    A compose file that relied on the old `/var/lib` default now puts the
+    database somewhere inside the container's root home, and the named volume
+    it mounts is a directory nothing writes to -- so every restart is a fresh
+    server with no password set, and the volume looks healthy and empty.
+    """
+    environment = server_service(name)["environment"]
+
+    assert isinstance(environment, list), (
+        "use the list form; see test_an_unset_key_is_passed_as_absent_rather_than_as_empty"
+    )
+    assert f"ORS_DATA_DIR={DATA_DIR}" in environment, (
+        f"{name} never sets ORS_DATA_DIR; the code default moved off /var/lib in M3c,"
+        " so this compose file's named volume would sit empty while the database"
+        " landed inside the container's own root home"
+    )
+
+
+@pytest.mark.parametrize("name", COMPOSE_FILES)
 def test_the_database_is_a_named_volume_and_not_the_daemons_state_directory(name):
     """`/var/lib/openrackscreen` on the host belongs to the daemon, not to this.
 
