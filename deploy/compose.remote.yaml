@@ -9,7 +9,6 @@
 # than localhost.
 services:
   server:
-    image: ghcr.io/silkepilon/openrackscreen:latest
     build:
       context: ..
       dockerfile: deploy/Dockerfile

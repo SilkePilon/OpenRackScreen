@@ -1,0 +1,11 @@
+# Run the published image instead of building this checkout.
+#
+#   docker compose -f deploy/compose.pi.yaml -f deploy/compose.image.yaml up -d
+#
+# Separate from the two files it overrides, and not merged into them, because
+# compose prefers `image:` over `build:` when a service names both -- so a file
+# carrying both never builds your working tree, and the symptom is a container
+# that starts, goes healthy, answers /api/health and 404s every page.
+services:
+  server:
+    image: ghcr.io/silkepilon/openrackscreen:latest

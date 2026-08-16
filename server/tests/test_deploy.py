@@ -38,6 +38,14 @@ DEPLOY = ROOT / "deploy"
 
 COMPOSE_FILES = ["compose.pi.yaml", "compose.remote.yaml"]
 
+# The override that pulls the published image instead of building the
+# checkout. Kept out of COMPOSE_FILES on purpose: it is not one of the two
+# files an operator brings up on its own, and every test that walks
+# COMPOSE_FILES asserting properties of *the server this container runs*
+# would otherwise have to special-case the one file whose `server` service
+# has no `build:` at all.
+COMPOSE_IMAGE = DEPLOY / "compose.image.yaml"
+
 # Where the database and the key live inside the container, and the one string
 # that has to be the same in three files. Named once here so that a test which
 # disagrees with the Dockerfile is a failure rather than two tests quietly
@@ -253,6 +261,37 @@ def served(monkeypatch, tmp_path, environment: dict[str, str]) -> dict[str, Any]
     assert main() == 0
 
     return captured[0]
+
+
+# --------------------------------------------------------------------------
+# `image:` versus `build:`
+# --------------------------------------------------------------------------
+
+
+def test_no_compose_file_names_both_an_image_and_a_build():
+    """Compose prefers `image:`, so naming both never builds your checkout.
+
+    Measured, not theorised: on this machine a 45-hour-old copy of
+    `ghcr.io/silkepilon/openrackscreen:latest` was started instead of the
+    working tree, went `healthy`, answered `/api/health`, and returned 404 for
+    every page -- because it predated the interface being in the image. The
+    README had to grow a paragraph telling people to pass `--build`. This test
+    is that paragraph, enforced.
+    """
+    for name in COMPOSE_FILES:
+        document = compose(name)
+        for service_name, service in document["services"].items():
+            assert not ("image" in service and "build" in service), (
+                f"{name}:{service_name} names both; compose will silently use the image"
+            )
+
+
+def test_the_image_override_pins_the_published_tag():
+    """Pulling a published image stays possible, and stays a thing you ask for."""
+    document = yaml.safe_load(COMPOSE_IMAGE.read_text())
+    service = document["services"]["server"]
+    assert service["image"] == "ghcr.io/silkepilon/openrackscreen:latest"
+    assert "build" not in service
 
 
 # --------------------------------------------------------------------------

@@ -13,7 +13,6 @@
 # -- and reaches this server on localhost.
 services:
   server:
-    image: ghcr.io/silkepilon/openrackscreen:latest
     build:
       context: ..
       dockerfile: deploy/Dockerfile
