@@ -132,6 +132,19 @@ error the moment the unit was written."""
 _USAGE_EXIT = 2
 """The conventional shell exit code for "you typed it wrong", and argparse's."""
 
+_RECLOCK_EXIT = 3
+"""`run` returns this, not 0, when a push changed the timezone and stopped the
+rack instead of applying it against a stale clock (see `_snapshot_handler`).
+
+Indistinguishable from 0 used to mean indistinguishable from a clean SIGTERM: a
+supervisor watching for a non-zero exit -- `Restart=on-failure`, anything that
+is not systemd, or nobody at all -- had no way to tell "stopped on purpose" from
+"stopped and needs re-clocking" apart. `Restart=always` still does the actual
+recovery on the shipped unit; this is for every caller that is not it, most of
+all a rack run by hand, which used to print nothing and sit dark with an exit
+code that claimed success.
+"""
+
 _STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 """What systemd sends on `stop`, and what a person at a terminal presses."""
 
@@ -696,6 +709,23 @@ def _run(args: argparse.Namespace) -> int:
             # function needs -- re-read rather than assumed, because
             # `join_a_server` is the one thing here allowed to have changed it.
             settings = load_link_settings(args.link)
+            if settings is None:
+                # `join_a_server`'s own docstring promises it blocks "until
+                # either the interface approves it or the operator interrupts
+                # the process" -- a clean return with nothing written, on
+                # abandonment, is a shape it names rather than rules out. The
+                # same file also documents a pairing that was written but
+                # cannot be read back (HIGH 2's own scenario). Checked here,
+                # explicitly, rather than leaving `_boot`'s
+                # `assert settings is not None` to catch it: an assert is a
+                # traceback under `python -u`, and silently vanishes under
+                # `python -O` into a row-3 boot nobody asked for -- neither is
+                # a message a person over SSH can act on.
+                print(
+                    f"{args.link}: still not paired after the join flow returned; nothing to run",
+                    file=sys.stderr,
+                )
+                return 1
             booted = _boot(args, settings)
     else:
         booted = _boot(args, settings)
@@ -718,7 +748,14 @@ def _run(args: argparse.Namespace) -> int:
         frames=frames,
     )
     _install_signal_handlers(supervisor.stop)
-    link = _link(args, settings, supervisor, clock, version, frames, config.timezone)
+    # Set by `_snapshot_handler` -- and only by it -- when a push stopped the
+    # rack because it changed the timezone, so this is how `run` tells that
+    # apart from an ordinary SIGTERM once `run_forever` returns. See
+    # `_RECLOCK_EXIT`.
+    reclock_requested = threading.Event()
+    link = _link(
+        args, settings, supervisor, clock, version, frames, config.timezone, reclock_requested
+    )
     pump = _frame_pump(frames, supervisor, link)
     try:
         # `run_forever` shuts down from its own `finally`, including when `start`
@@ -741,6 +778,19 @@ def _run(args: argparse.Namespace) -> int:
                 # loud because the only way to get here is the failure the link's
                 # own send watchdog exists for.
                 log.warning("the link thread did not stop; leaving it to the process exit")
+    if reclock_requested.is_set():
+        # Distinct from 0 on purpose -- see `_RECLOCK_EXIT`. `Restart=always`
+        # on the shipped unit does not read this at all; it restarts on any
+        # exit. Everything else that might be running this (`Restart=on-failure`,
+        # a different supervisor, a person at a terminal) does read it, and
+        # used to be told this was a clean stop.
+        print(
+            f"{args.link}: stopped because a push changed the timezone; restart this "
+            "rack to pick up the new clock (systemd's Restart=always already does this "
+            "on its own)",
+            file=sys.stderr,
+        )
+        return _RECLOCK_EXIT
     return 0
 
 
@@ -841,7 +891,7 @@ at two, and it is a daemon thread either way.
 
 
 def _snapshot_handler(
-    supervisor: Supervisor, booted_timezone: str
+    supervisor: Supervisor, booted_timezone: str, reclock_requested: threading.Event
 ) -> Callable[[DaemonConfig, int], None]:
     """Apply a push, unless it would run the rack against the wrong clock.
 
@@ -855,23 +905,55 @@ def _snapshot_handler(
     the wrong zone for the rest of the process: a UTC+2 rack sleeping at 01:00
     local and waking at 09:00 local, silently, until someone restarts it.
 
-    So a timezone-changing push is not applied here at all. The supervisor is
-    stopped instead, which under the shipped unit's `Restart=always` is exactly
-    the restart the mismatch needs -- `main` rebuilds the clock from the pushed
-    config's own timezone on the way back up. Nothing is lost by not applying
-    it first: `LinkClient._dispatch` still writes the cache and acks the push
-    once this returns without raising, so the next boot reads the new timezone
-    (and everything else in the push) straight out of that same snapshot,
-    without needing to be pushed again.
+    **Checked before any of that: can the pushed timezone even be resolved.**
+    `DaemonConfig.timezone` is a bare `str` -- nothing on the server or in the
+    schema validates it against the host's tzdata, because the server has no
+    way to know what tzdata any given rack ships -- so `Europe/Amsterdaam`, one
+    letter off, reaches here exactly as easily as a real zone does. Applied the
+    way a real mismatch is applied -- stop, let `Restart=always` bring it back
+    -- that typo is unrecoverable: the next boot rebuilds the clock from the
+    same unresolvable name, `_boot_from_cache` raises `ClockError`, falls back
+    to row 3, claims `config_version=None`, the server reads that as "never
+    got it" and pushes the same value again -- forever, panels dark, on a rack
+    that was healthy before the push landed. So this is raised instead of
+    swallowed into a stop: raising here reaches `LinkClient._config`, which
+    turns any exception out of `on_snapshot` into a `Nack` naming the reason
+    and leaves the supervisor untouched -- the push is refused, the person who
+    typed it sees why in the interface, and the rack keeps running the
+    configuration it already had.
+
+    A timezone that *does* resolve but differs from `booted_timezone` is a
+    different problem with a different fix: not applied here either, but the
+    supervisor is stopped instead of the push being refused, which under the
+    shipped unit's `Restart=always` is exactly the restart the mismatch needs
+    -- `main` rebuilds the clock from the pushed config's own timezone on the
+    way back up. Nothing is lost by not applying it first: `LinkClient._dispatch`
+    still writes the cache and acks the push once this returns without raising,
+    so the next boot reads the new timezone (and everything else in the push)
+    straight out of that same snapshot, without needing to be pushed again.
+    `reclock_requested` is set first, so `run` can tell this stop apart from an
+    ordinary SIGTERM once `run_forever` returns and answer with `_RECLOCK_EXIT`
+    rather than 0 -- see that constant and `run`'s own use of it.
     """
 
     def handle(snapshot: DaemonConfig, pushed: int) -> None:
         if snapshot.timezone != booted_timezone:
+            try:
+                system_clock(snapshot.timezone)
+            except ClockError:
+                log.error(
+                    "a push named a timezone this host cannot resolve; refusing "
+                    "it so the rack keeps running instead of boot-looping into "
+                    "the same failure on every restart",
+                    extra={"was": booted_timezone, "pushed": snapshot.timezone},
+                )
+                raise
             log.warning(
                 "a push changed the timezone, which a running rack cannot pick up; "
                 "stopping so it comes back clocked correctly",
                 extra={"was": booted_timezone, "now": snapshot.timezone},
             )
+            reclock_requested.set()
             supervisor.stop()
             return
         supervisor.apply(snapshot)
@@ -887,6 +969,7 @@ def _link(
     version: int | None,
     frames: FrameStream,
     booted_timezone: str,
+    reclock_requested: threading.Event,
 ) -> LinkClient | None:
     """The link to the server, if this rack has ever been paired. Raises nothing.
 
@@ -897,20 +980,40 @@ def _link(
     optimistic direction is a push the server skips and a rack left showing the
     previous configuration forever.
 
-    `booted_timezone` is `config.timezone` as `_run` booted it -- handed on to
-    `_snapshot_handler`, which needs it for the one thing a push may not do to a
-    running rack: change it. See that function's docstring.
+    `booted_timezone` is `config.timezone` as `_run` booted it, and
+    `reclock_requested` is `_run`'s own event -- both handed on to
+    `_snapshot_handler`, which needs the first for the one thing a push may not
+    do to a running rack (change it) and sets the second when that is why it
+    stopped. See that function's docstring.
+
+    `version` also decides what the log line says when `settings` is `None`,
+    and not only what `config_version` claims. `settings` is `None` here for
+    two different reasons that a flat "no pairing" would conflate: a rack that
+    really was never paired (in which case `version` is `None` too -- nothing
+    to boot from but the file), and a rack whose *pairing* was unreadable
+    while a good cached snapshot sat right beside it (`version` is then the
+    cache's own, not `None`) -- `_boot_from_cache`'s docstring calls this out
+    by name. That second rack is not running from its config file; it may not
+    even have one.
     """
     if settings is None:
-        log.info(
-            "this rack has no pairing; running from its config file", extra={"path": str(args.link)}
-        )
+        if version is not None:
+            log.info(
+                "this rack's pairing could not be read, but a cached snapshot beside "
+                "it was usable; running from that cache, not from a config file",
+                extra={"path": str(args.link), "config_version": version},
+            )
+        else:
+            log.info(
+                "this rack has no pairing; running from its config file",
+                extra={"path": str(args.link)},
+            )
         return None
     try:
         client = LinkClient(
             settings=settings,
             settings_path=Path(args.link),
-            on_snapshot=_snapshot_handler(supervisor, booted_timezone),
+            on_snapshot=_snapshot_handler(supervisor, booted_timezone, reclock_requested),
             stop=supervisor.stop_event,
             clock=clock,
             config_version=version,

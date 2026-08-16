@@ -1037,6 +1037,7 @@ def test_the_detect_and_probe_handlers_are_wired_into_the_link(
             None,
             frames,
             "UTC",
+            threading.Event(),
         )
 
         assert client is not None

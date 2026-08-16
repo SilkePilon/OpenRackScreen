@@ -15,13 +15,20 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
-from ors_daemon.__main__ import DEFAULT_LINK_PATH, _command_handler, _frame_pump, main
-from ors_daemon.clock import system_clock
+from ors_daemon.__main__ import (
+    _RECLOCK_EXIT,
+    DEFAULT_LINK_PATH,
+    _command_handler,
+    _frame_pump,
+    main,
+)
+from ors_daemon.clock import ClockError, system_clock
 from ors_daemon.config import load_cached_snapshot, resolve_screens
 from ors_daemon.frames import FramePump, FrameStream
 from ors_daemon.link import LinkSettings, write_link_settings
@@ -53,13 +60,13 @@ def write_cache(path: Path, version: int = 12, snapshot: Any = None) -> Path:
     return path
 
 
-def write_config(tmp_path: Path, name: str = "LOCAL") -> Path:
+def write_config(tmp_path: Path, name: str = "LOCAL", timezone: str = "UTC") -> Path:
     path = tmp_path / "rack.yaml"
     path.write_text(
         yaml.safe_dump(
             {
                 "version": 1,
-                "timezone": "UTC",
+                "timezone": timezone,
                 "night": {"enabled": False},
                 "screens": [
                     {
@@ -80,6 +87,11 @@ class RecordingSupervisor:
     """Stands in for the real one so `run` returns instead of running forever."""
 
     instances: list[RecordingSupervisor] = []
+    # Set by a test that needs something to happen *during* `run_forever` --
+    # a real one blocks until `stop`, and a push arriving mid-block is exactly
+    # what `_run`'s `_RECLOCK_EXIT` handling needs to observe. This fake
+    # returns at once, so without a hook there is no "during" to speak of.
+    run_forever_hook: Callable[[RecordingSupervisor], None] | None = None
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
@@ -94,6 +106,8 @@ class RecordingSupervisor:
 
     def run_forever(self) -> None:
         self.ran += 1
+        if RecordingSupervisor.run_forever_hook is not None:
+            RecordingSupervisor.run_forever_hook(self)
 
     def stop(self) -> None:
         self.stops += 1
@@ -148,6 +162,7 @@ class FakeLink:
 @pytest.fixture(autouse=True)
 def _fresh_doubles(monkeypatch: pytest.MonkeyPatch) -> None:
     RecordingSupervisor.instances.clear()
+    RecordingSupervisor.run_forever_hook = None
     FakeLink.instances.clear()
     monkeypatch.setattr("ors_daemon.__main__.Supervisor", RecordingSupervisor)
     monkeypatch.setattr("ors_daemon.__main__.LinkClient", FakeLink)
@@ -585,8 +600,32 @@ def test_running_unpaired_without_config_fails_cleanly_not_with_a_traceback(
     assert RecordingSupervisor.instances == []
 
 
+def test_join_a_server_returning_unpaired_fails_cleanly_not_with_an_assert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """MEDIUM-C. `join_a_server`'s own docstring promises it blocks "until
+    either the interface approves it or the operator interrupts the process"
+    -- a clean return with nothing written, on abandonment, is a shape that
+    docstring names rather than rules out. So is a pairing written but then
+    unreadable, which is HIGH 2's own scenario from round 1.
+
+    Both used to fall through to `_boot`'s `assert settings is not None`,
+    which is an `AssertionError` traceback under an ordinary interpreter and
+    silently vanishes under `python -O` into an unrequested row-3 boot.
+    Neither is a message a person over SSH can act on; `_run` has to check
+    this itself, explicitly, right after the re-read.
+    """
+    monkeypatch.setattr("ors_daemon.__main__.join_a_server", lambda args: None)
+
+    assert run_no_config(tmp_path) == 1
+    error = capsys.readouterr().err
+    assert "Traceback" not in error
+    assert RecordingSupervisor.instances == [], "nothing was ever started"
+
+
+@pytest.mark.parametrize("extra_args", [(), ("--no-discovery",)], ids=["default", "--no-discovery"])
 def test_an_unreadable_pairing_still_boots_from_a_good_cached_snapshot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_args: tuple[str, ...]
 ) -> None:
     """`load_link_settings` returns `None` for a corrupt or unreadable pairing
     file exactly the way it does for an absent one -- its own docstring: "a
@@ -599,6 +638,13 @@ def test_an_unreadable_pairing_still_boots_from_a_good_cached_snapshot(
     not fall into the join flow -- and, before Task 15, into a traceback --
     while a perfectly good `snapshot.json` sits right beside the pairing it
     cannot read.
+
+    LOW-E: parametrized over `--no-discovery` too, not only the default. Row
+    5's refusal -- discovery off, no `--server` -- has to be decided *after*
+    trying the cache, not evaluated first with the cache never reached; the
+    reworded `--no-discovery` help text and the README both claim the cache
+    gate applies to row 5 as well, and nothing before this exercised the two
+    together.
     """
     link = tmp_path / "link.json"
     link.write_text("{ not valid json")  # load_link_settings returns None for this
@@ -607,7 +653,7 @@ def test_an_unreadable_pairing_still_boots_from_a_good_cached_snapshot(
     joined: list[Any] = []
     monkeypatch.setattr("ors_daemon.__main__.join_a_server", lambda *a, **k: joined.append(True))
 
-    assert run_no_config(tmp_path) == 0
+    assert run_no_config(tmp_path, *extra_args) == 0
     assert joined == [], "a usable cached snapshot must be tried before giving up on this rack"
     assert [
         screen.config.name for screen in RecordingSupervisor.instances[-1].kwargs["screens"]
@@ -792,8 +838,41 @@ def test_a_push_that_changes_the_timezone_stops_the_rack_instead_of_running_it_m
     So a timezone-changing push must not be applied here at all: the
     supervisor is stopped instead, which the shipped unit's `Restart=always`
     turns into the restart the mismatch actually needs.
+
+    MEDIUM-D: booted from a *non-UTC* config and pushed `UTC`, deliberately the
+    reverse of the obvious way to write this. Every other test in this suite
+    boots `UTC`, so a mutant that replaced `booted_timezone` at its call site
+    with the literal `"UTC"` still passed the whole daemon suite -- nothing
+    pinned that `_snapshot_handler` is comparing against the timezone the rack
+    actually booted with rather than the schema's own default. Booting
+    `Europe/Amsterdam` and pushing `UTC` fails under that mutant (`"UTC" ==
+    "UTC"` looks like no change at all) exactly where the UTC-booted version of
+    this test cannot tell the difference.
     """
-    write_config(tmp_path)  # timezone: UTC
+    write_config(tmp_path, timezone="Europe/Amsterdam")
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+    supervisor = RecordingSupervisor.instances[-1]
+    pushed = DaemonConfig.model_validate({**SNAPSHOT, "timezone": "UTC"})
+
+    FakeLink.instances[0].kwargs["on_snapshot"](pushed, 9)
+
+    assert supervisor.applied == [], "must not run against a clock built for the old zone"
+    assert supervisor.stops == 1, "left to restart, which is what re-clocks it"
+
+
+def test_a_push_matching_the_timezone_the_rack_actually_booted_with_applies_normally(
+    tmp_path: Path,
+) -> None:
+    """MEDIUM-D's converse, and the other half of the same mutant: a rack
+    booted `Europe/Amsterdam` that gets pushed the exact same zone back has to
+    apply it, not stop -- a rack that cannot tell "same zone" from "different
+    zone" any way but "differs from a hardcoded UTC" would stop on *every*
+    push it was ever sent, forever, once it was ever paired to anything but a
+    UTC-configured server.
+    """
+    write_config(tmp_path, timezone="Europe/Amsterdam")
     (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
 
     assert run(tmp_path) == 0
@@ -802,8 +881,76 @@ def test_a_push_that_changes_the_timezone_stops_the_rack_instead_of_running_it_m
 
     FakeLink.instances[0].kwargs["on_snapshot"](pushed, 9)
 
-    assert supervisor.applied == [], "must not run against a clock built for the old zone"
-    assert supervisor.stops == 1, "left to restart, which is what re-clocks it"
+    assert supervisor.applied == [pushed], "same timezone as booted; must apply, not stop"
+    assert supervisor.stops == 0
+
+
+def test_a_push_with_an_unresolvable_timezone_is_refused_not_boot_looped(tmp_path: Path) -> None:
+    """MEDIUM-B. `DaemonConfig.timezone` is a bare `str` with no validation
+    against the host's tzdata -- the server has no way to know what any given
+    rack ships -- so `Europe/Amsterdaam`, one letter off, reaches here exactly
+    as easily as a real zone does.
+
+    Treated as an ordinary mismatch -- stop, let `Restart=always` bring it back
+    -- that typo boot-loops a rack that was healthy: the next boot rebuilds the
+    clock from the very same unresolvable name, `_boot_from_cache` raises
+    `ClockError`, falls back to row 3, claims `config_version=None`, and the
+    server reads that as "never got it" and pushes the identical broken value
+    again. Forever, panels dark.
+
+    So this is raised instead of swallowed into a stop. `LinkClient._config`
+    turns any exception out of `on_snapshot` into a `Nack` naming the reason
+    and leaves the running configuration untouched -- refused, not applied,
+    and not stopped either.
+    """
+    write_config(tmp_path)  # timezone: UTC
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+    supervisor = RecordingSupervisor.instances[-1]
+    pushed = DaemonConfig.model_validate({**SNAPSHOT, "timezone": "Europe/Amsterdaam"})
+
+    with pytest.raises(ClockError):
+        FakeLink.instances[0].kwargs["on_snapshot"](pushed, 9)
+
+    assert supervisor.applied == [], "an unresolvable timezone must not be applied either"
+    assert supervisor.stops == 0, "a stop only helps if the next boot could rebuild the clock"
+
+
+def test_a_timezone_reclock_stop_exits_nonzero_not_like_a_clean_stop(tmp_path: Path) -> None:
+    """MEDIUM-A. `run` used to return 0 unconditionally, so a stop caused by a
+    timezone-changing push was indistinguishable from a clean SIGTERM. Only
+    `Restart=always` recovers a rack that exits that way; `Restart=on-failure`,
+    any supervisor that is not systemd, and a rack run by hand at a terminal
+    all read exit 0 as success and never re-clock at all -- the hand-run rack
+    prints nothing and just stops.
+
+    The push has to land *during* `run_forever`, not after `run` has already
+    returned -- `run_forever_hook` is what lets this fake simulate that,
+    calling the link's `on_snapshot` from inside the call `_run` is blocked on
+    in a real process.
+    """
+
+    def push_a_mismatched_timezone(supervisor: RecordingSupervisor) -> None:
+        pushed = DaemonConfig.model_validate({**SNAPSHOT, "timezone": "Europe/Amsterdam"})
+        FakeLink.instances[-1].kwargs["on_snapshot"](pushed, 9)
+
+    write_config(tmp_path)  # timezone: UTC
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+    RecordingSupervisor.run_forever_hook = push_a_mismatched_timezone
+
+    assert run(tmp_path) == _RECLOCK_EXIT
+    assert RecordingSupervisor.instances[-1].stops == 1
+
+
+def test_a_clean_stop_still_exits_zero(tmp_path: Path) -> None:
+    """The pin for the test above: `_RECLOCK_EXIT` must be reserved for a
+    re-clock, not handed out for an ordinary stop that never touched a push at
+    all."""
+    write_config(tmp_path)
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
 
 
 def test_the_link_claims_the_version_the_rack_is_actually_running(tmp_path: Path) -> None:
