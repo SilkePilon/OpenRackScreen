@@ -214,3 +214,25 @@ def test_the_environment_still_wins_for_the_data_directory(monkeypatch, tmp_path
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.setenv("ORS_DATA_DIR", str(tmp_path / "explicit"))
     assert resolve_data_dir() == tmp_path / "explicit"
+
+
+def test_an_empty_environment_variable_is_not_an_answer(monkeypatch, tmp_path):
+    """`- ORS_DATA_DIR=` in a compose file, or `Environment=ORS_WEB_DIR=` in a
+    unit, is a typo that reaches the process as an empty string rather than as
+    an unset variable.
+
+    Both resolvers treat it as unset and fall through to their default, which
+    is the safe reading -- `Path("")` is `Path(".")`, so honouring it would put
+    the database in whatever directory the server happened to be started from
+    and look for the interface there too. Safe, and until now unpinned in
+    either function: `if from_environment:` swapped for
+    `if from_environment is not None:` passed every other test in this file.
+    """
+    from ors_server.__main__ import packaged_web_dir, resolve_data_dir, resolve_web_dir
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("ORS_DATA_DIR", "")
+    monkeypatch.setenv("ORS_WEB_DIR", "")
+
+    assert resolve_data_dir() == tmp_path / "state" / "openrackscreen"
+    assert resolve_web_dir() == packaged_web_dir()
