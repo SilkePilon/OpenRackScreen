@@ -15,6 +15,8 @@ other. There is exactly one list of what this repository publishes, and
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -119,6 +121,17 @@ def test_version_modules_are_the_four_with_a_dunder_version():
 def test_every_published_package_has_a_pyproject():
     for name, path in PACKAGES.items():
         assert path.is_file(), f"{name} is published but {path} does not exist"
+        # The release workflow's "Group distributions by package" step derives
+        # its target directory from this `PACKAGES` key, but the *actual*
+        # built filename comes from `project.name` -- `uv build` names the
+        # wheel after the latter, not the former. If the two ever disagree,
+        # the grouping glob (built on the key) stops matching the file (built
+        # on the name), and that distribution is left ungrouped. This is now
+        # load-bearing for publishing and was previously unasserted.
+        assert _document(path)["project"]["name"] == name, (
+            f"{path} declares project.name != {name!r}; the release workflow's "
+            "grouping step assumes these agree"
+        )
 
 
 def test_all_five_versions_agree():
@@ -208,6 +221,216 @@ def _find_step(steps: list[dict], predicate, description: str) -> dict:
     step = next((s for s in steps if predicate(s)), None)
     assert step is not None, f"no step found: {description}"
     return step
+
+
+def _heredoc_script(run: str) -> str:
+    """Pull the Python source out of a `uv run python - <<'PY' ... PY` step's
+    `run:` block. Tests that want to check *behaviour* -- what the grouping
+    step actually does to a `dist/` directory, not just what its YAML looks
+    like -- execute this, rather than re-implementing the step's logic
+    in the test. A second implementation is exactly the kind of thing that
+    silently stops matching the first the day only one of them is edited."""
+    match = re.search(r"<<'PY'\n(.*)\nPY\n?$", run, re.DOTALL)
+    assert match, "run step is not a `uv run python - <<'PY' ... PY` heredoc"
+    return match.group(1)
+
+
+def _built_filenames(version: str = TARGET_VERSION) -> list[str]:
+    """The sdist/wheel filenames `uv build --all-packages` actually produces
+    for every published package, at `version` -- underscored, per PEP 503
+    normalisation, regardless of the hyphenated `PACKAGES` key."""
+    filenames = []
+    for name in PACKAGES:
+        underscored = name.replace("-", "_")
+        filenames.append(f"{underscored}-{version}.tar.gz")
+        filenames.append(f"{underscored}-{version}-py3-none-any.whl")
+    return filenames
+
+
+def _run_grouping_script(tmp_path: Path, filenames: list[str]) -> subprocess.CompletedProcess[str]:
+    """Actually execute the release workflow's "Group distributions by
+    package" step against a synthetic `dist/` populated with `filenames`
+    (empty files -- the step never reads content, only names), in a
+    directory carrying its own copy of `tools/version.py` so the script's own
+    `sys.path.insert(0, "tools")` resolves exactly as it does in CI.
+    """
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir()
+    (tools_dir / "version.py").write_text((ROOT / "tools/version.py").read_text())
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    for filename in filenames:
+        (dist_dir / filename).write_bytes(b"")
+
+    document = _release_workflow()
+    group = _find_step(
+        document["jobs"]["build"]["steps"],
+        lambda s: s.get("name") == "Group distributions by package",
+        "distribution-grouping step",
+    )
+    script = _heredoc_script(group["run"])
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_the_release_workflow_groups_every_built_distribution(tmp_path: Path):
+    """The happy path, run for real: every one of the five packages' sdist
+    and wheel lands in its own `dist/<name>/` (hyphenated, matching the
+    `PACKAGES` key -- not `dist/<name_with_underscores>/`, which is what the
+    built *filenames* use), and nothing is left at `dist/`'s top level.
+    Executing the actual script, rather than asserting on the YAML around it,
+    is what catches a grouping step whose target-directory naming quietly
+    drifts from the `PACKAGES` key it is supposed to match -- keeping this
+    step's name, its `PACKAGES` import, and every publish step's
+    `packages-dir` all unchanged, but a directory the grouping step wrote to
+    dist/ors_schema/ (underscored) while every publish step still reads
+    dist/ors-schema/ (hyphenated) -- would fail loudly here instead of
+    silently on a real tag.
+    """
+    result = _run_grouping_script(tmp_path, _built_filenames())
+    assert result.returncode == 0, result.stderr
+
+    dist_dir = tmp_path / "dist"
+    for name in PACKAGES:
+        underscored = name.replace("-", "_")
+        grouped = sorted(p.name for p in (dist_dir / name).iterdir())
+        expected = sorted(
+            [
+                f"{underscored}-{TARGET_VERSION}.tar.gz",
+                f"{underscored}-{TARGET_VERSION}-py3-none-any.whl",
+            ]
+        )
+        assert grouped == expected, f"{name}: grouped into {grouped}, expected {expected}"
+
+    leftover = sorted(p.name for p in dist_dir.iterdir() if p.suffix in {".whl", ".gz"})
+    assert leftover == [], f"left ungrouped at dist/'s top level: {leftover}"
+
+
+def test_the_release_workflow_grouping_step_refuses_a_stray_distribution(tmp_path: Path):
+    """A built distribution matching no `PACKAGES` key -- a sixth workspace
+    member, or a `project.name` that drifted from its `PACKAGES` key -- must
+    not be silently left at `dist/`'s top level. Left there, `upload-artifact`
+    still uploads it and no `publish` step ever names it: a green workflow
+    that quietly never published it.
+    """
+    filenames = [*_built_filenames(), "ors_widget-0.1.0-py3-none-any.whl"]
+    result = _run_grouping_script(tmp_path, filenames)
+    assert result.returncode != 0, "a stray distribution must fail the grouping step"
+    assert "ors_widget" in result.stderr, result.stderr
+
+
+def test_the_release_workflow_grouping_step_refuses_a_missing_distribution(tmp_path: Path):
+    """A package whose files all fail to match -- a build that silently
+    produced zero (or only one) of its sdist/wheel pair -- must not pass
+    through to an empty (or half-empty) `dist/<name>/` and a `publish` step
+    that runs, and reports success, over nothing.
+    """
+    filenames = [f for f in _built_filenames() if not f.startswith("ors_schema-")]
+    result = _run_grouping_script(tmp_path, filenames)
+    assert result.returncode != 0, "a package missing its distributions must fail the grouping step"
+    assert "ors-schema" in result.stderr, result.stderr
+
+
+def test_the_release_workflow_publish_steps_read_the_directories_grouping_creates():
+    """Nothing previously tied the publish steps' `packages-dir` to the
+    directories the grouping step actually creates, or to the artifact that
+    `upload-artifact` actually uploads: `packages-dir` could name a directory
+    the grouping step never populates, or the artifact's `path:` could be
+    narrowed to a single package's subdirectory, and every existing test
+    stayed green, because none of them read `packages-dir` past its basename,
+    or looked at `upload-artifact`'s `path`, or the grouping step's own
+    existence, all at once. Both failures are loud -- but only against a real
+    `v*` tag, which is the one place this project cannot afford to find out.
+    """
+    document = _release_workflow()
+    build_steps = document["jobs"]["build"]["steps"]
+    publish_steps = [
+        step
+        for step in document["jobs"]["publish"]["steps"]
+        if step.get("uses", "").startswith("pypa/gh-action-pypi-publish")
+    ]
+    assert publish_steps, "publish must actually publish something"
+
+    group = _find_step(
+        build_steps,
+        lambda s: s.get("name") == "Group distributions by package",
+        "distribution-grouping step",
+    )
+    assert "PACKAGES" in group["run"], (
+        "the grouping step must derive its directories from tools.version.PACKAGES, "
+        "not a second, hand-copied list"
+    )
+
+    assert {step["with"]["packages-dir"] for step in publish_steps} == {
+        f"dist/{name}/" for name in PACKAGES
+    }, "every publish step's packages-dir must name a directory the grouping step creates"
+
+    upload = _find_step(
+        build_steps,
+        lambda s: s.get("uses", "").startswith("actions/upload-artifact"),
+        "upload-artifact step",
+    )
+    assert upload["with"]["path"] == "dist/", (
+        "the uploaded artifact must carry every package's grouped directory, not one alone"
+    )
+
+
+def test_the_release_workflow_publish_steps_pin_skip_existing():
+    """`skip-existing: true` is what makes a rerun after a partial publish
+    failure safe: a package already on PyPI is skipped rather than rejected
+    as a duplicate. Losing it from even one of the five steps turns the
+    resume this workflow depends on into a hard failure the first time it is
+    exercised for real.
+    """
+    document = _release_workflow()
+    publish_steps = [
+        step
+        for step in document["jobs"]["publish"]["steps"]
+        if step.get("uses", "").startswith("pypa/gh-action-pypi-publish")
+    ]
+    assert publish_steps, "publish must actually publish something"
+    assert all(step["with"].get("skip-existing") is True for step in publish_steps), (
+        "skip-existing must stay pinned to true on every publish step"
+    )
+
+
+def test_the_release_workflow_warns_before_a_silent_skip():
+    """`skip-existing: true` is correct for its intended case -- a resume
+    after a partial failure -- but it makes another case silent: delete and
+    re-push a `v*` tag at a different commit to "fix" a released bug, and all
+    five uploads are skipped as duplicates, the workflow reports success, and
+    PyPI still serves the old artifacts. This asserts the step this repo
+    added to make that run's log visibly different: it must run before any
+    package is actually published, it must actually query PyPI rather than
+    just print a static message, and it must not be able to fail the job --
+    a `publish` step that would otherwise succeed must never be blocked by a
+    PyPI hiccup answering this check.
+    """
+    document = _release_workflow()
+    steps = document["jobs"]["publish"]["steps"]
+    warn = _find_step(
+        steps,
+        lambda s: s.get("name") == "Warn about packages already published at this version",
+        "pre-publish PyPI check",
+    )
+    assert "continue-on-error" not in warn, (
+        "the warning step must not need continue-on-error -- it must not raise at all"
+    )
+    assert "if" not in warn, "the warning step must not be conditionally skipped"
+    assert "pypi.org" in warn["run"], "the warning step must actually query PyPI"
+    assert "raise" not in warn["run"], "the warning step must never fail the job"
+
+    publish_steps = [
+        step for step in steps if step.get("uses", "").startswith("pypa/gh-action-pypi-publish")
+    ]
+    assert publish_steps, "publish must actually publish something"
+    assert steps.index(warn) < min(steps.index(step) for step in publish_steps), (
+        "the warning must run before any package is published"
+    )
 
 
 def test_the_release_workflow_refuses_a_wheel_without_the_interface():
@@ -302,14 +525,24 @@ def test_the_release_workflow_only_triggers_on_version_tags():
     """YAML 1.1's bareword booleans mean `on:` parses under `yaml.safe_load`
     to the boolean key `True`, not the string `"on"` -- a trap for anyone
     reading this trigger back out with `document["on"]`, which raises
-    `KeyError` and checks nothing.
+    `KeyError` and checks nothing. A bare `document[True]` is no better: it
+    swaps one unexplained `KeyError` for another, in the same file whose own
+    docstring argues against exactly that failure mode. Quoting the key as
+    `"on":` in the workflow -- valid YAML, identical to what GitHub Actions
+    parses, and what `yamllint`'s `truthy` rule tells people to do -- would
+    trip either bare lookup; `.get` against both keys, plus an explaining
+    assert, does not.
 
     Firing on a branch push instead of a tag push would let CI attempt to
     publish on every commit merged to a branch, and publishing is
     irreversible per version.
     """
     document = _release_workflow()
-    trigger = document[True]
+    trigger = document.get(True, document.get("on"))
+    assert trigger is not None, (
+        "release.yml has no `on:` trigger under either the YAML-1.1 boolean "
+        "key or a literal string 'on' key"
+    )
     assert isinstance(trigger, dict) and trigger.get("push", {}).get("tags") == ["v*"], (
         "release must trigger only on pushes of version tags (on: push: tags: ['v*'])"
     )
