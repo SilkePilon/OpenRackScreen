@@ -36,9 +36,12 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -47,6 +50,7 @@ from ors_render import RenderContext, render_screen
 from ors_schema.daemon import DaemonConfig, DisplayConfig
 from ors_schema.link import Command
 
+from ors_daemon import __version__
 from ors_daemon.clock import Clock, ClockError, system_clock
 from ors_daemon.config import (
     ConfigError,
@@ -59,6 +63,7 @@ from ors_daemon.config import (
 from ors_daemon.displays import DisplayBackend, build_display
 from ors_daemon.frames import FramePump, FrameStream
 from ors_daemon.hardware import SPI_ROOT, detect_handler, probe_handler
+from ors_daemon.install import InstallReport, Roots, install, uninstall
 from ors_daemon.link import (
     LinkClient,
     LinkError,
@@ -168,14 +173,56 @@ def _parser() -> argparse.ArgumentParser:
         help="seconds to hold the ordinals on the glass (default: until interrupted)",
     )
 
+    install_command = subparsers.add_parser(
+        "install", help="set this machine up to run the daemon as a service"
+    )
+    install_command.add_argument(
+        "--no-spi",
+        action="store_true",
+        help="do not touch /boot/firmware/config.txt. Both SPI buses are enabled by "
+        "default, because SPI1 being off is the most common reason every panel comes "
+        "up unavailable and nothing reports it.",
+    )
+    install_command.add_argument(
+        "--prefix",
+        type=Path,
+        default=Path("/opt/openrackscreen"),
+        help="where to build the venv the service runs from (default: %(default)s)",
+    )
+    install_command.add_argument(
+        "--use-current-interpreter",
+        action="store_true",
+        help="point the unit at the ors-daemon already running instead of building a "
+        "venv. Refused if the service user could not execute it.",
+    )
+    install_command.add_argument(
+        "--upgrade",
+        action="store_true",
+        help="reinstall into the prefix at this version and restart the service",
+    )
+
+    uninstall_command = subparsers.add_parser(
+        "uninstall", help="stop the service and remove the unit and the venv"
+    )
+    uninstall_command.add_argument(
+        "--purge",
+        action="store_true",
+        help="also delete /var/lib/openrackscreen, which holds the pairing and this "
+        "rack's identity. That costs a re-approval in the interface.",
+    )
+
     # Added last and to every subparser that has a config to read, so `--config`
     # reads the same wherever it appears rather than being positional in one
     # command and not another. `connect` is the exception and deliberately so:
     # pairing happens before a rack has a configuration, and afterwards the
     # configuration comes from the server -- requiring it here would make the
     # first thing an operator runs the one thing they cannot yet supply.
+    # `install` and `uninstall` are exceptions for the same underlying reason:
+    # neither reads a rack.yaml, so requiring one here would make the very
+    # first command anyone runs on a fresh machine ask for a file that has no
+    # reason to exist yet.
     for name, sub in subparsers.choices.items():
-        if name != "connect":
+        if name not in ("connect", "install", "uninstall"):
             sub.add_argument("--config", required=True, type=Path, help="path to rack.yaml")
     return parser
 
@@ -208,6 +255,14 @@ def main(argv: list[str] | None = None) -> int:
         return _connect(args)
     if args.command == "run":
         return _run(args)
+    if args.command in ("install", "uninstall"):
+        # Checked here rather than inside `install.install`, which is a pure
+        # function over injected roots and must stay callable from a test
+        # that is not root -- which is every test in that suite.
+        if os.geteuid() != 0:
+            print(f"ors-daemon {args.command} has to run as root.", file=sys.stderr)
+            return _USAGE_EXIT
+        return _install(args) if args.command == "install" else _uninstall(args)
 
     try:
         config = load_config(args.config)
@@ -360,6 +415,89 @@ def _warn_if_the_daemon_will_not_be_able_to_read_it(path: Path) -> None:
         f"run unpaired. `chown openrackscreen: {path}`, or run this command as that user.",
         file=sys.stderr,
     )
+
+
+@dataclass(frozen=True)
+class _SubprocessRunner:
+    """The real `install.Runner`: every argv goes through `subprocess.run`.
+
+    The only implementation of `install.Runner` this module ships that
+    touches the machine it runs on -- everything under `daemon/tests/` uses
+    `FakeRunner` instead, which is what keeps `install`'s own test suite off
+    the machine running it.
+    """
+
+    def run(self, argv: list[str]) -> int:
+        return subprocess.run(argv).returncode
+
+
+def _real_roots(prefix: Path) -> Roots:
+    """`Roots` built from the real filesystem, for the CLI's own use.
+
+    Nothing else in this module names `/etc`, `/boot`, `/var/lib` or
+    `/etc/systemd/system` -- `install.install` and `install.uninstall` are
+    parameterised on `Roots` precisely so that only this one function, called
+    from production code and never from a test, has to.
+    """
+    return Roots(
+        etc=Path("/etc"),
+        boot=Path("/boot"),
+        state=Path("/var/lib"),
+        prefix=prefix,
+        systemd=Path("/etc/systemd/system"),
+    )
+
+
+def _print_install_report(report: InstallReport) -> None:
+    """The short code, the SPI diff and whether a reboot is owed.
+
+    The short code is the one thing a person standing at the rack reads off
+    this terminal and compares against what the web interface shows before
+    approving it -- if this function does not print it, that whole approval
+    gesture has nothing to check against.
+    """
+    if report.short_code:
+        print(f"short code: {report.short_code}")
+    print(f"unit: {report.unit_path}")
+    print(f"service user: {'created' if report.created_user else 'already existed'}")
+    if report.reboot_needed:
+        print("SPI: config.txt updated; a reboot is needed for the new setting to take effect")
+    else:
+        print("SPI: no change (already enabled, or --no-spi was passed)")
+    print(f"reboot needed: {'yes' if report.reboot_needed else 'no'}")
+    if report.warnings:
+        print(report.warnings_text(), file=sys.stderr)
+    if report.failed:
+        print("install did not finish cleanly; see the warnings above.", file=sys.stderr)
+
+
+def _install(args: argparse.Namespace) -> int:
+    """Build the real `Roots` and a real `Runner`, then run `install.install`."""
+    executable = None
+    if args.use_current_interpreter:
+        executable = Path(sys.argv[0])
+    report = install(
+        _real_roots(args.prefix),
+        _SubprocessRunner(),
+        version=__version__,
+        now=datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
+        enable_spi_step=not args.no_spi,
+        use_current_interpreter=args.use_current_interpreter,
+        executable=executable,
+    )
+    _print_install_report(report)
+    return 1 if report.failed else 0
+
+
+def _uninstall(args: argparse.Namespace) -> int:
+    """Build the real `Roots` and a real `Runner`, then run `install.uninstall`."""
+    report = uninstall(
+        _real_roots(Path("/opt/openrackscreen")), _SubprocessRunner(), purge=args.purge
+    )
+    if report.warnings:
+        print(report.warnings_text())
+    print("uninstalled.")
+    return 0
 
 
 def _run(args: argparse.Namespace) -> int:
