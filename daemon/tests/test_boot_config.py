@@ -244,6 +244,19 @@ def test_a_line_under_an_uppercase_all_header_counts_as_present(tmp_path):
     assert result.added == ()
 
 
+def test_a_line_starting_with_a_bracket_but_never_closed_is_not_a_filter_header(tmp_path):
+    """A real `config.txt` filter header is exactly `[name]`. `"[pi3"`, with
+    no closing bracket, is not one -- it is ordinary noise that happens to
+    start with `[` and (having no `=`) is otherwise skipped, so it must not
+    flip `unconditional` to `False` and hide the settings that follow it.
+    Getting this wrong would make the two lines below permanently invisible
+    to `_already_has`, so the tool would append duplicates on every run.
+    """
+    _boot(tmp_path, "firmware/config.txt", "[pi3\ndtparam=spi=on\ndtoverlay=spi1-2cs\n")
+    result = enable_spi(tmp_path, NOW)
+    assert result.added == ()
+
+
 def test_a_second_run_after_the_all_reset_finds_nothing_to_do(tmp_path):
     """HIGH 1 and HIGH 2 combined: a run that adds lines under a fresh
     `[all]` must be recognised as already-present by the very next run, or
