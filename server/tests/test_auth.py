@@ -472,6 +472,32 @@ def test_the_change_is_refused_before_the_hash_the_way_login_is(tmp_path, monkey
     assert asked[before:] == [], "the hash was computed for a request the limiter had refused"
 
 
+def test_the_limit_is_not_reset_by_a_header_the_caller_writes(tmp_path, monkeypatch):
+    """`X-Forwarded-For` is written by whoever sends it.
+
+    Keying on it would let one attacker be a new client on every request and
+    never meet the limit at all -- which is not a weaker limit, it is no limit,
+    on the route that replaces the password. `request.client.host` is what the
+    connection really came from, and behind a reverse proxy it is uvicorn's
+    `--proxy-headers` that makes that the real client.
+    """
+    _, client = signed_in(tmp_path)
+    monkeypatch.setattr(
+        "ors_server.api.auth.verify_password", verify_that_counts([], "correct horse")
+    )
+
+    codes = [
+        client.post(
+            "/api/auth/password",
+            json={"current": WRONG_GUESS, "new": NEW_PASSWORD},
+            headers={"X-Forwarded-For": f"198.51.100.{attempt}"},
+        ).status_code
+        for attempt in range(12)
+    ]
+
+    assert 429 in codes, "a new address per request must not be a fresh budget per request"
+
+
 def test_a_burst_of_wrong_current_passwords_counts_against_the_login_too(tmp_path, monkeypatch):
     """One secret, one budget.
 
