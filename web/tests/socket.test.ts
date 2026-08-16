@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { createLiveSocket, type LiveFrame, type LiveSocket } from "../src/live/socket"
+import {
+  createLiveSocket,
+  type LiveFrame,
+  type LiveSocket,
+  type SessionAnswer,
+} from "../src/live/socket"
 // Lifted to ./fake-socket unchanged when task 6 needed the same socket one level
 // up, in the tests for the provider that owns this client. Its docstring carries
 // the reasoning that used to be here.
@@ -13,6 +18,21 @@ type Harness = {
   dialledAt: number[]
   daemons: number[][]
   frames: LiveFrame[]
+  /** One entry per time the client asked whether the session ended. */
+  asked: Question[]
+}
+
+/**
+ * One asking of "does this browser still have a session", left unanswered.
+ *
+ * A deferred promise rather than a resolved one, because every rule worth
+ * pinning here is about *when* the answer lands: two refused dials while one
+ * question is still open must not become two questions, and an answer that
+ * arrives after the server has taken this tab back must not latch anything.
+ */
+type Question = {
+  answer(with_: SessionAnswer): void
+  fail(): void
 }
 
 const running: LiveSocket[] = []
@@ -24,16 +44,29 @@ const running: LiveSocket[] = []
 // tests, and `now` drives the one rule in this module that is not obvious.
 // `random` is passed only by the tests that assert an exact delay, so every
 // other test runs on `Math.random` as the browser will.
-function harness(options: { random?: () => number } = {}): Harness {
+// `probeSession` is passed only by the tests that are about it. Everywhere else
+// it is absent, which is the client task 5 shipped: a socket with nobody to ask
+// retries and says nothing. That default is what keeps the tests above honest --
+// none of them can be passing because something answered a question for them.
+function harness(options: { random?: () => number; probed?: boolean } = {}): Harness {
   const sockets: FakeSocket[] = []
   const dialledAt: number[] = []
   const daemons: number[][] = []
   const frames: LiveFrame[] = []
+  const asked: Question[] = []
   const live = createLiveSocket({
     url: "ws://rack.invalid/ws/ui",
     onDaemons: (online) => daemons.push(online),
     onFrame: (frame) => frames.push(frame),
     ...(options.random === undefined ? {} : { random: options.random }),
+    ...(options.probed === true
+      ? {
+          probeSession: () =>
+            new Promise<SessionAnswer>((resolve, reject) => {
+              asked.push({ answer: resolve, fail: () => reject(new Error("no")) })
+            }),
+        }
+      : {}),
     openSocket: (url) => {
       const socket = new FakeSocket(url)
       sockets.push(socket)
@@ -42,8 +75,19 @@ function harness(options: { random?: () => number } = {}): Harness {
     },
   })
   running.push(live)
-  return { live, sockets, dialledAt, daemons, frames }
+  return { live, sockets, dialledAt, daemons, frames, asked }
 }
+
+/**
+ * Let a settled probe promise reach the client before anything is asserted.
+ *
+ * `then` on an already-resolved promise is a microtask, and every test below
+ * runs on fake timers, where `advanceTimersByTimeAsync` is the usual way one
+ * gets drained. Some of these assertions happen with no time passing at all, so
+ * they need this instead: it is a wait on the JavaScript job queue, not on a
+ * clock, and it fails no differently if the client never had a `then` to run.
+ */
+const settle = () => Promise.resolve()
 
 /** The socket this harness is talking on now. */
 function current(test: Harness): FakeSocket {
@@ -495,5 +539,190 @@ describe("the browser socket", () => {
 
     expect(random).toHaveBeenCalled()
     expect((test.dialledAt.at(-1) ?? Number.NaN) - droppedAt).toBe(875)
+  })
+})
+
+/**
+ * The one thing a browser is not told, and what this client does about it.
+ *
+ * A handshake the server rejects gives the page no status code -- 1006 and
+ * nothing else, which is the same 1006 a server that is not running produces. So
+ * these tests are about *when* the client asks somebody who can tell, and about
+ * the four things that stop the asking from becoming a poll. What the answer
+ * means, and the 401 that carries it, are `LiveProvider`'s and `App`'s; nothing
+ * in this module ever learns whether the session ended.
+ */
+describe("a dial that never opened", () => {
+  it("asks whether the session ended -- and does not ask when a live link drops", async () => {
+    vi.useFakeTimers()
+    const test = harness({ probed: true })
+    test.live.connect()
+
+    // A connection that opened and then went away says nothing about the
+    // session: it was good a moment ago. Asking here would be one question per
+    // wifi blip, on every tab in the building.
+    current(test).accept()
+    current(test).drop()
+    await vi.advanceTimersByTimeAsync(1000)
+    await settle()
+    expect(test.asked).toHaveLength(0)
+
+    // The dial that followed it was refused -- or the server is gone, which is
+    // indistinguishable from here, and is exactly why something has to be asked.
+    current(test).drop()
+    await settle()
+    expect(test.asked).toHaveLength(1)
+    // And the reconnect was armed anyway. Recovering is this client's job; the
+    // question is a side enquiry and must not replace it.
+    expect(test.live.state).toBe("reconnecting")
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(test.sockets).toHaveLength(3)
+  })
+
+  it("asks once, not once per attempt, when something answered", async () => {
+    // The defect this fix must not become: a question on every reconnect is a
+    // question every thirty seconds forever, which is the silent loop it
+    // replaced wearing a different hat.
+    vi.useFakeTimers()
+    const test = harness({ probed: true })
+    test.live.connect()
+    current(test).drop()
+    await settle()
+    expect(test.asked).toHaveLength(1)
+
+    // Something that speaks HTTP replied. Whatever it said, the question has
+    // been answered; asking it again would be asking a question already asked.
+    test.asked[0].answer("answered")
+    await settle()
+
+    for (let round = 0; round < 5; round += 1) {
+      await vi.advanceTimersByTimeAsync(60_000)
+      current(test).drop()
+      await settle()
+    }
+
+    expect(test.asked).toHaveLength(1)
+    // Six refusals, and the client is still dialling: what was silenced is the
+    // question, not the recovery.
+    expect(test.sockets).toHaveLength(6)
+  })
+
+  it("asks again after a question nothing answered, because the outage comes first", async () => {
+    // The order of events this whole fix exists for: the server goes away
+    // (nothing answers anything), and comes back having forgotten this tab's
+    // session (the handshake is refused). A client that asked only once would
+    // have spent its one question on the outage and never noticed the refusal.
+    vi.useFakeTimers()
+    const test = harness({ probed: true })
+    test.live.connect()
+    current(test).drop()
+    await settle()
+    expect(test.asked).toHaveLength(1)
+
+    // Nothing answered: no server, or a proxy's 502 in front of one that is not
+    // running. Neither of those is a fact about a session.
+    test.asked[0].answer("unanswered")
+    await settle()
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    current(test).drop()
+    await settle()
+    expect(test.asked).toHaveLength(2)
+
+    // And this time the server was there to answer, so it stops.
+    test.asked[1].answer("answered")
+    await settle()
+    await vi.advanceTimersByTimeAsync(60_000)
+    current(test).drop()
+    await settle()
+    expect(test.asked).toHaveLength(2)
+  })
+
+  it("asks one question at a time", async () => {
+    // A probe of a server that is not answering can take longer than the dial
+    // that provoked it takes to fail again. Without this the questions compound,
+    // one per attempt, against the machine that is already not answering.
+    vi.useFakeTimers()
+    const test = harness({ probed: true })
+    test.live.connect()
+    current(test).drop()
+    await settle()
+    expect(test.asked).toHaveLength(1)
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    current(test).drop()
+    await settle()
+    expect(test.asked).toHaveLength(1)
+
+    // Answered by nothing, so the question is open again -- and now there is
+    // room for it.
+    test.asked[0].answer("unanswered")
+    await settle()
+    await vi.advanceTimersByTimeAsync(60_000)
+    current(test).drop()
+    await settle()
+    expect(test.asked).toHaveLength(2)
+  })
+
+  it("drops an answer that arrives after the server has taken the tab back", async () => {
+    // A question is an HTTP request and takes as long as it takes; the reconnect
+    // behind it is a second away. An answer applied to the connection after the
+    // one it was asked about latches the question shut for the life of the tab,
+    // which is a client that never asks again.
+    vi.useFakeTimers()
+    const test = harness({ probed: true })
+    test.live.connect()
+    current(test).drop()
+    await settle()
+    expect(test.asked).toHaveLength(1)
+
+    await vi.advanceTimersByTimeAsync(1000)
+    current(test).accept()
+    // Now it lands, saying what was true one connection ago.
+    test.asked[0].answer("answered")
+    await settle()
+
+    current(test).drop()
+    await vi.advanceTimersByTimeAsync(60_000)
+    current(test).drop()
+    await settle()
+    expect(test.asked).toHaveLength(2)
+  })
+
+  it("treats a question that threw as one nothing answered", async () => {
+    // Not defensiveness for its own sake: a rejection that left the "one at a
+    // time" flag set would disable the question for good, silently, which is
+    // this defect again in a smaller room.
+    vi.useFakeTimers()
+    const test = harness({ probed: true })
+    test.live.connect()
+    current(test).drop()
+    await settle()
+    test.asked[0].fail()
+    await settle()
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    current(test).drop()
+    await settle()
+    expect(test.asked).toHaveLength(2)
+  })
+
+  it("starts asking again when a closed client is connected again", async () => {
+    // StrictMode's mount, unmount, mount does exactly this, and so does a route
+    // that leaves the live view and comes back. What must not survive it is an
+    // answer: the client that comes back knows nothing about the session.
+    vi.useFakeTimers()
+    const test = harness({ probed: true })
+    test.live.connect()
+    current(test).drop()
+    await settle()
+    test.asked[0].answer("answered")
+    await settle()
+
+    test.live.close()
+    test.live.connect()
+    current(test).drop()
+    await settle()
+    expect(test.asked).toHaveLength(2)
   })
 })

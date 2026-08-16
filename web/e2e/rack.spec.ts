@@ -345,74 +345,77 @@ test("6: the server going away is said honestly, and blamed on nobody", async ({
 })
 
 /**
- * **This spec does not pass, and it is not weakened to make it.**
+ * **The spec this file was written to fail, now passing for real.**
  *
- * `test.fail()` is a declaration that the assertions below are right and the
- * product is wrong -- Playwright runs every one of them, records the failure,
- * and turns the run red the day it starts passing, which is when the annotation
- * comes off. Nothing here has been softened, skipped or deleted.
+ * It carried `test.fail()` when it was written, and the diagnosis with it:
+ * `ors_server.auth.Sessions` keeps its tokens in a `set` in memory and says so
+ * -- "a restart logs everyone out, which is acceptable here" -- so a restarted
+ * server answers **401** to every `/ws/ui` handshake this tab will ever make
+ * again, and a browser is given **no status code** for a rejected handshake.
+ * `onclose` fires 1006, which is what a server that is not running gives too, so
+ * the client could not tell a refused session from a dead server and did the
+ * only safe thing, which was to retry. Nothing else asked -- nothing in this
+ * interface polls -- so no `fetch` ever met that 401 and the tab sat on a stale
+ * panel, dialling a refusal every thirty seconds, with nothing anywhere saying
+ * why.
  *
- * **What it found.** `ors_server.auth.Sessions` keeps its tokens in a `set` in
- * memory, and says so: "In-memory sessions. A restart logs everyone out, which
- * is acceptable here." So the moment the server is restarted the browser is
- * holding a cookie that names nothing, and `/ws/ui` -- whose router is
- * `APIRouter(dependencies=[Depends(require_session)])` -- answers **401** to
- * every handshake this tab will ever attempt again. Measured, outside the
- * browser: sign in, restart the server with the same `ORS_DATA_DIR` and the
- * same `ORS_SECRET_KEY`, and `GET /api/auth/me` goes from
- * `{"authenticated":true}` to `{"authenticated":false}` while every guarded
- * route answers 401. In this run's own server log, after the restart:
- * `"WebSocket /ws/ui" 401`, five times, once per backoff step.
+ * **What was chosen, of the two.** Not persisting sessions, which would reverse
+ * an M3a decision argued on purpose. The other one: *notice the refusal and
+ * route to /login*, because that is the rule this interface already has -- §5.2
+ * and §7, "any 401 from any request returns to /login once, without a redirect
+ * loop" -- and a handshake refused with 401 **is** a 401. So the client asks one
+ * guarded route (`GET /api/settings`) what a refused dial meant, and the answer
+ * arrives at the same `setUnauthorizedHandler` every page's queries use, with
+ * the same once-only latch. No second rule was built and `ws_ui.py` did not
+ * change.
  *
- * **So the interface cannot recover, and -- worse -- cannot say so.** A browser
- * is given no status code for a rejected WebSocket handshake; `onclose` fires
- * with 1006 and nothing else, so `socket.ts` cannot tell a refused session from
- * a server that is down and does the only safe thing, which is to retry. And
- * nothing else asks: no page in this interface polls, so no `fetch` ever gets
- * the 401 that `setUnauthorizedHandler` exists to act on. The tab sits on a
- * stale panel, dialling a 401 every thirty seconds, for as long as it is open.
+ * **So "recovers" means what it can honestly mean**: the session really did end,
+ * and no interface can invent one. This spec asserts the whole of the recovery
+ * -- the interface says so on its own, in the same document, and signing in
+ * again brings back the very panel this story has been about, still drawing the
+ * rack's own pixels. What it refuses to accept is the old behaviour: a silent
+ * loop, and a picture that is no longer being updated presented as if it were.
  *
- * **Two things it breaks, and neither of them is this file.** The design spec's
- * definition of done, item 4: "Stopping the server leaves the rack rendering,
- * the interface says so honestly, and **it recovers when the server returns**."
- * And its own failure table: "Session expires | Any 401 routes to `/login`
- * once, without a loop" -- which the interface honours for `fetch` and cannot
- * honour here.
- *
- * **Whose it is.** Not one task's mistake: it is the seam between M3a's session
- * design (`Sessions`, argued and deliberate) and M3b's socket (task 5, which
- * has no way to see the refusal). It is a milestone-level choice between two
- * fixes, and a test task is the wrong place to pick one:
- *
- * 1. *Persist the session*, so a restart keeps the tab signed in and this spec
- *    passes as written. It reverses an M3a decision that was argued on purpose.
- * 2. *Notice the refusal and route to `/login`.* A dial that closes without
- *    ever having opened is either a dead server or a dead session; asking
- *    `GET /api/auth/me` at that moment distinguishes them, and the existing
- *    401 handler does the rest. The interface becomes honest, no reload is
- *    needed -- and the panel still does not come back on its own, so this spec
- *    would have to be rewritten to say "recovers into a sign-in".
+ * Two failures it can still catch, and they are the interesting ones: an
+ * interface that says nothing (it never reaches /login), and one that treats
+ * every dropped socket as an ended session (spec 6, which stops the server and
+ * requires that nothing of the kind is said).
  */
 test("7: the server comes back and the interface recovers, without a reload", async ({ rack, ui }) => {
-  test.fail()
   await rack.startServer()
 
-  const panel = ui.getByTestId(`panel-${screenId}`)
-  // Nothing is clicked and nothing is reloaded: the socket dials again on its
-  // own backoff, the rack dials again on its own, and the subscriptions this
-  // tab made are replayed on the handshake.
+  // Nothing is clicked and nothing is reloaded. The socket dials again on its
+  // own backoff; the handshake is refused because this browser's session died
+  // with the old process; the client asks a guarded route what that meant and
+  // gets the 401 the WebSocket could not carry.
   //
   // Forty-five seconds because the client's schedule is 1, 2, 4, 8, 16 and then
-  // 30 seconds with jitter, so a working recovery lands inside it -- and
-  // because a declared failure is spent on every run, and two minutes of it
-  // would be two minutes nobody gets back.
-  await expect(panel).toHaveAttribute("data-state", "live", { timeout: 45_000 })
+  // 30 seconds with jitter, so the first dial after the server is back lands
+  // inside it -- and the question that follows is one HTTP request.
+  await expect(ui.getByRole("heading", { name: "Sign in" })).toBeVisible({ timeout: 45_000 })
+  expect(new URL(ui.url()).pathname).toBe("/login")
+
+  // **Without a reload**, said as something a spec can fail: this property was
+  // written on the document before the server was stopped, and a reload of any
+  // kind -- including the `location.reload()` a cruder fix would have used to
+  // get here -- would have thrown it away.
+  expect(await ui.evaluate(() => window.orsDocumentMark)).toBe(MARK)
+
+  await ui.getByLabel("Password").fill(PASSWORD)
+  await ui.getByRole("button", { name: "Sign in" }).click()
+  await expect(ui.getByRole("heading", { name: "Daemons", level: 1 })).toBeVisible()
+  await ui.getByRole("link", { name: "Screens" }).click()
+
+  // And the panel comes back to life: a fresh socket, this tab's subscriptions
+  // replayed on the handshake, the rack's frames arriving again. The red is
+  // spec 5's edit, which the rack has been drawing on its own glass throughout
+  // -- so this is the whole path, restored, and not merely a page that renders.
+  const panel = ui.getByTestId(`panel-${screenId}`)
+  await expect(panel).toHaveAttribute("data-state", "live", { timeout: 60_000 })
   await expect
     .poll(async () => (await readPanel(ui, screenId)).red, { timeout: 30_000 })
     .toBeGreaterThan(500)
 
-  // **Without a reload**, said as something a spec can fail: this property was
-  // written on the document before the server was stopped, and a reload of any
-  // kind would have thrown it away.
+  // Still the same document, at the end as at the beginning.
   expect(await ui.evaluate(() => window.orsDocumentMark)).toBe(MARK)
 })

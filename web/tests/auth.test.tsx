@@ -1,15 +1,23 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
-import { act, render, screen } from "@testing-library/react"
+import { act, render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { http, HttpResponse } from "msw"
 import { MemoryRouter } from "react-router"
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { api } from "../src/api/client"
 import { sessionKey } from "../src/api/queries"
 import { RequireSession } from "../src/routes/RequireSession"
+import { collectSockets, type FakeSocket } from "./fake-socket"
 import { server } from "./msw"
 import { renderApp } from "./render"
+
+// The two tests at the foot of this file stub `WebSocket`; every other test in
+// it renders the authenticated shell, which builds one, and would inherit the
+// stub. `setup.ts`'s inert socket is what comes back.
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 // `GET /api/auth/me` is open and always answers 200 with two booleans -- it is
 // the one route that tells the interface which of the two pre-session states
@@ -254,5 +262,99 @@ describe("getting in", () => {
     expect(
       screen.queryByRole("heading", { name: /set a password/i }),
     ).not.toBeInTheDocument()
+  })
+})
+
+/**
+ * The 401 nobody could see, and the two things it must not be confused with.
+ *
+ * `/ws/ui` is refused at the handshake when the session is gone -- a server
+ * restart is enough, because `Sessions` is in memory and says so -- and a browser
+ * is given **no status code** for a rejected handshake: `onclose` fires 1006,
+ * which is character-for-character what a server that is not running produces.
+ * Nothing polls, so before this rule no `fetch` ever met that 401 and the tab sat
+ * on a stale panel dialling a refusal every thirty seconds with nothing anywhere
+ * saying why.
+ *
+ * The fix is not a second rule. The socket asks one guarded route whether this
+ * browser still has a session, and the answer -- if it is a refusal -- is an
+ * ordinary 401 arriving at the one handler above, latch, exclusion and all.
+ *
+ * These two tests are the same event with one thing changed: whether a server
+ * answered. That is the entire difference between a session that **ended** and a
+ * server that is **down**, and it is the difference the WebSocket could not carry.
+ */
+describe("a refused handshake", () => {
+  /** The connection the interface is holding -- the last one, past StrictMode's. */
+  function held(sockets: FakeSocket[]): FakeSocket {
+    const socket = sockets.at(-1)
+    if (socket === undefined) throw new Error("the interface dialled nothing")
+    return socket
+  }
+
+  it("is a 401 like any other, and returns to login once", async () => {
+    const sockets = collectSockets()
+    let asked = 0
+    let meCalls = 0
+    server.use(
+      http.get("/api/auth/me", () => {
+        meCalls += 1
+        // Signed in when the page loaded; forgotten by the time the socket is
+        // refused, which is exactly what a server restart does.
+        return HttpResponse.json({ authenticated: meCalls === 1, password_set: true })
+      }),
+      http.get("/api/daemons", () => HttpResponse.json([])),
+      // The route the question is asked on. It is guarded, so it can say the one
+      // thing `GET /api/auth/me` never can.
+      http.get("/api/settings", () => {
+        asked += 1
+        return HttpResponse.json({ detail: "not authenticated" }, { status: 401 })
+      }),
+    )
+    const { pushes, path } = renderApp({ at: "/daemons" })
+    expect(await screen.findByRole("heading", { name: "Daemons" })).toBeInTheDocument()
+
+    // Refused before it ever opened -- which is all the browser will ever say
+    // about it.
+    act(() => held(sockets).drop())
+
+    expect(await screen.findByRole("heading", { name: /sign in/i })).toBeInTheDocument()
+    expect(path()).toBe("/login")
+    // Once, and asked once: the redirect is stopped from repeating by the latch
+    // in `App`, and the question by the client's own.
+    expect(pushes()).toBe(1)
+    expect(asked).toBe(1)
+  })
+
+  it("is not a session that ended when nothing answered at all", async () => {
+    const sockets = collectSockets()
+    let asked = 0
+    server.use(
+      me({ authenticated: true, password_set: true }),
+      http.get("/api/daemons", () => HttpResponse.json([])),
+      // No server. `HttpResponse.error()` is a `fetch` that rejects, which is
+      // what a stopped server gives a browser -- no status, nothing to read.
+      http.get("/api/settings", () => {
+        asked += 1
+        return HttpResponse.error()
+      }),
+    )
+    const { pushes, path } = renderApp({ at: "/daemons" })
+    expect(await screen.findByRole("heading", { name: "Daemons" })).toBeInTheDocument()
+
+    act(() => held(sockets).drop())
+    // The question really was asked -- otherwise this test would pass against an
+    // interface that does nothing at all, which is the interface it exists to
+    // refuse.
+    await waitFor(() => expect(asked).toBe(1))
+
+    // And nothing was concluded from silence. The rack is still rendering and
+    // the panels still say what they were saying; a server that is down is not a
+    // session that ended, and signing somebody out because their server is
+    // restarting would be this interface inventing a fact it was never told.
+    expect(path()).toBe("/daemons")
+    expect(pushes()).toBe(0)
+    expect(screen.queryByRole("heading", { name: /sign in/i })).not.toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: "Daemons" })).toBeInTheDocument()
   })
 })

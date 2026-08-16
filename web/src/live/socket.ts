@@ -24,6 +24,23 @@ export type LiveState =
   /** It was up and is not: waiting out the backoff, or dialling again. */
   | "reconnecting"
 
+/**
+ * What came back from asking whether this browser still has a session.
+ *
+ * The two values are "the question was answered" and "it was not" -- deliberately
+ * **not** "the session ended" and "it did not". An ended session is a 401, and
+ * this interface has exactly one place a 401 goes; a client that reported the
+ * answer here would be the second copy of that rule. All this module does with
+ * an answer is stop asking.
+ *
+ * `"unanswered"` is every case where nothing that knows about sessions replied:
+ * a request that reached no server at all, and equally a 502 from a proxy in
+ * front of a server that is not running. Treating that as an answer would put a
+ * client behind a reverse proxy back where this rule found it -- refused
+ * forever, with nothing anywhere saying why.
+ */
+export type SessionAnswer = "answered" | "unanswered"
+
 /** One panel's image, exactly as the rack encoded it. */
 export type LiveFrame = {
   screenId: number
@@ -126,6 +143,7 @@ export function createLiveSocket({
   url,
   onDaemons,
   onFrame,
+  probeSession,
   now = () => performance.now(),
   random = Math.random,
   openSocket = (target) => new WebSocket(target),
@@ -140,6 +158,28 @@ export function createLiveSocket({
    */
   onDaemons: (online: number[]) => void
   onFrame: (frame: LiveFrame) => void
+  /**
+   * Ask, once, whether this browser still has a session -- because a dial was
+   * refused and a browser is told nothing about why.
+   *
+   * **The one thing this module cannot see.** A handshake that is rejected gives
+   * the page no status code: `onerror` carries nothing and the close code is
+   * 1006, which is the same 1006 a server that is not running produces. So a
+   * dial that closed without ever opening is *either* a dead server or a dead
+   * session, and only something that speaks HTTP can tell them apart.
+   *
+   * Injected rather than done here, and the split is the point: this module owns
+   * **when** the question is worth asking, because that is a fact about the dial
+   * lifecycle and the backoff it rides on; the caller owns **what asking means**,
+   * because that is a route, an API client and a 401 rule -- none of which
+   * belongs in a socket. See `LiveProvider`, which supplies the only
+   * implementation that ships.
+   *
+   * Optional, because a client with no way to ask is exactly task 5's client:
+   * it retries and says nothing, which is the honest behaviour when there is
+   * nobody to ask.
+   */
+  probeSession?: () => Promise<SessionAnswer>
   /** Monotonic milliseconds. Only ever used to measure how long a link held. */
   now?: () => number
   /** `[0, 1)`. Injected so a test can pin a schedule that is deliberately not fixed. */
@@ -163,6 +203,64 @@ export function createLiveSocket({
   let attempt = 0
   /** When the current connection opened, or `null` if it never did. */
   let openedAt: number | null = null
+  /**
+   * Whether the session question has been asked *and answered* since a
+   * connection last opened. What stops the asking from becoming a poll.
+   */
+  let answered = false
+  /** Whether one is in flight, so two refused dials cannot make two questions. */
+  let asking = false
+  /**
+   * Which question an answer arriving now belongs to.
+   *
+   * A probe is an HTTP request and takes as long as it takes; the reconnect
+   * behind it is a second away. So a connection can open while an answer is
+   * still on its way, and applying that answer would latch the question shut on
+   * the strength of something that was true one connection ago -- which is a
+   * client that never asks again, for the rest of the tab's life. Bumped by
+   * everything that makes an earlier answer out of date; an answer whose era has
+   * moved on is dropped.
+   */
+  let era = 0
+
+  /** Whatever was known about the session is old news; ask again if refused. */
+  function reopenTheQuestion(): void {
+    era += 1
+    answered = false
+  }
+
+  /**
+   * Ask whether the session is what refused that handshake -- at most once.
+   *
+   * Called only from a close that never opened. Everything that keeps this from
+   * becoming a poll is here or in the schedule it rides on: one at a time, never
+   * again once something answered, and never more often than the backoff dials.
+   * A session that really ended costs exactly one of these.
+   *
+   * An answer of `"unanswered"` deliberately latches nothing. That is the
+   * server-is-down case, and it is the ordinary order of events -- the server
+   * goes away first and comes back with this tab's session forgotten second -- so
+   * a rule that asked only once would have spent its one question on the outage
+   * and never noticed the refusal that followed.
+   *
+   * A `probeSession` that *throws* is treated as an answer of nothing, for the
+   * same reason and one more: leaving `asking` true would disable the question
+   * for good, silently, which is this defect again in a smaller room.
+   */
+  function askWhetherTheSessionEnded(): void {
+    if (probeSession === undefined || asking || answered) return
+    asking = true
+    const asked = era
+    void probeSession().then(
+      (answer) => {
+        asking = false
+        if (answer === "answered" && era === asked) answered = true
+      },
+      () => {
+        asking = false
+      },
+    )
+  }
 
   function nextDelay(): number {
     const ceiling = Math.min(MAX_DELAY_MS, FIRST_DELAY_MS * 2 ** attempt)
@@ -312,6 +410,9 @@ export function createLiveSocket({
       if (socket !== dialled) return
       state = "open"
       openedAt = now()
+      // The server took this tab back, so whatever was learned about the session
+      // while it would not is no longer the answer to anything.
+      reopenTheQuestion()
       // The whole point of keeping the set. The server has no memory of this
       // tab across a socket: `_let_go` takes every subscription out of the hub
       // when the last one ended, so a panel that is still on screen is watched
@@ -327,9 +428,16 @@ export function createLiveSocket({
     dialled.onclose = () => {
       if (socket !== dialled) return
       socket = null
+      const neverOpened = openedAt === null
       if (openedAt !== null && now() - openedAt >= STABLE_MS) attempt = 0
       state = "reconnecting"
       timer = setTimeout(dial, nextDelay())
+      // A connection that opened and then went away says nothing about the
+      // session -- it was good a moment ago. One that *never opened* is the
+      // ambiguous case: a refused handshake and an absent server look identical
+      // from here. Asked after the reconnect is armed, because recovering is
+      // this client's job and the question is somebody else's.
+      if (neverOpened) askWhetherTheSessionEnded()
     }
   }
 
@@ -341,6 +449,10 @@ export function createLiveSocket({
       if (socket !== null || timer !== null) return
       state = "connecting"
       attempt = 0
+      // With the backoff: a client being started again is a client that knows
+      // nothing yet, and an answer left over from before the close belongs to a
+      // connection nobody holds.
+      reopenTheQuestion()
       dial()
     },
 

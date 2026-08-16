@@ -1,9 +1,10 @@
 import { useQueryClient } from "@tanstack/react-query"
 import { useEffect, type ReactNode } from "react"
 
+import { api } from "@/api/client"
 import { daemonsKey, type Daemon } from "@/api/queries"
 import { frameStore } from "@/live/frames"
-import { createLiveSocket } from "@/live/socket"
+import { createLiveSocket, type SessionAnswer } from "@/live/socket"
 
 /**
  * The one `/ws/ui` connection, and the two places what arrives on it goes.
@@ -21,6 +22,10 @@ import { createLiveSocket } from "@/live/socket"
  * `GET /api/daemons` assembles a snapshot per rack on the event loop, and
  * asking it for something the socket just said would spend the server's
  * frame-relay time on it.
+ *
+ * A third wire, added later and running the other way: when a dial is *refused*,
+ * the socket asks a question it cannot answer itself, and this is where the
+ * question is turned into a request. See `askWhetherTheSessionEnded`.
  */
 
 /**
@@ -59,6 +64,51 @@ function withOnline(online: number[]) {
     })
 }
 
+/**
+ * Turn a refused handshake into the 401 it really is, on a route that can say so.
+ *
+ * **The whole point is what this function does not do**: it does not decide
+ * anything. It makes one ordinary request through the ordinary client, and the
+ * `setUnauthorizedHandler` middleware in `api/client.ts` -- the one place in this
+ * interface where "a 401 returns to /login once" is written down -- does the
+ * rest, exactly as it does for a query on any page. A refused handshake is a
+ * 401; it just needed something able to carry one.
+ *
+ * **Why `GET /api/settings` and not `GET /api/auth/me`.** `me` is open and
+ * answers 200 either way, on purpose -- it is how the interface tells "no
+ * password has ever been set" from "there is one and this browser has no
+ * session". It would report `authenticated: false` and trigger nothing, so
+ * acting on it would mean reading a body and deciding what it means: a second
+ * copy of the 401 rule, beside the first and free to disagree with it. The
+ * request has to be one that is genuinely refused, so it has to be guarded.
+ *
+ * **Why this guarded route.** `GET /api/daemons` is out by §4.4 -- it assembles a
+ * snapshot per rack on the event loop, which is the server's frame-relay time.
+ * `GET /api/integrations` needs a `daemon_id`, and a probe that invents a rack id
+ * can be refused for a reason that is not the session. `/api/settings` takes no
+ * parameters, belongs to no rack, and reads two named keys of one table: the
+ * smallest answer the guarded router has. Its body is discarded -- what is being
+ * asked about is the session, not the settings.
+ *
+ * **What counts as an answer.** A 2xx (the session is fine) or a 401 (it is not,
+ * and the middleware has already acted). Nothing else: a 502 from a proxy in
+ * front of a stopped server is a server that is down wearing an HTTP status, and
+ * calling it an answer would leave a client behind a reverse proxy refused
+ * forever with nothing saying why -- which is the defect this exists to end.
+ */
+async function askWhetherTheSessionEnded(): Promise<SessionAnswer> {
+  try {
+    const { response } = await api.GET("/api/settings")
+    return response.ok || response.status === 401 ? "answered" : "unanswered"
+  } catch {
+    // openapi-fetch builds the Request and awaits `fetch`, which rejects when
+    // nothing answered at all. That is the server-is-down case, and it is not an
+    // answer to anything: nothing here is said, nothing is navigated, and the
+    // panels go on saying what they were saying.
+    return "unanswered"
+  }
+}
+
 export function LiveProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient()
 
@@ -67,6 +117,7 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       url: liveUrl(),
       onDaemons: (online) => queryClient.setQueryData(daemonsKey, withOnline(online)),
       onFrame: (frame) => frameStore.push(frame),
+      probeSession: askWhetherTheSessionEnded,
     })
 
     /**
