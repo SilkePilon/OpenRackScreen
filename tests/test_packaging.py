@@ -193,28 +193,171 @@ def test_module_version_matches_its_distributions_version(name: str):
     )
 
 
+def _release_workflow() -> dict:
+    import yaml
+
+    return yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+
+
+def _find_step(steps: list[dict], predicate, description: str) -> dict:
+    """`next(...)` with no default raises a bare `StopIteration` on a missing
+    step -- indistinguishable, in a test report, from any other bug in the
+    generator. Renaming the step this is looking for should fail with a
+    message that says what's missing, not a stack trace with no assertion in
+    it."""
+    step = next((s for s in steps if predicate(s)), None)
+    assert step is not None, f"no step found: {description}"
+    return step
+
+
 def test_the_release_workflow_refuses_a_wheel_without_the_interface():
     """The gate that stops §2.3's failure reaching an index.
 
     A published `ors-server` wheel with no `ors_server/web/index.html` in it
     installs cleanly and serves no pages. That is not recoverable by yanking:
-    somebody has already installed it. The workflow has to check before it
-    uploads, and this asserts the check is there rather than trusting a
-    reviewer to notice its removal.
+    somebody has already installed it. This asserts the check's *behaviour*
+    -- what it actually runs, and that nothing can silence it -- rather than
+    a step name and a position, either of which survives a mutation that
+    guts the check (e.g. `continue-on-error: true` with the body replaced by
+    `echo skipping`) while leaving a name-and-order-only test green.
     """
-    import yaml
+    document = _release_workflow()
+    steps = document["jobs"]["build"]["steps"]
 
-    document = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
-    build = document["jobs"]["build"]
-    steps = [step.get("name", step.get("uses", "")) for step in build["steps"]]
-    check = next(i for i, name in enumerate(steps) if "no interface" in name)
-    upload = next(i for i, name in enumerate(steps) if "upload-artifact" in name)
-    # Ordering asserted on the job graph and the step list, not on a substring
-    # search of the file. A text search for "pypi.org" passes whatever the
-    # workflow does -- `pypa/gh-action-pypi-publish` does not contain that
-    # string -- which is a test that reads like a gate and is not one.
-    assert check < upload, "the interface check must run before the artifact is uploaded"
-    assert (
-        document["jobs"]["publish"]["needs"] == "build"
-        or "build" in document["jobs"]["publish"]["needs"]
-    ), "publish must not run unless build succeeded"
+    check = _find_step(steps, lambda s: "no interface" in s.get("name", ""), "interface gate")
+    upload = _find_step(
+        steps,
+        lambda s: s.get("uses", "").startswith("actions/upload-artifact"),
+        "upload-artifact step",
+    )
+
+    assert "continue-on-error" not in check, (
+        "the interface gate must not be allowed to fail silently"
+    )
+    assert "if" not in check, "the interface gate must not be conditionally skipped"
+    assert "ors_server/web/index.html" in check["run"], (
+        "the interface gate must actually inspect the wheel for the interface"
+    )
+
+    # Ordering asserted on the step list itself, not a text search of the
+    # file. A text search for "pypi.org" passes whatever the workflow does --
+    # `pypa/gh-action-pypi-publish` does not contain that string -- which is
+    # a test that reads like a gate and is not one.
+    assert steps.index(check) < steps.index(upload), (
+        "the interface check must run before the artifact is uploaded"
+    )
+
+    needs = document["jobs"]["publish"]["needs"]
+    needs = [needs] if isinstance(needs, str) else needs
+    # `"build" in needs` alone is a substring match when `needs` is a bare
+    # string: it also accepts a job named `buildx`. Normalise to a list
+    # first, so membership means membership.
+    assert "build" in needs, "publish must not run unless build succeeded"
+
+
+def test_the_release_workflow_refuses_a_wheel_with_a_local_path_dependency():
+    """Spec §9: `[tool.uv.sources]` is uv-only and should never reach a
+    published `Requires-Dist`, but "should" is how a `file://` requirement
+    gets published and fails to install for everyone outside this workspace.
+    Mirrors the interface gate's test above: asserts the check inspects
+    wheel metadata, and that nothing can silence it -- not merely that a step
+    with a plausible name exists somewhere in the file.
+    """
+    document = _release_workflow()
+    steps = document["jobs"]["build"]["steps"]
+    check = _find_step(steps, lambda s: "local path" in s.get("name", ""), "local-path gate")
+
+    assert "continue-on-error" not in check, (
+        "the local-path gate must not be allowed to fail silently"
+    )
+    assert "if" not in check, "the local-path gate must not be conditionally skipped"
+    assert "Requires-Dist" in check["run"], (
+        "the local-path gate must actually inspect wheel metadata for Requires-Dist"
+    )
+
+
+def test_the_release_workflow_uploads_and_downloads_the_same_artifact_name():
+    """A rename on either side of the `build` / `publish` boundary makes
+    `download-artifact` fetch nothing. `publish` then runs against an empty
+    `dist/`, and `pypa/gh-action-pypi-publish` over zero files is a workflow
+    that reports green having published nothing.
+    """
+    document = _release_workflow()
+    upload = _find_step(
+        document["jobs"]["build"]["steps"],
+        lambda s: s.get("uses", "").startswith("actions/upload-artifact"),
+        "upload-artifact step",
+    )
+    download = _find_step(
+        document["jobs"]["publish"]["steps"],
+        lambda s: s.get("uses", "").startswith("actions/download-artifact"),
+        "download-artifact step",
+    )
+    assert upload["with"]["name"] == download["with"]["name"], (
+        "build must upload the exact artifact name publish downloads"
+    )
+
+
+def test_the_release_workflow_only_triggers_on_version_tags():
+    """YAML 1.1's bareword booleans mean `on:` parses under `yaml.safe_load`
+    to the boolean key `True`, not the string `"on"` -- a trap for anyone
+    reading this trigger back out with `document["on"]`, which raises
+    `KeyError` and checks nothing.
+
+    Firing on a branch push instead of a tag push would let CI attempt to
+    publish on every commit merged to a branch, and publishing is
+    irreversible per version.
+    """
+    document = _release_workflow()
+    trigger = document[True]
+    assert isinstance(trigger, dict) and trigger.get("push", {}).get("tags") == ["v*"], (
+        "release must trigger only on pushes of version tags (on: push: tags: ['v*'])"
+    )
+
+
+def test_the_release_workflow_checks_the_tag_matches_the_version_before_publishing():
+    """`tools/version.read_versions` is the one place this repository already
+    knows what version every package believes it is. Publishing a tag that
+    disagrees with the tree ships a version number the tag on GitHub and the
+    version on PyPI will forever disagree about.
+    """
+    document = _release_workflow()
+    check = _find_step(
+        document["jobs"]["build"]["steps"],
+        lambda s: "tag matches the version" in s.get("name", ""),
+        "tag-matches-version gate",
+    )
+    assert "read_versions" in check["run"], (
+        "the tag/version gate must actually compare against tools.version.read_versions"
+    )
+
+
+def test_the_release_meta_package_publishes_last():
+    """`pypa/gh-action-pypi-publish` runs one `twine upload` per step here,
+    sequentially, aborting on the first failure. `openrackscreen` pins
+    `ors-daemon` and `ors-server`; if it published before either, a failure
+    partway through would leave a meta-package on PyPI pinning a dependency
+    that never made it there -- a version that can never resolve and, once
+    published, can never be re-uploaded. Every package with dependents must
+    publish after all of them.
+    """
+    document = _release_workflow()
+    publish_steps = [
+        step
+        for step in document["jobs"]["publish"]["steps"]
+        if step.get("uses", "").startswith("pypa/gh-action-pypi-publish")
+    ]
+    assert publish_steps, "publish must actually publish something"
+
+    order = [step["with"]["packages-dir"].strip("/").rsplit("/", 1)[-1] for step in publish_steps]
+    assert order[-1] == "openrackscreen", "the meta-package must publish last"
+    assert order.index("ors-schema") < order.index("ors-render"), (
+        "ors-render depends on ors-schema and must publish after it"
+    )
+    for dependent in ("ors-daemon", "ors-server"):
+        assert order.index("ors-render") < order.index(dependent), (
+            f"{dependent} depends on ors-render and must publish after it"
+        )
+        assert order.index(dependent) < order.index("openrackscreen"), (
+            f"openrackscreen depends on {dependent} and must publish after it"
+        )

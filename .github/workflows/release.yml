@@ -3,6 +3,13 @@ name: release
 # A tag, not a branch push: publishing is irreversible per version, and a
 # workflow that fired on every merge would burn version numbers on commits
 # nobody meant to ship.
+#
+# The glob below matches prerelease tags too (`v0.2.0-rc1` satisfies `v*`),
+# but "Check the tag matches the version in the tree" compares the tag
+# verbatim against `read_versions()`, which only ever holds an exact release
+# version -- so no prerelease tag can pass that check today. That is
+# deliberate: if prereleases are ever wanted, fix the comparison, not this
+# glob.
 on:
   push:
     tags: ["v*"]
@@ -14,6 +21,24 @@ jobs:
       - uses: actions/checkout@v5
 
       - uses: astral-sh/setup-uv@v9.0.0
+
+      # Before anything else costs runner time: a mismatched tag is a typo in
+      # a release command, not a code problem, and reading two TOML files is
+      # cheap. Failing here instead of after the interface build and the
+      # dependency-heavy `uv build` below turns a ~2 minute failure into a
+      # sub-second one.
+      - name: Check the tag matches the version in the tree
+        run: |
+          uv run python - <<'PY'
+          import sys
+          sys.path.insert(0, "tools")
+          import os
+          from version import read_versions
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          versions = set(read_versions().values())
+          if versions != {tag}:
+              raise SystemExit(f"tag {tag!r} does not match {versions}")
+          PY
 
       # pnpm before node: the store cache is this action's own, and `pnpm` has
       # to be on PATH before anything can ask it where its store is. Mirrors
@@ -40,19 +65,6 @@ jobs:
         run: |
           rm -rf server/src/ors_server/web
           cp -r web/dist server/src/ors_server/web
-
-      - name: Check the tag matches the version in the tree
-        run: |
-          uv run python - <<'PY'
-          import sys
-          sys.path.insert(0, "tools")
-          import os
-          from version import read_versions
-          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
-          versions = set(read_versions().values())
-          if versions != {tag}:
-              raise SystemExit(f"tag {tag!r} does not match {versions}")
-          PY
 
       - name: Build every distribution
         run: uv build --all-packages --out-dir dist
@@ -89,6 +101,27 @@ jobs:
           print("no wheel names a local path")
           PY
 
+      # Sorted into one directory per package so `publish` below can upload
+      # each package as its own `twine` invocation, in dependency order,
+      # instead of one alphabetical `dist/*` glob. A single glob would upload
+      # `openrackscreen-*` before any `ors_*` file (alphabetically first) and,
+      # since twine aborts on the first failure, could leave the meta-package
+      # published while pinning two dependencies that never made it to PyPI --
+      # a version that can never resolve and can never be re-uploaded.
+      - name: Group distributions by package
+        run: |
+          uv run python - <<'PY'
+          import pathlib, sys
+          sys.path.insert(0, "tools")
+          from version import PACKAGES
+          dist = pathlib.Path("dist")
+          for name in PACKAGES:
+              target = dist / name
+              target.mkdir(exist_ok=True)
+              for path in dist.glob(f"{name.replace('-', '_')}-*"):
+                  path.rename(target / path.name)
+          PY
+
       - uses: actions/upload-artifact@v4
         with:
           name: distributions
@@ -107,4 +140,37 @@ jobs:
         with:
           name: distributions
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+
+      # One `twine upload` per package, in dependency order, leaves first and
+      # the meta-package last: `ors-daemon` and `ors-server` both pin
+      # `ors-schema` and `ors-render`, and `openrackscreen` pins both of them.
+      # This is not atomic -- nothing here can be, once a tag exists -- but it
+      # means every prefix of a partial run is still a *valid* set: nothing
+      # that depends on an unpublished pin is ever uploaded ahead of it.
+      # `skip-existing` makes a rerun after a partial failure safe: packages
+      # already on PyPI are silently skipped rather than rejected.
+      - name: Publish ors-schema
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/ors-schema/
+          skip-existing: true
+      - name: Publish ors-render
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/ors-render/
+          skip-existing: true
+      - name: Publish ors-daemon
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/ors-daemon/
+          skip-existing: true
+      - name: Publish ors-server
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/ors-server/
+          skip-existing: true
+      - name: Publish openrackscreen
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/openrackscreen/
+          skip-existing: true
