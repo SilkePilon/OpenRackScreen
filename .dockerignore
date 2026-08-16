@@ -16,6 +16,20 @@
 venv/
 **/.venv/
 
+# The same argument as `.venv`, one order of magnitude larger: `web/node_modules`
+# is 339 MB of the working tree, and the Node stage installs its own from the
+# lockfile. Without this line every build sends all of it to the daemon and then
+# `COPY web/ ./` drops it *on top of* the tree `pnpm install --frozen-lockfile`
+# just made -- so a `buildx --platform linux/arm64` for the Pi gets a rollup and
+# an esbuild built for x86, and a developer who has never run `pnpm install`
+# gets a different image from one who has.
+**/node_modules/
+
+# The previous local `pnpm build`. The Node stage makes its own and would
+# overwrite this, so copying it in buys a slower context and a chance of
+# shipping a stale build if the stage ever stops rebuilding it.
+web/dist/
+
 # History and tooling state. Nothing in the build reads them.
 .git/
 .github/
