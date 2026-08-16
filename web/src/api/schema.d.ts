@@ -1250,7 +1250,16 @@ export interface components {
             /** Default */
             default?: unknown;
         };
-        /** PasswordBody */
+        /**
+         * PasswordBody
+         * @description The one password `setup` claims and `login` proves.
+         *
+         *     `repr=False` for the reason `Hello.token` and `IntegrationBody.credential`
+         *     carry it, and `PasswordChange` below: a model's `repr` is what reaches a log
+         *     the moment anybody drops one into an `extra`, and the field this holds is a
+         *     plaintext admin password. There is nothing about being the *login* body that
+         *     makes it safer to log than the change body two screens down.
+         */
         PasswordBody: {
             /** Password */
             password: string;
@@ -1932,6 +1941,13 @@ export interface operations {
                     "application/json": components["schemas"]["PasswordChanged"];
                 };
             };
+            /** @description the current password is wrong */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1940,6 +1956,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
+            };
+            /** @description too many password attempts from this client; see login */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
