@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -76,19 +75,25 @@ def settings_assembled(monkeypatch, tmp_path) -> AppSettings:
     return captured[0]
 
 
-def test_the_interface_is_looked_for_where_the_image_puts_it(monkeypatch, tmp_path) -> None:
-    """The one path task 18's `COPY` has to agree with, pinned rather than implied.
+def test_the_interface_defaults_to_the_packaged_copy_when_main_assembles_settings(
+    monkeypatch, tmp_path
+) -> None:
+    """`main` wires `resolve_web_dir` into `AppSettings`, not a literal path.
 
-    `/app/web` and nothing inside `/app/.venv`: the venv's layout carries the
-    interpreter version (`lib/python3.12/site-packages/...`), so a `COPY` naming
-    it is a Dockerfile that breaks on a Python bump with a blank page and a
-    clean log. The default is a container path for the same reason
-    `ORS_DATA_DIR`'s is -- this is how the shipped server is configured, and a
-    checkout that wants its own build says so below.
+    Not `/app/web`: that path exists only inside the container, and `main`
+    itself has no business knowing it. `deploy/Dockerfile` pins
+    `ORS_WEB_DIR=/app/web` explicitly instead, which is what
+    `test_deploy.py::test_the_built_interface_lands_where_the_server_looks_for_it`
+    checks agrees with the image's own `COPY`. A checkout that wants its own
+    build sets `ORS_WEB_DIR=web/dist`; `create_app` warns once and serves the
+    API alone when the directory holds no build, which is the ordinary
+    developer state.
     """
+    from ors_server.__main__ import packaged_web_dir
+
     monkeypatch.delenv("ORS_WEB_DIR", raising=False)
 
-    assert settings_assembled(monkeypatch, tmp_path).web_dir == Path("/app/web")
+    assert settings_assembled(monkeypatch, tmp_path).web_dir == packaged_web_dir()
 
 
 def test_the_interface_directory_can_be_moved_by_the_environment(monkeypatch, tmp_path) -> None:
@@ -141,3 +146,34 @@ def test_the_server_reads_forwarded_headers_from_a_reverse_proxy(monkeypatch, tm
 
     default = inspect.signature(uvicorn.config.Config.__init__).parameters["proxy_headers"].default
     assert default is True, "uvicorn's default moved; the deploy notes depend on this"
+
+
+def test_the_web_directory_defaults_to_the_one_inside_the_wheel(monkeypatch):
+    """Not `/app/web`, which exists only in the container.
+
+    A pip-installed server whose `web_dir` pointed at a container path would
+    serve `/api/*`, pass its health check, and answer 404 for every page --
+    the exact shape of the failure a stale published image already produced
+    on this project once, and one nobody diagnoses quickly, because the
+    server looks healthy from every angle except a browser.
+    """
+    from ors_server.__main__ import packaged_web_dir, resolve_web_dir
+
+    monkeypatch.delenv("ORS_WEB_DIR", raising=False)
+    assert resolve_web_dir() == packaged_web_dir()
+    # And it is inside the installed package, not beside the repository.
+    assert packaged_web_dir().name == "web"
+    assert packaged_web_dir().parent.name == "ors_server"
+
+
+def test_the_environment_still_wins_over_the_packaged_directory(monkeypatch, tmp_path):
+    """The container sets it explicitly, and must keep winning.
+
+    Pinned because the packaged default is the *new* behaviour: a resolution
+    order that consulted the wheel first would make `ORS_WEB_DIR` dead in
+    every deployment that sets it, and the Dockerfile is one of those.
+    """
+    from ors_server.__main__ import resolve_web_dir
+
+    monkeypatch.setenv("ORS_WEB_DIR", str(tmp_path))
+    assert resolve_web_dir() == tmp_path

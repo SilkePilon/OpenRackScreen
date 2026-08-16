@@ -177,11 +177,13 @@ RUN useradd --system --create-home --uid 10001 ors \
 
 COPY --from=builder --chown=ors:ors /app/.venv /app/.venv
 
-# `/app/web` because that is the default `ORS_WEB_DIR` in `__main__.py`, and
-# deliberately not a path inside `/app/.venv`: the venv's layout carries the
-# interpreter version in it (`lib/python3.12/site-packages/...`), so a `COPY`
-# naming that path is a Dockerfile that breaks on a Python bump with a blank
-# page and no error.
+# `/app/web`, matching the `ORS_WEB_DIR` set explicitly below, and deliberately
+# not a path inside `/app/.venv`: the venv's layout carries the interpreter
+# version in it (`lib/python3.12/site-packages/...`), so a `COPY` naming that
+# path is a Dockerfile that breaks on a Python bump with a blank page and no
+# error. `ors_server.__main__.resolve_web_dir` no longer defaults to a
+# container path at all -- a pip-installed server has no `/app` -- so this
+# image sets `ORS_WEB_DIR` itself rather than relying on an implicit default.
 #
 # Getting this destination wrong has no loud failure at all. `mount_interface`
 # treats a missing build as the ordinary developer state -- a checkout that has
@@ -196,10 +198,15 @@ COPY --from=interface --chown=ors:ors /build/web/dist /app/web
 # `127.0.0.1` inside a container is the container and nothing else, so a
 # published port in front of it refuses every connection -- including the
 # healthcheck's -- while the server runs perfectly and logs nothing.
+#
+# `ORS_WEB_DIR=/app/web` because the server no longer assumes it: the code
+# default is now the copy shipped inside the wheel, so an image whose `COPY`
+# above lands the interface anywhere else has to say so, explicitly, here.
 ENV PATH="/app/.venv/bin:$PATH" \
     ORS_DATA_DIR=/var/lib/openrackscreen \
     ORS_HOST=0.0.0.0 \
-    ORS_PORT=8080
+    ORS_PORT=8080 \
+    ORS_WEB_DIR=/app/web
 
 USER ors
 EXPOSE 8080

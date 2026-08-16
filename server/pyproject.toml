@@ -22,6 +22,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ors_server"]
+# `artifacts`, not just `packages`. Hatchling honours .gitignore when selecting
+# files, and `src/ors_server/web/` is gitignored precisely because it is a build
+# output that would go stale the day it were committed. Without this line the
+# wheel builds cleanly and ships no interface.
+artifacts = ["src/ors_server/web/**"]
 
 [tool.uv.sources]
 ors-schema = { workspace = true }

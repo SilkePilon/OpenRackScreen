@@ -35,6 +35,29 @@ the transport instead of from the encoder.
 """
 
 
+def packaged_web_dir() -> Path:
+    """The built interface, as shipped inside the wheel.
+
+    `Path(__file__).parent` and not `importlib.resources`: the directory is
+    handed to starlette's `StaticFiles`, which wants a real path on a real
+    filesystem, and this project is never installed from a zipimport.
+    """
+    return Path(__file__).resolve().parent / "web"
+
+
+def resolve_web_dir() -> Path:
+    """Where the built interface is. The environment first, the wheel second.
+
+    In that order because the container sets `ORS_WEB_DIR` deliberately, and a
+    resolution that preferred the packaged copy would make that setting dead
+    everywhere it is used. A checkout serving its own build sets it to
+    `web/dist`; `create_app` warns once and serves the API alone when the
+    directory holds no build, which stays the ordinary developer state.
+    """
+    from_environment = os.environ.get("ORS_WEB_DIR")
+    return Path(from_environment) if from_environment else packaged_web_dir()
+
+
 def main() -> int:
     # First, before anything that can log: `create_app` reports a rebuilt
     # schema, and until this runs the root logger has no handler and every
@@ -43,16 +66,7 @@ def main() -> int:
     settings = AppSettings(
         data_dir=Path(os.environ.get("ORS_DATA_DIR", "/var/lib/openrackscreen")),
         secret_key=os.environ.get("ORS_SECRET_KEY"),
-        # Where the built interface is, defaulting to where the image puts it --
-        # the same shape as `ORS_DATA_DIR` above, whose default is a container
-        # path too. `/app/web` and not somewhere inside `/app/.venv`, because
-        # the venv's own layout carries the interpreter version in it
-        # (`lib/python3.12/site-packages/...`) and a `COPY` naming that path is
-        # a Dockerfile that breaks on a Python bump with a blank page and no
-        # error. A checkout wanting to serve its own build sets this to
-        # `web/dist`; `create_app` warns once and serves the API alone when the
-        # directory holds no build, which is the ordinary developer state.
-        web_dir=Path(os.environ.get("ORS_WEB_DIR", "/app/web")),
+        web_dir=resolve_web_dir(),
     )
     uvicorn.run(
         create_app(settings),
