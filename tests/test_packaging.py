@@ -422,7 +422,15 @@ def test_the_release_workflow_warns_before_a_silent_skip():
     )
     assert "if" not in warn, "the warning step must not be conditionally skipped"
     assert "pypi.org" in warn["run"], "the warning step must actually query PyPI"
-    assert "raise" not in warn["run"], "the warning step must never fail the job"
+    # Deliberately narrow, and deliberately not a search for "raise": that
+    # spelling matched the word inside a *comment* explaining which exception
+    # the handler has to catch, so the assertion failed on prose. It was never
+    # the real guarantee anyway -- a step can fail without the word appearing
+    # at all, which is exactly how a bare `TimeoutError` used to get through
+    # here. `test_a_slow_pypi_does_not_fail_the_release` runs the script and
+    # is what actually holds this; these two are the cheap spelling check.
+    assert "SystemExit" not in warn["run"], "the warning step must never fail the job"
+    assert "sys.exit" not in warn["run"], "the warning step must never fail the job"
 
     publish_steps = [
         step for step in steps if step.get("uses", "").startswith("pypa/gh-action-pypi-publish")
@@ -431,6 +439,51 @@ def test_the_release_workflow_warns_before_a_silent_skip():
     assert steps.index(warn) < min(steps.index(step) for step in publish_steps), (
         "the warning must run before any package is published"
     )
+
+
+def test_a_slow_pypi_does_not_fail_the_release(tmp_path: Path):
+    """The warning step runs the real script against a PyPI that never answers.
+
+    `"raise" not in run` above is a *textual* check, and it passed while the
+    step could still crash: the handler caught `urllib.error.URLError`, and a
+    server that accepts the connection and is then slow to answer raises a
+    bare `TimeoutError` from the read, which urllib does not wrap. A connect
+    refusal and a connect timeout do arrive as `URLError`; a read timeout does
+    not. So the single most likely thing to go wrong -- PyPI being slow or
+    rate-limiting a release -- failed the `publish` job on a step whose entire
+    purpose is to print a warning.
+
+    Executed rather than asserted about, because that is the only way to see
+    it. The script is pulled out of the live workflow, `urlopen` is replaced
+    before it runs, and the working directory is the repository so the real
+    `tools/version.py` and the real manifests are what it reads. Nothing is
+    written anywhere.
+    """
+    warn = _find_step(
+        _release_workflow()["jobs"]["publish"]["steps"],
+        lambda s: s.get("name") == "Warn about packages already published at this version",
+        "pre-publish PyPI check",
+    )
+    script = tmp_path / "warn.py"
+    script.write_text(_heredoc_script(warn["run"]))
+
+    finished = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import urllib.request, sys\n"
+            "def _never_answers(*args, **kwargs):\n"
+            "    raise TimeoutError('The read operation timed out')\n"
+            "urllib.request.urlopen = _never_answers\n"
+            f"exec(compile(open({str(script)!r}).read(), 'warn-step', 'exec'))\n",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert finished.returncode == 0, f"a slow PyPI failed the release step:\n{finished.stderr}"
+    assert "could not check PyPI" in finished.stdout
 
 
 def test_the_release_workflow_refuses_a_wheel_without_the_interface():

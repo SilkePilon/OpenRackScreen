@@ -200,7 +200,19 @@ jobs:
                       continue
                   print(f"::warning::could not check PyPI for {name}=={version}: {exc}")
                   continue
-              except urllib.error.URLError as exc:
+              except OSError as exc:
+                  # `OSError`, not `urllib.error.URLError`, which is what this
+                  # caught until a review reproduced the gap. A server that
+                  # accepts the connection and is then slow to answer fails
+                  # the *read* with a bare `TimeoutError`, and urllib does not
+                  # wrap that one. A connect refusal and a connect timeout do
+                  # both arrive as `URLError`; a read timeout does not -- so
+                  # the single most likely thing to go wrong here, PyPI being
+                  # slow or rate-limiting a release, crashed this step and
+                  # failed the publish on a check that exists only to print a
+                  # warning. `URLError`, `TimeoutError` and `ConnectionError`
+                  # are all `OSError`, so this is the narrowest clause that
+                  # covers every one of them.
                   print(f"::warning::could not check PyPI for {name}=={version}: {exc}")
                   continue
               already_published.append(f"{name}=={version}")
