@@ -446,6 +446,20 @@ describe("the integrations page", () => {
     const created = await screen.findByRole("region", { name: "loki-tail on pi-loft" })
     expect(within(created).getByText(/a credential is stored/i)).toBeInTheDocument()
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    expect(screen.getByText("loki-tail was added.")).toBeInTheDocument()
+    appearsNowhere(NEW_TOKEN, said)
+
+    // Opening the form again starts from an empty one, and here that is a rule
+    // about the credential before it is one about convenience: an abandoned or
+    // finished attempt must not leave a plaintext secret sitting in a box for
+    // whoever is next at this browser. The last create's answer goes with it --
+    // it is an answer about a write that has already happened, and left standing
+    // over a fresh form it reads as this one's.
+    await userEvent.click(screen.getByRole("button", { name: "Add an integration to pi-loft" }))
+    const again = within(await screen.findByRole("dialog"))
+    expect(again.getByRole("textbox", { name: "Name" })).toHaveValue("")
+    expect(again.queryByLabelText("Credential to store")).not.toBeInTheDocument()
+    expect(screen.queryByText("loki-tail was added.")).not.toBeInTheDocument()
     appearsNowhere(NEW_TOKEN, said)
   })
 
@@ -500,10 +514,14 @@ describe("the integrations page", () => {
       expect(screen.getByRole("region", { name: "vault-probe on pi-loft" })).toBeInTheDocument(),
     )
     expect(cardOf("vault-probe on pi-loft").getByText(/a credential is stored/i)).toBeInTheDocument()
+    expect(cardOf("vault-probe on pi-loft").getByText("vault-probe was saved.")).toBeInTheDocument()
 
     // Then: the clear, which is a different request and says so explicitly.
     await userEvent.click(screen.getByRole("button", { name: "Edit vault-probe" }))
     const clearing = within(await screen.findByRole("dialog"))
+    // Setting up the next edit clears what the last one answered, for the reason
+    // the delete and the create do: it is about a write that has happened.
+    expect(screen.queryByText("vault-probe was saved.")).not.toBeInTheDocument()
 
     // The half-typed replacement, which is the same wipe wearing a different
     // hat: "replace it" with an empty box builds `credential: ""`, which is the
