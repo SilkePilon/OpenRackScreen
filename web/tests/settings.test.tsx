@@ -174,6 +174,12 @@ describe("the settings page", () => {
     // it holds is a password, and it has been used.
     appearsNowhere(CURRENT_PASSWORD, said)
     appearsNowhere(NEXT_PASSWORD, said)
+
+    // The last write's answer is not an answer about a form somebody has since
+    // started filling in again -- "2 other sign-ins were ended" sitting under a
+    // half-typed second change reads as a report on the change being typed.
+    await userEvent.type(card.getByLabelText("Current password"), "a")
+    expect(screen.queryByText(/sign-ins were ended/i)).not.toBeInTheDocument()
   })
 
   it("says which password was wrong without signing the admin out", async () => {
@@ -230,6 +236,11 @@ describe("the settings page", () => {
     const card = within(await screen.findByRole("region", { name: "Admin password" }))
     await userEvent.type(card.getByLabelText("Current password"), CURRENT_PASSWORD)
     await userEvent.type(card.getByLabelText("New password"), NEXT_PASSWORD)
+    // Nothing to compare yet. A confirmation box that has not been typed into
+    // is not a mismatch, and a warning that appears on the first keystroke of
+    // every password is one people learn to read past.
+    expect(card.queryByText(/typed differently twice/i)).not.toBeInTheDocument()
+
     await userEvent.type(card.getByLabelText("Confirm the new password"), "eight-red-lantern")
 
     expect(card.getByText(/typed differently twice/i)).toBeInTheDocument()
@@ -340,8 +351,12 @@ describe("the settings page", () => {
       http.patch("/api/settings", async ({ request }) => {
         const body = (await request.json()) as { night: Settings["night"] }
         bodies.push(body)
-        stored = { ...stored, night: body.night }
-        return HttpResponse.json(stored)
+        // The write lands -- and another tab moves the window again before this
+        // one refetches, so what comes back is not what was sent. A form that
+        // kept what was typed goes on showing 21:15 for a server that holds
+        // 23:30, which is the defect `SleepTab` was fixed for one page over.
+        stored = { ...stored, night: { enabled: true, start: "23:30", end: "05:05" } }
+        return HttpResponse.json({ ...stored, night: body.night })
       }),
     )
     renderApp({ at: "/settings" })
@@ -374,6 +389,10 @@ describe("the settings page", () => {
     await waitFor(() =>
       expect(bodies).toEqual([{ night: { enabled: true, start: "21:15", end: "06:20" } }]),
     )
+    // And afterwards the boxes hold what the server holds, not what was typed.
+    await waitFor(() => expect(card.getByLabelText("Dark from")).toHaveValue("23:30"))
+    expect(card.getByLabelText("Light again at")).toHaveValue("05:05")
+    expect(screen.getByText("The night window was saved.")).toBeInTheDocument()
   })
 
   it("names the one rack of four that did not get the change, and not the three that did", async () => {
