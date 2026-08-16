@@ -465,6 +465,66 @@ export function useSettings() {
   })
 }
 
+/** What a settings amendment may carry. Both fields optional, `extra="forbid"`. */
+export type SettingsBody = components["schemas"]["SettingsBody"]
+
+/**
+ * Change the timezone, the night window, or both.
+ *
+ * **Rack-wide, and that is what makes the header the only signal.** Neither
+ * setting belongs to a rack: `build_snapshot` reads both for whichever daemon it
+ * is assembling, so the route never calls `affects` and `Change` reads the
+ * affected set as every rack there is. It can therefore never be narrowed to a
+ * 202 -- an edit that reached three racks of four answers a plain 200 -- and
+ * `X-Unservable-Daemons` is the only thing anywhere in that response that names
+ * the fourth. `useMutate` reads it on every success, which is the whole reason
+ * every write on this page goes through it.
+ *
+ * `invalidates` names the settings and nothing else. The edit does bump every
+ * rack's `config_version`, but the racks are patched by the live socket on every
+ * page that draws one, and re-asking for the whole listing here would be a
+ * second snapshot-per-rack assembly on the event loop for an edit that changed
+ * no rack's rows.
+ *
+ * Mounted per card rather than once for the page, deliberately: the two cards
+ * write different fields and are refused for different reasons, and one
+ * mutation between them would render a refusal about a timezone under a night
+ * window somebody else was editing.
+ */
+export function useSaveSettings() {
+  return useMutate<Settings, SettingsBody>({
+    send: (body) => api.PATCH("/api/settings", { body }),
+    invalidates: [settingsKey],
+  })
+}
+
+/** The current password and the new one. Both write-only; neither ever comes back. */
+export type PasswordChange = components["schemas"]["PasswordChange"]
+
+/** That the password changed, and how many other browsers it signed out. */
+export type PasswordChanged = components["schemas"]["PasswordChanged"]
+
+/**
+ * Replace the admin password, proving the current one.
+ *
+ * `invalidates: []`, and not because nothing changed: **this browser's session
+ * is the one the route deliberately keeps**. Every other session ends, which is
+ * what makes the change worth anything if the password leaked, and none of them
+ * is in this tab's cache. Removing `sessionKey` here would send this tab to
+ * re-ask `GET /api/auth/me` about a session that is still perfectly good.
+ *
+ * `useMutate` for the half of its job that applies -- a refusal arrives as an
+ * `ApiError` carrying the server's own sentence, which is the whole of what this
+ * card has to say about a 403 or a 429. The unservable header is always absent
+ * here, which parses to an empty list: a password is not a rack's configuration.
+ */
+export function useChangePassword() {
+  return useMutate<PasswordChanged, PasswordChange>({
+    send: (body) => api.POST("/api/auth/password", { body }),
+    invalidates: [],
+  })
+}
+
 export type Session = {
   authenticated: boolean
   password_set: boolean

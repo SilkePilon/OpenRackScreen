@@ -2,14 +2,14 @@ import { useId, useState } from "react"
 
 import { useSettings, type Screen } from "@/api/queries"
 import type { components } from "@/api/schema"
+import { NightWindowFields } from "@/components/NightWindowFields"
+import { WRAP_NOTE, describeNight, sameNight, type NightWindow } from "@/components/night"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { useUnsaved } from "@/routes/screens/unsaved"
 
 type ScreenBody = components["schemas"]["ScreenBody"]
-type NightWindow = components["schemas"]["NightWindow"]
 
 /**
  * The override this screen holds, or `null` because it holds none.
@@ -28,17 +28,6 @@ function readNight(raw: Screen["sleep_override"]): NightWindow | null {
   }
 }
 
-function same(left: NightWindow | null, right: NightWindow | null): boolean {
-  if (left === null || right === null) return left === right
-  return left.enabled === right.enabled && left.start === right.start && left.end === right.end
-}
-
-/** "dark between 23:00 and 07:00", which is the sentence the two times mean. */
-function describe(night: NightWindow, timezone: string): string {
-  if (!night.enabled) return "Never sleeps."
-  return `Dark between ${night.start} and ${night.end}, ${timezone} time.`
-}
-
 /**
  * When this one panel is dark, against what the whole server does.
  *
@@ -47,6 +36,13 @@ function describe(night: NightWindow, timezone: string): string {
  * owns the rack thinks in "dark between 23:00 and 07:00", not in "dark for
  * eight hours" -- and interpreting the wrap is the daemon's job, so nothing
  * here reads a clock or decides whether the panel is asleep right now.
+ *
+ * The three controls, the sentence and the note about the wrap are
+ * `components/night`'s, shared with the settings page's global window: this is
+ * the same edit made in two places, and the seam this project has been bitten
+ * by three times is the one where the two copies start behaving differently.
+ * What stays here is what really differs -- whether there is an override at
+ * all, and what an untouched field falls back to.
  *
  * Turning the override off sends `sleep_override: null`, which is a change and
  * not an absence: `_columns` uses `exclude_unset` rather than `exclude_none`
@@ -106,7 +102,7 @@ export function SleepTab({
   }
 
   const wanted: NightWindow | null = overriding ? shown : null
-  const moved = !same(wanted, held)
+  const moved = !sameNight(wanted, held)
   // The last write's notice is not an answer about a form that has moved on
   // from it.
   useUnsaved(moved, edited)
@@ -116,7 +112,7 @@ export function SleepTab({
       <p className="text-sm text-muted-foreground">
         {night === undefined
           ? "The rack's own night window is still being read."
-          : `Every panel on this server: ${describe(night, settings.data?.timezone ?? "server")}`}
+          : `Every panel on this server: ${describeNight(night, settings.data?.timezone ?? "server")}`}
       </p>
 
       <div className="flex items-center justify-between gap-4">
@@ -126,36 +122,15 @@ export function SleepTab({
 
       {overriding && (
         <>
-          <div className="flex items-center justify-between gap-4">
-            <Label htmlFor={field("enabled")}>Sleeps at all</Label>
-            <Switch id={field("enabled")} checked={shown.enabled} onCheckedChange={setEnabled} />
-          </div>
-
-          <div className="grid grid-cols-2 gap-2">
-            <div className="grid gap-2">
-              <Label htmlFor={field("start")}>Dark from</Label>
-              <Input
-                id={field("start")}
-                type="time"
-                value={shown.start}
-                onChange={(event) => setStart(event.target.value)}
-              />
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor={field("end")}>Light again at</Label>
-              <Input
-                id={field("end")}
-                type="time"
-                value={shown.end}
-                onChange={(event) => setEnd(event.target.value)}
-              />
-            </div>
-          </div>
+          <NightWindowFields
+            value={shown}
+            onEnabled={setEnabled}
+            onStart={setStart}
+            onEnd={setEnd}
+          />
 
           <p className="text-xs text-muted-foreground">
-            {`This panel: ${describe(shown, settings.data?.timezone ?? "server")} ` +
-              "A start later than the end means the window crosses midnight, which is the usual " +
-              "way round."}
+            {`This panel: ${describeNight(shown, settings.data?.timezone ?? "server")} ${WRAP_NOTE}`}
           </p>
         </>
       )}

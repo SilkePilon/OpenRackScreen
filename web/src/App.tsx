@@ -10,6 +10,7 @@ import { DaemonsPage } from "@/routes/daemons/DaemonsPage"
 import { IntegrationsPage } from "@/routes/integrations/IntegrationsPage"
 import { LoginPage } from "@/routes/login/LoginPage"
 import { ScreensPage } from "@/routes/screens/ScreensPage"
+import { SettingsPage } from "@/routes/settings/SettingsPage"
 import { SetupPage } from "@/routes/setup/SetupPage"
 import { TemplatesPage } from "@/routes/templates/TemplatesPage"
 
@@ -95,7 +96,7 @@ function App() {
         <Route path="/screens" element={<ScreensPage />} />
         <Route path="/templates" element={<TemplatesPage />} />
         <Route path="/integrations" element={<IntegrationsPage />} />
-        <Route path="/settings" element={<Placeholder title="Settings" />} />
+        <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<Placeholder title="No such page" />} />
       </Route>
     </Routes>
