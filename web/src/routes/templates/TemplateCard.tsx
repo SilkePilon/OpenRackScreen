@@ -39,7 +39,12 @@ const PREVIEW_SIZE = 240
  *
  * A template no panel names has nothing to render against, and the route would
  * answer 404 for a screen that is not there. The card says so in words rather
- * than asking for a picture that cannot be drawn.
+ * than asking for a picture that cannot be drawn -- but **only once the panels
+ * have actually been read**. `GET /api/templates` and `GET /api/screens` are
+ * independent, so "no panel draws it yet" is a definite claim about a list this
+ * card may not have; a fetch in flight and a fetch that failed both look exactly
+ * like a screen list with nothing in it. Unread, it says nothing, and the page
+ * says instead that the panels are being read or could not be.
  *
  * **Nothing here turns the picture.** `rotation` and `hflip` describe how the
  * glass is bolted into the rack -- all four of the user's are 270 -- and the
@@ -51,14 +56,18 @@ const PREVIEW_SIZE = 240
 function Preview({
   template,
   drawing,
+  panelsKnown,
   rackName,
 }: {
   template: Template
   /** The panel to draw it through, or `undefined` because no panel names it. */
   drawing: Screen | undefined
+  /** Whether `GET /api/screens` has actually answered. */
+  panelsKnown: boolean
   rackName: (daemonId: number) => string
 }) {
   if (drawing === undefined) {
+    if (!panelsKnown) return null
     return (
       <p className="max-w-prose text-sm text-muted-foreground">
         No panel draws it yet, and the preview is rendered for a panel &mdash; assign one and the
@@ -108,6 +117,7 @@ export function TemplateCard({
   templates,
   screens,
   drawing,
+  panelsKnown,
   racks,
   remove,
 }: {
@@ -118,6 +128,15 @@ export function TemplateCard({
   screens: Screen[]
   /** The panels that name this template, in the server's order. */
   drawing: Screen[]
+  /**
+   * Whether `GET /api/screens` has answered.
+   *
+   * Everything this card says about panels is a claim about that list, and
+   * `screens.data ?? []` cannot tell "no panels" from "not yet" or "the request
+   * failed". So the sentence about no panel drawing it, and the control that
+   * offers panels to assign, both wait for it.
+   */
+  panelsKnown: boolean
   racks: Daemon[]
   /**
    * The page's delete, passed down rather than mounted here.
@@ -185,7 +204,12 @@ export function TemplateCard({
           }
         />
 
-        <Preview template={template} drawing={drawing[0]} rackName={rackName} />
+        <Preview
+          template={template}
+          drawing={drawing[0]}
+          panelsKnown={panelsKnown}
+          rackName={rackName}
+        />
 
         {/* No list at all for a template nothing draws, rather than an empty
             labelled one: "Panels drawing ring-gauge" with nothing under it is a
@@ -204,12 +228,18 @@ export function TemplateCard({
       </CardContent>
 
       <CardFooter className="flex flex-wrap gap-2">
-        <AssignPanelDialog
-          template={template}
-          candidates={candidates}
-          rackName={rackName}
-          patch={patch}
-        />
+        {/* Only once the panels have been read. Unread, every panel there is
+            filters out of `candidates`, so this would open on an empty select
+            -- an assign control offering nothing, on a rack wall that is fully
+            configured, with the reason a page away. */}
+        {panelsKnown && (
+          <AssignPanelDialog
+            template={template}
+            candidates={candidates}
+            rackName={rackName}
+            patch={patch}
+          />
+        )}
         <AmendTemplateDialog template={template} amend={amend} />
         {!template.builtin && <DeleteTemplateDialog template={template} remove={remove} />}
       </CardFooter>

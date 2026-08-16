@@ -78,8 +78,14 @@ export function TemplatesPage() {
       )}
       {/* The panels are a separate fetch, and every card is about them: which
           panel is previewed, which panels can be assigned, which can be
-          detached. A page that only said the templates loaded would draw every
-          card as "no panel draws it" while this request was failing. */}
+          detached. The two requests are independent, so on any load where the
+          templates resolve first there is a moment -- and on a failure, forever
+          -- with templates in hand and no panels; a page that said only that
+          the templates had loaded would draw every card as "no panel draws it"
+          for a rack wall that is fully configured. Hence a pending line of its
+          own, the shape `ScreensPage` uses, and the `screens.isSuccess` the
+          cards below are handed. */}
+      {screens.isPending && <p className="text-sm text-muted-foreground">Reading the panels&hellip;</p>}
       {screens.isError && (
         <Alert variant="destructive">
           <AlertTitle>The panels could not be read</AlertTitle>
@@ -118,6 +124,7 @@ export function TemplatesPage() {
             templates={templates.data}
             screens={screenRows}
             drawing={drawnBy(screenRows, template.name)}
+            panelsKnown={screens.isSuccess}
             racks={rackRows}
             remove={remove}
           />

@@ -247,6 +247,60 @@ describe("the templates page", () => {
     expect(cardOf("aurora-clock").getByText(/no panel draws it/i)).toBeInTheDocument()
   })
 
+  it("says nothing about which panels draw what until the panels have been read", async () => {
+    // `GET /api/templates` and `GET /api/screens` are independent requests, and
+    // every claim a card makes is about the second one. Read as `screens.data ??
+    // []`, a fetch still in flight and a fetch that failed are both
+    // indistinguishable from a server with no panels on it -- so a page that
+    // waited only for the templates says "No panel draws it yet" on every card
+    // of a rack wall that is fully configured, and offers an assign dialog
+    // listing panels it has not read.
+    //
+    // Not only the error case: the templates resolving first is the ordinary
+    // load. This is task 13's defect one page over -- `ScreensPage` gates "No
+    // racks are paired yet" on `!screens.isPending && !racks.isPending &&
+    // !racks.isError` for exactly this reason -- so it is gated the same way
+    // here, and both halves are driven below: pending, then failed.
+    let release: (response: Response) => void = () => {}
+    const held = new Promise<Response>((resolve) => {
+      release = resolve
+    })
+    server.use(
+      SIGNED_IN,
+      // The racks fail outright, which is the same rule on the other fetch: an
+      // unread listing must not be drawn as an empty one either.
+      http.get("/api/daemons", () =>
+        HttpResponse.json({ detail: "the daemon table could not be read" }, { status: 500 }),
+      ),
+      http.get("/api/templates", () => HttpResponse.json(TEMPLATES)),
+      http.get("/api/screens", () => held),
+    )
+    renderApp({ at: "/templates" })
+
+    // The cards are up, because the templates arrived. The panels have not.
+    await screen.findByRole("region", { name: "ring-gauge" })
+    expect(screen.getByText(/Reading the panels/)).toBeInTheDocument()
+    expect(screen.queryByText(/no panel draws it/i)).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: /^Assign a panel to/ })).not.toBeInTheDocument()
+    // The gate is exactly as wide as the claim: amending a template needs no
+    // panel list, so it is still offered, and the racks that could not be read
+    // are said out loud rather than left to be inferred from a blank card.
+    expect(screen.getByRole("button", { name: "Amend ring-gauge" })).toBeInTheDocument()
+    expect(screen.getByText("The racks could not be read")).toBeInTheDocument()
+    expect(screen.getByText("the daemon table could not be read")).toBeInTheDocument()
+
+    release(HttpResponse.json({ detail: "the screen table could not be read" }, { status: 500 }))
+
+    // And a request that failed is a request that failed, permanently: the page
+    // says so, and no card has quietly started claiming that nothing draws it.
+    expect(await screen.findByText("The panels could not be read")).toBeInTheDocument()
+    expect(screen.getByText("the screen table could not be read")).toBeInTheDocument()
+    await waitFor(() => expect(screen.queryByText(/Reading the panels/)).not.toBeInTheDocument())
+    expect(screen.queryByText(/no panel draws it/i)).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: /^Assign a panel to/ })).not.toBeInTheDocument()
+    expect(screen.getByRole("region", { name: "ring-gauge" })).toBeInTheDocument()
+  })
+
   it("assigns a panel by name, and draws what the server answered", async () => {
     const patched: unknown[] = []
     let screens = SCREENS
@@ -304,7 +358,7 @@ describe("the templates page", () => {
     // The racks that did not get it, from the header and from nothing else.
     const notice = await screen.findByText(/was saved, but nothing was sent/i)
     expect(notice).toHaveTextContent("pi-cellar")
-    expect(notice).toHaveTextContent("daemon 63")
+    expect(notice).toHaveTextContent("rack 63")
     // Not the rack the edited panel is on, which is what a page reading the
     // body instead of the header would say.
     expect(notice).not.toHaveTextContent("pi-loft")
@@ -489,7 +543,7 @@ describe("the templates page", () => {
 
     const notice = await screen.findByText(/was saved, but nothing was sent/i)
     expect(notice).toHaveTextContent("pi-cellar")
-    expect(notice).toHaveTextContent("daemon 63")
+    expect(notice).toHaveTextContent("rack 63")
 
     // And the list was re-asked, so the card shows what the server holds.
     await waitFor(() =>
@@ -547,5 +601,12 @@ describe("the templates page", () => {
     expect(dialog.getByText(/no other template for it to draw/i)).toBeInTheDocument()
     expect(dialog.queryByRole("combobox", { name: "Draws instead" })).not.toBeInTheDocument()
     expect(dialog.getByRole("button", { name: "Detach the panel" })).toBeDisabled()
+    // And the remedy points somewhere that exists. There is no create anywhere
+    // in this interface -- no page here makes a template -- so "add a template
+    // first" would send the reader hunting for a button nobody has built. The
+    // route is named instead, and so is the other way out: `app.py` re-seeds
+    // every built-in it ships with at each start.
+    expect(dialog.getByText(/POST \/api\/templates/)).toBeInTheDocument()
+    expect(dialog.getByText(/restarting the server/)).toBeInTheDocument()
   })
 })

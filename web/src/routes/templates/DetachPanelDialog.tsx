@@ -37,6 +37,12 @@ import {
  * refuses with the reason and the thing to do about it. That state is reachable
  * -- one template on a server whose table was emptied and re-seeded with one row
  * -- and the alternative is an empty select that looks broken.
+ *
+ * The remedy names a route rather than a page, because there is no create
+ * anywhere in this interface -- "add a template first" would send the reader
+ * looking for a button nobody has built. `POST /api/templates` is one way out;
+ * `seed_builtin_templates` runs on every start of `app.py` and inserts anything
+ * missing, so restarting the server is the other.
  */
 export function DetachPanelDialog({
   screen,
@@ -84,8 +90,10 @@ export function DetachPanelDialog({
         {others.length === 0 ? (
           <p className="text-sm text-muted-foreground">
             {`There is no other template for it to draw, so ${screen.name} cannot be detached from ` +
-              `${template.name} yet. Add a template first — this page does not make them — and ` +
-              "the panel can be moved to it."}
+              `${template.name} yet. No page in this interface creates one — a template is a ` +
+              "document of scenes and that editor is phase 2 — so the two ways to get a second " +
+              "are POST /api/templates, and restarting the server, which re-seeds every built-in " +
+              "it ships with."}
           </p>
         ) : (
           <div className="grid gap-2">

@@ -302,7 +302,7 @@ describe("the racks", () => {
     const notice = await screen.findByText(/no configuration that can be sent/i)
     expect(notice).toHaveTextContent("pi-cellar")
     // An id with no row is still a rack somebody has to go and look at.
-    expect(notice).toHaveTextContent("daemon 63")
+    expect(notice).toHaveTextContent("rack 63")
     expect(notice).not.toHaveTextContent("pi-loft")
     expect(notice).not.toHaveTextContent("pi-attic")
   })

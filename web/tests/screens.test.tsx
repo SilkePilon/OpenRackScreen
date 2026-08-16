@@ -630,7 +630,7 @@ describe("the screens page", () => {
     const notice = await screen.findByText(/was saved, but nothing was sent/i)
     expect(notice).toHaveTextContent("pi-cellar")
     // An id with no row is named as an id rather than drawn as nothing.
-    expect(notice).toHaveTextContent("daemon 63")
+    expect(notice).toHaveTextContent("rack 63")
     // Not the rack the edited screen is on, which is the answer a page reading
     // the body instead of the header would give.
     expect(notice).not.toHaveTextContent("pi-loft")
