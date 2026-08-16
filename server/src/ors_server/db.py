@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 """Bumped whenever the schema below changes.
 
 There are no migrations: a bump exports the database and rebuilds it empty.
@@ -102,6 +102,32 @@ CREATE TABLE IF NOT EXISTS daemon_event (
     level     TEXT NOT NULL,
     kind      TEXT NOT NULL,
     message   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS claim (
+    id           TEXT PRIMARY KEY,
+    hostname     TEXT NOT NULL,
+    address      TEXT NOT NULL,
+    fingerprint  TEXT NOT NULL UNIQUE,
+    short_code   TEXT NOT NULL,
+    version      TEXT NOT NULL,
+    public_key   TEXT NOT NULL,
+    first_seen   REAL NOT NULL,
+    -- Reserved for a later task's poll-and-deliver route, not written by
+    -- anything in this schema version. `claims.approve` hands its key back
+    -- to its own caller and deletes the row in the same statement instead of
+    -- parking it here: `fingerprint` above is UNIQUE across every row this
+    -- table has ever held, so a completed claim left in place would go on
+    -- occupying that rack's only slot, and a rack that ever needed to file
+    -- again -- a database rebuilt out from under a paired daemon, say --
+    -- could not. See `claims.approve`'s docstring for the full argument.
+    granted_key  TEXT,
+    daemon_id    INTEGER REFERENCES daemon(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS denied_fingerprint (
+    fingerprint  TEXT PRIMARY KEY,
+    denied_at    REAL NOT NULL
 );
 """
 
