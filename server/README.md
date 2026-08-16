@@ -255,15 +255,28 @@ For a 64-bit Pi from another machine:
 docker buildx build --platform linux/arm64 -f deploy/Dockerfile -t openrackscreen .
 ```
 
-`arm64` is the supported target, and since the interface moved into the image it
-is the **only** ARM target: the official `node:24` images publish `linux/amd64`,
-`linux/arm64/v8`, `linux/ppc64le` and `linux/s390x` and no `linux/arm/v7`, so a
-32-bit build now fails in the Node stage before it reaches any Python. Use the
-64-bit Raspberry Pi OS.
+Only the Python half of that is emulated. The Node stage is pinned to
+`--platform=$BUILDPLATFORM`, so `pnpm install`, `tsc -b` and `vite build` run
+natively on the machine you are building on: `dist` is HTML, JS and CSS, and it
+is the same bytes whatever CPU emitted them. The uv builder is not pinned that
+way on purpose — it installs wheels *for* the target.
+
+`arm64` is the supported target, and it is the **only** ARM target. It has been
+since this image first existed, which is older than the interface being in it:
+the first `FROM` in `deploy/Dockerfile` is
+`ghcr.io/astral-sh/uv:0.12-python3.12-trixie-slim`, and that tag publishes
+`linux/amd64` and `linux/arm64` and no `linux/arm/v7`. A
+`--platform linux/arm/v7` build therefore fails on that line — before any
+Python, and before the Node stage is even reached. `node:24` publishes no
+`linux/arm/v7` either, so the interface stage is a second wall behind the first
+one rather than the thing that closed 32-bit ARM. Use the 64-bit Raspberry Pi
+OS.
 
 The builder stage still installs `gcc` and `libc6-dev` for a 32-bit reason —
 `argon2-cffi-bindings` publishes no `armv7l` wheel, so Argon2 would compile from
-C there, while `cryptography` does ship one. That layer is now unreachable in
-practice and is kept because it is cheap (one apt layer in a stage nothing
-ships), because the wheel situation is what would have to change first, and
-because the runtime stage must still not have a compiler in it either way.
+C there, while `cryptography` does ship one. That layer has been dead in
+practice since the uv tag was pinned, and is kept because it is cheap (one apt
+layer in a stage nothing ships), because the wheel situation is what would have
+to change first, and because the runtime stage must still not have a compiler in
+it either way. Anyone reopening 32-bit ARM starts at the uv base image, not at
+Node.

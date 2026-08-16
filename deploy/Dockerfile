@@ -33,11 +33,16 @@ FROM ghcr.io/astral-sh/uv:0.12-python3.12-trixie-slim AS builder
 # `test_the_reason_the_builder_carries_a_compiler_is_still_true` reads the lock
 # and fails the day an armv7l wheel appears, which is when this can go.
 #
-# Since the interface stage below arrived, this layer is unreachable in practice
-# and is kept honestly rather than deleted: `node:24` publishes linux/amd64,
-# linux/arm64/v8, linux/ppc64le and linux/s390x and **no linux/arm/v7**, so a
-# 32-bit build now fails in the Node stage long before Argon2 is compiled here.
-# arm64 is the supported target; see server/README.md.
+# This layer has been unreachable in practice since the `FROM` directly below it,
+# and *not* since the interface stage further down: the tag
+# `ghcr.io/astral-sh/uv:0.12-python3.12-trixie-slim` publishes linux/amd64 and
+# linux/arm64 and **no linux/arm/v7**. So `buildx --platform linux/arm/v7` fails
+# at the first `FROM` in this file -- this stage's own -- and has done since that
+# tag was pinned, in the commit that created this Dockerfile. `node:24` publishes
+# no armv7 either, so the interface stage is a second wall behind the first one;
+# it is not what closed 32-bit ARM. arm64 has always been the only ARM target
+# here. Kept rather than deleted, and honestly labelled: reopening 32-bit starts
+# at the uv base image, not at Node. See server/README.md.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -96,7 +101,19 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Not the final stage, and the position in this file is the whole guard: a stage
 # appended at the bottom -- which is where one appends things -- becomes the
 # image, and `docker build` would then ship a Node base with no Python in it.
-FROM node:24-trixie-slim AS interface
+#
+# `--platform=$BUILDPLATFORM` -- the machine doing the building, not the machine
+# being built for. What leaves this stage is `dist`: HTML, JS and CSS, which are
+# the same bytes whatever CPU emitted them. Without this pin the documented Pi
+# cross-build (`buildx --platform linux/arm64`, server/README.md) runs `pnpm
+# install`, `tsc -b` and `vite build` under qemu-arm64 -- the slowest and by far
+# the most fragile part of any cross-build, for an artefact with no architecture
+# in it. The uv builder above is the opposite case and is deliberately *not*
+# pinned this way: it resolves and installs wheels *for* the target, and an
+# amd64 `.venv` copied into an arm64 runtime is a broken image.
+# `$BUILDPLATFORM` is a BuildKit built-in, which the `# syntax=` line at the top
+# of this file guarantees is in play.
+FROM --platform=$BUILDPLATFORM node:24-trixie-slim AS interface
 
 WORKDIR /build/web
 
