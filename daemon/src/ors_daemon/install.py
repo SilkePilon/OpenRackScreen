@@ -81,13 +81,27 @@ class Runner(Protocol):
 @dataclass(frozen=True)
 class InstallReport:
     """What `install` did, in enough detail to print and to decide an exit
-    code from."""
+    code from.
+
+    `failed` alone conflates two different shapes, and `refused` is the field
+    that tells them apart. The `--use-current-interpreter` permission check
+    is the one place `install()` returns *before* touching anything -- no
+    directories, no user, no unit, no SPI step -- so `refused=True` there
+    means every line describing those steps would be reporting work that
+    never happened. Every other failure (a `useradd`/`usermod` exiting
+    something other than 0 or 9, say) is discovered *after* `install()` has
+    already gone on to write the unit, run `systemctl`, attempt the SPI step
+    and create the identity -- `refused=False` there, because the state on
+    disk is genuinely mixed and the steps that did run are worth reporting
+    honestly, clearly marked as a partial install rather than withheld.
+    """
 
     unit_path: Path
     created_user: bool
     short_code: str
     reboot_needed: bool
     failed: bool
+    refused: bool = False
     # `tuple`, not `list`: `frozen=True` makes a dataclass hashable by
     # default, and a `list` field breaks that silently -- the class
     # statement succeeds either way, and only calling `hash()` on an
@@ -376,6 +390,7 @@ def install(
                 short_code="",
                 reboot_needed=False,
                 failed=True,
+                refused=True,
                 warnings=tuple(warnings),
             )
         bin_path = str(executable)
@@ -488,6 +503,7 @@ def install(
         short_code=ident.short_code,
         reboot_needed=reboot_needed,
         failed=failed,
+        refused=False,
         warnings=tuple(warnings),
     )
 

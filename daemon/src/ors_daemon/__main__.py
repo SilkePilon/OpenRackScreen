@@ -464,21 +464,40 @@ def _print_install_report(report: InstallReport, *, no_spi: bool) -> None:
     which reads `False` both when SPI was already on and when `--no-spi`
     skipped the step entirely -- two different facts to tell an operator, one
     boolean between them.
+
+    `report.failed` alone does not say which of two shapes a failure is, and
+    printing the same way for both would be wrong in one direction or the
+    other -- see `InstallReport.refused`. `refused=True` is the early
+    `--use-current-interpreter` permission check, which returns before
+    anything else is touched, so `unit:`/`service user:`/an SPI line would
+    describe work that never happened; only the warnings are true, so only
+    the warnings are printed. `refused=False` with `failed=True` is a failure
+    discovered mid-run (`useradd`/`usermod` exiting something other than 0 or
+    9, say) -- `install()` keeps going past that, so the unit may genuinely
+    have been written, `systemctl` genuinely called and the SPI step
+    genuinely attempted. Withholding those lines there is exactly the
+    operator-hostile shape this function used to have: the person most in
+    need of detail, debugging a half-finished install over SSH, would be told
+    the least. Everything printed in that branch is something `install()`
+    provably ran; nothing here claims a step that a `return` upstream
+    prevented from happening.
     """
     if report.short_code:
         print(f"short code: {report.short_code}")
-    if report.failed:
-        # The early `--use-current-interpreter` refusal returns from
-        # `install()` before anything else is touched -- no directories, no
-        # user, no unit, no SPI step -- so printing those lines here would
-        # report actions that were never taken. A failure discovered mid-run
-        # (`useradd` exiting something other than 0 or 9, say) leaves state
-        # that is genuinely mixed; "see the warnings above" is the honest
-        # summary either way, and is exactly what they say.
+    if report.failed and report.refused:
+        # Refused before touching anything -- no directories, no user, no
+        # unit, no SPI step ran -- so printing those lines here would report
+        # actions that were never taken. "see the warnings above" is the
+        # honest summary of the whole of it.
         if report.warnings:
             print(report.warnings_text(), file=sys.stderr)
         print("install did not finish cleanly; see the warnings above.", file=sys.stderr)
         return
+    if report.failed:
+        print(
+            "install: PARTIAL -- it failed partway through. Everything below is real, "
+            "not undone, and the state below reflects what actually happened."
+        )
     print(f"unit: {report.unit_path}")
     print(f"service user: {'created' if report.created_user else 'already existed'}")
     if no_spi:
@@ -492,6 +511,8 @@ def _print_install_report(report: InstallReport, *, no_spi: bool) -> None:
     print(f"reboot needed: {'yes' if report.reboot_needed else 'no'}")
     if report.warnings:
         print(report.warnings_text(), file=sys.stderr)
+    if report.failed:
+        print("install did not finish cleanly; see the warnings above.", file=sys.stderr)
 
 
 def _install(args: argparse.Namespace) -> int:

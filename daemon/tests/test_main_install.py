@@ -268,6 +268,67 @@ def test_install_exits_1_when_the_report_is_failed(monkeypatch, capsys, tmp_path
 # -- --use-current-interpreter ---------------------------------------------
 
 
+def test_install_prints_partial_details_when_it_fails_partway(monkeypatch, capsys, tmp_path):
+    """`useradd` failing does not stop `install()` -- it still writes the
+    real unit, runs the `systemctl` calls and attempts the SPI step -- so
+    withholding `unit:`/`reboot needed:`/the SPI line here would tell the
+    person debugging a half-finished install over SSH the least at the
+    moment they need the most. This is the MEDIUM round-2 finding: unlike
+    `test_install_use_current_interpreter_refusal_prints_only_the_warning`
+    (which is the *other* failure shape -- nothing touched at all), this one
+    must print every line that is true, marked as a partial install."""
+    _as_root_with_fake_machine(monkeypatch, tmp_path)
+    config_txt = tmp_path / "boot" / "firmware" / "config.txt"
+    config_txt.parent.mkdir(parents=True)
+    config_txt.write_text("# nothing\n")
+
+    class FailingUseraddRunner(FakeRunner):
+        def run(self, argv: list[str]) -> int:
+            super().run(argv)
+            return 1 if argv[:1] == ["useradd"] else 0
+
+    monkeypatch.setattr("ors_daemon.__main__._SubprocessRunner", FailingUseraddRunner)
+
+    code = main(["install", "--prefix", str(tmp_path / "prefix")])
+
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "unit:" in captured.out
+    assert str(tmp_path / "systemd" / "openrackscreen.service") in captured.out
+    assert "reboot needed:" in captured.out
+    assert any(line.startswith("SPI:") for line in captured.out.splitlines())
+    assert "partial" in (captured.out + captured.err).lower()
+    # The unit really was written -- the printed path is not a claim about
+    # work that never happened.
+    assert (tmp_path / "systemd" / "openrackscreen.service").exists()
+
+
+def test_install_use_current_interpreter_refusal_still_prints_none_of_them(
+    monkeypatch, capsys, tmp_path
+):
+    """Companion to the partial-install test above: the early refusal is the
+    *other* failure shape -- `install()` returns before touching anything at
+    all -- so it must still print none of `unit:`/`service user:`/an SPI
+    line, even now that the partial-failure branch above prints them for a
+    different kind of failure."""
+    _as_root_with_fake_machine(monkeypatch, tmp_path)
+    bad = tmp_path / "etc" / "private" / "bin" / "ors-daemon"
+    bad.parent.mkdir(parents=True)
+    bad.write_text("#!/bin/sh\n")
+    bad.chmod(0o700)  # not o+rx
+    monkeypatch.setattr(sys, "argv", [str(bad)])
+
+    code = main(["install", "--use-current-interpreter", "--prefix", str(tmp_path / "prefix")])
+
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "unit:" not in out
+    assert "service user:" not in out
+    assert "SPI" not in out
+    assert "reboot needed:" not in out
+    assert not (tmp_path / "systemd" / "openrackscreen.service").exists()
+
+
 def test_install_use_current_interpreter_names_that_executable(monkeypatch, capsys, tmp_path):
     """Dropping either `--use-current-interpreter` or its `executable` from
     the unit lands a service that runs from the /opt venv instead of the
