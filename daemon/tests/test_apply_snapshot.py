@@ -1023,8 +1023,12 @@ def test_a_timezone_reclock_stop_exits_nonzero_not_like_a_clean_stop(
     assert RecordingSupervisor.instances[-1].stops == 1
 
     error = capsys.readouterr().err
-    assert "timezone" in error, "names what changed"
-    assert "restart" in error, "names the remedy"
+    # The exact wording of `_run`'s own print, not just words that happen to
+    # also appear in the WARNING `_snapshot_handler` logs on the same stderr
+    # (which already contains "timezone" on its own) -- tied to the print
+    # itself so deleting it cannot pass by coincidence.
+    assert "stopped because a push changed the timezone" in error, "names what changed"
+    assert "restart this rack to pick up the new clock" in error, "names the remedy"
 
 
 def test_a_clean_stop_still_exits_zero(tmp_path: Path, capsys: Any) -> None:
