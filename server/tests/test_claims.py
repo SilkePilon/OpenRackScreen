@@ -742,6 +742,61 @@ def test_an_expired_grant_does_not_delete_the_rack_it_created(tmp_path):
     assert authenticate_key(made, key) == daemon_id, "and the key it holds still authenticates"
 
 
+def test_a_rack_that_did_connect_is_not_reclaimed_out_from_under_itself(tmp_path):
+    """The `last_seen IS NULL` half of `approve`'s reclaim.
+
+    Reclaiming is only ever safe against a grant nobody collected. A rack that
+    really did connect has a `daemon` row an admin has been configuring, and
+    `screen` and `integration` cascade off it -- so if that same rack loses its
+    pairing and re-files, deleting the row to make way would destroy the
+    configuration it is re-pairing in order to keep. Same fingerprint, same
+    hostname, and still refused: the approval collides loudly and the claim
+    stays pending, which is a state a person can see and act on.
+    """
+    made = database(tmp_path)
+    filed = file_one(made, n=61, now=0.0)
+    assert filed is not None
+    approved = approve_one(made, filed.id, now=0.0)
+    assert approved is not None
+    daemon_id, live_key = approved
+
+    # It connected, and it has been configured.
+    with closing(made.connect()) as connection:
+        connection.execute(
+            "UPDATE daemon SET last_seen = ? WHERE id = ?",
+            ("2026-08-16T09:00:00Z", daemon_id),
+        )
+        connection.execute(
+            "INSERT INTO screen (daemon_id, position, name, display, template)"
+            " VALUES (?, 1, 'Weather', '{}', 'ring-gauge')",
+            (daemon_id,),
+        )
+
+    # The same rack loses its pairing and asks again.
+    refiled = file_claim(
+        made,
+        hostname=filed.hostname,
+        address=filed.address,
+        fingerprint=filed.fingerprint,
+        short_code=filed.short_code,
+        version=filed.version,
+        public_key="a-fresh-ephemeral-key",
+        now=CLAIM_LIFETIME_S * 3,
+    )
+    assert refiled is not None
+
+    with pytest.raises(sqlite3.IntegrityError):
+        approve_one(made, refiled.id, now=CLAIM_LIFETIME_S * 3)
+
+    assert authenticate_key(made, live_key) == daemon_id, "the live rack keeps its key"
+    with closing(made.connect()) as connection:
+        screens = connection.execute(
+            "SELECT COUNT(*) AS n FROM screen WHERE daemon_id = ?", (daemon_id,)
+        ).fetchone()["n"]
+    assert screens == 1, "and its configuration"
+    assert [claim.id for claim in list_pending(made, now=CLAIM_LIFETIME_S * 3)] == [refiled.id]
+
+
 def test_a_different_rack_sharing_a_hostname_is_refused_not_reclaimed(tmp_path):
     """The other half of `approve`'s reclaim: it is scoped to the approving
     claim's own fingerprint, so a genuinely different rack that happens to
