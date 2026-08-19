@@ -30,6 +30,14 @@ OPEN_PATHS = {
     "/api/auth/setup",
     "/api/auth/login",
     "/api/auth/logout",
+    # The claim protocol's two unauthenticated routes (design spec S6.3): a
+    # rack that has not been approved holds no session and no other
+    # credential, which is the entire reason claims exist rather than a
+    # shared secret. Confidentiality here rests on the claim id being a
+    # 256-bit bearer token disclosed only in the `202`, not on the endpoint
+    # requiring a login -- see `api/claims.py`'s module docstring.
+    "/api/racks/claims",
+    "/api/racks/claims/{claim_id}",
     # FastAPI's own. They describe the API, not the rack.
     "/api/docs",
     "/api/docs/oauth2-redirect",
