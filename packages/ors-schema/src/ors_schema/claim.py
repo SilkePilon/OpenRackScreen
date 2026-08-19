@@ -15,11 +15,18 @@ had a claim client there was one production speller of these twelve bytes
 (`test_api_claims.unseal`), and that independence was the only thing standing
 between a one-sided edit and a silent protocol rename. Sharing the constant
 then would have deleted the check and put nothing in its place. What replaced
-it is the frozen wire vector: `test_api_claims.test_the_sealed_blob_matches_a_frozen_wire_vector`
-and `daemon/tests/test_join.test_the_daemon_opens_a_frozen_wire_vector` each
-carry a ciphertext produced before this tag could be edited, so no edit here
--- one-sided or coordinated, in this file or in either end's -- can leave the
-suite green. With the format pinned from outside, one definition for the two
+it is the frozen wire vector, and the pin is the test at each end that feeds
+production: `test_api_claims.test_the_frozen_vector_is_the_format_the_live_seal_still_produces`
+(which seals with the live `_seal` and opens with the test's own literal) and
+`daemon/tests/test_join.test_the_daemon_opens_a_frozen_wire_vector` (whose
+reader *is* production). Each carries a ciphertext produced before this tag
+could be edited, so no edit here -- one-sided or coordinated, in this file or
+in either end's -- can leave the suite green.
+`test_api_claims.test_the_sealed_blob_matches_a_frozen_wire_vector` is not one
+of the two, verified by mutation: it opens the frozen blob with the test's own
+`unseal`, and no production code runs in it at all.
+
+With the format pinned from outside, one definition for the two
 production ends is the safer arrangement: a daemon and a server that disagree
 about this string do not fail, they simply never pair.
 

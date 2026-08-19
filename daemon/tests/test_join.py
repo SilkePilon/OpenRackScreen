@@ -39,7 +39,16 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from ors_daemon.discovery import Found
 from ors_daemon.identity import Identity
-from ors_daemon.join import join_a_server, open_claim_key, server_from_url
+from ors_daemon.join import (
+    BACKOFF_CAP_S,
+    BACKOFF_FACTOR,
+    BACKOFF_FIRST_S,
+    HTTP_TIMEOUT_S,
+    POLL_INTERVAL_S,
+    join_a_server,
+    open_claim_key,
+    server_from_url,
+)
 from ors_daemon.link import load_link_settings
 
 # Every field distinct from every other, and none of them a prefix or a
@@ -428,8 +437,12 @@ def test_the_backoff_is_capped_so_a_rack_left_refused_still_reappears(tmp_path: 
     paired, naps, _link = join(tmp_path, http)
 
     assert paired is True
-    assert max(naps.seconds) <= 900.0, "a quarter of an hour is already a long time to wait"
     assert naps.seconds[-1] == naps.seconds[-2], "and it settles at the cap rather than growing"
+    assert max(naps.seconds) == BACKOFF_CAP_S, "the ceiling is the constant, not some other number"
+    assert BACKOFF_CAP_S <= 300.0, (
+        "five minutes is the argument in the constant's own docstring: a rack is never "
+        "more than that behind an admin who has just fixed whatever was wrong"
+    )
 
 
 def test_a_claim_that_is_gone_is_refiled_rather_than_polled_for_ever(tmp_path: Path) -> None:
@@ -453,6 +466,69 @@ def test_a_claim_that_is_gone_is_refiled_rather_than_polled_for_ever(tmp_path: P
     assert http.polled[-1].endswith("/claim-fresh")
     settings = load_link_settings(link)
     assert settings is not None and settings.key == "daemon-key-fresh"
+
+
+def test_a_claim_that_is_gone_is_refiled_after_a_wait_rather_than_at_full_speed(
+    tmp_path: Path,
+) -> None:
+    """The refile above, at the speed the filing endpoint allows.
+
+    A 404 is the one answer that sends this client straight back to `_file`,
+    and `_file` resets the backoff on every claim the server accepts -- so a
+    peer that answers 202 to every filing and 404 to every poll (a deny that
+    lands between the two, an expiry race, or simply a peer that behaves that
+    way) is a lap with nothing in it that waits. Measured before this wait
+    existed: forty-one filings and forty polls with an empty sleep list, at
+    whatever rate the socket managed. The module docstring's whole argument is
+    that this client does not hammer.
+    """
+    http = FakeHttp(
+        [filed("claim-expired"), filed("claim-fresh")],
+        [Reply(404, {"detail": "no such claim"}), approving("daemon-key-fresh")],
+    )
+
+    paired, naps, _link = join(tmp_path, http)
+
+    assert paired is True
+    assert naps.seconds == [BACKOFF_FIRST_S], (
+        "the second filing waited, and waited the interval the filing limiter is sized by"
+    )
+
+
+def test_a_filing_the_server_accepts_starts_the_backoff_over(tmp_path: Path) -> None:
+    """`_Backoff.reset()`, which is otherwise invisible: make it a no-op, or
+    delete either call site, and every other test here still passes.
+
+    Both call sites are answers from the server that mean the waiting is over
+    -- a claim it accepted, and a poll it answered -- and what they buy is that
+    a rack which spent five minutes getting in does not spend five minutes
+    again over the first 429 after it. The naps below are the whole sequence,
+    because it is the only place the value is observable:
+
+    | # | what happened            | wait | backoff after |
+    | 1 | filing refused           |    5 |            10 |
+    | 2 | filing refused           |   10 |            20 |
+    | 3 | filing accepted          |    - |    5 (`_file`) |
+    | 4 | poll refused             |    5 |            10 |
+    | 5 | poll answered, pending   |    - | 5 (`_wait_for_approval`) |
+    | 6 | the interval between polls |  5 |             5 |
+    | 7 | poll 404, so refile      |    5 |            10 |
+    """
+    http = FakeHttp(
+        [refused(), refused(), filed("claim-one"), filed("claim-two")],
+        [refused(), pending(), Reply(404, {"detail": "no such claim"}), approving("k")],
+    )
+
+    paired, naps, _link = join(tmp_path, http)
+
+    assert paired is True
+    assert naps.seconds == [
+        BACKOFF_FIRST_S,
+        BACKOFF_FIRST_S * BACKOFF_FACTOR,
+        BACKOFF_FIRST_S,
+        POLL_INTERVAL_S,
+        BACKOFF_FIRST_S,
+    ], "without both resets these keep doubling from where the last refusal left them"
 
 
 def test_a_denied_rack_cannot_tell_it_was_denied_and_keeps_trying_behind_a_backoff(
@@ -494,6 +570,27 @@ def test_a_pending_claim_is_polled_slower_than_the_servers_own_budget(tmp_path: 
     assert paired is True
     assert len(naps.seconds) == 2, "one wait between each pair of polls"
     assert min(naps.seconds) >= 2.0, "well inside sixty a minute, with room for a retry"
+
+
+def test_a_status_this_client_does_not_know_is_polled_again_not_taken_as_an_approval(
+    tmp_path: Path,
+) -> None:
+    """`approved` and only `approved`, not "anything that is not `pending`".
+
+    A server one version ahead answering some third status has not granted
+    anything, and `ClaimPollResult`'s three sealed fields are `None` until it
+    has. A client that read the absence of `pending` as a grant would fail to
+    decrypt what is not there, return `False`, and leave a rack that can never
+    pair with a server that would have approved it a second later.
+    """
+    http = FakeHttp([filed("c")], [Reply(200, {"status": "queued"}), approving("k")])
+
+    paired, naps, link = join(tmp_path, http)
+
+    assert paired is True
+    settings = load_link_settings(link)
+    assert settings is not None and settings.key == "k"
+    assert naps.seconds == [POLL_INTERVAL_S], "it waited and polled again, like any other pending"
 
 
 def test_a_poll_refused_for_rate_backs_off_rather_than_refiling(tmp_path: Path) -> None:
@@ -593,7 +690,20 @@ def test_every_request_carries_a_timeout(tmp_path: Path) -> None:
     join(tmp_path, http)
 
     assert http.timeouts, "there were requests to check"
-    assert all(isinstance(timeout, int | float) and timeout > 0 for timeout in http.timeouts)
+    assert all(timeout == HTTP_TIMEOUT_S for timeout in http.timeouts)
+
+
+def test_the_request_timeout_is_short_against_the_interval_between_polls() -> None:
+    """What `HTTP_TIMEOUT_S`'s docstring claims, asserted rather than asserted
+    of it that it is positive.
+
+    The flow is one blocking request at a time, so the timeout is not merely a
+    bound on a slow request: it is how long the admin's click waits behind a
+    socket that has stopped answering. A timeout an order of magnitude above
+    the poll interval turns each stall into minutes of a rack that looks
+    exactly like one nobody has approved yet.
+    """
+    assert 0 < HTTP_TIMEOUT_S <= 2 * POLL_INTERVAL_S
 
 
 # --- `--server URL`, the thing that settles two servers ---------------------

@@ -33,6 +33,7 @@ from ors_daemon.__main__ import (
 )
 from ors_daemon.clock import ClockError, system_clock
 from ors_daemon.config import load_cached_snapshot, resolve_screens
+from ors_daemon.discovery import Found
 from ors_daemon.frames import FramePump, FrameStream
 from ors_daemon.link import LinkSettings, write_link_settings
 from ors_daemon.snapshot import SnapshotStore
@@ -596,18 +597,24 @@ def test_a_freshly_installed_rack_enters_the_join_flow(
     )
 
 
-def test_running_unpaired_without_config_fails_cleanly_not_with_a_traceback(
+def test_row_four_with_a_server_url_naming_no_host_fails_cleanly_not_with_a_traceback(
     tmp_path: Path, capsys: Any
 ) -> None:
-    """Row 4 through the *real*, unpatched join flow -- unlike every other
-    test of row 4 in this file, nothing here monkeypatches `join_a_server`.
+    """Row 4 through the *real*, unpatched join flow, by the `--server` branch.
 
-    `--server rack:8080` is the one way to reach that flow and have it come
-    back promptly: it names no host at all (`urlsplit` reads `rack` as the
-    scheme), which is the typo `connect` already had to learn to reject, so
-    `join.server_from_url` refuses it before anything is dialled and no socket
-    is opened by this test. Every other shape of row 4 blocks until an admin
-    clicks, which is what it is for.
+    Unlike every other test of row 4 in this file, nothing here monkeypatches
+    `join_a_server`: what is being asked is whether the wiring around it --
+    `main`, `_run`, the identity, `server_from_url`, `_run`'s own unpaired
+    check -- holds together on a machine in the state `install` leaves.
+
+    The branch it reaches is the bad `--server` one, and the name says so:
+    `rack:8080` names no host at all (`urlsplit` reads `rack` as the scheme),
+    so `join.server_from_url` refuses it before anything is dialled and this
+    test opens no socket. `server_from_url`'s own refusals are covered at unit
+    level in `test_join.py`; what is added here is that the refusal reaches a
+    person. The general shape of row 4 -- no `--server`, so a browse -- is
+    `test_row_four_with_no_server_browses_and_refuses_to_choose_between_two`
+    below.
 
     This is exactly the state `ors-daemon install` leaves a fresh machine in:
     both `examples/openrackscreen.service` and the unit `install.py` generates
@@ -624,6 +631,52 @@ def test_running_unpaired_without_config_fails_cleanly_not_with_a_traceback(
     assert "rack:8080" in error, "the message has to name the thing that is wrong"
     assert "http://" in error, "and show what a URL it can use looks like"
     assert "ors-daemon connect" in error, "the message has to name what to do instead"
+    assert RecordingSupervisor.instances == []
+
+
+def test_row_four_with_no_server_browses_and_refuses_to_choose_between_two(
+    tmp_path: Path, capsys: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What an unpaired rack with no `--server` at all does: it browses.
+
+    The one test that pins `__main__`'s choice of `servers`. Replace
+    `discovery.discover` there with anything that answers nothing -- a stub, a
+    lambda, an empty list -- and every other test in this repository still
+    passes, because every other row-4 test either patches `join_a_server` away
+    or hands it a `--server`. The rack this is about is the ordinary one: a
+    fresh Pi on a LAN, nothing typed, which is exactly the path design spec
+    S6.1 describes and the path `conftest.py`'s browse guard otherwise makes
+    unreachable.
+
+    Two servers are the answer that comes back **before any HTTP**, so this
+    needs no client and no sleeper: design spec S8's failure table says both
+    are named and neither is used, and `join_a_server` returns `False` on the
+    first lap. A rack that quietly took the first would pick a different one
+    on the next boot with nothing anywhere recording the choice.
+    """
+    monkeypatch.setattr(
+        "ors_daemon.__main__.discovery.discover",
+        lambda: [
+            Found(host="192.0.2.10", port=8080, scheme="http"),
+            Found(host="198.51.100.77", port=9090, scheme="http"),
+        ],
+    )
+
+    assert run_no_config(tmp_path) == 1
+
+    # Read off stderr rather than out of `caplog`: `main` installs this
+    # daemon's own JSON handler and stops propagating, so what a test can see
+    # is exactly what the journal will hold, which is the point of the line.
+    error = capsys.readouterr().err
+    named = [json.loads(line) for line in error.splitlines() if line.startswith("{")]
+    answered = [record for record in named if "servers" in record]
+    assert answered, "the log has to say which servers answered; it is the only way to choose"
+    assert answered[-1]["servers"] == ["http://192.0.2.10:8080", "http://198.51.100.77:9090"], (
+        "both of them, in full, so the operator can put one of them after --server"
+    )
+    assert "--server" in answered[-1]["message"], "and say what to do with them"
+    assert "Traceback" not in error
+    assert "ors-daemon connect" in error
     assert RecordingSupervisor.instances == []
 
 

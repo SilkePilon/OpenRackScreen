@@ -85,9 +85,16 @@ def unseal(sealed: dict, private_key: X25519PrivateKey) -> str:
     rather than imported from `api.claims._HKDF_INFO` -- which since Task 15
     is itself an alias for `ors_schema.CLAIM_HKDF_INFO`, shared with the real
     daemon client in `ors_daemon.join`. This copy is what still fails when
-    that one definition and this end's use of it drift apart; the two frozen
-    vectors (below, and `daemon/tests/test_join.py`'s) are what fail when they
-    move together.
+    that one definition and this end's use of it drift apart.
+
+    What fails when they move *together* is the frozen vector -- but only
+    through the test that runs production code, which at this end is
+    `test_the_frozen_vector_is_the_format_the_live_seal_still_produces` below
+    and **not** `test_the_sealed_blob_matches_a_frozen_wire_vector`. That one
+    opens a constant with this function, so nothing in it is production and a
+    coordinated edit leaves it passing; it is verified by mutation to do so.
+    The daemon's `test_the_daemon_opens_a_frozen_wire_vector` does both jobs at
+    once, because that end's reader is the shipped one.
     """
     peer_public = X25519PublicKey.from_public_bytes(
         base64.b64decode(sealed["ephemeral_public_key"])

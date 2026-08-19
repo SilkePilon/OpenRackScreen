@@ -128,11 +128,23 @@ before.** While `test_api_claims.unseal` was the only peer implementation in
 this repository, its own independently spelled literal was the thing that made
 a one-sided edit here fail a test rather than silently rename the protocol; a
 shared constant then would have deleted that check and put nothing in its
-place. What replaced it is the frozen wire vector below
-(`test_the_sealed_blob_matches_a_frozen_wire_vector`, and its opposite number
-`daemon/tests/test_join.py::test_the_daemon_opens_a_frozen_wire_vector`):
-each carries a ciphertext produced before this tag could be edited, so no edit
--- one-sided *or* coordinated -- leaves the suite green. With the format pinned
+place. What replaced it is the frozen wire vector below -- and **which**
+test of that vector is the pin is worth getting right, because only one of the
+two is:
+
+* `test_the_frozen_vector_is_the_format_the_live_seal_still_produces` is what
+  fails when this tag moves. It feeds the vector's peer key to the live
+  `_seal` and opens the result with `unseal`'s own literal, so a tag edited
+  here is a key the peer implementation cannot derive.
+* `test_the_sealed_blob_matches_a_frozen_wire_vector` does **not**, verified
+  by mutation: it opens a frozen blob with `unseal`, and neither of those two
+  is production. It is a check on the vector and on `unseal`.
+* `daemon/tests/test_join.py::test_the_daemon_opens_a_frozen_wire_vector` is
+  the daemon's pin, and there one test does both jobs, because that end's
+  reader (`join.open_claim_key`) *is* production.
+
+Between them no edit to this tag -- one-sided *or* coordinated -- leaves the
+suite green. With the format pinned
 from outside, one definition for the two production ends is the safer
 arrangement, because the failure a drift between them produces is not an error
 anywhere: it is a rack that files, is approved, and never pairs.

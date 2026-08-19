@@ -9,6 +9,7 @@ is the supported way for both to have one.
 from __future__ import annotations
 
 import threading
+from typing import Any
 
 import pytest
 from ors_daemon.snapshot import SnapshotStore
@@ -76,3 +77,40 @@ def watch_parks():
     one is instrumented rather than constructed.
     """
     return watch
+
+
+@pytest.fixture(autouse=True)
+def _no_network_browse(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test in this directory browses the LAN for a server.
+
+    Row 4 of `_boot`'s table -- unpaired, no `--config`, no `--server` -- runs
+    `discovery.discover` for real, and a test that reaches it finds whatever
+    happens to be on the developer's machine, joins a multicast group out of
+    whatever CI runner it is on, and then blocks in `join_a_server` until the
+    per-test timeout. That is not hypothetical: it is what the first run of
+    this suite did once Task 15 replaced row 4's stub. The same reasoning
+    `server/tests/conftest.py::_no_mdns_announcement` is written down with
+    applies here -- a guard a test has to remember is a guard that gets
+    forgotten, and forgetting it is invisible on a laptop and a multicast
+    packet out of CI.
+
+    **Both names, and `discover` is the one that does the work.** Patching
+    `browse` alone would not stop anything: `discover` binds it as a default
+    argument at definition time, so the module attribute is not what it calls,
+    and it catches `Exception` around the browse and answers `[]` -- so an
+    `AssertionError` from `browse` would be swallowed into "no server found"
+    and the test would pass while having tried. `browse` is patched anyway,
+    for anything that reaches past `discover` to call it directly.
+
+    `test_discovery.py` is unaffected: it imports both names directly and hands
+    every `discover` call its own stub factory, which is the seam this module
+    exists to have.
+    """
+
+    def refuse(*args: object, **kwargs: object) -> list[Any]:
+        raise AssertionError(
+            "a test browsed the network; inject a `servers` callable, or pass --server"
+        )
+
+    monkeypatch.setattr("ors_daemon.discovery.browse", refuse)
+    monkeypatch.setattr("ors_daemon.discovery.discover", refuse)

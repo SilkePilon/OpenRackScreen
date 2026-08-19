@@ -86,7 +86,10 @@ HTTP_TIMEOUT_S = 10.0
 
 A socket with no timeout, on a rack that has just come up, is a join flow
 parked in `recv` for ever with the panels dark and nothing in the log. Ten
-seconds is generous for a LAN and short against `POLL_INTERVAL_S`.
+seconds is generous for a LAN, and it is held within a couple of
+`POLL_INTERVAL_S` -- the whole flow is one blocking request at a time, so a
+timeout much larger than the interval between polls is a stall the admin's
+click waits behind rather than a request that is merely slow.
 """
 
 POLL_INTERVAL_S = 5.0
@@ -187,9 +190,16 @@ class _Backoff:
     """How long to wait after a refusal, growing until it reaches the cap.
 
     A tiny object rather than a local, because the wait has to survive a
-    filing, a poll and a refile -- a client that reset it on every lap would
-    hammer exactly as hard as one with no backoff at all, which is what the
-    server's limiter is there to refuse.
+    filing, a poll and a refile -- a client that started it over on every lap
+    would hammer exactly as hard as one with no backoff at all, which is what
+    the server's limiter is there to refuse.
+
+    `reset` is called **on success**, and only there: an accepted filing and a
+    poll the server answered are both evidence that whatever the waiting was
+    for is over, so the next refusal starts at `BACKOFF_FIRST_S` again rather
+    than at whatever a previous bad patch had grown it to. A rack that waited
+    five minutes to be let in, was let in, and then met one 429 should not
+    wait five minutes again.
     """
 
     def __init__(self) -> None:
@@ -289,15 +299,31 @@ def join_a_server(
 
         sealed = _wait_for_approval(http, server, claim_id, backoff, sleeper)
         if sealed is None:
+            # A 404 is the *only* thing that gets here, and the next statement
+            # after `continue` is another filing -- so without this wait a
+            # server answering 202 and then 404 (a deny that lands between the
+            # two, an expiry race, a peer that simply behaves that way) is
+            # filed against as fast as the socket will carry it, and
+            # `_file`'s `backoff.reset()` on each accepted claim means the
+            # backoff never grows out of it either. The filing endpoint allows
+            # ten a minute, which is what this is sized against, and it is the
+            # same wait a refusal takes for the same reason.
+            backoff.nap(sleeper)
             continue
 
         try:
             key = open_claim_key(sealed, private_key)
         except (InvalidTag, KeyError, TypeError, ValueError) as error:
-            # Not retried, deliberately. The poll is idempotent -- the same
-            # ciphertext comes back every time -- so another lap gets the same
-            # bytes, and a rack that wrote this anyway would dial for ever
-            # with a credential nothing accepts and no sign of why.
+            # Not retried *in this process*, deliberately. The poll is
+            # idempotent -- the same ciphertext comes back every time -- so
+            # another lap here gets the same bytes, and a rack that wrote this
+            # anyway would dial for ever with a credential nothing accepts and
+            # no sign of why. Under the shipped unit's `Restart=always` the
+            # whole flow does come back every `RestartSec=5` with a fresh
+            # keypair, which is benign rather than the hammering it looks
+            # like: `file_claim` reuses the single pending row per
+            # fingerprint, so the queue does not fill, and a re-approve after
+            # a one-off corruption is what recovers the rack.
             log.error(
                 "the key this server sent cannot be opened, so this rack is not paired; "
                 "the two ends disagree about the claim format, most likely a version apart",
