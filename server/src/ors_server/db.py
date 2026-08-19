@@ -7,12 +7,24 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 """Bumped whenever the schema below changes.
 
 There are no migrations: a bump exports the database and rebuilds it empty.
 That is a deliberate trade for a single-file database holding a config you can
 re-enter, and the export is what makes it survivable -- see `initialise`.
+
+5, not 4, even though 4 was never released (no tag, no build on `master` ever
+carried it): it was a committed, reviewable state on this branch (`36439ba`),
+and a database created from *that* commit is version 4 without `granted_at`,
+`granted_key` or `daemon_id` on `claim`. Upgrading such a file today raises
+`sqlite3.OperationalError: no such column: granted_at` out of `claims.py`, not
+out of anything in this module -- the version already matches `SCHEMA_VERSION`,
+so `initialise` takes the "nothing changed" branch and never exports or
+rebuilds. That is an undiagnosable start failure for the exact people most
+likely to hit it: every dev or CI checkout that made a database on this branch
+before this round. Bumping the number costs nothing and turns that into the
+ordinary export-and-rebuild path.
 """
 
 _SCHEMA = """
@@ -113,17 +125,21 @@ CREATE TABLE IF NOT EXISTS claim (
     version      TEXT NOT NULL,
     public_key   TEXT NOT NULL,
     first_seen   REAL NOT NULL,
-    -- Ciphertext for a later task's poll-and-deliver route, still not written
-    -- by anything in this schema version. `claims.approve` leaves this NULL
-    -- and hands the plaintext key back to its own caller instead of parking
-    -- it here -- writing a live credential in the clear would be the one
-    -- thing every other credential path in this schema (`token_hash`,
-    -- `key_hash`) goes out of its way not to do. What this round changes is
-    -- that the *row* now survives approval (`granted_at` set, `daemon_id`
-    -- filled in, nothing deleted), with `public_key` and `fingerprint` still
-    -- on it -- which is what a future poll route needs on hand to encrypt
-    -- the key to the daemon's ephemeral key and store *that* here, safely,
-    -- for a repeat poll to re-send. See `claims.approve`'s docstring.
+    -- Ciphertext, written by `claims.approve` -- sealed to the claim's
+    -- ephemeral `public_key` (design spec S6.3 step 5), never the plaintext
+    -- key itself. That is not in tension with "a live credential never
+    -- touches the database in the clear": `secret.ciphertext` is redacted
+    -- from the export below for the same reason and is exactly this kind of
+    -- column -- encrypted still counts. The server holds no private half of
+    -- the ephemeral keypair (only the daemon does), so a sealed blob sitting
+    -- here is not a working credential to anyone who does not already hold
+    -- that private key; storing it is what makes the poll route's repeat
+    -- reads (design spec's own forward note on S6.3 step 5) idempotent by
+    -- construction -- `GET /api/racks/claims/{id}` becomes a plain read of
+    -- this column, the same ciphertext every time, rather than something
+    -- that has to be minted once and remembered elsewhere. `public_key` and
+    -- `fingerprint` stay on the row alongside it because that is what
+    -- `approve` needs on hand to build the ciphertext in the first place.
     granted_key  TEXT,
     -- NULL means still pending. Set, atomically, by the one guarded UPDATE
     -- that decides an approval race (`claims.approve`'s docstring) -- this
@@ -161,10 +177,24 @@ CREATE TABLE IF NOT EXISTS denied_fingerprint (
 # the same rule and matters more: the key it is derived from is presented on
 # every connect for the life of the pairing, not once.
 #
+# `claim.id` is not derived from a credential -- it *is* one, verbatim: design
+# spec S6.3 step 4 makes the claim id itself the bearer credential a daemon's
+# poll authenticates with (see `claims.file_claim`'s own comment on the
+# `INSERT`), so exporting it in the clear would hand a plaintext file on disk
+# the one thing that lets its reader collect a pending grant. `claim.granted_key`
+# is `secret.ciphertext`'s case again, not `token_hash`'s: it is sealed to the
+# claim's ephemeral public key, not plaintext, but encrypted still counts, and a
+# rebuild discards it exactly as it discards `key_hash` -- there is nothing here
+# worth keeping in the clear either.
+#
 # Keyed by the table name in the database being exported, which on a rebuild is
 # the *old* schema's: renaming a table here without keeping its old name would
 # quietly stop redacting the export that matters.
-_REDACTED = {"secret": {"ciphertext"}, "daemon": {"token_hash", "key_hash"}}
+_REDACTED = {
+    "secret": {"ciphertext"},
+    "daemon": {"token_hash", "key_hash"},
+    "claim": {"id", "granted_key"},
+}
 
 # Everything not named above is exported verbatim, `integration.config` included,
 # and that is deliberate: the export exists so a rack's integration configuration

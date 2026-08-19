@@ -114,7 +114,53 @@ def test_the_export_redacts_the_key_a_daemon_reconnects_with(tmp_path):
     text = export.read_text()
 
     assert "5eaf00d" not in text, "an export is a file on disk; it does not carry a key hash"
-    assert json.loads(text)["daemon"][0]["key_hash"] == "<redacted>"
+
+
+def test_the_export_redacts_the_claim_id_and_the_granted_key(tmp_path):
+    """`claim.id` is not derived from a credential -- it *is* one (design spec
+    S6.3 step 4, and `claims.py`'s own comment on the `INSERT` says so): a
+    daemon's poll authenticates with it directly. `claim.granted_key` is
+    `secret.ciphertext`'s case, not `token_hash`'s -- sealed to the claim's
+    ephemeral public key rather than plaintext -- but the same rule applies:
+    encrypted still counts, and a rebuild discards it exactly as it discards
+    `key_hash`.
+    """
+    path = tmp_path / "ors.db"
+    database = Database(path)
+    database.initialise()
+    with database.connect() as connection:
+        connection.execute(
+            "INSERT INTO claim"
+            " (id, hostname, address, fingerprint, short_code, version, public_key,"
+            "  first_seen, granted_key)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "claim-id-is-the-bearer-credential",
+                "rack-pi",
+                "10.0.0.5",
+                "fp-1",
+                "AAAAAA",
+                "1.0.0",
+                "pk-1",
+                0.0,
+                "sealed-blob-not-plaintext",
+            ),
+        )
+        connection.execute("PRAGMA user_version = 0")
+
+    export = Database(path).initialise()
+    text = export.read_text()
+
+    assert "claim-id-is-the-bearer-credential" not in text, (
+        "an export is a file on disk; it does not carry the claim's bearer credential"
+    )
+    assert "sealed-blob-not-plaintext" not in text, (
+        "encrypted still counts -- an export does not carry the sealed key either"
+    )
+    record = json.loads(text)["claim"][0]
+    assert record["id"] == "<redacted>"
+    assert record["granted_key"] == "<redacted>"
+    assert record["hostname"] == "rack-pi", "the rest of the row still exports"
 
 
 def test_foreign_keys_are_enforced(tmp_path):
