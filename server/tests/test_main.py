@@ -236,3 +236,31 @@ def test_an_empty_environment_variable_is_not_an_answer(monkeypatch, tmp_path):
 
     assert resolve_data_dir() == tmp_path / "state" / "openrackscreen"
     assert resolve_web_dir() == packaged_web_dir()
+
+
+def test_the_port_uvicorn_binds_is_the_port_the_announcement_will_name(monkeypatch, tmp_path):
+    """One read of `ORS_PORT`, reaching both places that need it.
+
+    They are not interchangeable and they cannot disagree: uvicorn binds the
+    port, and `AppSettings.port` is the number the mDNS announcement tells every
+    rack on the network to dial. Two reads is one number written twice, and the
+    way two such numbers stop agreeing -- a default changed in one of them --
+    produces a server that works perfectly for anybody typing its URL and is
+    unpairable by discovery, which no test on this machine would have seen.
+    """
+    monkeypatch.setenv("ORS_PORT", "9443")
+    assert served(monkeypatch, tmp_path)["port"] == 9443
+
+    monkeypatch.setenv("ORS_PORT", "9443")
+    assert settings_assembled(monkeypatch, tmp_path).port == 9443
+
+
+def test_the_port_defaults_to_the_one_the_deploy_notes_publish(monkeypatch, tmp_path):
+    """8080, in both places, when nothing says otherwise. `server/README.md`
+    and `deploy/Dockerfile` both name it, and `AppSettings.port` defaults to the
+    same constant `resolve_port` falls back to."""
+    monkeypatch.delenv("ORS_PORT", raising=False)
+    assert served(monkeypatch, tmp_path)["port"] == 8080
+
+    monkeypatch.delenv("ORS_PORT", raising=False)
+    assert settings_assembled(monkeypatch, tmp_path).port == 8080

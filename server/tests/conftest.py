@@ -100,6 +100,26 @@ def teardown_race_guard() -> Exit:
 
 
 @pytest.fixture(autouse=True)
+def _no_mdns_announcement(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test in this directory announces itself on the network.
+
+    `create_app` builds an `Announcer` unless `ORS_ANNOUNCE=0` says otherwise,
+    and the four tests here that enter a `TestClient` as a context manager run
+    the lifespan that starts it -- which binds sockets, joins a multicast group
+    and advertises a port nothing in the test is listening on, out of whatever
+    machine the suite is running on. Set here rather than in the four tests
+    because the fifth one is the problem: a guard a test has to remember is a
+    guard that gets forgotten, and forgetting it is invisible on a developer's
+    laptop and a multicast packet out of a CI runner.
+
+    `test_announce.py` is what covers the other side of the switch, and it
+    unsets this itself for the tests that need it on -- with a stub in place of
+    `Announcer`, so that even those transmit nothing.
+    """
+    monkeypatch.setenv("ORS_ANNOUNCE", "0")
+
+
+@pytest.fixture(autouse=True)
 def _websocket_teardown_race(monkeypatch: pytest.MonkeyPatch) -> None:
     """Apply the guard to every test in this directory. See the module docstring.
 

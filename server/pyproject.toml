@@ -12,6 +12,15 @@ dependencies = [
     "argon2-cffi>=23.1",
     "cryptography>=43.0",
     "zeroconf>=0.132",
+    # zeroconf's own hard dependency, named here because `announce.py` imports
+    # it directly: it is what enumerates this host's addresses for the A
+    # records of the announcement. zeroconf 0.150 deprecated its own
+    # `get_all_addresses` wrapper and its removal notice says to use `ifaddr`
+    # directly, so relying on the wrapper would make a future zeroconf an
+    # ImportError at server start. Depending on it by name rather than through
+    # zeroconf's resolution is the difference between a dependency and an
+    # accident.
+    "ifaddr>=0.2",
 ]
 
 [project.scripts]

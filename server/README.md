@@ -213,6 +213,7 @@ nothing else.
 | `ORS_SECRET_KEY` | generated | see above. Unrecoverable. |
 | `ORS_WEB_DIR` | `/app/web` | where the built interface is. See [The interface is inside the image](#the-interface-is-inside-the-image). |
 | `ORS_LOG_LEVEL` | `INFO` | one JSON object per line, on stdout. |
+| `ORS_ANNOUNCE` | on | `ORS_ANNOUNCE=0`, exactly that value, stops the server announcing itself over mDNS as `_openrackscreen._tcp.local.`. The announcement is how a freshly installed rack finds a server to ask to join; a container on a bridge network cannot be reached at the address it would announce, and a failure to announce is a warning rather than a refusal to start in any case. Racks on a network that drops multicast are paired with `ors-daemon run --server URL` instead. |
 | `FORWARDED_ALLOW_IPS` | `127.0.0.1` | which proxies' `X-Forwarded-For` to believe. |
 
 ## Health

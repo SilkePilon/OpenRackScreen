@@ -5,7 +5,7 @@ from pathlib import Path
 
 import uvicorn
 
-from ors_server.app import AppSettings, create_app
+from ors_server.app import DEFAULT_PORT, AppSettings, create_app
 from ors_server.logging import setup_logging
 
 WS_MAX_MESSAGE_BYTES = 512 * 1024
@@ -77,6 +77,19 @@ def resolve_data_dir() -> Path:
     return base / "openrackscreen"
 
 
+def resolve_port() -> int:
+    """The port to listen on, read once and used twice.
+
+    Once for uvicorn, which binds it, and once for `AppSettings`, which is
+    where the mDNS announcement gets the number it tells racks to dial. Two
+    reads of `ORS_PORT` would be two numbers that have to agree, and the way
+    they stop agreeing is a server announcing 8080 while listening on 8443 --
+    which no test on this machine could see and every rack on the network
+    would.
+    """
+    return int(os.environ.get("ORS_PORT", str(DEFAULT_PORT)))
+
+
 def main() -> int:
     # First, before anything that can log: `create_app` reports a rebuilt
     # schema, and until this runs the root logger has no handler and every
@@ -86,11 +99,12 @@ def main() -> int:
         data_dir=resolve_data_dir(),
         secret_key=os.environ.get("ORS_SECRET_KEY"),
         web_dir=resolve_web_dir(),
+        port=resolve_port(),
     )
     uvicorn.run(
         create_app(settings),
         host=os.environ.get("ORS_HOST", "0.0.0.0"),
-        port=int(os.environ.get("ORS_PORT", "8080")),
+        port=settings.port,
         # Both of these are settled here rather than left to a default, and for
         # opposite reasons.
         #
