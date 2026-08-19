@@ -16,7 +16,12 @@ from starlette.types import Scope
 
 from ors_server import __version__
 from ors_server.api.auth import router as auth_router
-from ors_server.api.claims import CLAIM_RATE_LIMIT_MAX_ATTEMPTS, CLAIM_RATE_LIMIT_WINDOW_S
+from ors_server.api.claims import (
+    CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS,
+    CLAIM_POLL_RATE_LIMIT_WINDOW_S,
+    CLAIM_RATE_LIMIT_MAX_ATTEMPTS,
+    CLAIM_RATE_LIMIT_WINDOW_S,
+)
 from ors_server.api.claims import public_router as claims_public_router
 from ors_server.api.claims import router as claims_router
 from ors_server.api.daemons import router as daemons_router
@@ -309,6 +314,14 @@ def create_app(settings: AppSettings) -> FastAPI:
     # would be the wrong kind of "reuse".
     app.state.claim_limiter = Limiter(
         max_attempts=CLAIM_RATE_LIMIT_MAX_ATTEMPTS, window_seconds=CLAIM_RATE_LIMIT_WINDOW_S
+    )
+    # And a third, for the poll. Not the filing budget above: a daemon polls
+    # while it waits and files again when its claim expires, so one shared
+    # counter would let a patient rack spend the attempts it needs in order to
+    # re-file. See `api/claims.py`'s `CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS`.
+    app.state.claim_poll_limiter = Limiter(
+        max_attempts=CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS,
+        window_seconds=CLAIM_POLL_RATE_LIMIT_WINDOW_S,
     )
     # The one piece of outbound HTTP this server makes, held here rather than
     # imported at its call site so a test can replace it with a function --

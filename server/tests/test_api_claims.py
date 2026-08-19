@@ -22,6 +22,7 @@ module docstring, and restated briefly at each test that turns on them:
 from __future__ import annotations
 
 import base64
+import json
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
@@ -29,7 +30,13 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from fastapi.testclient import TestClient
-from ors_server.api.claims import CLAIM_RATE_LIMIT_MAX_ATTEMPTS, CLAIM_RATE_LIMIT_WINDOW_S
+from ors_server.api.claims import (
+    CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS,
+    CLAIM_POLL_RATE_LIMIT_WINDOW_S,
+    CLAIM_RATE_LIMIT_MAX_ATTEMPTS,
+    CLAIM_RATE_LIMIT_WINDOW_S,
+    _seal,
+)
 from ors_server.app import AppSettings, create_app
 from ors_server.claims import MAX_PENDING
 from ors_server.pairing import authenticate_key
@@ -146,6 +153,13 @@ def test_the_33rd_claim_answers_429(tmp_path):
     one_more = TestClient(app, client=("10.9.9.9", 50000))
     response = one_more.post("/api/racks/claims", json=claim_body(n=MAX_PENDING))
     assert response.status_code == 429
+    # The same body a *suppressed* refiling gets, in
+    # `test_denying_suppresses_a_refiling_within_the_window` -- one string for
+    # both refusals is the requirement (`claims.file_claim`'s own docstring),
+    # and the string is one that is true of both. This case really is a full
+    # queue; the other one usually is not, and the route cannot tell the
+    # reader which it is without giving away the thing it is withholding.
+    assert response.json() == {"detail": "claim refused"}
 
 
 def test_the_rate_limiter_refuses_a_burst_from_one_address_before_the_store_is_touched(
@@ -307,6 +321,11 @@ def test_denying_suppresses_a_refiling_within_the_window(tmp_path):
     refiled = client.post("/api/racks/claims", json=claim_body(n=1))
 
     assert refiled.status_code == 429
+    # Byte-identical to the full-queue refusal above -- see
+    # `test_the_33rd_claim_answers_429`. The queue here holds nothing at all,
+    # which is why the old "the claim queue is full" was a false sentence
+    # printed into the Pi's log for the commonest case of this refusal.
+    assert refiled.json() == {"detail": "claim refused"}
     assert client.get("/api/claims").json() == []
 
 
@@ -366,3 +385,143 @@ def test_denying_an_unknown_fingerprint_answers_404(tmp_path):
     client = logged_in(build(tmp_path))
 
     assert client.post("/api/claims/no-such-fingerprint/deny").status_code == 404
+
+
+def test_sealing_twice_to_the_same_peer_is_fresh_in_both_the_nonce_and_the_key():
+    """Three facts about `_seal`, pinned together because each is harmless
+    alone and their conjunction is the whole security of AES-GCM here.
+
+    The ephemeral keypair is generated per call, so a frozen nonce alone
+    never repeats a (key, nonce) pair; the nonce is random per call, so a
+    static module-level keypair alone never repeats one either. **Both** at
+    once is key-and-nonce reuse -- the keystream is the same for two
+    messages, which is plaintext recovery from the XOR and, because the GHASH
+    authentication key is recoverable from two tags under one key/nonce,
+    forgery as well. A round-trip test decrypts one message and cannot see
+    any of that: it passes with a hardcoded nonce, and it passes with a
+    module-level `X25519PrivateKey.generate()`.
+
+    The length is pinned as the literal `12` for the same reason the rate
+    limiter's budget is: `os.urandom(16)` also round-trips, because AES-GCM
+    accepts any nonce length, and 96 bits is the one size that goes straight
+    into the counter block instead of through GHASH -- it is the size every
+    peer implementation assumes, and the daemon that has to open this is not
+    written yet.
+
+    Peer key held **the same** across both calls on purpose: this is about
+    what `_seal` varies by itself, not about what its argument varies for it.
+    """
+    _, peer_public_key = ephemeral_keypair()
+
+    first = json.loads(_seal("a-daemon-key", peer_public_key))
+    second = json.loads(_seal("a-daemon-key", peer_public_key))
+
+    assert first["nonce"] != second["nonce"], "a repeated nonce under a repeated key is reuse"
+    assert first["ephemeral_public_key"] != second["ephemeral_public_key"], (
+        "a static ephemeral key makes every nonce a repeated one"
+    )
+    assert len(base64.b64decode(first["nonce"])) == 12
+    assert len(base64.b64decode(second["nonce"])) == 12
+    # And the two are not merely different headers over one ciphertext.
+    assert first["ciphertext"] != second["ciphertext"]
+
+
+def test_a_fingerprint_holding_a_granted_row_and_a_new_pending_one_resolves_to_the_pending_one(
+    tmp_path,
+):
+    """Design spec S8's own failure row: "the approval arrives while the
+    daemon is offline", so the rack files a new claim and is approved again.
+
+    `claim_pending_fingerprint` is a *partial* unique index (`db.py`), so the
+    granted row and the new pending row coexist under one fingerprint for up
+    to `claims.CLAIM_LIFETIME_S` -- thirty minutes. `_pending_claim_id` reads
+    with `fetchone`, so without its `AND granted_at IS NULL` it resolves to
+    the older, granted row, `claims.approve` refuses that id, and every
+    Approve *and* Deny click on the rack the admin is actually looking at
+    answers 404 until the old row ages out.
+    """
+    client = logged_in(build(tmp_path))
+    first_private_key, first_public_key = ephemeral_keypair()
+    first_filed = client.post(
+        "/api/racks/claims", json=claim_body(n=1, public_key=first_public_key)
+    )
+    approve_by_fingerprint(client, "fp-000001")
+    first_key = unseal(
+        client.get(f"/api/racks/claims/{first_filed.json()['claim_id']}").json(),
+        first_private_key,
+    )
+
+    # Offline through its own approval; it files again under the same
+    # fingerprint, with a fresh ephemeral keypair as a restarted daemon would.
+    second_private_key, second_public_key = ephemeral_keypair()
+    refiled = client.post("/api/racks/claims", json=claim_body(n=1, public_key=second_public_key))
+    assert refiled.status_code == 202, refiled.text
+    assert [row["fingerprint"] for row in client.get("/api/claims").json()] == ["fp-000001"]
+
+    second = approve_by_fingerprint(client, "fp-000001")
+
+    # The 200 is the finding: without `AND granted_at IS NULL` this is a 404,
+    # from `_pending_claim_id` handing `claims.approve` the granted row's id.
+    assert second["name"] == "rack-1"
+    # And it really is a *second* grant, not the first one read back -- the
+    # rack's id is not the evidence for that (`approve` reclaims the name of
+    # an uncollected grant to the same fingerprint, and SQLite hands the freed
+    # rowid straight back), the credential is: the key sealed to the second
+    # claim's keypair authenticates, and the first one no longer does.
+    polled = client.get(f"/api/racks/claims/{refiled.json()['claim_id']}")
+    assert polled.status_code == 200
+    second_key = unseal(polled.json(), second_private_key)
+    assert second_key != first_key
+    database = client.app.state.database
+    assert authenticate_key(database, second_key) == second["id"]
+    assert authenticate_key(database, first_key) is None
+    assert client.get("/api/claims").json() == []
+
+
+def test_the_poll_endpoint_is_rate_limited_per_address_with_its_own_budget(tmp_path):
+    """`GET /api/racks/claims/{id}` is unauthenticated *and* writes --
+    `claims.get_claim` runs `_expire`'s three `DELETE`s before it reads -- so
+    an unlimited poll is a write loop anyone on the LAN can drive without
+    ever filing a claim. Every request in this test names an id nobody filed,
+    which is the cheap case for the caller and the same cost for the server.
+
+    The budget is pinned as a literal for the reason the filing limiter's is:
+    a test that only fed the constant back into its own `range()` would go on
+    passing if somebody widened it to a thousand.
+    """
+    client = build(tmp_path)
+    assert CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS == 60
+    assert CLAIM_POLL_RATE_LIMIT_WINDOW_S == 60.0
+    # A budget of its own, not the filing endpoint's: a daemon polls while it
+    # waits and files again when its claim expires, and one shared counter
+    # would let a patient rack spend the attempts it needs in order to
+    # re-file.
+    assert CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS != CLAIM_RATE_LIMIT_MAX_ATTEMPTS
+
+    unknown_id = "a" * 43
+    for n in range(CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS):
+        response = client.get(f"/api/racks/claims/{unknown_id}")
+        assert response.status_code == 404, (n, response.text)
+
+    over_the_limit = client.get(f"/api/racks/claims/{unknown_id}")
+
+    assert over_the_limit.status_code == 429
+    # The filing budget is untouched by the polling: separate counters.
+    assert client.post("/api/racks/claims", json=claim_body(n=1)).status_code == 202
+
+
+def test_approving_a_claim_records_a_created_event_like_pairing_by_token_does(tmp_path):
+    """`POST /api/daemons` writes `info`/`created` for a rack minted from a
+    pairing token, and design spec S7's status panel is a reader of that
+    list. A rack that joins by claim is the rack this whole milestone exists
+    for, and without a line here its history is empty for its entire life --
+    the one kind of rack whose panel shows nothing.
+    """
+    client = logged_in(build(tmp_path))
+    client.post("/api/racks/claims", json=claim_body(n=1))
+
+    approved = approve_by_fingerprint(client, "fp-000001")
+
+    events = client.get(f"/api/events?daemon_id={approved['id']}").json()
+    assert [(event["level"], event["kind"]) for event in events] == [("info", "created")]
+    assert "rack-1" in events[0]["message"]

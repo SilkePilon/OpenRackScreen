@@ -65,7 +65,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
 from ors_server import claims as claim_store
-from ors_server.api.changes import one_row
+from ors_server.api.changes import one_row, write_event
 from ors_server.auth import now
 
 CLAIM_RATE_LIMIT_MAX_ATTEMPTS = 10
@@ -80,8 +80,50 @@ be able to lock an admin out of logging in by sharing a counter with them.
 way `Sessions()` is.
 """
 
+CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS = 60
+CLAIM_POLL_RATE_LIMIT_WINDOW_S = 60.0
+"""`GET /api/racks/claims/{id}`'s own budget: sixty a minute from one address,
+which is one poll a second sustained.
+
+**A limit at all**, because that route is unauthenticated by necessity and it
+*writes*: `claims.get_claim` runs `_expire`'s three `DELETE`s before it reads
+anything, so every poll -- including one for a claim id nobody ever filed -- is
+a SQLite write transaction. Anyone on the LAN could drive that in a loop
+without ever filing a claim, which made the poll the cheaper of this module's
+two public endpoints to hammer and the only one with no limit in front of it.
+Design spec S6.5 sizes its rate row against the filing endpoint and the queue,
+so this is a limit that section does not require rather than one it forbids.
+
+**A second `Limiter` and not `claim_limiter`'s counter**, for the same reason
+`claim_limiter` is not `Sessions`'s: a daemon polls while it waits and files
+when its claim expires, and sharing one budget would let its own polling use
+up the attempts it needs in order to re-file -- a rack that locks itself out
+of pairing by waiting patiently.
+
+**Sixty rather than `CLAIM_RATE_LIMIT_MAX_ATTEMPTS`'s ten**, because a poll is
+a loop and a filing is not. A daemon waits on a human's click for as long as
+`claims.CLAIM_LIFETIME_S` (thirty minutes), and ten a minute would refuse any
+client polling faster than once every six seconds -- inside the range a
+backoff *starts* at, so it would refuse Task 15's client on its first few
+laps. One a second is above anything a backing-off client ever asks for, and
+still bounds an unauthenticated caller to one write transaction a second per
+address.
+"""
+
 _HKDF_INFO = b"ors-claim-v1"
 _PUBLIC_KEY_BYTES = 32
+_NONCE_BYTES = 12
+"""AES-GCM's native nonce length. What matters about it here is that it is
+*fresh*, not that it is twelve: `_seal` generates a new ephemeral key on every
+call, so even a nonce that never changed would still never repeat a
+(key, nonce) pair -- but AES-GCM's entire security argument is that neither
+repeats, and a later edit that froze either one alone would be harmless while
+an edit that froze both is key-and-nonce reuse, which is plaintext recovery
+and forgery. Neither half is visible in a test that only decrypts one message.
+`test_sealing_twice_to_the_same_peer_is_fresh_in_both_the_nonce_and_the_key`
+pins all three facts -- fresh nonce, fresh ephemeral key, twelve bytes -- so
+that no single one of those edits can survive on its own.
+"""
 
 
 def _seal(daemon_key: str, daemon_public_key_b64: str) -> str:
@@ -110,7 +152,7 @@ def _seal(daemon_key: str, daemon_public_key_b64: str) -> str:
     ephemeral = X25519PrivateKey.generate()
     shared = ephemeral.exchange(peer)
     key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=_HKDF_INFO).derive(shared)
-    nonce = os.urandom(12)
+    nonce = os.urandom(_NONCE_BYTES)
     ciphertext = AESGCM(key).encrypt(nonce, daemon_key.encode(), None)
     return json.dumps(
         {
@@ -265,6 +307,13 @@ async def file_claim_route(request: Request, body: ClaimRequest) -> ClaimFiled:
     withhold, confirming to anyone probing a fingerprint that it was the one
     an admin had denied. Design spec S6.5's own failure table only ever
     names 429 for this endpoint's refusals, for the same reason.
+
+    The `detail` says `"claim refused"` and not `"the claim queue is full"`,
+    which it used to. Both are equally indistinguishable -- one string for
+    both refusals is the whole requirement, and the requirement stands -- but
+    the queue is usually *not* full when a suppressed fingerprint re-files,
+    so the old string was a sentence the server knew to be false, printed
+    into the Pi's log and the admin's toast. "Refused" is true of both.
     """
     state = request.app.state
     client = request.client.host if request.client else "unknown"
@@ -285,7 +334,7 @@ async def file_claim_route(request: Request, body: ClaimRequest) -> ClaimFiled:
         now=moment,
     )
     if claim is None:
-        raise HTTPException(status_code=429, detail="the claim queue is full")
+        raise HTTPException(status_code=429, detail="claim refused")
     return ClaimFiled(claim_id=claim.id)
 
 
@@ -317,10 +366,25 @@ async def poll_claim(request: Request, claim_id: str) -> ClaimPollResult:
     live claims, which is itself a signal, and `_expire` runs a `DELETE`
     ahead of every read on this path whose cost swamps a 43-byte compare.
     What actually keeps a guessed id from being ground out prefix-first is
-    that `id` is a SQLite `TEXT PRIMARY KEY`: the comparison happens inside a
-    B-tree descent against whichever rows the index visits, not against the
-    one true value byte by byte, so the timing is a function of the tree, not
-    of how many leading characters the guess got right.
+    not the B-tree, and an earlier version of this paragraph claiming it was
+    said something untrue: a leaf comparison in SQLite *is* a `memcmp` and
+    *is* prefix-sensitive. It is what the guess gets compared against that
+    holds. `claim.id` is `secrets.token_urlsafe(32)` (`claims.file_claim`),
+    so the handful of rows a descent touches are other racks' random
+    43-character ids, statistically unrelated to the target's; a guess that
+    happens to share a longer prefix with one of *those* has learned nothing
+    about the one id that would actually work, and the row that would answer
+    is the row the descent does not reach until the guess is already right.
+    The signal a byte-at-a-time compare against the true value would leak is
+    therefore not present to leak.
+
+    **Rate-limited, with its own budget** -- see
+    `CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS`. Asked before the store is touched
+    and `record`ed only after `too_many`, exactly as `file_claim_route` does
+    and for the identical reason (`limiter.py`: `record` never prunes). It
+    matters more here than there, because this route writes on every call
+    whether or not the id is real: `get_claim` runs `_expire`'s `DELETE`s
+    first, so an unlimited poll is an unauthenticated write loop.
 
     **`granted_key` is read with a second query, deliberately.**
     `claims.Claim` -- what `get_claim` returns -- does not carry the sealed
@@ -330,8 +394,16 @@ async def poll_claim(request: Request, claim_id: str) -> ClaimPollResult:
     as one that was never granted, not a crash: `row is None` is checked,
     not assumed away.
     """
-    database = request.app.state.database
-    claim = claim_store.get_claim(database, claim_id, now())
+    state = request.app.state
+    client = request.client.host if request.client else "unknown"
+    limiter = state.claim_poll_limiter
+    moment = now()
+    if limiter.too_many(client, moment):
+        raise HTTPException(status_code=429, detail="too many polls from this address")
+    limiter.record(client, moment)
+
+    database = state.database
+    claim = claim_store.get_claim(database, claim_id, moment)
     if claim is None:
         raise HTTPException(status_code=404, detail="no such claim")
     if claim.granted_at is None:
@@ -358,7 +430,20 @@ def _pending_claim_id(connection: sqlite3.Connection, fingerprint: str) -> str:
     """The true `claim.id` for this fingerprint's still-pending row, or the
     404 both `approve_claim` and `deny_claim` answer for one that is not
     there -- already granted, already denied, expired, or never filed.
-    `claim_pending_fingerprint` (`db.py`) guarantees at most one row matches.
+
+    **`AND granted_at IS NULL` is what makes "at most one row" true**, and
+    dropping it is not a tidy-up. `claim_pending_fingerprint` (`db.py`) is a
+    *partial* unique index, qualified on exactly that predicate, precisely so
+    that a granted row steps out of the way and a re-file can land a fresh
+    pending row beside it -- which design spec S8's failure table describes
+    happening routinely ("the approval arrives while the daemon is offline",
+    so the rack files again and is approved again), for up to
+    `claims.CLAIM_LIFETIME_S`. Both rows then share this fingerprint, the
+    read below is a `fetchone`, and without the guard it would resolve to the
+    older *granted* one -- so every Approve and every Deny click on the
+    genuinely pending claim would answer 404 until the granted row aged out.
+    `test_a_fingerprint_holding_a_granted_row_and_a_new_pending_one_resolves_to_the_pending_one`
+    is what holds it.
     """
     row = one_row(
         connection,
@@ -400,6 +485,24 @@ async def approve_claim(request: Request, fingerprint: str) -> ClaimApproved:
     leaving the claim exactly as pending and deniable as it was before this
     call -- loud and recoverable, which is what the route owes the admin who
     just clicked, not a stack trace.
+
+    **One history event, the same one `POST /api/daemons` writes.** That
+    route records `info`/`created` for a rack minted from a pairing token,
+    and design spec S7's status panel reads that list; without a line here, a
+    rack that joined by claim -- the racks this whole milestone is about --
+    showed an empty history for its entire life. It is written here rather
+    than inside `claims.approve` on purpose: `ors_server.claims` is the store
+    and takes no dependency on this package, its `approve` is called directly
+    by `test_claims.py` where a history row is not part of what it is
+    testing, and `approve` runs `seal` under `BEGIN IMMEDIATE` with the write
+    lock held (its own docstring), which is not a transaction to lengthen
+    with a second table's insert and its ring-buffer prune. The cost of that
+    choice is exact and small: the event is written after `approve` has
+    already committed, on the connection this route opens anyway to read the
+    rack's name, so a crash in the microseconds between them leaves a real
+    rack with an empty event list -- cosmetic, and recoverable by anything
+    that happens to it afterwards, where a longer write lock is felt by every
+    reader of the module.
     """
     database = request.app.state.database
     moment = now()
@@ -425,6 +528,9 @@ async def approve_claim(request: Request, fingerprint: str) -> ClaimApproved:
             "SELECT name FROM daemon WHERE id = ?",
             (daemon_id,),
             missing=f"no daemon {daemon_id}",
+        )
+        write_event(
+            connection, daemon_id, "info", "created", f"joined by claim as {name_row['name']!r}"
         )
     return ClaimApproved(id=daemon_id, name=name_row["name"])
 

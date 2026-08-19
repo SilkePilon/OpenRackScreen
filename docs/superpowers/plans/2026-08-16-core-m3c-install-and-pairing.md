@@ -2461,9 +2461,19 @@ Cover:
   a reused key is the thing X25519-per-claim exists to avoid.)*
 - On `approved`, the key decrypts and is written to the link file, and the
   function returns `True`.
-- On `denied`, it stops and returns `False` rather than re-filing immediately.
-  *(A denied rack that reappears every five seconds trains people to click
-  Approve.)*
+- **There is no `denied` status, and the client must not pretend there is.**
+  `claims.deny` deletes the row, so a poll after a deny answers **404 —
+  byte-identical to a claim id nobody ever filed**, deliberately, so that a
+  prober cannot confirm a deny. What a denied rack actually does is: poll →
+  404 → file a new claim → **429** (its fingerprint is suppressed, and that
+  429 is byte-identical to the queue-full one) → back off and retry, for
+  `DENY_SUPPRESSION_S` = 24 hours, after which it reappears in the admin's
+  queue. Test that path, not a `denied` branch. *(A denied rack **cannot
+  tell it was denied and retries indefinitely**. That is by design — the
+  alternative is an endpoint that confirms to anyone holding a fingerprint
+  that an admin denied it — so the backoff, not a stop, is what keeps a
+  refused rack from reappearing every five seconds and training people to
+  click Approve.)*
 - A 429 backs off and retries; assert the sleeper was called with increasing
   values.
 - An expired claim (404 on poll) files a **new** claim rather than waiting for

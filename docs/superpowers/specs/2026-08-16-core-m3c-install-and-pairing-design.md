@@ -444,8 +444,17 @@ is parameterised on its roots — `etc_root`, `boot_root`, `state_root`,
 - **Boot order**: all four rows of §5's table, including a supervisor started on
   zero screens that opens two when a snapshot arrives.
 - **Claim protocol**: the cap, the rate limit, expiry, deny-suppression, a poll
-  rejected when its claim id is wrong, and that the key is handed over exactly
-  once and is absent from the second response.
+  rejected when its claim id is wrong, and that a repeat poll of an approved
+  claim returns **the same ciphertext** — the grant is idempotent, not
+  discard-on-read — with the granted row's own expiry (`CLAIM_LIFETIME_S`
+  after `granted_at`) being what ends the delivery window rather than the
+  first read. §6.3 step 5 left "idempotent or defer the discard" open to
+  whoever implemented the poll route; it was settled as idempotent, because
+  the store writes the sealed blob to `claim.granted_key` and never clears
+  it, and because discard-on-read is the failure §6.3's own forward note
+  names: a poll that merely guessed or observed a claim id would consume the
+  one-shot delivery and leave the legitimate daemon permanently unable to
+  pair.
 - **Discovery**: `zeroconf` stubbed; one server, two servers, none.
 - **Packaging**: the five versions and every intra-project pin agree; the built
   server wheel contains `ors_server/web/index.html`; no wheel's `Requires-Dist`

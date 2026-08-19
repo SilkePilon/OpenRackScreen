@@ -93,6 +93,17 @@ MUTATES_NOTHING = {
     # for the same gap on a different route); it is not licence claimed by
     # accident here, it is the only place these three could be filed once
     # `change()` was ruled out by `claims.py`'s own transaction shape.
+    #
+    # Approve additionally writes one row this sweep cannot see, and it is
+    # named here rather than left to the blind spot: `changes.write_event`,
+    # the same `info`/`created` history line `POST /api/daemons` records for a
+    # rack paired by token, on the connection the route already opens to read
+    # the new rack's name. It is a `daemon_event`, which is history and not
+    # configuration -- nothing bumps a version for it and no snapshot carries
+    # it -- and `link/ws_daemon.py` writes the same rows outside any `change`
+    # for exactly that reason. What holds that it happens at all is
+    # `test_api_claims.py`'s
+    # `test_approving_a_claim_records_a_created_event_like_pairing_by_token_does`.
     "POST /api/racks/claims",
     "POST /api/claims/{fingerprint}/approve",
     "POST /api/claims/{fingerprint}/deny",
