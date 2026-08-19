@@ -105,12 +105,37 @@ a loop and a filing is not. A daemon waits on a human's click for as long as
 `claims.CLAIM_LIFETIME_S` (thirty minutes), and ten a minute would refuse any
 client polling faster than once every six seconds -- inside the range a
 backoff *starts* at, so it would refuse Task 15's client on its first few
-laps. One a second is above anything a backing-off client ever asks for, and
-still bounds an unauthenticated caller to one write transaction a second per
-address.
+laps.
+
+Sixty in a rolling sixty-second window is one a second as a **ceiling**, not
+as headroom above one: a client polling at a steady 1 Hz holds sixty entries
+in the window and the next poll meets `too_many`'s `>=`. The number is sized
+for a client that backs off, which is the client design spec S6.3 describes
+and the one Task 15 will write -- a two-second interval spends half the
+budget, a five-second one a fifth -- and it still bounds an unauthenticated
+caller to one write transaction a second per address, which is what the limit
+is for.
 """
 
 _HKDF_INFO = b"ors-claim-v1"
+"""The HKDF `info` tag, and therefore **wire protocol**: a daemon that derives
+with a different tag derives a different key and cannot open anything sealed
+here, whatever else the two ends agree on.
+
+It is deliberately *not* imported from `ors-schema` and shared with the peer
+implementation. The peer that exists today is `test_api_claims.unseal`, which
+spells the same twelve bytes out as its own literal; that independence is what
+makes a one-sided edit here fail a test instead of silently renaming the
+protocol on both ends at once. A coordinated edit -- rename, grep, update both
+copies -- would still pass every round-trip test, so it is
+`test_the_sealed_blob_matches_a_frozen_wire_vector` and not the round trip
+that holds this constant: that test carries a ciphertext produced before this
+tag could be edited, so nothing this repository can change will make it decode
+again. The constant should move into `ors-schema` in Task 15, when a second
+*production* importer exists, and only alongside that vector -- moving it
+without one would delete the independent literal and put nothing in its place.
+"""
+
 _PUBLIC_KEY_BYTES = 32
 _NONCE_BYTES = 12
 """AES-GCM's native nonce length. What matters about it here is that it is
@@ -499,10 +524,18 @@ async def approve_claim(request: Request, fingerprint: str) -> ClaimApproved:
     with a second table's insert and its ring-buffer prune. The cost of that
     choice is exact and small: the event is written after `approve` has
     already committed, on the connection this route opens anyway to read the
-    rack's name, so a crash in the microseconds between them leaves a real
-    rack with an empty event list -- cosmetic, and recoverable by anything
-    that happens to it afterwards, where a longer write lock is felt by every
-    reader of the module.
+    rack's name -- and the cost is *not* the empty event list an earlier
+    version of this paragraph named. A crash between the commit and the write
+    would indeed leave a real rack with no history, and that is cosmetic; the
+    failure worth stating is the other one. Anything that raises after
+    `approve` has committed -- `write_event` itself, or the `one_row` name
+    read above it -- becomes a 500 for a rack that already exists, already
+    holds its key and is already paired, so the admin is told the approval
+    failed when it did not, and the obvious retry answers 404 because the
+    claim is gone. That is the price of writing the event outside the
+    transaction, and it is accepted against holding SQLite's write lock
+    across a second table's insert and its ring-buffer prune, which every
+    reader of this module pays for.
     """
     database = request.app.state.database
     moment = now()

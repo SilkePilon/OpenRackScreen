@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
@@ -38,7 +39,7 @@ from ors_server.api.claims import (
     _seal,
 )
 from ors_server.app import AppSettings, create_app
-from ors_server.claims import MAX_PENDING
+from ors_server.claims import CLAIM_LIFETIME_S, MAX_PENDING
 from ors_server.pairing import authenticate_key
 
 
@@ -225,6 +226,14 @@ def test_approving_with_a_session_creates_the_rack(tmp_path):
 
     assert approved["name"] == "rack-1"
     assert isinstance(approved["id"], int)
+    # The rack, and *not* the key. `ClaimApproved` carries two fields on
+    # purpose (design spec S6.3 step 5): the minted daemon key reaches its
+    # rack over `GET /api/racks/claims/{id}` sealed to the claim's ephemeral
+    # public key and nowhere else, which is the entire reason `_seal` exists.
+    # Adding it here would put a live credential in cleartext on plain HTTP
+    # and in the admin's browser -- and every assertion above still passes
+    # with it there, so the shape is pinned exactly rather than by name.
+    assert set(approved) == {"id", "name"}
     listed = client.get("/api/daemons").json()
     assert [daemon["name"] for daemon in listed] == ["rack-1"]
     # And it is gone from the pending list -- `list_pending` excludes
@@ -489,7 +498,7 @@ def test_the_poll_endpoint_is_rate_limited_per_address_with_its_own_budget(tmp_p
     a test that only fed the constant back into its own `range()` would go on
     passing if somebody widened it to a thousand.
     """
-    client = build(tmp_path)
+    app = create_app(AppSettings(data_dir=tmp_path))
     assert CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS == 60
     assert CLAIM_POLL_RATE_LIMIT_WINDOW_S == 60.0
     # A budget of its own, not the filing endpoint's: a daemon polls while it
@@ -499,15 +508,25 @@ def test_the_poll_endpoint_is_rate_limited_per_address_with_its_own_budget(tmp_p
     assert CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS != CLAIM_RATE_LIMIT_MAX_ATTEMPTS
 
     unknown_id = "a" * 43
+    one_rack = TestClient(app, client=("10.0.0.1", 50000))
     for n in range(CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS):
-        response = client.get(f"/api/racks/claims/{unknown_id}")
+        response = one_rack.get(f"/api/racks/claims/{unknown_id}")
         assert response.status_code == 404, (n, response.text)
 
-    over_the_limit = client.get(f"/api/racks/claims/{unknown_id}")
+    over_the_limit = one_rack.get(f"/api/racks/claims/{unknown_id}")
 
     assert over_the_limit.status_code == 429
+    # **Per address**, which is the half of this a single-address test cannot
+    # see: with one global counter every assertion above still passes, and
+    # pairing then stops on a two-rack site with no attacker in it -- a rack
+    # polling every two seconds spends half of the sixty, the second rack
+    # spends the rest, and every rack after that is refused for as long as
+    # the first two keep waiting on the admin's click.
+    another_rack = TestClient(app, client=("10.0.0.2", 50000))
+    assert another_rack.get(f"/api/racks/claims/{unknown_id}").status_code == 404
+
     # The filing budget is untouched by the polling: separate counters.
-    assert client.post("/api/racks/claims", json=claim_body(n=1)).status_code == 202
+    assert one_rack.post("/api/racks/claims", json=claim_body(n=1)).status_code == 202
 
 
 def test_approving_a_claim_records_a_created_event_like_pairing_by_token_does(tmp_path):
@@ -525,3 +544,102 @@ def test_approving_a_claim_records_a_created_event_like_pairing_by_token_does(tm
     events = client.get(f"/api/events?daemon_id={approved['id']}").json()
     assert [(event["level"], event["kind"]) for event in events] == [("info", "created")]
     assert "rack-1" in events[0]["message"]
+
+
+# A sealed blob produced by `_seal`'s algorithm before any of the constants
+# below could be edited, kept as literals so that nothing this repository
+# can change will make it decode again if the wire format moves.
+#
+# Not generated here and not derived from `api.claims`: that is the point.
+# `_HKDF_INFO`, the HKDF length and salt, the AEAD and its associated data
+# are protocol -- a Pi in the field holds the peer half of them in a release
+# that shipped months ago. The round-trip test catches a *one-sided* drift
+# (`unseal` above holds its own `b"ors-claim-v1"`, so mutating the production
+# tag alone fails it), but it cannot catch a *coordinated* one: rename the
+# tag, grep, update both copies, and every round trip still passes while
+# every rack already installed stops being able to open its own key. This
+# vector is the thing that fails in that case.
+VECTOR_PEER_PRIVATE_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+VECTOR_SEALED = {
+    "ephemeral_public_key": "NYBy1jZYgNGu6jKa35EhODhR7SGijjt16WXQ0s0WYlQ=",
+    "nonce": "AAECAwQFBgcICQoL",
+    "ciphertext": "O176Qz6Y6DEl4eOeoibBqifbq9oQP30KYVUgxXwvM0P7CXd1M+kp9gYcyBFtWmf5rRY=",
+}
+VECTOR_PLAINTEXT = "the-daemon-key-this-vector-freezes"
+
+
+def test_the_sealed_blob_matches_a_frozen_wire_vector():
+    """The wire format is a frozen artefact, not merely a self-consistent one.
+
+    `unseal` is the written peer implementation this repository has, and it
+    is what a daemon's author would copy. Everything else in this file proves
+    the two halves agree with *each other* right now, which is exactly the
+    property a coordinated edit preserves. Here the ciphertext is a constant:
+    it was produced by the algorithm this module and `api.claims._seal`
+    describe -- X25519, HKDF-SHA256 with `info=b"ors-claim-v1"`, no salt, a
+    32-byte key, AES-GCM with a 12-byte nonce and no associated data -- and
+    if any one of those moves, `unseal` stops recovering `VECTOR_PLAINTEXT`
+    and this test says so, in the repository, before a rack in the field
+    discovers it as a pairing that silently never completes.
+
+    It needs no daemon, no server and no database: it is the format alone.
+    """
+    private_key = X25519PrivateKey.from_private_bytes(base64.b64decode(VECTOR_PEER_PRIVATE_KEY))
+
+    assert unseal(VECTOR_SEALED, private_key) == VECTOR_PLAINTEXT
+
+
+def test_the_frozen_vector_is_the_format_the_live_seal_still_produces():
+    """The other half of the vector above: that it is still *this* code's
+    output shape and not a fossil of an algorithm nothing runs any more.
+
+    A frozen vector alone can rot -- if `_seal` moved and `unseal` moved with
+    it, the vector would fail and the honest fix would be to regenerate it,
+    which is the moment somebody has to decide whether the format may move at
+    all. This test makes the pairing explicit: the peer key of the vector is
+    fed to the live `_seal`, and what comes back is opened by the same
+    `unseal` that opens the frozen blob. Both passing means the field format
+    and the current format are one format.
+    """
+    private_key = X25519PrivateKey.from_private_bytes(base64.b64decode(VECTOR_PEER_PRIVATE_KEY))
+    public_bytes = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+    fresh = json.loads(_seal(VECTOR_PLAINTEXT, base64.b64encode(public_bytes).decode()))
+
+    assert set(fresh) == set(VECTOR_SEALED)
+    assert unseal(fresh, private_key) == VECTOR_PLAINTEXT
+    # A fresh seal is a fresh ephemeral key and nonce, so it is *not* the
+    # vector byte for byte -- which is why the vector has to be a constant.
+    assert fresh != VECTOR_SEALED
+
+
+def test_polling_a_claim_that_aged_out_answers_404_like_one_never_filed(tmp_path, monkeypatch):
+    """The route hands `now()` to `claims.get_claim`, and that argument is
+    what ages a claim out (`claims._expire`).
+
+    Expiry itself is the store's, exhaustively covered in `test_claims.py`;
+    what is covered here is only that this route forwards the current moment
+    rather than a constant. A route that passed `0.0` -- or any fixed value --
+    would keep every claim ever filed alive and pollable forever from an
+    unauthenticated endpoint, and `_expire`'s `DELETE`s would never run, so
+    the `claim` table would grow without bound from anyone on the LAN.
+    Nothing else in this file would notice: every other test polls inside the
+    same instant it files.
+
+    The clock is moved by patching `now` where this module reads it, which is
+    the only seam there is -- `poll_claim` takes no time argument.
+    """
+    client = build(tmp_path)
+    filed = client.post("/api/racks/claims", json=claim_body(n=1))
+    claim_id = filed.json()["claim_id"]
+    assert client.get(f"/api/racks/claims/{claim_id}").status_code == 200
+
+    later = time.time() + CLAIM_LIFETIME_S + 1.0
+    monkeypatch.setattr("ors_server.api.claims.now", lambda: later)
+
+    polled = client.get(f"/api/racks/claims/{claim_id}")
+
+    # The same 404, and the same body, an id nobody ever filed gets -- an
+    # expired claim is not a distinguishable third answer.
+    assert polled.status_code == 404
+    assert polled.json() == client.get("/api/racks/claims/" + "a" * 43).json()
