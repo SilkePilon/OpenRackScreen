@@ -519,7 +519,11 @@ def test_two_servers_are_both_named_and_neither_is_filed_with(tmp_path: Path) ->
     would pick a different one on the next boot and nothing anywhere would
     record the choice; `--server` settles it.
     """
-    http = FakeHttp()
+    # Scripted to *succeed*, so that "neither of them" is what this test
+    # measures rather than what the fake refuses to answer: a client that
+    # quietly took the first of the two would pair here, and the assertions
+    # below are what say it must not.
+    http = FakeHttp([filed("would-have-been-a-mistake")], [approving("the-wrong-servers-key")])
 
     paired, _naps, link = join(tmp_path, http, servers=lambda: [SERVER, OTHER_SERVER])
 
