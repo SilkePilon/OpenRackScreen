@@ -1,8 +1,8 @@
-import { useQueryClient } from "@tanstack/react-query"
+import { useQueryClient, type QueryClient } from "@tanstack/react-query"
 import { useEffect, type ReactNode } from "react"
 
 import { api } from "@/api/client"
-import { daemonsKey, type Daemon } from "@/api/queries"
+import { claimsKey, daemonsKey, type Daemon } from "@/api/queries"
 import { frameStore } from "@/live/frames"
 import { createLiveSocket, type SessionAnswer } from "@/live/socket"
 
@@ -109,13 +109,48 @@ async function askWhetherTheSessionEnded(): Promise<SessionAnswer> {
   }
 }
 
+/**
+ * Re-ask for the racks waiting to join, because something moved on the server.
+ *
+ * Design spec S7 requires that "a rack that appears while the page is open
+ * appears without a reload", and names this socket as what does it. **What
+ * carries it is the `daemons` message, because that is the only message this
+ * socket has that is not a picture of one panel.** There is no `claim` frame:
+ * `ws_ui.py` encodes exactly two types, and the route a rack files a claim
+ * through is an unauthenticated `POST` that touches no hub and wakes no browser.
+ *
+ * So this is honest about its reach and it is worth writing down rather than
+ * discovering later. What it covers is every moment the server's set of
+ * connected racks changes -- which includes the end of this very flow, a rack
+ * that was approved collecting its key and dialling in, and every reconnect on
+ * a site with more than one rack. What it does not cover is a claim filed on a
+ * network where nothing else moves at all; that entry waits for the next
+ * `daemons` message, or for this tab to be focused again, which is when React
+ * Query re-asks a stale query on its own.
+ *
+ * **Invalidated rather than patched**, for `useMutate`'s reason: no server state
+ * is invented by this client. The message says which racks are online and
+ * nothing whatever about what is waiting, so the only correct response to it is
+ * to go and ask. It costs nothing on the pages that do not show the list --
+ * `invalidateQueries` refetches observed queries, and the claims query is
+ * mounted only by the Daemons page.
+ */
+function theClaimsAreStale(queryClient: QueryClient): void {
+  void queryClient.invalidateQueries({ queryKey: claimsKey })
+}
+
 export function LiveProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient()
 
   useEffect(() => {
     const live = createLiveSocket({
       url: liveUrl(),
-      onDaemons: (online) => queryClient.setQueryData(daemonsKey, withOnline(online)),
+      onDaemons: (online) => {
+        queryClient.setQueryData(daemonsKey, withOnline(online))
+        // And the claims, which this message does not carry and cannot: see
+        // `theClaimsAreStale`.
+        theClaimsAreStale(queryClient)
+      },
       onFrame: (frame) => frameStore.push(frame),
       probeSession: askWhetherTheSessionEnded,
     })

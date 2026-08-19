@@ -127,7 +127,11 @@ export function PairDialog() {
             <DialogHeader>
               <DialogTitle>Pair a rack</DialogTitle>
               <DialogDescription>
-                A name for the Pi, so you can tell it from the others. It can be changed later.
+                {"A name for the Pi, so you can tell it from the others. It can be changed " +
+                  "later. This is the way in for a rack that cannot find this server on " +
+                  "its own -- a network that drops multicast, or a Pi on another subnet. " +
+                  "A rack that can find it asks to join instead, and is let in from this " +
+                  "page without a token ever being typed."}
               </DialogDescription>
             </DialogHeader>
             <div className="grid gap-2">

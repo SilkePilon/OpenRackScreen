@@ -61,6 +61,100 @@ export function useDaemons() {
   })
 }
 
+/**
+ * One rack asking to be let in, as `GET /api/claims` reports it.
+ *
+ * **There is no claim id in it, and that is the server's decision rather than
+ * an omission here.** The claim id is the bearer credential a waiting daemon
+ * polls with (`api/claims.py`'s module docstring, design spec S6.3 step 4), and
+ * this list is a page anyone who can read an admin's screen can also read over
+ * the wire; the route therefore answers `fingerprint` instead, which correlates
+ * rows and unlocks nothing. Every admin route below keys on that.
+ */
+export type PendingClaim = components["schemas"]["PendingClaim"]
+
+/**
+ * The racks waiting to join. One key, no rack in it: a claim is not a daemon.
+ *
+ * Invalidated from three places and never patched: the two writes below, and
+ * the live socket in `LiveProvider` -- design spec S7's "a rack that appears
+ * while the page is open appears without a reload".
+ */
+export const claimsKey = ["claims"] as const
+
+/**
+ * The pending claims, asked of the server.
+ *
+ * Nothing polls, here as everywhere else in this interface. `list_pending` runs
+ * the claim table's expiry sweep before it reads anything, so every ask is a
+ * SQLite write transaction, and an interval per open admin tab would be a
+ * write loop for a list that changes when somebody plugs in a Pi.
+ */
+export function useClaims() {
+  return useQuery<PendingClaim[]>({
+    queryKey: claimsKey,
+    queryFn: async () => {
+      const { data, error, response } = await api.GET("/api/claims")
+      if (!data) {
+        throw new ApiError(
+          response.status,
+          detailFrom(error) ?? "the racks waiting to join could not be read",
+        )
+      }
+      return data
+    },
+  })
+}
+
+/**
+ * What an approval answers: the rack that now exists.
+ *
+ * Not the key. That is minted, sealed to the claim's ephemeral public key and
+ * handed to the daemon over `GET /api/racks/claims/{id}` and nowhere else, so
+ * there is nothing here for this interface to show once and forget -- unlike
+ * the token flow, which is the whole reason `TokenOnce` exists.
+ */
+export type ClaimApproved = components["schemas"]["ClaimApproved"]
+
+/**
+ * Let one rack in: create it, mint its key, seal the key to this claim.
+ *
+ * Keyed on the claim's `fingerprint`, which is what the route takes and the
+ * only identifier `GET /api/claims` hands out.
+ *
+ * `invalidates` names both lists because an approval writes to both: the claim
+ * leaves the pending list, and a rack that was not there a moment ago is in the
+ * daemon list. A page that re-read only the claims would drop the entry and
+ * show no rack in its place until somebody navigated.
+ *
+ * Mounted per dialog, with the fingerprint in a closure rather than in the
+ * variables: unlike `useDeleteTemplate`, whose card goes away on success, a
+ * *refused* approval is the case this hook's result has to survive -- a 409
+ * leaves the claim exactly as pending as it was, so the dialog stays up and has
+ * to render the refusal beside the code it is still asking about.
+ */
+export function useApproveClaim(fingerprint: string) {
+  return useMutate<ClaimApproved, void>({
+    send: () =>
+      api.POST("/api/claims/{fingerprint}/approve", { params: { path: { fingerprint } } }),
+    invalidates: [claimsKey, daemonsKey],
+  })
+}
+
+/**
+ * Refuse one rack: delete the claim and suppress its fingerprint for a day.
+ *
+ * `invalidates` names the claims and nothing else -- a deny mints no rack,
+ * touches no configuration and bumps no version. It removes a row from exactly
+ * the list this key holds.
+ */
+export function useDenyClaim(fingerprint: string) {
+  return useMutate<{ [key: string]: boolean }, void>({
+    send: () => api.POST("/api/claims/{fingerprint}/deny", { params: { path: { fingerprint } } }),
+    invalidates: [claimsKey],
+  })
+}
+
 /** A rack and the token that pairs it. Answered once, by two routes, and never listed. */
 export type DaemonCreated = components["schemas"]["DaemonCreated"]
 

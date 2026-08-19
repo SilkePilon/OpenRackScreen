@@ -359,7 +359,13 @@ describe("the screens page", () => {
     // Asserted at the wire -- the `{action, screen_id}` messages the socket
     // really sent -- and not at the frame store, because the store knowing a
     // panel is on screen is not the Pi being told to stop.
-    server.use(...reading([WEATHER, TRAINS, KITCHEN]), NO_EVENTS)
+    // The claim list too, because this test navigates to the Daemons page,
+    // which asks for it. Empty: nothing here is about a rack waiting to join.
+    server.use(
+      ...reading([WEATHER, TRAINS, KITCHEN]),
+      NO_EVENTS,
+      http.get("/api/claims", () => HttpResponse.json([])),
+    )
     const rig = mountScreens()
     await rig.connect()
 

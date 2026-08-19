@@ -17,6 +17,7 @@ import { cn } from "@/lib/utils"
 import { DeleteDaemonDialog } from "@/routes/daemons/DeleteDaemonDialog"
 import { EventList } from "@/routes/daemons/EventList"
 import { PairDialog } from "@/routes/daemons/PairDialog"
+import { PendingClaims } from "@/routes/daemons/PendingClaims"
 import { RotateKeyDialog } from "@/routes/daemons/RotateKeyDialog"
 
 /**
@@ -163,6 +164,13 @@ export function DaemonsPage() {
         <h1 className="text-2xl font-semibold">Daemons</h1>
         <PairDialog />
       </div>
+
+      {/* Above the rack list, per design spec S7, and above its pending and
+          error states too: a rack asking to be let in is the only thing on this
+          page that somebody is standing next to a Pi waiting for, and it must
+          not be below a listing that is still loading or has failed. It draws
+          nothing at all when nothing is waiting. */}
+      <PendingClaims />
 
       {racks.isPending && <p className="text-sm text-muted-foreground">Reading the racks&hellip;</p>}
       {racks.isError && (
