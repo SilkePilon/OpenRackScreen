@@ -1355,3 +1355,26 @@ def test_the_readme_says_the_secret_key_cannot_be_recovered():
     assert "ors_secret_key" in readme
     assert "unrecoverable" in readme or "cannot be recovered" in readme
     assert "systemd" in readme, "the daemon is not in compose and the README has to say so"
+
+
+def test_the_image_does_not_announce_itself_over_mdns(dockerfile: str) -> None:
+    """`ORS_ANNOUNCE=0`, because from a bridge the announcement is worse than none.
+
+    mDNS is link-layer -- multicast to 224.0.0.251 with a TTL of 1 -- and a
+    Docker bridge is a NAT, so the datagram never reaches the LAN whatever
+    address is written in it. What a bridged container would register is
+    loopback and its own bridge address, neither of which names anything a rack
+    can reach.
+
+    That matters more than being merely useless. A rack that finds nothing is
+    told to pass `--server`, which is the message that names the fix; a rack
+    that finds an unreachable entry files a claim that fails instead, and two
+    such entries trip the "more than one server, pair with none" refusal on a
+    LAN that has exactly one.
+
+    `deploy/compose.mdns.yaml` turns it back on alongside `network_mode: host`.
+    Both halves are needed and neither is enough: host networking without the
+    variable is a silent server, and the variable without host networking is
+    the announcement this line exists to suppress.
+    """
+    assert dockerfile_env(dockerfile)["ORS_ANNOUNCE"] == "0"
