@@ -799,6 +799,7 @@ name = "ors-daemon"
 version = "0.2.0"
 source = { editable = "daemon" }
 dependencies = [
+    { name = "cryptography" },
     { name = "ors-render" },
     { name = "ors-schema" },
     { name = "pydantic" },
@@ -819,6 +820,7 @@ hardware = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=43.0" },
     { name = "luma-lcd", marker = "extra == 'hardware'", specifier = ">=2.11" },
     { name = "numpy", marker = "extra == 'hardware'", specifier = ">=1.26" },
     { name = "ors-render", editable = "packages/ors-render" },

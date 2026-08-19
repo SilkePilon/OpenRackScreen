@@ -62,6 +62,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from fastapi import APIRouter, HTTPException, Request
+from ors_schema import CLAIM_HKDF_INFO
 from pydantic import BaseModel, Field, field_validator
 
 from ors_server import claims as claim_store
@@ -117,23 +118,28 @@ caller to one write transaction a second per address, which is what the limit
 is for.
 """
 
-_HKDF_INFO = b"ors-claim-v1"
+_HKDF_INFO = CLAIM_HKDF_INFO
 """The HKDF `info` tag, and therefore **wire protocol**: a daemon that derives
 with a different tag derives a different key and cannot open anything sealed
 here, whatever else the two ends agree on.
 
-It is deliberately *not* imported from `ors-schema` and shared with the peer
-implementation. The peer that exists today is `test_api_claims.unseal`, which
-spells the same twelve bytes out as its own literal; that independence is what
-makes a one-sided edit here fail a test instead of silently renaming the
-protocol on both ends at once. A coordinated edit -- rename, grep, update both
-copies -- would still pass every round-trip test, so it is
-`test_the_sealed_blob_matches_a_frozen_wire_vector` and not the round trip
-that holds this constant: that test carries a ciphertext produced before this
-tag could be edited, so nothing this repository can change will make it decode
-again. The constant should move into `ors-schema` in Task 15, when a second
-*production* importer exists, and only alongside that vector -- moving it
-without one would delete the independent literal and put nothing in its place.
+**Imported from `ors-schema` since Task 15, and it deliberately was not
+before.** While `test_api_claims.unseal` was the only peer implementation in
+this repository, its own independently spelled literal was the thing that made
+a one-sided edit here fail a test rather than silently rename the protocol; a
+shared constant then would have deleted that check and put nothing in its
+place. What replaced it is the frozen wire vector below
+(`test_the_sealed_blob_matches_a_frozen_wire_vector`, and its opposite number
+`daemon/tests/test_join.py::test_the_daemon_opens_a_frozen_wire_vector`):
+each carries a ciphertext produced before this tag could be edited, so no edit
+-- one-sided *or* coordinated -- leaves the suite green. With the format pinned
+from outside, one definition for the two production ends is the safer
+arrangement, because the failure a drift between them produces is not an error
+anywhere: it is a rack that files, is approved, and never pairs.
+
+The bound name stays `_HKDF_INFO` so that `_seal` below reads as the algorithm
+it implements rather than as a package lookup, and so that the one literal in
+the server's tests still names something to grep for.
 """
 
 _PUBLIC_KEY_BYTES = 32

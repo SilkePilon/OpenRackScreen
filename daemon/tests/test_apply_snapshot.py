@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 import yaml
+from ors_daemon import identity
 from ors_daemon.__main__ import (
     _RECLOCK_EXIT,
     _USAGE_EXIT,
@@ -598,22 +599,65 @@ def test_a_freshly_installed_rack_enters_the_join_flow(
 def test_running_unpaired_without_config_fails_cleanly_not_with_a_traceback(
     tmp_path: Path, capsys: Any
 ) -> None:
-    """Row 4 today, before Task 15 lands: `join_a_server` is a deliberate stub
-    that raises `NotImplementedError` rather than silently doing nothing (see
-    its docstring). This is the *real*, unpatched stub -- unlike every other
+    """Row 4 through the *real*, unpatched join flow -- unlike every other
     test of row 4 in this file, nothing here monkeypatches `join_a_server`.
+
+    `--server rack:8080` is the one way to reach that flow and have it come
+    back promptly: it names no host at all (`urlsplit` reads `rack` as the
+    scheme), which is the typo `connect` already had to learn to reject, so
+    `join.server_from_url` refuses it before anything is dialled and no socket
+    is opened by this test. Every other shape of row 4 blocks until an admin
+    clicks, which is what it is for.
 
     This is exactly the state `ors-daemon install` leaves a fresh machine in:
     both `examples/openrackscreen.service` and the unit `install.py` generates
     run `ExecStart=... run` with no `--config`, under `Restart=always` and
-    `StartLimitIntervalSec=0`. Left uncaught, this command's `NotImplementedError`
-    was a Python traceback written to the journal every `RestartSec=5`, forever.
+    `StartLimitIntervalSec=0`. Anything raising out of the join flow is a
+    Python traceback written to the journal every `RestartSec=5`, forever --
+    which is what the `NotImplementedError` stub this replaced used to do
+    before `_run` learned to catch it, and what the flow itself must now never
+    do.
     """
-    assert run_no_config(tmp_path) == 1
+    assert run_no_config(tmp_path, "--server", "rack:8080") == 1
     error = capsys.readouterr().err
     assert "Traceback" not in error
+    assert "rack:8080" in error, "the message has to name the thing that is wrong"
+    assert "http://" in error, "and show what a URL it can use looks like"
     assert "ors-daemon connect" in error, "the message has to name what to do instead"
     assert RecordingSupervisor.instances == []
+
+
+def test_an_unreadable_identity_stops_the_join_flow_without_a_traceback(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """`identity.load_or_create` refuses a file it cannot parse rather than
+    minting a second identity over it -- the admin would otherwise be looking
+    at a pending claim that had quietly stopped being this rack's. Its
+    `ValueError` reaches row 4, where the audience is somebody over SSH.
+    """
+    (tmp_path / "identity.json").write_text("{ not an identity")
+    (tmp_path / "identity.json").chmod(0o600)
+
+    assert run_no_config(tmp_path, "--server", "http://s:8080") == 1
+    error = capsys.readouterr().err
+    assert "Traceback" not in error
+    assert "identity" in error
+    assert RecordingSupervisor.instances == []
+
+
+def test_the_join_flow_prints_the_short_code_an_admin_has_to_compare(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """Design spec S6.4: the short code is the whole of what makes the
+    approve click meaningful, and it is compared against what the rack says
+    about itself. `install` prints it once, at install time; by the time
+    somebody opens the interface, the console this rack is running on is the
+    only place left that can show it.
+    """
+    assert run_no_config(tmp_path, "--server", "rack:8080") == 1
+
+    code = identity.load_or_create(tmp_path / "identity.json").short_code
+    assert code in capsys.readouterr().err
 
 
 def test_join_a_server_returning_unpaired_fails_cleanly_not_with_an_assert(

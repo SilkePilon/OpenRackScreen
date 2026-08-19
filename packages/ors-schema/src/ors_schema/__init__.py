@@ -1,5 +1,6 @@
 __version__ = "0.2.0"
 
+from ors_schema.claim import CLAIM_HKDF_INFO
 from ors_schema.daemon import (
     DaemonConfig,
     DisplayConfig,
@@ -62,6 +63,7 @@ from ors_schema.scene import (
 )
 
 __all__ = [
+    "CLAIM_HKDF_INFO",
     "PALETTE_TOKEN",
     "PROTOCOL_VERSION",
     "Ack",

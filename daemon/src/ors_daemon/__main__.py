@@ -58,9 +58,11 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -69,7 +71,7 @@ from ors_render import RenderContext, render_screen
 from ors_schema.daemon import DaemonConfig, DisplayConfig
 from ors_schema.link import Command
 
-from ors_daemon import __version__
+from ors_daemon import __version__, discovery, identity, join
 from ors_daemon.clock import Clock, ClockError, system_clock
 from ors_daemon.config import (
     ConfigError,
@@ -79,6 +81,7 @@ from ors_daemon.config import (
     resolve_screens,
     system_scenes,
 )
+from ors_daemon.discovery import Found
 from ors_daemon.displays import DisplayBackend, build_display
 from ors_daemon.frames import FramePump, FrameStream
 from ors_daemon.hardware import SPI_ROOT, detect_handler, probe_handler
@@ -703,20 +706,17 @@ def _run(args: argparse.Namespace) -> int:
             # Row 4: the state a freshly installed rack is in, and it is not an
             # error. Browse for a server (or dial --server directly), file a
             # claim, and wait to be approved in the interface.
-            try:
-                join_a_server(args)
-            except NotImplementedError as exc:
-                # Task 15 has not landed yet, and this is the one call in the
-                # module that can raise instead of returning -- deliberately,
-                # per its own docstring, so a stub that quietly did nothing
-                # could not masquerade as success. Left uncaught this was a
-                # traceback on exactly the path `ors-daemon install` leaves a
-                # fresh machine on: the shipped unit runs `run` with no
-                # `--config` under `Restart=always` and
-                # `StartLimitIntervalSec=0`, so it repeated every `RestartSec=5`
-                # forever.
-                print(str(exc), file=sys.stderr)
-                return 1
+            #
+            # No `try` around it any more. It used to catch the
+            # `NotImplementedError` its own stub raised, before Task 15; what
+            # replaced the stub reports every failure it has as a log line and
+            # a plain return, so a bare `except` here would only be able to
+            # catch a bug -- and the shipped unit runs this under
+            # `Restart=always` with `StartLimitIntervalSec=0`, so a traceback
+            # here is one repeated every `RestartSec=5` forever either way.
+            # The check below is what turns "returned without pairing" into a
+            # message and an exit, and it does not care why.
+            join_a_server(args)
             # Once paired, the pairing just written is what the rest of this
             # function needs -- re-read rather than assumed, because
             # `join_a_server` is the one thing here allowed to have changed it.
@@ -808,24 +808,56 @@ def _run(args: argparse.Namespace) -> int:
     return 0
 
 
+IDENTITY_FILENAME = "identity.json"
+"""What `install` calls this rack's identity, beside the pairing.
+
+`install.py` writes `<state dir>/identity.json` and `--link` defaults to
+`<state dir>/link.json`, so deriving one from the other keeps a non-default
+`--link` -- a test's `tmp_path`, or a second daemon on one machine -- pointing
+at its own identity rather than at the service's.
+"""
+
+
+def _only(server: Found) -> list[Found]:
+    """`--server URL`'s answer to the question discovery answers by browsing.
+
+    A named function and not a lambda so that `join.join_a_server` sees the
+    same shape either way: something it can call again on every lap, because
+    the list it gets back is allowed to change (`discovery.discover` finds a
+    server that booted after this Pi did; this one never will, which is the
+    whole point of naming it).
+    """
+    return [server]
+
+
+def _join_client() -> Any:  # pragma: no cover - constructs the real HTTP client
+    """The blocking HTTP client the join flow files and polls with.
+
+    Built here rather than inside `ors_daemon.join` so that module takes its
+    client as an argument and every test of it runs without a socket, the same
+    way `discovery` takes its browse.
+    """
+    import requests
+
+    return requests.Session()
+
+
 def join_a_server(args: argparse.Namespace) -> None:
     """Pair a freshly installed rack with no operator having typed a token.
 
-    **Not implemented here.** This is the seam Task 15 fills in --
-    `ors_daemon.discovery` and `ors_daemon.join`, the modules this would call
-    into, do not exist yet. `_run` calls this exact name, unconditionally,
-    whenever this rack is neither paired (`settings is None`) nor handed
-    `--config`, and it is the only caller: that is row 4 of `_boot`'s
-    docstring, the state `install` leaves a machine in, and the daemon may not
-    take a different path through it than this function.
+    `_run` calls this exact name, unconditionally, whenever this rack is
+    neither paired (`settings is None`) nor handed `--config` and has no usable
+    cache: that is row 4 of `_boot`'s docstring, the state `install` leaves a
+    machine in, and the daemon may not take a different path through it.
 
-    What it is expected to do, for whoever implements Task 15: browse for a
-    server over mDNS (or dial `args.server` directly if it was given, which is
-    how this is reachable even with `args.no_discovery` set), file a claim
-    with this rack's identity, and block until either the interface approves
-    it or the operator interrupts the process. On approval it writes the
-    pairing to `args.link` the same way `connect` does -- `write_link_settings`
-    -- so this function's caller finds it the moment this returns.
+    This is the wiring; `ors_daemon.join` is the protocol. What happens here is
+    the three things that need a `Namespace` and a terminal: reading (or
+    minting) this rack's identity beside the pairing, turning `--server URL`
+    into the record discovery would have answered with, and telling whoever is
+    watching the console what short code to compare -- because approving
+    without comparing it is approving a stranger's rack (design spec S6.4), and
+    a code that only ever appeared in `install`'s output is one nobody has in
+    front of them by the time the interface asks.
 
     It is deliberately not expected to also start the rack: nothing here reads
     a pushed configuration or returns one. Once this returns, `_run` re-reads
@@ -840,17 +872,74 @@ def join_a_server(args: argparse.Namespace) -> None:
     this function beyond what it already promised: block, then write the
     pairing.
 
-    Raises rather than returns a value, until it exists: a stub that quietly
-    did nothing would make `_run` claim success having paired nothing, which is
-    the one shape row 4 must never take. `_run` catches exactly this exception
-    around its one call here and turns it into a message on stderr and a
-    non-zero exit rather than a traceback, precisely because this is a stub
-    today and not a bug once it stops being one.
+    **Returning without a pairing is a shape, not a bug.** Two servers
+    answered and neither may be chosen, `--server` names nothing dialable, this
+    rack's identity file cannot be read, a key arrived that will not decrypt,
+    or somebody pressed Ctrl-C. Each says so on stderr here or in the log, and
+    `_run`'s own check turns the silence that follows into a message naming
+    `ors-daemon connect` and a non-zero exit. Nothing here raises: the shipped
+    unit runs this under `Restart=always` with `StartLimitIntervalSec=0`, so a
+    traceback is one written to the journal every `RestartSec=5` forever.
     """
-    raise NotImplementedError(
-        "the join flow is not implemented yet (Task 15); pair this rack in the "
-        "meantime with `ors-daemon connect --server ... --token ...`"
+    link = Path(args.link)
+    try:
+        identity_path = link.with_name(IDENTITY_FILENAME)
+    except ValueError:
+        # `--link /` and `--link .` name no file, so there is no name to put
+        # an identity beside. The same `ValueError` `_cache_beside` exists for.
+        print(
+            f"{link}: --link has to name a file, so that this rack's identity and its "
+            "pairing can live beside each other",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        rack = identity.load_or_create(identity_path)
+    except (OSError, ValueError) as exc:
+        # `load_or_create` refuses an identity file it cannot parse, and one
+        # readable by more than its owner, rather than replacing it -- both
+        # deliberately, both recoverable only by a person. See its docstring.
+        print(f"cannot read this rack's identity: {exc}", file=sys.stderr)
+        return
+
+    # Before `--server` is looked at, not after: the short code is a fact
+    # about this rack and not about any server, and a rack that cannot dial
+    # anything yet is exactly the one whose operator is about to go and read
+    # this line off the console.
+    print(
+        f"this rack is not paired yet. Its short code is {rack.short_code} -- compare it "
+        "in the interface before approving.",
+        file=sys.stderr,
     )
+
+    if args.server:
+        found = join.server_from_url(args.server)
+        if found is None:
+            print(
+                f"--server {args.server}: not a URL a claim can be filed against. "
+                "It needs a scheme and a host, e.g. http://rack.local:8080",
+                file=sys.stderr,
+            )
+            return
+        servers: Callable[[], list[Found]] = partial(_only, found)
+    else:
+        servers = discovery.discover
+
+    try:
+        join.join_a_server(
+            identity=rack,
+            servers=servers,
+            link_path=link,
+            sleeper=time.sleep,
+            http=_join_client(),
+        )
+    except KeyboardInterrupt:
+        # The one thing in here that can interrupt a wait measured in minutes,
+        # and the operator's own doing. `_run` installs its signal handlers
+        # only once the rack is up, so without this an impatient Ctrl-C during
+        # a backoff is a `KeyboardInterrupt` traceback out of `main`.
+        print("interrupted; this rack is still not paired.", file=sys.stderr)
 
 
 FRAMES_JOIN_TIMEOUT = 1.0
