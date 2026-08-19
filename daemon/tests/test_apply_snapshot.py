@@ -634,6 +634,13 @@ def test_row_four_with_a_server_url_naming_no_host_fails_cleanly_not_with_a_trac
     assert RecordingSupervisor.instances == []
 
 
+class _NoHttp:
+    """An HTTP client that fails rather than dials. See its one use below."""
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(f"this path may not reach the network, and it called http.{name}")
+
+
 def test_row_four_with_no_server_browses_and_refuses_to_choose_between_two(
     tmp_path: Path, capsys: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -660,6 +667,16 @@ def test_row_four_with_no_server_browses_and_refuses_to_choose_between_two(
             Found(host="192.0.2.10", port=8080, scheme="http"),
             Found(host="198.51.100.77", port=9090, scheme="http"),
         ],
+    )
+    # The one thing standing in for anything real, and it stands in for a
+    # `requests.Session` with something that refuses to be used: reaching this
+    # decision must not dial, and a client that would open a TCP connection to
+    # either of those addresses is what this says out loud rather than what
+    # this test would otherwise merely be assuming. `_join_client` builds the
+    # session and holds no logic, so nothing under test is patched away.
+    monkeypatch.setattr(
+        "ors_daemon.__main__._join_client",
+        lambda: _NoHttp(),
     )
 
     assert run_no_config(tmp_path) == 1
