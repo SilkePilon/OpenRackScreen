@@ -16,6 +16,7 @@ deliberately built on those two names rather than a second hash-and-compare.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -113,9 +114,42 @@ def _expire(connection: sqlite3.Connection, now: float) -> None:
     poll ever sees it -- the exact bug this qualifier exists to prevent. A
     granted row is stale `CLAIM_LIFETIME_S` after `granted_at` instead (see
     `CLAIM_LIFETIME_S`'s docstring for why that clock and that window).
+
+    A granted row that ages out this way leaves behind a `daemon` row too --
+    `approve` mints it before delivery to the daemon is guaranteed, and
+    nothing else in this module rolls it back if the daemon was too slow to
+    poll. Left alone, that row permanently occupies `daemon.name`: the rack
+    it belongs to re-files under the same hostname, an admin re-approves, and
+    `INSERT INTO daemon` raises `sqlite3.IntegrityError` on the name it can
+    never free -- every retry burning another claim, forever. So this sweep
+    deletes the orphan alongside its claim, restricted to `last_seen IS
+    NULL`: nothing in this codebase yet updates that column on a real daemon
+    connection (a later task's job -- there is no daemon socket wired to
+    `claim_pending_fingerprint`'s daemon rows at all yet), so every row
+    `approve` mints has it NULL regardless of whether delivery succeeded,
+    which makes this unconditional in practice today and self-limiting the
+    moment that connection handling exists: a daemon that really did collect
+    its key and has since connected sets `last_seen` and stops matching, so a
+    daemon that paired successfully and is merely slow to reconnect is never
+    swept out from under itself.
+
+    This was weighed against the other fix the same finding named -- holding
+    `daemon.status` at something other than `'paired'` until the poll route
+    confirms delivery -- and rejected for this module specifically because
+    that route, and the acknowledgement channel it would need, do not exist
+    yet (design spec S6.3 step 5's own forward note leaves that decision to
+    whichever task builds the poll route). Sweeping the orphan here needs
+    nothing this module does not already have.
     """
     connection.execute(
         "DELETE FROM claim WHERE granted_at IS NULL AND first_seen <= ?",
+        (now - CLAIM_LIFETIME_S,),
+    )
+    connection.execute(
+        "DELETE FROM daemon WHERE last_seen IS NULL AND id IN ("
+        "SELECT daemon_id FROM claim"
+        " WHERE granted_at IS NOT NULL AND granted_at <= ? AND daemon_id IS NOT NULL"
+        ")",
         (now - CLAIM_LIFETIME_S,),
     )
     connection.execute(
@@ -141,7 +175,7 @@ def file_claim(
 ) -> Claim | None:
     """File a claim, or refresh the pending one this fingerprint already holds.
 
-    `None` covers three refusals a caller must not be able to tell apart --
+    `None` covers two refusals a caller must not be able to tell apart --
     the queue is full, or this fingerprint was denied and is still
     suppressed -- exactly as `pairing.claim_token` answers `None` for a token
     nobody minted and one already spent without distinguishing them.
@@ -243,33 +277,80 @@ def count_pending(database: Database, now: float) -> int:
         )
 
 
-def approve(database: Database, claim_id: str, now: float) -> tuple[int, str] | None:
+def _seal_not_implemented(key: str, public_key: str) -> str:
+    """`approve`'s default `seal` -- always raises, naming the task that owes it.
+
+    Sealing the minted key to the claim's ephemeral X25519 public key (design
+    spec S6.3 step 5) is real cryptography this module does not own; Task 13
+    does. This default exists so `approve` has a seam to take it through
+    (`approve(..., seal=<the real one>)`) rather than a hardcoded call to
+    something that does not exist in this codebase yet, while making it
+    impossible to reach production behaviour by omission: nothing here calls
+    `approve` without passing `seal` -- there is no route wired to it yet (see
+    this module's own docstring) -- so the only way to hit this by accident is
+    a future caller that forgets the argument, which is exactly what naming
+    Task 13 in the message is for.
+    """
+    raise NotImplementedError(
+        "claims.approve() has no key-sealing primitive: pass seal= (Task 13's"
+        " X25519 seal, design spec S6.3 step 5) -- there is no default that"
+        " does the sealing, because approving a claim without one would leave"
+        " a live credential with nowhere safe to be encrypted to."
+    )
+
+
+def approve(
+    database: Database,
+    claim_id: str,
+    now: float,
+    *,
+    seal: Callable[[str, str], str] = _seal_not_implemented,
+) -> tuple[int, str] | None:
     """Approve a pending claim: create its daemon, mint a key, hand it over once.
 
-    The guarded `UPDATE ... WHERE id = ? AND granted_at IS NULL RETURNING *`
-    is the one statement that decides an approval race, exactly as
-    `pairing._spend_token`'s guarded `UPDATE` decides a token race: two
-    callers approving the same id at once can both reach this function, but
-    SQLite serialises the two `UPDATE`s, and only the one whose `WHERE`
-    still matches gets to mint a key at all -- the other's `RETURNING` is
-    empty and it returns `None` before ever reaching `INSERT INTO daemon`.
-    (A guard built the other way round -- insert the `daemon` row first and
-    let its own `UNIQUE(name)` decide the race -- was the earlier, rejected
-    shape: the loser would still have raised `sqlite3.IntegrityError` out of
-    a write it should never have attempted, a crash standing in for a clean
-    `None`.)
+    `seal(key, public_key)` is the caller's X25519 seal (design spec S6.3
+    step 5, Task 13's to supply) -- this module owns none of that
+    cryptography, so it takes it as a seam instead. The default,
+    `_seal_not_implemented`, always raises; there is nothing safe it could do
+    instead, since minting a key with no way to encrypt it would mean
+    handing a live credential to a caller with nothing to do with it.
 
-    The guard is `granted_at`, not `daemon_id`, on purpose: the new `daemon`
-    row does not exist yet at the moment the race has to be decided, so
-    `daemon_id` cannot be part of the same atomic statement that decides it
-    -- it is filled in a moment later, once minting the daemon is safe to do
-    because this call has already won. `granted_at IS NULL` is therefore what
-    "still pending" means everywhere in this module (`file_claim`,
-    `list_pending`, `count_pending`, `claim_pending_fingerprint`), so a reader
-    who catches the row between the guard firing and `daemon_id` landing
-    still sees it correctly as no-longer-pending.
+    **One transaction, not three autocommitted statements.** A `BEGIN
+    IMMEDIATE` takes the write lock before anything is read, so the guarded
+    read (`SELECT ... WHERE granted_at IS NULL`), `INSERT INTO daemon` and
+    the guarded `UPDATE claim SET granted_at = ?, granted_key = ?, daemon_id
+    = ?` all land together or not at all. The three-statement shape this
+    replaced (`UPDATE claim SET granted_at` / `INSERT INTO daemon` / `UPDATE
+    claim SET daemon_id`) ran under `Database.connect`'s autocommit
+    (`isolation_level=None`): each statement committed the instant it ran, so
+    a `daemon.name` collision on the second statement raised
+    `sqlite3.IntegrityError` out of a claim that the *first* statement had
+    already, irreversibly, marked granted. The claim was then permanently
+    unapprovable (the guard says granted), undeniable (`deny`'s own guard
+    says the same), and invisible (`list_pending` excludes granted rows) --
+    the exact crash-standing-in-for-a-clean-`None` failure the guard was
+    built to eliminate in the first place, relocated from the loser of a
+    race onto the claim itself. Folding all three into one transaction closes
+    that: on `IntegrityError` the whole transaction rolls back, the claim's
+    `granted_at` is never set, and it is exactly as pending as it was before
+    this call -- `list_pending` still shows it, a corrected retry can still
+    approve it, and the caller sees the `IntegrityError` propagate, which is
+    the API's to turn into a 409 (the same division of labour
+    `mint_token_on`'s docstring describes for the same collision).
 
-    The row is **not** deleted. Row deletion was the earlier, rejected shape,
+    The guard is `granted_at`, not `daemon_id`, on purpose, independent of
+    the transaction change above: the new `daemon` row does not exist yet at
+    the moment the guarded read happens, so `daemon_id` cannot be part of
+    what decides "still pending" -- it is filled in a moment later, in the
+    same statement that sets `granted_at`, once minting the daemon is known
+    to be safe. `granted_at IS NULL` is therefore what "still pending" means
+    everywhere in this module (`file_claim`, `list_pending`, `count_pending`,
+    `claim_pending_fingerprint`), and the partial index
+    `claim_pending_fingerprint` is keyed on it for the same reason (see
+    `db.py`'s schema comment, and the whitebox test pinning that the index
+    and this guard name the same column).
+
+    The row is **not** deleted. Row deletion was an earlier, rejected shape,
     and it broke the protocol outright: the design spec (S6.3 steps 4-5)
     describes the daemon collecting its key on a *separate* poll,
     `GET /api/racks/claims/{id}`, after this call has already returned to the
@@ -278,44 +359,60 @@ def approve(database: Database, claim_id: str, now: float) -> tuple[int, str] | 
     lets a repeat poll re-send the same thing rather than finding it gone,
     which is the design spec's own forward note on the poll route: it must be
     either idempotent or hold its discard until the daemon acknowledges
-    receipt, and idempotent needs exactly this -- a survivor to serve from.
-    A granted row does not live forever either: see `_expire` and
-    `CLAIM_LIFETIME_S`'s docstring for its own retention.
+    receipt. Storing `seal`'s ciphertext in `granted_key` rather than handing
+    only the plaintext back is what makes idempotent the free choice here --
+    a repeat poll is then a plain `SELECT granted_key FROM claim WHERE id =
+    ?`, the same ciphertext every time, needing nothing remembered anywhere
+    else. A granted row does not live forever either: see `_expire` and
+    `CLAIM_LIFETIME_S`'s docstring for its own retention, and for what
+    happens to the `daemon` row this call mints if the poll never comes.
 
-    `RETURNING *`, not a named subset: whatever calls this next (the poll
-    route) needs `public_key` and `fingerprint` off the *same* row to build
-    the encrypted handover the spec describes, and a second `get_claim` call
-    to fetch them would reopen the read-then-write race this guard exists to
-    close.
-
-    The plaintext key itself still never touches the database: `granted_key`
-    is left NULL here, exactly as before, and `_fingerprint(key)` is what
-    `daemon.key_hash` stores instead -- the same helper and the same column
-    `pairing.claim_token` writes to, so a daemon paired by a claim
-    authenticates through `authenticate_key` exactly as one paired by a token
-    does. A future poll route that wants to *deliver* the key still has to
-    encrypt it to `public_key` and store that ciphertext in `granted_key`
-    itself; minting one here without anywhere safe to put it would only be
-    handing a live credential to a caller with nothing to do with it yet.
+    The plaintext key itself still never touches the database: `key` is
+    returned to this call's own caller and nowhere else, `seal(key,
+    public_key)` -- not `key` -- is what lands in `granted_key`, and
+    `_fingerprint(key)` is what `daemon.key_hash` stores, the same helper and
+    the same column `pairing.claim_token` writes to, so a daemon paired by a
+    claim authenticates through `authenticate_key` exactly as one paired by a
+    token does. A sealed blob at rest is not the same thing `granted_key`'s
+    old NULL was avoiding: the server holds no private half of the claim's
+    ephemeral keypair, so `seal`'s output is no more a working credential to
+    a reader of the database file than `secret.ciphertext` is (see `db.py`'s
+    schema comment on `granted_key` for the fuller version of this point).
     """
     with closing(database.connect()) as connection:
         _expire(connection, now)
-        row = connection.execute(
-            "UPDATE claim SET granted_at = ? WHERE id = ? AND granted_at IS NULL RETURNING *",
-            (now, claim_id),
-        ).fetchone()
-        if row is None:
-            return None
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                "SELECT public_key, hostname, version FROM claim"
+                " WHERE id = ? AND granted_at IS NULL",
+                (claim_id,),
+            ).fetchone()
+            if row is None:
+                connection.execute("ROLLBACK")
+                return None
 
-        key = token_urlsafe(KEY_BYTES)
-        stamp = datetime.now(UTC).isoformat()
-        cursor = connection.execute(
-            "INSERT INTO daemon (name, key_hash, version, status, paired_at, created_at)"
-            " VALUES (?, ?, ?, 'paired', ?, ?)",
-            (row["hostname"], _fingerprint(key), row["version"], stamp, stamp),
-        )
-        daemon_id = int(cursor.lastrowid)
-        connection.execute("UPDATE claim SET daemon_id = ? WHERE id = ?", (daemon_id, claim_id))
+            key = token_urlsafe(KEY_BYTES)
+            blob = seal(key, row["public_key"])
+            stamp = datetime.now(UTC).isoformat()
+            cursor = connection.execute(
+                "INSERT INTO daemon (name, key_hash, version, status, paired_at, created_at)"
+                " VALUES (?, ?, ?, 'paired', ?, ?)",
+                (row["hostname"], _fingerprint(key), row["version"], stamp, stamp),
+            )
+            daemon_id = int(cursor.lastrowid)
+            updated = connection.execute(
+                "UPDATE claim SET granted_at = ?, granted_key = ?, daemon_id = ?"
+                " WHERE id = ? AND granted_at IS NULL RETURNING id",
+                (now, blob, daemon_id, claim_id),
+            ).fetchone()
+            if updated is None:
+                connection.execute("ROLLBACK")
+                return None
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+        connection.execute("COMMIT")
         return daemon_id, key
 
 

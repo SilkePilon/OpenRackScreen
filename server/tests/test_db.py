@@ -267,3 +267,49 @@ def test_redaction_does_not_invent_a_column_the_old_schema_lacked(tmp_path):
     exported = Database(path).export()["daemon"][0]
 
     assert exported == {"id": 1, "name": "old"}, "an export describes the database that existed"
+
+
+def test_a_pre_round_2_claim_table_upgrades_instead_of_crashing_on_start(tmp_path):
+    """Round 2 MEDIUM 4. `36439ba` was a committed, reviewable state on this
+    branch whose `claim` table has no `granted_at` column (`claims.approve`
+    deleted the row instead of keeping it, back then) and stamped
+    `user_version = 4`. If `SCHEMA_VERSION` here were still 4, a database
+    created from that commit would look, to `initialise`, like nothing
+    changed -- version already matches, so it skips the export-and-rebuild
+    branch entirely -- and every later read touching `granted_at` would raise
+    `sqlite3.OperationalError: no such column: granted_at` out of
+    `claims.py`, not out of anything naming a schema mismatch. Bumping to 5
+    makes `initialise` take the ordinary upgrade path instead.
+    """
+    path = tmp_path / "ors.db"
+    with sqlite3.connect(path) as connection:
+        # The exact `claim` DDL committed at 36439ba: `granted_key` and
+        # `daemon_id` exist, `granted_at` does not, and `fingerprint` is a
+        # plain UNIQUE column rather than the later partial index.
+        connection.execute(
+            "CREATE TABLE claim ("
+            " id TEXT PRIMARY KEY, hostname TEXT NOT NULL, address TEXT NOT NULL,"
+            " fingerprint TEXT NOT NULL UNIQUE, short_code TEXT NOT NULL,"
+            " version TEXT NOT NULL, public_key TEXT NOT NULL, first_seen REAL NOT NULL,"
+            " granted_key TEXT, daemon_id INTEGER"
+            ")"
+        )
+        connection.execute(
+            "INSERT INTO claim"
+            " (id, hostname, address, fingerprint, short_code, version, public_key, first_seen)"
+            " VALUES ('claim-a', 'host-a', '10.0.0.1', 'fp-a', 'AAAAAA', '1.0', 'key-a', 0.0)"
+        )
+        connection.execute("PRAGMA user_version = 4")
+
+    # Must not raise -- version 4 no longer matches SCHEMA_VERSION, so
+    # `initialise` exports the old rows and rebuilds with the current schema,
+    # which does have `granted_at`.
+    export = Database(path).initialise()
+
+    assert export is not None
+    exported_claim = json.loads(export.read_text())["claim"][0]
+    assert exported_claim["hostname"] == "host-a"
+    assert "granted_at" not in exported_claim, "the export describes the pre-upgrade schema"
+    with Database(path).connect() as connection:
+        # The column that a stuck-at-4 SCHEMA_VERSION would make unreachable.
+        assert connection.execute("SELECT granted_at FROM claim").fetchall() == []

@@ -50,6 +50,38 @@ def file_one(made: Database, *, n: int = 1, now: float = 0.0):
     )
 
 
+def _fake_seal(key: str, public_key: str) -> str:
+    """A stand-in for Task 13's real X25519 seal (design spec S6.3 step 5).
+
+    Deliberately *not* `key` verbatim anywhere in the result -- a fake that
+    just concatenated the plaintext key would make
+    `test_only_the_hash_of_the_granted_key_is_stored` pass for the wrong
+    reason, by writing the very thing that test exists to catch onto disk
+    under a different column. Reversing `key` keeps the round trip provable
+    (`_fake_unseal` below) without the plaintext substring ever appearing.
+
+    `approve`'s own default raises `NotImplementedError` naming Task 13 (see
+    `test_approve_with_no_seal_raises_naming_task_13`), so every other test
+    in this file that calls `approve` goes through `approve_one` below
+    instead, which supplies this.
+    """
+    return f"sealed:{public_key}:{key[::-1]}"
+
+
+def _fake_unseal(blob: str, public_key: str) -> str:
+    """The inverse of `_fake_seal`, for a test that wants to prove the right
+    key reached the right public key rather than merely that *something* did.
+    """
+    prefix = f"sealed:{public_key}:"
+    assert blob.startswith(prefix), f"not a _fake_seal blob for {public_key!r}: {blob!r}"
+    return blob[len(prefix) :][::-1]
+
+
+def approve_one(made: Database, claim_id: str, now: float):
+    """`approve`, with the fake `seal` every test but the seam test itself wants."""
+    return approve(made, claim_id, now, seal=_fake_seal)
+
+
 def test_a_filed_claim_appears_in_the_pending_list(tmp_path):
     made = database(tmp_path)
 
@@ -213,7 +245,7 @@ def test_a_granted_claim_frees_its_slot_for_the_cap_and_is_hidden_from_the_queue
     made = database(tmp_path)
     filed = [file_one(made, n=i, now=0.0) for i in range(1, MAX_PENDING + 1)]
     assert all(c is not None for c in filed)
-    approved = approve(made, filed[0].id, now=0.0)
+    approved = approve_one(made, filed[0].id, now=0.0)
     assert approved is not None
     assert count_pending(made, now=0.0) == MAX_PENDING - 1
 
@@ -232,7 +264,7 @@ def test_approve_returns_a_daemon_id_and_a_key_and_creates_the_daemon_row(tmp_pa
     filed = file_one(made, n=3, now=10.0)
     assert filed is not None
 
-    result = approve(made, filed.id, now=10.0)
+    result = approve_one(made, filed.id, now=10.0)
 
     assert result is not None
     daemon_id, key = result
@@ -253,8 +285,8 @@ def test_approve_twice_hands_the_key_over_only_once(tmp_path):
     filed = file_one(made, n=4, now=10.0)
     assert filed is not None
 
-    first = approve(made, filed.id, now=10.0)
-    second = approve(made, filed.id, now=11.0)
+    first = approve_one(made, filed.id, now=10.0)
+    second = approve_one(made, filed.id, now=11.0)
 
     assert first is not None
     assert second is None
@@ -278,7 +310,7 @@ def test_approve_then_two_polls_and_a_second_approve(tmp_path):
     filed = file_one(made, n=20, now=10.0)
     assert filed is not None
 
-    approved = approve(made, filed.id, now=10.0)
+    approved = approve_one(made, filed.id, now=10.0)
     assert approved is not None
     daemon_id, key = approved
 
@@ -296,7 +328,7 @@ def test_approve_then_two_polls_and_a_second_approve(tmp_path):
     assert authenticate_key(made, key) == daemon_id
     assert authenticate_key(made, key) == daemon_id
 
-    again = approve(made, filed.id, now=13.0)
+    again = approve_one(made, filed.id, now=13.0)
     assert again is None
 
 
@@ -307,7 +339,7 @@ def test_a_refiled_claim_after_grant_gets_a_fresh_row_not_a_collision(tmp_path):
     made = database(tmp_path)
     filed = file_one(made, n=21, now=0.0)
     assert filed is not None
-    approved = approve(made, filed.id, now=0.0)
+    approved = approve_one(made, filed.id, now=0.0)
     assert approved is not None
 
     refiled = file_one(made, n=21, now=100.0)
@@ -333,7 +365,7 @@ def test_a_granted_claim_is_swept_a_lifetime_after_it_was_granted(tmp_path):
     made = database(tmp_path)
     filed = file_one(made, n=22, now=0.0)
     assert filed is not None
-    approved = approve(made, filed.id, now=0.0)
+    approved = approve_one(made, filed.id, now=0.0)
     assert approved is not None
 
     just_under = CLAIM_LIFETIME_S - 0.001
@@ -354,7 +386,7 @@ def test_a_claim_approved_late_survives_its_own_filing_deadline(tmp_path):
     assert filed is not None
 
     just_before_pending_deadline = CLAIM_LIFETIME_S - 1.0
-    approved = approve(made, filed.id, now=just_before_pending_deadline)
+    approved = approve_one(made, filed.id, now=just_before_pending_deadline)
     assert approved is not None
 
     # Past the *filing's* deadline, but well inside the grant's own deadline.
@@ -369,7 +401,7 @@ def test_only_the_hash_of_the_granted_key_is_stored(tmp_path):
     filed = file_one(made, n=5, now=0.0)
     assert filed is not None
 
-    _, key = approve(made, filed.id, now=0.0)
+    _, key = approve_one(made, filed.id, now=0.0)
 
     assert key.encode() not in (tmp_path / "ors.db").read_bytes()
 
@@ -409,7 +441,7 @@ def test_deny_of_an_already_granted_claim_returns_false_and_leaves_it_alone(tmp_
     made = database(tmp_path)
     filed = file_one(made, n=12, now=0.0)
     assert filed is not None
-    approved = approve(made, filed.id, now=0.0)
+    approved = approve_one(made, filed.id, now=0.0)
     assert approved is not None
 
     assert deny(made, filed.id, now=1.0) is False
@@ -457,7 +489,7 @@ def test_approve_of_an_expired_claim_returns_none(tmp_path):
     filed = file_one(made, n=9, now=0.0)
     assert filed is not None
 
-    assert approve(made, filed.id, now=CLAIM_LIFETIME_S) is None
+    assert approve_one(made, filed.id, now=CLAIM_LIFETIME_S) is None
     with closing(made.connect()) as connection:
         count = connection.execute("SELECT COUNT(*) AS n FROM daemon").fetchone()["n"]
     assert count == 0, "an expired claim must not be able to mint a daemon"
@@ -526,3 +558,195 @@ def test_the_three_constants_are_pinned_by_value(tmp_path):
       fingerprint may file again.
     """
     assert (MAX_PENDING, CLAIM_LIFETIME_S, DENY_SUPPRESSION_S) == (32, 1800.0, 86400.0)
+
+
+def test_approve_with_no_seal_raises_naming_task_13(tmp_path):
+    """`approve`'s default `seal` always raises, naming the task that owes
+    the real X25519 seal (design spec S6.3 step 5) -- a future caller that
+    forgets to pass one gets an exception pointing at exactly what to fix,
+    not a key minted with nowhere safe to be encrypted to. The claim must
+    not be left half-granted by the attempt: `seal` is called before
+    anything is written, so the failure leaves no trace at all.
+    """
+    made = database(tmp_path)
+    filed = file_one(made, n=32, now=0.0)
+    assert filed is not None
+
+    with pytest.raises(NotImplementedError, match="Task 13"):
+        approve(made, filed.id, now=0.0)
+
+    assert [c.id for c in list_pending(made, now=0.0)] == [filed.id]
+    with closing(made.connect()) as connection:
+        count = connection.execute("SELECT COUNT(*) AS n FROM daemon").fetchone()["n"]
+    assert count == 0
+
+
+def test_approve_writes_the_sealed_key_not_the_plaintext_to_granted_key(tmp_path):
+    """`granted_key` now holds `seal(key, public_key)`'s ciphertext -- not
+    NULL (the round-1 shape) and not the plaintext key
+    (`test_only_the_hash_of_the_granted_key_is_stored` already pins that
+    absence). Round-tripping through `_fake_unseal` proves it is the right
+    key sealed to the right public key, not merely that some non-NULL bytes
+    landed in the column.
+    """
+    made = database(tmp_path)
+    filed = file_one(made, n=33, now=0.0)
+    assert filed is not None
+
+    _, key = approve_one(made, filed.id, now=0.0)
+
+    row = claim_row(made, filed.id)
+    assert row["granted_key"] is not None
+    assert _fake_unseal(row["granted_key"], filed.public_key) == key
+
+
+def test_approve_survives_a_daemon_name_collision_leaving_the_claim_pending(tmp_path):
+    """Round 2 CRITICAL 1. `approve` used to be three autocommitted
+    statements (`Database.connect`'s `isolation_level=None` means each lands
+    the instant it runs): `UPDATE claim SET granted_at`, then
+    `INSERT INTO daemon`, then `UPDATE claim SET daemon_id`. A `daemon.name`
+    collision on the second statement raised `sqlite3.IntegrityError` out of
+    a claim the *first* statement had already, irreversibly, marked granted
+    -- unapprovable (the guard says granted), undeniable (`deny`'s guard says
+    the same), and invisible (`list_pending` excludes granted rows),
+    permanently, with no daemon and no key to show for it either. Folding the
+    three into one `BEGIN IMMEDIATE` transaction means the whole attempt
+    rolls back instead: the claim comes out exactly as pending as it went in.
+    """
+    made = database(tmp_path)
+    filed = file_one(made, n=30, now=10.0)
+    assert filed is not None
+    with closing(made.connect()) as connection:
+        connection.execute(
+            "INSERT INTO daemon (name, created_at) VALUES (?, ?)",
+            (filed.hostname, "2026-08-12T09:00:00Z"),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        approve_one(made, filed.id, now=10.0)
+
+    # Unapprovable no longer means undeniable, invisible, or permanently
+    # burned -- the claim is still exactly where it was before the collision.
+    assert [c.id for c in list_pending(made, now=10.0)] == [filed.id]
+    row = claim_row(made, filed.id)
+    assert row["granted_at"] is None
+    assert row["daemon_id"] is None
+    assert row["granted_key"] is None
+    with closing(made.connect()) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) AS n FROM daemon WHERE name = ?", (filed.hostname,)
+        ).fetchone()["n"]
+    assert count == 1, "the failed approve must not have minted a second daemon row"
+
+    # Free the name, and the very claim that just failed approves cleanly.
+    with closing(made.connect()) as connection:
+        connection.execute("DELETE FROM daemon WHERE name = ?", (filed.hostname,))
+
+    retried = approve_one(made, filed.id, now=11.0)
+
+    assert retried is not None
+    assert deny(made, filed.id, now=12.0) is False, "the claim is granted now, not deniable"
+
+
+def test_a_slow_daemon_that_never_polls_frees_its_name_for_a_later_approval(tmp_path):
+    """Round 2 HIGH 2. `approve` mints the `daemon` row before delivery to
+    the daemon is guaranteed, and nothing rolled it back if the poll never
+    came. A rack too slow to poll before its grant aged out (`_expire`, past
+    `CLAIM_LIFETIME_S` counted from `granted_at`) left an orphaned `daemon`
+    row permanently occupying its own hostname -- unable to ever pair again
+    through this path, burning a fresh claim on every retry
+    (`INSERT INTO daemon` raising `sqlite3.IntegrityError` on the name, every
+    single time). `_expire`'s sweep now takes the orphan with the claim.
+    """
+    made = database(tmp_path)
+    filed = file_one(made, n=31, now=0.0)
+    assert filed is not None
+    approved = approve_one(made, filed.id, now=0.0)
+    assert approved is not None
+
+    # The daemon never actually polled to collect its key -- `last_seen` is
+    # still NULL, exactly as `approve` leaves it -- and the grant ages out
+    # unpolled.
+    swept_at = CLAIM_LIFETIME_S
+    assert get_claim(made, filed.id, now=swept_at) is None
+    with closing(made.connect()) as connection:
+        orphan_count = connection.execute(
+            "SELECT COUNT(*) AS n FROM daemon WHERE name = ?", (filed.hostname,)
+        ).fetchone()["n"]
+    assert orphan_count == 0, "the orphaned daemon row must be swept with its expired claim"
+
+    # The rack tries again under the same hostname and fingerprint.
+    refiled = file_claim(
+        made,
+        hostname=filed.hostname,
+        address=filed.address,
+        fingerprint=filed.fingerprint,
+        short_code=filed.short_code,
+        version=filed.version,
+        public_key=filed.public_key,
+        now=swept_at,
+    )
+    assert refiled is not None
+
+    reapproved = approve_one(made, refiled.id, now=swept_at)
+
+    assert reapproved is not None, "the swept orphan must not block reapproval forever"
+    with closing(made.connect()) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) AS n FROM daemon WHERE name = ?", (filed.hostname,)
+        ).fetchone()["n"]
+    assert count == 1, "the reapproval's own daemon row, not a second one beside an orphan"
+
+
+def test_a_daemon_that_did_reconnect_is_not_swept_by_an_expired_grant(tmp_path):
+    """The orphan sweep added for HIGH 2 is restricted to `last_seen IS
+    NULL` specifically so it does not clean up a daemon that really did
+    collect its key and has since connected -- nothing in this module sets
+    `last_seen` (a later task's job), so this test reaches in with raw SQL to
+    stand in for "the daemon connected", and pins that once it has, an
+    otherwise-identical expired grant leaves it alone.
+    """
+    made = database(tmp_path)
+    filed = file_one(made, n=34, now=0.0)
+    assert filed is not None
+    approved = approve_one(made, filed.id, now=0.0)
+    assert approved is not None
+    daemon_id, _ = approved
+    with closing(made.connect()) as connection:
+        connection.execute(
+            "UPDATE daemon SET last_seen = ? WHERE id = ?",
+            ("2026-08-12T09:00:00Z", daemon_id),
+        )
+
+    swept_at = CLAIM_LIFETIME_S
+    assert get_claim(made, filed.id, now=swept_at) is None, "the claim row still ages out"
+    assert daemon_row(made, daemon_id) is not None, "a daemon that connected is not an orphan"
+
+
+def test_the_pending_fingerprint_index_is_keyed_by_granted_at_not_daemon_id(tmp_path):
+    """Round 2 MEDIUM 5. Whitebox, pinning which column the partial index
+    `claim_pending_fingerprint` and the `approve` guard must agree means
+    "pending": `granted_at`, not `daemon_id`. `approve` now sets both in the
+    same `UPDATE` (round 2's fix for CRITICAL 1 above), so this state never
+    actually appears on disk through `approve` itself any more -- it is
+    reconstructed here with raw SQL specifically so a future change that
+    reintroduces two separate statements, or that mutates the index's own
+    predicate to match, is still caught: a row with `granted_at` set and
+    `daemon_id` still NULL must count as no-longer-pending to the index,
+    freeing its fingerprint for a second row to land.
+    """
+    made = database(tmp_path)
+    with closing(made.connect()) as connection:
+        connection.execute(
+            "INSERT INTO claim"
+            " (id, hostname, address, fingerprint, short_code, version, public_key,"
+            "  first_seen, granted_at)"
+            " VALUES ('claim-a', 'host-a', '10.0.0.1', 'shared-fp', 'AAAAAA', '1.0',"
+            "  'key-a', 0.0, 1.0)"
+        )
+        # granted_at is set; daemon_id is still NULL.
+        connection.execute(
+            "INSERT INTO claim"
+            " (id, hostname, address, fingerprint, short_code, version, public_key, first_seen)"
+            " VALUES ('claim-b', 'host-b', '10.0.0.2', 'shared-fp', 'BBBBBB', '2.0', 'key-b', 1.0)"
+        )
