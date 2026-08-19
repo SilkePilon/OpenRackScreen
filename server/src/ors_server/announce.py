@@ -19,10 +19,20 @@ a container on a bridge network, a machine whose only interface is down, a
 network where multicast is dropped. So `app.py` treats a failed announcement as
 a warning, `--server URL` exists on the daemon for exactly those networks, and
 `ORS_ANNOUNCE=0` turns this off for deployments that would rather be silent.
+
+**A bridged container is the case where it fails without failing.** mDNS is a
+link-layer protocol and a Docker bridge is a NAT, so the multicast never
+reaches the LAN at all -- while the addresses this host has *inside* the bridge
+are the bridge's and mean nothing outside it. The announcement therefore
+succeeds, and nothing hears it. That is why `deploy/Dockerfile` sets
+`ORS_ANNOUNCE=0` and `deploy/compose.mdns.yaml` -- host networking -- is the
+supported way for a container to be discoverable. No advertised-address setting
+would help: the packet does not leave the bridge whatever address is in it.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import socket
@@ -86,12 +96,37 @@ def announcing_is_enabled(environment: Any | None = None) -> bool:
     return values.get(ANNOUNCE_ENV, "1").strip() != "0"
 
 
+def reaches_the_lan(address: str) -> bool:
+    """Whether an address of this host is one another machine could dial.
+
+    Loopback and link-local are not, and dropping them is the entire job here.
+    `127.0.0.1` in an announcement is not merely useless: it *sorts first* among
+    the addresses of any ordinary `192.168.x` or `172.x` host, the daemon takes
+    the first IPv4 of what it resolves, and what the rack then dials is itself
+    -- a claim filed against port 8080 on the Pi, rather than the "no server
+    found, pass --server" that names the fix. Link-local goes with it: `169.254`
+    exists because DHCP did not answer, and a server that only has one is not
+    reachable from a rack that got a lease.
+
+    An address that will not parse is dropped too. `ifaddr` reads the interface
+    table and has no reason to hand back anything else, and an entry this cannot
+    make sense of is not an entry to publish as somewhere to dial.
+    """
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:  # pragma: no cover - not something the interface table produces
+        return False
+    return not (parsed.is_loopback or parsed.is_link_local)
+
+
 def local_addresses() -> list[str]:
-    """Every IPv4 address this host has, for the A records of the announcement.
+    """Every IPv4 address of this host that a rack on the LAN could dial.
 
     Without them the registration publishes a SRV record naming a host nothing
     answers for, and a rack that resolves the service gets an entry it cannot
     dial -- so this is not decoration, it is the address in the advertisement.
+    `test_the_announcement_carries_this_hosts_own_lan_address` is what fails if
+    this ever answers with nothing on a host that has an address.
 
     `ifaddr` and not `zeroconf.get_all_addresses`, which is the same call and is
     deprecated in 0.150 with a removal notice saying to use `ifaddr` directly;
@@ -101,7 +136,8 @@ def local_addresses() -> list[str]:
 
     IPv4 only, deliberately: the daemon dials one URL, a link-local IPv6
     address needs its scope to be dialled at all, and a rack and its server on
-    one LAN have IPv4 between them or they have nothing.
+    one LAN have IPv4 between them or they have nothing. And never loopback or
+    link-local -- see `reaches_the_lan`, where the whole argument is.
     """
     try:
         adapters = ifaddr.get_adapters()
@@ -109,7 +145,12 @@ def local_addresses() -> list[str]:
         log.warning("could not enumerate this host's addresses to announce", exc_info=True)
         return []
     return sorted(
-        {address.ip for adapter in adapters for address in adapter.ips if address.is_IPv4}
+        {
+            address.ip
+            for adapter in adapters
+            for address in adapter.ips
+            if address.is_IPv4 and reaches_the_lan(address.ip)
+        }
     )
 
 

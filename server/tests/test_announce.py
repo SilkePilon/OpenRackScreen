@@ -10,17 +10,26 @@ The service type is asserted as a **literal** and never as
 `announce.SERVICE_TYPE`: comparing the constant to itself passes under any
 typo, and a typo here is a rack that never finds anything with no error
 anywhere on either end.
+
+**The other copy of that literal is in `daemon/tests/test_discovery.py`**, and
+it is deliberately not shared with this one -- two independent transcriptions of
+a wire constant is what makes either pin mean anything, so importing one into
+the other would delete the check rather than tidy it. They are named in each
+other so that a protocol change is one `grep` from both, which is the part that
+was missing.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+import ifaddr
 import pytest
 from fastapi.testclient import TestClient
 from ors_server import announce
 from ors_server.announce import Announcer
 from ors_server.app import AppSettings, create_app
+from zeroconf import Zeroconf
 
 
 class StubZeroconf:
@@ -78,13 +87,13 @@ def test_the_txt_record_carries_the_scheme_the_port_and_the_version():
     repeated here because the spec says so and because a peer that has the TXT
     without having resolved the SRV can still build a URL from it.
     """
-    it, stub = announcer(port=8080, version="0.2.0")
+    it, stub = announcer(port=9123, version="0.2.0")
 
     it.start()
 
     assert stub.registered[0].decoded_properties == {
         "scheme": "http",
-        "port": "8080",
+        "port": "9123",
         "version": "0.2.0",
     }
 
@@ -107,6 +116,99 @@ def test_a_host_with_no_name_still_announces_under_something(monkeypatch):
     it.start()
 
     assert stub.registered[0].name == "openrackscreen._openrackscreen._tcp.local."
+
+
+# --------------------------------------------------------------------------
+# The address in the advertisement
+# --------------------------------------------------------------------------
+
+
+def interfaces(*addresses: Any) -> list[ifaddr.Adapter]:
+    """An `ifaddr` interface table, in `ifaddr`'s own types.
+
+    Its own types rather than a hand-made stand-in, so that these tests read
+    `is_IPv4` and `.ip` off the class production code reads them off: a fake
+    with the attributes remembered here would keep passing through a rename in
+    `ifaddr` that stopped the server announcing any address at all.
+
+    IPv6 addresses are the three-tuple `(address, flowinfo, scope_id)` `ifaddr`
+    reports them as, which is also how `is_IPv4` tells the two apart.
+    """
+    return [
+        ifaddr.Adapter(f"eth{index}", f"eth{index}", [ifaddr.IP(address, 24, f"eth{index}")])
+        for index, address in enumerate(addresses)
+    ]
+
+
+def test_the_announcement_carries_this_hosts_own_lan_address(monkeypatch):
+    """An announcement with no address is a SRV record naming nothing dialable.
+
+    The registration succeeds, the rack resolves it, and what comes back has a
+    port and no host -- so `discover` drops it and the network looks empty. That
+    is the failure `local_addresses` exists to prevent, and until this test it
+    was pinned by nothing: both `local_addresses() -> []` and dropping
+    `parsed_addresses=` entirely passed the whole suite.
+    """
+    monkeypatch.setattr(
+        announce.ifaddr, "get_adapters", lambda: interfaces("192.168.7.5", "10.0.0.9")
+    )
+    it, stub = announcer()
+
+    it.start()
+
+    assert stub.registered[0].parsed_addresses() == ["10.0.0.9", "192.168.7.5"]
+
+
+def test_the_announcement_never_tells_a_rack_to_dial_itself(monkeypatch):
+    """Loopback and link-local, dropped -- and dropped *first*, not just last.
+
+    `sorted()` over every IPv4 an ordinary host has puts `127.0.0.1` in front of
+    any `192.168.x` or `172.x` address, and the daemon takes the first IPv4 of
+    what it resolves. So an announcement that merely *included* loopback was one
+    a rack would dial itself over: a claim filed against port 8080 on the Pi,
+    instead of the "no server found, pass --server" that names the fix.
+
+    `169.254.x` goes with it -- it exists because DHCP did not answer. The
+    Docker bridge address stays, because it is a real address on a real
+    interface and nothing here can tell it apart from a second LAN; that one is
+    answered by the image not announcing at all (see `deploy/Dockerfile`).
+    """
+    monkeypatch.setattr(
+        announce.ifaddr,
+        "get_adapters",
+        lambda: interfaces("127.0.0.1", "169.254.11.2", "172.17.0.1", "192.168.0.145"),
+    )
+    it, stub = announcer()
+
+    it.start()
+
+    assert stub.registered[0].parsed_addresses() == ["172.17.0.1", "192.168.0.145"]
+
+
+def test_a_host_with_nothing_but_loopback_announces_no_address_rather_than_a_wrong_one(monkeypatch):
+    """The empty netns case, and the container-with-no-bridge case.
+
+    Nothing to announce is not an error: the registration still happens, and a
+    rack that resolves it drops an entry with no address. Announcing `127.0.0.1`
+    instead would give that rack something to dial, and what it would reach is
+    itself.
+    """
+    monkeypatch.setattr(announce.ifaddr, "get_adapters", lambda: interfaces("127.0.0.1"))
+    it, stub = announcer()
+
+    it.start()
+
+    assert announce.local_addresses() == []
+    assert stub.registered[0].parsed_addresses() == []
+
+
+def test_an_ipv6_only_interface_is_not_announced_as_an_a_record(monkeypatch):
+    """IPv4 only, deliberately -- and `ifaddr` reports v6 as a tuple, not a string."""
+    monkeypatch.setattr(
+        announce.ifaddr, "get_adapters", lambda: interfaces(("2001:db8::5", 0, 0), "192.168.7.5")
+    )
+
+    assert announce.local_addresses() == ["192.168.7.5"]
 
 
 def test_stopping_unregisters_the_service_it_registered():
@@ -225,6 +327,27 @@ def test_the_app_announces_the_port_it_was_told_to_serve_on(monkeypatch, tmp_pat
 
     assert announcers[0].port == 9123
     assert announcers[0].version, "a TXT record with no version is one no rack can read"
+
+
+def test_announcing_on_leaves_a_real_announcer_on_the_app(monkeypatch, tmp_path):
+    """The other half of `app.state.announcer is None`, which was all anything asserted.
+
+    No stub of `Announcer` anywhere in this one: what `create_app` puts on the
+    app has to be the real class, wired to the real `Zeroconf`, or the server
+    starts a lifespan that announces to nothing. Constructing one binds nothing
+    -- the factory is called in `start`, which this test never reaches -- so
+    this opens no socket either.
+    """
+    monkeypatch.delenv("ORS_ANNOUNCE", raising=False)
+
+    app = create_app(AppSettings(data_dir=tmp_path, port=9123))
+
+    assert isinstance(app.state.announcer, Announcer)
+    assert app.state.announcer.port == 9123
+    assert app.state.announcer.version, "a TXT record with no version is one no rack can read"
+    assert app.state.announcer.zeroconf_factory is Zeroconf, (
+        "the app's announcer would announce over something that is not a responder"
+    )
 
 
 def test_ors_announce_set_to_zero_builds_no_announcer(monkeypatch, tmp_path, announcers):

@@ -276,7 +276,7 @@ open.
 ### 6.1 Discovery
 
 The server announces `_openrackscreen._tcp.local.` over mDNS using `zeroconf`
-(pure Python, no C extension, so nothing to build on a Pi). The TXT record
+(ships aarch64 wheels, so nothing builds on a Pi). The TXT record
 carries the scheme, the port, and the server's version.
 
 An unpaired daemon browses for it on start. `--server URL` skips discovery

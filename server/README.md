@@ -190,6 +190,46 @@ shadowing them. So an unknown `/api/...` is still a JSON `404` and not the index
 page, which matters most for the requests that *do not* exist: a client
 misspelling a route gets an error it can read instead of a page.
 
+## mDNS discovery does not cross a Docker bridge
+
+A rack that has never been paired can find its server by itself: the server
+announces `_openrackscreen._tcp.local.` over mDNS, and `ors-daemon` browses for
+it. **That does not work from a container on a bridge network, and no setting
+inside the container can make it.** mDNS is a link-layer protocol — multicast to
+`224.0.0.251`, TTL 1 — and a Docker bridge is a NAT, so the announcement never
+reaches the LAN at all. The addresses the container would announce are the
+bridge's, which name nothing reachable from outside it either.
+
+Both compose files above use `ports:`, which is a bridge. So the image sets
+`ORS_ANNOUNCE=0`: an announcement nobody hears is merely useless, but one
+carrying an unreachable address is worse than none — a rack finds it, files a
+claim against an address that does not answer, and never prints the
+"no server found, pass `--server`" line that names the fix.
+
+Two ways to get discovery, and a rack only needs one of them:
+
+- **Host networking**, which puts the server on the LAN's own link:
+
+  ```bash
+  docker compose -f deploy/compose.pi.yaml -f deploy/compose.mdns.yaml up -d
+  ```
+
+  That overlay sets `network_mode: host` and turns `ORS_ANNOUNCE` back on. Both
+  halves are needed. It costs the container's network namespace: `8080` is now a
+  port on the host, a conflict there is a startup failure rather than a rebind,
+  and the server can reach every service on the host. Compose 2.24 or newer, for
+  the `!reset` that drops the published port.
+
+- **Or name the server**, which needs nothing from this side at all:
+
+  ```bash
+  sudo -u openrackscreen ors-daemon connect --server http://<host>:8080 --token <token>
+  ```
+
+  This is also the answer on any network that drops multicast between the rack
+  and the server — plenty do, including most managed switches with IGMP snooping
+  and every setup where the two are on different VLANs.
+
 ## Outbound network
 
 The server makes exactly one outbound HTTP call of its own: the **Test** button
@@ -213,7 +253,7 @@ nothing else.
 | `ORS_SECRET_KEY` | generated | see above. Unrecoverable. |
 | `ORS_WEB_DIR` | `/app/web` | where the built interface is. See [The interface is inside the image](#the-interface-is-inside-the-image). |
 | `ORS_LOG_LEVEL` | `INFO` | one JSON object per line, on stdout. |
-| `ORS_ANNOUNCE` | on | `ORS_ANNOUNCE=0`, exactly that value, stops the server announcing itself over mDNS as `_openrackscreen._tcp.local.`. The announcement is how a freshly installed rack finds a server to ask to join; a container on a bridge network cannot be reached at the address it would announce, and a failure to announce is a warning rather than a refusal to start in any case. Racks on a network that drops multicast are paired with `ors-daemon run --server URL` instead. |
+| `ORS_ANNOUNCE` | on in the code, **`0` in the image** | `ORS_ANNOUNCE=0`, exactly that value, stops the server announcing itself over mDNS as `_openrackscreen._tcp.local.` — which is how a freshly installed rack finds a server to ask to join. The image sets it off because the announcement does not reach the LAN from a bridge network at all, and the address in it would be the bridge's. See [mDNS discovery does not cross a Docker bridge](#mdns-discovery-does-not-cross-a-docker-bridge) for host networking, which is what turns it back on. A failure to announce is a warning rather than a refusal to start in any case. |
 | `FORWARDED_ALLOW_IPS` | `127.0.0.1` | which proxies' `X-Forwarded-For` to believe. |
 
 ## Health

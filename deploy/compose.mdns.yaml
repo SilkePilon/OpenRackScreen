@@ -1,0 +1,46 @@
+# Let the container be *found* by a rack that has never been paired.
+#
+#   docker compose -f deploy/compose.pi.yaml -f deploy/compose.mdns.yaml up -d
+#
+# An overlay and not a fourth standalone file, for the same reason
+# compose.image.yaml is one: it changes two things about whichever base you
+# already bring up, and a copy of the base would be a copy that drifts.
+#
+# **Why host networking, and why nothing else would do.** The server announces
+# itself over mDNS as `_openrackscreen._tcp.local.`, which is how a freshly
+# installed rack finds a server to ask to join (design §6.1). mDNS is a
+# link-layer protocol -- multicast to 224.0.0.251 with a TTL of 1 -- and a
+# Docker bridge is a NAT. The packet does not cross it. So a bridged container
+# announcing itself is heard by nothing on the LAN, and the addresses it would
+# announce are the bridge's, which name nothing reachable from outside it.
+# There is no "advertise this address instead" setting that helps: the datagram
+# never leaves the bridge whatever address is written in it. Host networking is
+# the fix because it is the only one -- the server ends up on the LAN's own
+# link, announcing the host's own address.
+#
+# `deploy/Dockerfile` sets `ORS_ANNOUNCE=0` for exactly that reason, so this
+# file has to switch it back on. Both halves are needed and neither is enough:
+# host networking without the variable is a silent server, and the variable
+# without host networking is the useless announcement the image is avoiding.
+#
+# **What it costs.** Host networking gives up the container's network namespace:
+# `ports:` no longer applies (it is reset below rather than left to be ignored
+# with a warning), `ORS_PORT` is now a port on the *host* and a conflict with
+# anything else listening on 8080 is a startup failure rather than a rebind, and
+# the server can reach every service on the host. On a Pi that drives panels and
+# runs one server, that is the ordinary arrangement; on a shared machine, weigh
+# it against pairing each rack with `ors-daemon connect --server URL`, which
+# needs none of this.
+#
+# `!reset` is a Compose feature (2.24+) and it is what actually removes a value
+# an earlier file set -- a plain `ports: []` here would *append* to the base
+# file's list and leave the published port in place.
+services:
+  server:
+    network_mode: host
+    ports: !reset null
+    environment:
+      # Back on, against the image's own `ORS_ANNOUNCE=0`. Exactly the value
+      # `announcing_is_enabled` reads as "off" is `0`; anything else, including
+      # this, leaves announcing on.
+      - ORS_ANNOUNCE=1

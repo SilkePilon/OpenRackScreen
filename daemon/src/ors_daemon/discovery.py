@@ -23,7 +23,9 @@ message. A traceback out of first boot says nothing anybody can act on.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -90,32 +92,113 @@ class Found:
         return f"{self.scheme}://{host}:{self.port}"
 
 
+class Heard:
+    """The service names one browse has heard, across the two threads that touch them.
+
+    `zeroconf` answers on a thread of its own while `browse` waits on the
+    caller's, so this set is written from one and read from the other. A bare
+    set is not enough for that: a copy taken while the browser is still adding
+    to it is `RuntimeError: Set changed size during iteration`, raised on the
+    caller's thread, out of a first-boot join flow, and only when a second
+    server answers late -- which is the moment this feature exists for. `names`
+    takes a sorted copy under the lock, and the caller never sees the set.
+    """
+
+    def __init__(self, added: Any) -> None:
+        self.added = added
+        self._lock = threading.Lock()
+        self._names: set[str] = set()
+
+    def note(self, zeroconf: Any, service_type: str, name: str, state_change: Any) -> None:
+        """`zeroconf`'s callback. **These four parameter names are a contract.**
+
+        `ServiceBrowser` fires its handlers with keywords -- `zeroconf=`,
+        `service_type=`, `name=`, `state_change=` -- so renaming any of them is
+        a `TypeError` raised on zeroconf's own thread, during a real browse on a
+        real network, which is the one place nothing in this repository runs.
+
+        `Added` only. `Removed` and `Updated` are dropped, because the answer
+        this browse gives is who is out there now, and a name that arrived and
+        withdrew inside one five-second window is not one to hand a join flow.
+        """
+        if state_change is self.added:
+            with self._lock:
+                self._names.add(name)
+
+    def names(self) -> list[str]:
+        """Everything heard so far, sorted, as a list nothing else is mutating.
+
+        Sorted here rather than at the caller so that the copy and the order are
+        one operation, taken under one lock.
+        """
+        with self._lock:
+            return sorted(self._names)
+
+
+def listen_window(timeout: float) -> float:
+    """The browse window in seconds, never negative.
+
+    `time.sleep` raises `ValueError` on a negative number, and a caller that
+    computed its window from a deadline already passed is asking for "do not
+    wait", not for a traceback.
+    """
+    return max(timeout, 0.0)
+
+
+def request(  # pragma: no cover - opens sockets
+    zeroconf: Any, service_type: str, name: str, timeout_ms: int
+) -> Any | None:
+    """One browsed name's SRV, TXT and A records, or None if it did not answer.
+
+    The second of this module's seams, and the reason the first can be thin:
+    with this injectable, everything `browse` decides -- which names it asks
+    about, in what order, and what becomes of one that does not resolve -- is
+    tested without a socket.
+    """
+    from zeroconf import ServiceInfo
+
+    info = ServiceInfo(service_type, name)
+    return info if info.request(zeroconf, timeout_ms) else None
+
+
+def resolve(
+    zeroconf: Any,
+    service_type: str,
+    names: Iterable[str],
+    requester: Callable[[Any, str, str, int], Any | None] = request,
+) -> list[Any]:
+    """Each browsed name, resolved; the ones that did not answer are dropped.
+
+    Dropped rather than reported without an address, because a name with no SRV
+    behind it is nothing a claim can be filed against. `RESOLVE_TIMEOUT_MS` is
+    spent per name, and the responder that did the browsing is reused rather
+    than a second one built -- a second `Zeroconf` binds its own sockets.
+    """
+    resolved = []
+    for name in names:
+        info = requester(zeroconf, service_type, name, RESOLVE_TIMEOUT_MS)
+        if info is not None:
+            resolved.append(info)
+    return resolved
+
+
 def browse(service_type: str, timeout: float) -> list[Any]:  # pragma: no cover - opens sockets
     """Listen for `timeout` seconds and resolve everything that answered.
 
-    The one function in this module that touches the network, and the one thing
-    `discover`'s `browser_factory` replaces: everything a test has an opinion
-    about -- what is browsed for, what is made of the answers, what happens when
-    there are none or two -- is on the other side of this seam.
+    The one function in this module that touches the network, and now only
+    that: a `Zeroconf`, a `ServiceBrowser`, and a sleep. Every decision it used
+    to hold -- which state changes count, what order the names are asked about
+    in, what happens to one that does not resolve, what a negative timeout means
+    -- is in `Heard`, `listen_window` and `resolve` above, where tests reach it.
     """
-    from zeroconf import ServiceBrowser, ServiceInfo, ServiceStateChange, Zeroconf
+    from zeroconf import ServiceBrowser, ServiceStateChange, Zeroconf
 
-    names: set[str] = set()
-
-    def note(zeroconf: Any, service_type: str, name: str, state_change: Any) -> None:
-        if state_change is ServiceStateChange.Added:
-            names.add(name)
-
+    heard = Heard(added=ServiceStateChange.Added)
     zeroconf = Zeroconf()
-    browser = ServiceBrowser(zeroconf, service_type, handlers=[note])
+    browser = ServiceBrowser(zeroconf, service_type, handlers=[heard.note])
     try:
-        time.sleep(max(timeout, 0.0))
-        resolved = []
-        for name in sorted(names):
-            info = ServiceInfo(service_type, name)
-            if info.request(zeroconf, RESOLVE_TIMEOUT_MS):
-                resolved.append(info)
-        return resolved
+        time.sleep(listen_window(timeout))
+        return resolve(zeroconf, service_type, heard.names())
     finally:
         browser.cancel()
         zeroconf.close()
@@ -133,10 +216,19 @@ def discover(
     server answering on two interfaces is one server -- what must never be
     collapsed is two *different* servers, which is the case the caller has to
     see in order to refuse to choose between them.
+
+    `except Exception` and not `except OSError`, measured against the installed
+    zeroconf 0.150: `NotRunningException`, `EventLoopBlocked`,
+    `NonUniqueNameException` and `IncomingDecodeError` all subclass
+    `zeroconf.Error(Exception)`, and not one of them is an `OSError`. Catching
+    only the sockets' own errors kept the letter of "a browse that fails is no
+    servers" while letting the browser's own failures out of a first-boot join
+    flow as a traceback -- out of the one module whose docstring promises the
+    opposite.
     """
     try:
         services = list(browser_factory(SERVICE_TYPE, timeout))
-    except OSError:
+    except Exception:  # noqa: BLE001 - the promise above: nothing here raises at the caller
         log.warning("could not browse for a server on this network", exc_info=True)
         return []
 
@@ -174,21 +266,48 @@ def _read(service: Any) -> Found | None:
 
 
 def _address(service: Any) -> str:
-    """The address to dial, IPv4 first.
+    """The address to dial: IPv4 first, and never one that names this rack.
 
     IPv4 first because a link-local IPv6 address needs its scope to be dialled
     at all and the server announces IPv4 anyway; the v6 address is taken only
     when it is the only one offered, which is better than reporting nothing.
+
+    **Loopback and link-local are dropped here as well as at the announcing
+    end**, and the repetition is deliberate: another implementation's
+    announcement -- or an older `ors-server`'s, which advertised every address
+    its host had -- is not ours to trust. `127.0.0.1` sorts ahead of any
+    `192.168.x` or `172.x` address, so a rack that took the first IPv4 dialled
+    *itself*: a claim filed against port 8080 on the Pi, rather than the "no
+    server found, pass --server" that names the fix. A service offering nothing
+    else is dropped by `_read`, which is what puts the caller back on that
+    message; two of them would trip "more than one server, pair with none" on a
+    LAN with exactly one.
     """
     try:
         addresses = [str(address) for address in service.parsed_addresses()]
     except Exception:  # noqa: BLE001 - anything on the LAN may have answered
         log.debug("ignoring an announcement whose addresses could not be read", exc_info=True)
         return ""
-    for address in addresses:
+    dialable = [address for address in addresses if _reaches_another_machine(address)]
+    for address in dialable:
         if ":" not in address:
             return address
-    return addresses[0] if addresses else ""
+    return dialable[0] if dialable else ""
+
+
+def _reaches_another_machine(address: str) -> bool:
+    """Whether an announced address is one this rack could dial a server at.
+
+    Anything that will not parse as an address goes too: `parsed_addresses` is
+    documented to answer addresses, and a peer that puts something else there
+    has given this rack nothing to dial.
+    """
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        log.debug("ignoring an announced address that is not an address: %r", address)
+        return False
+    return not (parsed.is_loopback or parsed.is_link_local)
 
 
 def _properties(service: Any) -> dict[str, str]:

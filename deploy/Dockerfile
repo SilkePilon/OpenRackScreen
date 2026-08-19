@@ -202,10 +202,27 @@ COPY --from=interface --chown=ors:ors /build/web/dist /app/web
 # `ORS_WEB_DIR=/app/web` because the server no longer assumes it: the code
 # default is now the copy shipped inside the wheel, so an image whose `COPY`
 # above lands the interface anywhere else has to say so, explicitly, here.
+#
+# `ORS_ANNOUNCE=0` because this image runs on a bridge network by default --
+# both compose files publish ports, which is what `ports:` means -- and mDNS is
+# a link-layer protocol that a bridge does not carry: the announcement never
+# reaches the LAN, while the addresses the container has *inside* the bridge are
+# the bridge's and mean nothing outside it. So announcing from here succeeds and
+# is heard by nobody, or is heard as an address no rack can dial. Both are worse
+# than silence: §6.1's flow is browse then claim, so an entry a rack cannot
+# reach is a failed claim instead of "no server found, pass --server", and two
+# of them trip "more than one server, pair with none" on a LAN with one server.
+#
+# There is no advertised-address setting that would fix it; the packet does not
+# leave the bridge whatever address is in it. `deploy/compose.mdns.yaml` is the
+# supported way to get discovery from a container -- host networking, which puts
+# the server on the LAN's own link -- and it turns this variable back on.
+# `test_the_image_does_not_announce_itself_from_a_bridge_network` pins the pair.
 ENV PATH="/app/.venv/bin:$PATH" \
     ORS_DATA_DIR=/var/lib/openrackscreen \
     ORS_HOST=0.0.0.0 \
     ORS_PORT=8080 \
+    ORS_ANNOUNCE=0 \
     ORS_WEB_DIR=/app/web
 
 USER ors
