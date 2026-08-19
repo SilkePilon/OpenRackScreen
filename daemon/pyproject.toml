@@ -17,6 +17,7 @@ dependencies = [
     # There is nothing to build here in any case: the C extension is an optional
     # speedup with a pure-Python fallback.
     "websockets>=13.0",
+    "zeroconf>=0.132",
 ]
 
 [project.scripts]
