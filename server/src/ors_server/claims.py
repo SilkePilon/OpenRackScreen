@@ -115,41 +115,40 @@ def _expire(connection: sqlite3.Connection, now: float) -> None:
     granted row is stale `CLAIM_LIFETIME_S` after `granted_at` instead (see
     `CLAIM_LIFETIME_S`'s docstring for why that clock and that window).
 
-    A granted row that ages out this way leaves behind a `daemon` row too --
-    `approve` mints it before delivery to the daemon is guaranteed, and
-    nothing else in this module rolls it back if the daemon was too slow to
-    poll. Left alone, that row permanently occupies `daemon.name`: the rack
-    it belongs to re-files under the same hostname, an admin re-approves, and
-    `INSERT INTO daemon` raises `sqlite3.IntegrityError` on the name it can
-    never free -- every retry burning another claim, forever. So this sweep
-    deletes the orphan alongside its claim, restricted to `last_seen IS
-    NULL`: nothing in this codebase yet updates that column on a real daemon
-    connection (a later task's job -- there is no daemon socket wired to
-    `claim_pending_fingerprint`'s daemon rows at all yet), so every row
-    `approve` mints has it NULL regardless of whether delivery succeeded,
-    which makes this unconditional in practice today and self-limiting the
-    moment that connection handling exists: a daemon that really did collect
-    its key and has since connected sets `last_seen` and stops matching, so a
-    daemon that paired successfully and is merely slow to reconnect is never
-    swept out from under itself.
+    Neither `DELETE` here touches the `daemon` table, on purpose, and that is
+    not the shape this function had a round ago. A granted row that ages out
+    can leave behind a `daemon` row `approve` minted before delivery to the
+    daemon was guaranteed, and this module once had a background sweep here
+    that deleted it too, restricted to `last_seen IS NULL`. That sweep is
+    gone: `last_seen` is not "has this daemon ever connected", it is
+    "connected within the last `CLAIM_LIFETIME_S`" -- `link/ws_daemon.py`'s
+    `_record_hello` and `_touch` are the only writers, and neither fires
+    until a websocket session opens, which the design spec (S4.3) describes
+    happening well after approval: the `config.txt` SPI edit means a rack
+    commonly reboots, or waits on a human to reboot it, between collecting
+    its key and ever dialling in. A `daemon` row minted a minute ago by a
+    still-rebooting, still-`'paired'`-and-correctly-configured rack has
+    `last_seen IS NULL` too, indistinguishable here from a true orphan -- and
+    this function runs from every read in this module, including the
+    unauthenticated `POST /api/racks/claims` path, so a sweep here fires
+    constantly and on a clock nobody watching the admin's screen controls.
+    Deleting that row deletes the rack: `screen` and `integration` both
+    reference `daemon.id` `ON DELETE CASCADE` (`db.py`), so an admin's
+    configuration of it is destroyed in the same instant, silently, and the
+    rack -- which still believes it is paired and holds a key that now
+    authenticates to nothing -- never files a new claim to recover. That is
+    strictly worse than the collision this sweep existed to avoid: a
+    `daemon.name` collision on re-approval is a loud `sqlite3.IntegrityError`
+    an admin sees and can act on (`approve`'s own docstring), where a sweep
+    here is a silent, permanent unpairing with no error for anyone.
 
-    This was weighed against the other fix the same finding named -- holding
-    `daemon.status` at something other than `'paired'` until the poll route
-    confirms delivery -- and rejected for this module specifically because
-    that route, and the acknowledgement channel it would need, do not exist
-    yet (design spec S6.3 step 5's own forward note leaves that decision to
-    whichever task builds the poll route). Sweeping the orphan here needs
-    nothing this module does not already have.
+    Colliding names are instead resolved in `approve`, against a `daemon` row
+    provably tied to the *same* claim's fingerprint, not against any row that
+    merely happens to share the pending claim's `first_seen`/`granted_at`
+    clock. See `approve`'s own docstring for that mechanism, and its limits.
     """
     connection.execute(
         "DELETE FROM claim WHERE granted_at IS NULL AND first_seen <= ?",
-        (now - CLAIM_LIFETIME_S,),
-    )
-    connection.execute(
-        "DELETE FROM daemon WHERE last_seen IS NULL AND id IN ("
-        "SELECT daemon_id FROM claim"
-        " WHERE granted_at IS NOT NULL AND granted_at <= ? AND daemon_id IS NOT NULL"
-        ")",
         (now - CLAIM_LIFETIME_S,),
     )
     connection.execute(
@@ -299,6 +298,21 @@ def _seal_not_implemented(key: str, public_key: str) -> str:
     )
 
 
+def _rollback(connection: sqlite3.Connection) -> None:
+    """Undo an open transaction, without hiding why it is being undone.
+
+    `ROLLBACK` on a connection SQLite has *already* rolled back itself --
+    which it does for `SQLITE_FULL`, `SQLITE_IOERR`, `SQLITE_BUSY` and
+    `SQLITE_NOMEM` -- raises `cannot rollback - no transaction is active`.
+    Raised from inside an `except` block, that replaces the disk-full or
+    I/O error the caller needed to see with a message about transactions.
+    """
+    try:
+        connection.execute("ROLLBACK")
+    except sqlite3.OperationalError:
+        pass
+
+
 def approve(
     database: Database,
     claim_id: str,
@@ -367,6 +381,14 @@ def approve(
     `CLAIM_LIFETIME_S`'s docstring for its own retention, and for what
     happens to the `daemon` row this call mints if the poll never comes.
 
+    **`seal` is called with the SQLite write lock held.** `BEGIN IMMEDIATE`
+    takes it before the guarded `SELECT`, and `seal` runs between that and
+    the `INSERT`, so it must be pure computation: no I/O, no network, no
+    lock of its own. An X25519 seal is sub-millisecond and fine; an HSM or a
+    remote KMS dropped in later would hold every reader of this module out
+    for the length of the call, because `_expire` makes even `get_claim` a
+    writer.
+
     The plaintext key itself still never touches the database: `key` is
     returned to this call's own caller and nowhere else, `seal(key,
     public_key)` -- not `key` -- is what lands in `granted_key`, and
@@ -384,21 +406,62 @@ def approve(
         connection.execute("BEGIN IMMEDIATE")
         try:
             row = connection.execute(
-                "SELECT public_key, hostname, version FROM claim"
+                "SELECT public_key, hostname, version, fingerprint FROM claim"
                 " WHERE id = ? AND granted_at IS NULL",
                 (claim_id,),
             ).fetchone()
             if row is None:
-                connection.execute("ROLLBACK")
+                _rollback(connection)
                 return None
 
             key = token_urlsafe(KEY_BYTES)
             blob = seal(key, row["public_key"])
             stamp = datetime.now(UTC).isoformat()
+            # Reclaim the name from an earlier grant to THIS SAME RACK that
+            # was never collected, and from nothing else. Without it, a rack
+            # whose first grant aged out unread re-files under the same
+            # hostname and every re-approval afterwards dies on `daemon.name`
+            # -- the row it needs the name back from is one this module minted
+            # and nobody ever used, but `INSERT` cannot know that.
+            #
+            # All three conditions are load-bearing and the fingerprint is
+            # the one that matters. It is read off `daemon.claim_fingerprint`
+            # and not off the claim table, because `_expire` has already
+            # deleted the claim that minted this row -- that expiry IS the
+            # scenario -- so the link has to live where it survives.
+            #
+            # `_expire` used to do this as a background
+            # sweep keyed on `last_seen IS NULL` alone, and that deleted live
+            # racks: `last_seen` is written only by `link/ws_daemon.py`'s
+            # `_record_hello` and `_touch`, so a rack that collected its key
+            # and is still rebooting -- routine, since the `config.txt` SPI
+            # edit requires one -- looked exactly like an orphan, and `screen`
+            # and `integration` cascade off `daemon.id`, so the admin's
+            # configuration went with it. Scoped to this claim's own
+            # fingerprint, the only row reachable is one that stands for an
+            # earlier attempt by the rack being approved right now.
+            #
+            # A DIFFERENT rack that merely shares a hostname is deliberately
+            # NOT reclaimed: the `INSERT` below raises `IntegrityError`, the
+            # transaction rolls back, the claim stays pending and deniable,
+            # and the route answers 409. Loud and recoverable, which is what
+            # the sweep traded away.
+            connection.execute(
+                "DELETE FROM daemon WHERE name = ? AND last_seen IS NULL AND claim_fingerprint = ?",
+                (row["hostname"], row["fingerprint"]),
+            )
             cursor = connection.execute(
-                "INSERT INTO daemon (name, key_hash, version, status, paired_at, created_at)"
-                " VALUES (?, ?, ?, 'paired', ?, ?)",
-                (row["hostname"], _fingerprint(key), row["version"], stamp, stamp),
+                "INSERT INTO daemon"
+                " (name, key_hash, version, status, paired_at, created_at, claim_fingerprint)"
+                " VALUES (?, ?, ?, 'paired', ?, ?, ?)",
+                (
+                    row["hostname"],
+                    _fingerprint(key),
+                    row["version"],
+                    stamp,
+                    stamp,
+                    row["fingerprint"],
+                ),
             )
             daemon_id = int(cursor.lastrowid)
             updated = connection.execute(
@@ -406,11 +469,13 @@ def approve(
                 " WHERE id = ? AND granted_at IS NULL RETURNING id",
                 (now, blob, daemon_id, claim_id),
             ).fetchone()
-            if updated is None:
-                connection.execute("ROLLBACK")
-                return None
+            # Not checked for `None`. `BEGIN IMMEDIATE` took the write lock
+            # before the guarded `SELECT` above ran, so no other writer can
+            # have set `granted_at` in between -- a branch here would be
+            # unreachable code hiding a `return None` that cannot happen.
+            assert updated is not None, "the guarded SELECT and UPDATE disagree"
         except BaseException:
-            connection.execute("ROLLBACK")
+            _rollback(connection)
             raise
         connection.execute("COMMIT")
         return daemon_id, key

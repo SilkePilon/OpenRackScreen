@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 """Bumped whenever the schema below changes.
 
 There are no migrations: a bump exports the database and rebuilds it empty.
@@ -47,6 +47,17 @@ CREATE TABLE IF NOT EXISTS daemon (
     status         TEXT NOT NULL DEFAULT 'unpaired',
     config_version INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL,
+    -- The install identity of the rack this row was minted for, when it was
+    -- minted by approving a claim rather than by spending a token. NULL for
+    -- every token-paired daemon and for every row predating M3c.
+    --
+    -- It exists so `claims.approve` can reclaim `daemon.name` from a grant
+    -- THIS SAME RACK never collected, and from nothing else. The obvious place
+    -- for that link is the claim row, and it cannot live there: `_expire`
+    -- deletes the claim long before the rack gets round to re-filing, and that
+    -- expiry IS the scenario. So it lives on the row that survives.
+    claim_fingerprint TEXT,
+    --
     -- Which of the two a credential is, decided by the schema rather than by
     -- convention. `pairing.py` reasons that one string can match at most one of
     -- those columns, because a token's hash is deleted the moment it is spent,

@@ -649,33 +649,30 @@ def test_approve_survives_a_daemon_name_collision_leaving_the_claim_pending(tmp_
 
 
 def test_a_slow_daemon_that_never_polls_frees_its_name_for_a_later_approval(tmp_path):
-    """Round 2 HIGH 2. `approve` mints the `daemon` row before delivery to
-    the daemon is guaranteed, and nothing rolled it back if the poll never
-    came. A rack too slow to poll before its grant aged out (`_expire`, past
-    `CLAIM_LIFETIME_S` counted from `granted_at`) left an orphaned `daemon`
-    row permanently occupying its own hostname -- unable to ever pair again
-    through this path, burning a fresh claim on every retry
-    (`INSERT INTO daemon` raising `sqlite3.IntegrityError` on the name, every
-    single time). `_expire`'s sweep now takes the orphan with the claim.
+    """Round 2 HIGH 2, resolved where the collision happens rather than by a
+    background sweep. `approve` mints the `daemon` row before delivery is
+    guaranteed, so a rack too slow to poll before its grant aged out left a
+    row permanently occupying its own hostname -- unable to pair again
+    through this path, `INSERT INTO daemon` raising `sqlite3.IntegrityError`
+    every retry. `approve` now reclaims that name, scoped to a row minted by
+    an earlier claim carrying THIS SAME FINGERPRINT.
     """
     made = database(tmp_path)
     filed = file_one(made, n=31, now=0.0)
     assert filed is not None
     approved = approve_one(made, filed.id, now=0.0)
     assert approved is not None
+    first_daemon_id, uncollected_key = approved
 
-    # The daemon never actually polled to collect its key -- `last_seen` is
-    # still NULL, exactly as `approve` leaves it -- and the grant ages out
-    # unpolled.
+    # The daemon never polled -- `last_seen` is NULL, as `approve` leaves it
+    # -- and the grant ages out unread. The daemon row deliberately SURVIVES
+    # that: sweeping it here is what destroyed live racks (see `_expire`).
     swept_at = CLAIM_LIFETIME_S
     assert get_claim(made, filed.id, now=swept_at) is None
-    with closing(made.connect()) as connection:
-        orphan_count = connection.execute(
-            "SELECT COUNT(*) AS n FROM daemon WHERE name = ?", (filed.hostname,)
-        ).fetchone()["n"]
-    assert orphan_count == 0, "the orphaned daemon row must be swept with its expired claim"
+    assert daemon_row(made, first_daemon_id) is not None, (
+        "the expiry of a claim must not delete a rack the admin may already be configuring"
+    )
 
-    # The rack tries again under the same hostname and fingerprint.
     refiled = file_claim(
         made,
         hostname=filed.hostname,
@@ -690,37 +687,96 @@ def test_a_slow_daemon_that_never_polls_frees_its_name_for_a_later_approval(tmp_
 
     reapproved = approve_one(made, refiled.id, now=swept_at)
 
-    assert reapproved is not None, "the swept orphan must not block reapproval forever"
+    assert reapproved is not None, "an uncollected grant must not block the same rack forever"
     with closing(made.connect()) as connection:
         count = connection.execute(
             "SELECT COUNT(*) AS n FROM daemon WHERE name = ?", (filed.hostname,)
         ).fetchone()["n"]
-    assert count == 1, "the reapproval's own daemon row, not a second one beside an orphan"
+    assert count == 1, "the reapproval's own row, not a second one beside the stale grant"
+    # Asserted on the key rather than on the id: SQLite reuses a rowid once the
+    # highest row is deleted, so the reapproval's fresh row can come back
+    # wearing `first_daemon_id`. The key is what actually distinguishes them,
+    # and the uncollected one must be dead.
+    assert authenticate_key(made, uncollected_key) is None, "the stale grant was reclaimed"
+    assert authenticate_key(made, reapproved[1]) == reapproved[0]
 
 
-def test_a_daemon_that_did_reconnect_is_not_swept_by_an_expired_grant(tmp_path):
-    """The orphan sweep added for HIGH 2 is restricted to `last_seen IS
-    NULL` specifically so it does not clean up a daemon that really did
-    collect its key and has since connected -- nothing in this module sets
-    `last_seen` (a later task's job), so this test reaches in with raw SQL to
-    stand in for "the daemon connected", and pins that once it has, an
-    otherwise-identical expired grant leaves it alone.
+def test_an_expired_grant_does_not_delete_the_rack_it_created(tmp_path):
+    """Round 3 HIGH 1, and the reason the background sweep is gone.
+
+    `last_seen` is not "has this rack ever connected" -- `link/ws_daemon.py`'s
+    `_record_hello` and `_touch` are its only writers, and neither fires until
+    a websocket opens. Design spec S4.3 makes the gap routine: the
+    `config.txt` SPI edit means a freshly installed Pi commonly reboots, or
+    waits on a human to reboot it, between collecting its key and dialling in.
+    So a correctly paired, still-rebooting rack has `last_seen IS NULL` and
+    was indistinguishable from an orphan -- and `screen` and `integration`
+    cascade off `daemon.id`, so sweeping it destroyed the admin's
+    configuration too, silently, from a path anyone on the LAN can trigger.
     """
     made = database(tmp_path)
-    filed = file_one(made, n=34, now=0.0)
+    filed = file_one(made, n=41, now=0.0)
     assert filed is not None
     approved = approve_one(made, filed.id, now=0.0)
     assert approved is not None
-    daemon_id, _ = approved
+    daemon_id, key = approved
+
+    # The admin configures the rack straight away, which spec S7 describes as
+    # the expected workflow -- approving "creates the rack".
     with closing(made.connect()) as connection:
         connection.execute(
-            "UPDATE daemon SET last_seen = ? WHERE id = ?",
-            ("2026-08-12T09:00:00Z", daemon_id),
+            "INSERT INTO screen (daemon_id, position, name, display, template)"
+            " VALUES (?, 1, 'Weather', '{}', 'ring-gauge')",
+            (daemon_id,),
         )
 
-    swept_at = CLAIM_LIFETIME_S
-    assert get_claim(made, filed.id, now=swept_at) is None, "the claim row still ages out"
-    assert daemon_row(made, daemon_id) is not None, "a daemon that connected is not an orphan"
+    # Long enough for the grant to age out, with the rack still rebooting.
+    assert get_claim(made, filed.id, now=CLAIM_LIFETIME_S * 3) is None
+
+    assert daemon_row(made, daemon_id) is not None, "the rack survives its grant expiring"
+    with closing(made.connect()) as connection:
+        screens = connection.execute(
+            "SELECT COUNT(*) AS n FROM screen WHERE daemon_id = ?", (daemon_id,)
+        ).fetchone()["n"]
+    assert screens == 1, "and so does everything cascading off it"
+    assert authenticate_key(made, key) == daemon_id, "and the key it holds still authenticates"
+
+
+def test_a_different_rack_sharing_a_hostname_is_refused_not_reclaimed(tmp_path):
+    """The other half of `approve`'s reclaim: it is scoped to the approving
+    claim's own fingerprint, so a genuinely different rack that happens to
+    share a hostname is left alone and the approval fails loudly instead.
+    Loud and recoverable is exactly what the sweep traded away.
+    """
+    made = database(tmp_path)
+    first = file_one(made, n=51, now=0.0)
+    assert first is not None
+    approved = approve_one(made, first.id, now=0.0)
+    assert approved is not None
+    incumbent_id, incumbent_key = approved
+
+    # A different rack -- different fingerprint, different short code -- that
+    # happens to have been given the same hostname.
+    stranger = file_claim(
+        made,
+        hostname=first.hostname,
+        address="10.0.0.99",
+        fingerprint="fingerprint-of-a-completely-different-rack",
+        short_code="ZZZ999",
+        version="0.2.0",
+        public_key="a-strangers-public-key",
+        now=1.0,
+    )
+    assert stranger is not None
+
+    with pytest.raises(sqlite3.IntegrityError):
+        approve_one(made, stranger.id, now=2.0)
+
+    assert daemon_row(made, incumbent_id) is not None, "the incumbent rack is untouched"
+    assert authenticate_key(made, incumbent_key) == incumbent_id
+    assert [claim.id for claim in list_pending(made, now=2.0)] == [stranger.id], (
+        "the refused claim stays pending so the route can answer 409 and an admin can deny it"
+    )
 
 
 def test_the_pending_fingerprint_index_is_keyed_by_granted_at_not_daemon_id(tmp_path):
