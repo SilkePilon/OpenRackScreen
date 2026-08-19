@@ -82,7 +82,12 @@ def unseal(sealed: dict, private_key: X25519PrivateKey) -> str:
     HKDF `info` tag is the one piece of shared protocol knowledge a real
     daemon would also hardcode (it is not a secret, and both ends must agree
     on it to derive the same key), so it is spelled out here literally
-    rather than imported from `api.claims._HKDF_INFO`.
+    rather than imported from `api.claims._HKDF_INFO` -- which since Task 15
+    is itself an alias for `ors_schema.CLAIM_HKDF_INFO`, shared with the real
+    daemon client in `ors_daemon.join`. This copy is what still fails when
+    that one definition and this end's use of it drift apart; the two frozen
+    vectors (below, and `daemon/tests/test_join.py`'s) are what fail when they
+    move together.
     """
     peer_public = X25519PublicKey.from_public_bytes(
         base64.b64decode(sealed["ephemeral_public_key"])
