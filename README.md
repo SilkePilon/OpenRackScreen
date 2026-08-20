@@ -199,9 +199,18 @@ reason.
 Compose prefers `image:` over `build:` when a service names both, so a file
 carrying both never builds your working tree — and the symptom is a container
 that starts, goes healthy, answers `/api/health` and 404s every page, which is
-what a stale tag on this machine actually did once. `deploy/compose.image.yaml`
-is the opt-in overlay for the published image, kept separate so that opting in
-is a thing you type:
+what a stale tag on this machine actually did once.
+
+**Add `--build` when the checkout has changed since the last one.** Removing the
+`image:` line did not remove the problem, it moved it: `docker compose up -d`
+builds only when the service has *no* image at all, and after that it reuses
+`<project>-server` no matter what the working tree says. Verified while checking
+this file — a compose file with `build:` and nothing else brought up a container
+running code from before the previous commit, and only `up -d --build` picked up
+the change. `down` does not help; it removes containers, not images.
+
+`deploy/compose.image.yaml` is the opt-in overlay for the published image, kept
+separate so that opting in is a thing you type:
 
 ```bash
 docker compose -f deploy/compose.pi.yaml -f deploy/compose.image.yaml up -d

@@ -50,9 +50,17 @@ sets the prefix if you want a different one.
 
 Neither file names an `image:`, and that is deliberate rather than an oversight:
 compose prefers `image:` over `build:` when a service has both, so a file
-carrying both never builds your working tree. `deploy/compose.image.yaml` is the
-opt-in overlay for the published image, kept separate so that opting in is a
-thing you type:
+carrying both never builds your working tree.
+
+**Pass `--build` whenever the checkout has moved.** `docker compose up -d`
+builds only when the service has no image yet; after the first one it reuses
+`<project>-server` regardless of what has changed on disk, and `down` removes
+containers rather than images. This was reproduced while checking this file: a
+container came up running code from before the previous commit, and behaved
+exactly as that code did.
+
+`deploy/compose.image.yaml` is the opt-in overlay for the published image, kept
+separate so that opting in is a thing you type:
 
 ```bash
 docker compose -f deploy/compose.pi.yaml -f deploy/compose.image.yaml up -d
@@ -452,7 +460,11 @@ Three ways to get discovery, and a rack only needs one of them:
   and the server — plenty do, including most managed switches with IGMP snooping
   and every setup where the two are on different VLANs.
 
-**None of this has ever crossed two machines.** Announcing and browsing were
+Verified on this machine, after the fix below: a container brought up with
+`-f deploy/compose.mdns.yaml up -d --build` logs
+`announcing <host>._openrackscreen._tcp.local. on port 8080` and
+`ors_daemon.discovery.discover()` returns it. **But none of this has ever
+crossed two machines.** Announcing and browsing were
 put against real sockets for the first time while this file was being verified
 — a server logging `announcing <host>._openrackscreen._tcp.local. on port 8080`,
 and `ors_daemon.discovery.discover()` returning it — but both ends were the same
