@@ -22,6 +22,7 @@ module docstring, and restated briefly at each test that turns on them:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import time
 
@@ -61,15 +62,45 @@ def ephemeral_keypair() -> tuple[X25519PrivateKey, str]:
     return private_key, base64.b64encode(public_bytes).decode()
 
 
+def fingerprint(n: int = 1) -> str:
+    """Rack `n`'s fingerprint: a real SHA-256 in lowercase hex.
+
+    It has to be real now. `ClaimRequest` recomputes `short_code` from this
+    field and refuses a pair that does not agree, so the old `f"fp-{n:06x}"`
+    -- which was never a digest and never had a derivable code -- is a body
+    the route correctly answers 422. Hashing the hostname keeps the property
+    that made the old spelling useful: distinct per `n`, and legible in a
+    failure message as "the one belonging to rack-3".
+    """
+    return hashlib.sha256(f"rack-{n}".encode()).hexdigest()
+
+
 def claim_body(*, n: int = 1, public_key: str | None = None) -> dict:
     """A well-formed filing body, fields chosen so no two calls collide."""
     return {
         "hostname": f"rack-{n}",
-        "fingerprint": f"fp-{n:06x}",
-        "short_code": f"CODE{n:02d}",
+        "fingerprint": fingerprint(n),
+        # Derived here rather than written out, because that is what the route
+        # now checks; a literal would be a body that has to be re-derived by
+        # hand every time `n` moves.
+        "short_code": short_code_of(fingerprint(n)),
         "version": "1.2.3",
         "public_key": public_key or ephemeral_keypair()[1],
     }
+
+
+def short_code_of(digest_hex: str) -> str:
+    """The daemon's derivation, spelled out here rather than imported.
+
+    A second, independent implementation, for `unseal`'s reason above: the
+    production check is `ClaimRequest`'s call into
+    `ors_schema.claim.derive_short_code`, and a test that asked that same
+    function what the answer should be would agree with any edit to it. This
+    is six characters of the base32 of the fingerprint's bytes -- what
+    `ors_daemon.identity._derive` computes and what the Pi prints -- written
+    the way a daemon's author would write it.
+    """
+    return base64.b32encode(bytes.fromhex(digest_hex)).decode("ascii")[:6]
 
 
 def unseal(sealed: dict, private_key: X25519PrivateKey) -> str:
@@ -106,8 +137,8 @@ def unseal(sealed: dict, private_key: X25519PrivateKey) -> str:
     return AESGCM(key).decrypt(nonce, ciphertext, None).decode()
 
 
-def approve_by_fingerprint(client: TestClient, fingerprint: str) -> dict:
-    response = client.post(f"/api/claims/{fingerprint}/approve")
+def approve_by_fingerprint(client: TestClient, digest: str) -> dict:
+    response = client.post(f"/api/claims/{digest}/approve")
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -211,8 +242,8 @@ def test_the_admin_routes_all_answer_401_without_a_session(tmp_path):
     assert filed.status_code == 202
 
     assert client.get("/api/claims").status_code == 401
-    assert client.post("/api/claims/fp-000001/approve").status_code == 401
-    assert client.post("/api/claims/fp-000001/deny").status_code == 401
+    assert client.post(f"/api/claims/{fingerprint(1)}/approve").status_code == 401
+    assert client.post(f"/api/claims/{fingerprint(1)}/deny").status_code == 401
 
 
 def test_get_claims_with_a_session_lists_what_was_filed(tmp_path):
@@ -224,8 +255,8 @@ def test_get_claims_with_a_session_lists_what_was_filed(tmp_path):
     assert len(pending) == 1
     row = pending[0]
     assert row["hostname"] == "rack-1"
-    assert row["fingerprint"] == "fp-000001"
-    assert row["short_code"] == "CODE01"
+    assert row["fingerprint"] == fingerprint(1)
+    assert row["short_code"] == short_code_of(fingerprint(1))
     assert row["version"] == "1.2.3"
     assert isinstance(row["first_seen"], float)
 
@@ -234,7 +265,7 @@ def test_approving_with_a_session_creates_the_rack(tmp_path):
     client = logged_in(build(tmp_path))
     client.post("/api/racks/claims", json=claim_body(n=1))
 
-    approved = approve_by_fingerprint(client, "fp-000001")
+    approved = approve_by_fingerprint(client, fingerprint(1))
 
     assert approved["name"] == "rack-1"
     assert isinstance(approved["id"], int)
@@ -291,7 +322,7 @@ def test_polling_an_approved_claim_is_idempotent_not_discard_on_read(tmp_path):
     private_key, public_key = ephemeral_keypair()
     filed = client.post("/api/racks/claims", json=claim_body(n=1, public_key=public_key))
     claim_id = filed.json()["claim_id"]
-    approve_by_fingerprint(client, "fp-000001")
+    approve_by_fingerprint(client, fingerprint(1))
 
     first = client.get(f"/api/racks/claims/{claim_id}")
     second = client.get(f"/api/racks/claims/{claim_id}")
@@ -315,7 +346,7 @@ def test_the_daemon_key_round_trips_and_authenticates(tmp_path):
     filed = client.post("/api/racks/claims", json=claim_body(n=1, public_key=public_key))
     claim_id = filed.json()["claim_id"]
 
-    approved = approve_by_fingerprint(client, "fp-000001")
+    approved = approve_by_fingerprint(client, fingerprint(1))
 
     polled = client.get(f"/api/racks/claims/{claim_id}")
     assert polled.status_code == 200
@@ -335,7 +366,7 @@ def test_denying_suppresses_a_refiling_within_the_window(tmp_path):
     docstring for why not a distinguishing 403)."""
     client = logged_in(build(tmp_path))
     client.post("/api/racks/claims", json=claim_body(n=1))
-    denied = client.post("/api/claims/fp-000001/deny")
+    denied = client.post(f"/api/claims/{fingerprint(1)}/deny")
     assert denied.status_code == 200
     assert denied.json() == {"ok": True}
 
@@ -357,13 +388,13 @@ def test_approving_a_daemon_name_collision_answers_409_not_500(tmp_path):
     admin can act on, not let it become a 500."""
     client = logged_in(build(tmp_path))
     client.post("/api/racks/claims", json=claim_body(n=1))
-    approve_by_fingerprint(client, "fp-000001")
+    approve_by_fingerprint(client, fingerprint(1))
 
     body = claim_body(n=2)
     body["hostname"] = "rack-1"  # collides with the daemon just minted
     client.post("/api/racks/claims", json=body)
 
-    response = client.post("/api/claims/fp-000002/approve")
+    response = client.post(f"/api/claims/{fingerprint(2)}/approve")
 
     assert response.status_code == 409
     # Loud and recoverable: the claim is still there to retry with a
@@ -383,6 +414,82 @@ def test_a_public_key_that_is_not_32_bytes_is_refused_at_filing_not_at_approval(
     assert response.status_code == 422
 
 
+def test_a_short_code_the_fingerprint_does_not_derive_is_refused(tmp_path):
+    """**The check design spec S6.4's whole argument assumes.**
+
+    Both fields used to be stored verbatim, so the claimant chose its own
+    code: `{"fingerprint": "a"*64, "short_code": "ZZZZZZ"}` answered 202 and
+    `ZZZZZZ` was what `GET /api/claims` and the admin's card showed. Anyone
+    who had seen a rack's code -- on its screen, in `journalctl -u
+    openrackscreen` -- could file under it with their own fingerprint and
+    their own ephemeral key and be indistinguishable from that rack in the
+    queue. S6.4 prices that attack at about 2^30 hashes; unchecked, it cost
+    nothing.
+
+    422 and not 429: see `ClaimRequest`'s validator for why this refusal is
+    not one of the two `file_claim` keeps indistinguishable.
+    """
+    client = logged_in(build(tmp_path))
+
+    body = claim_body(n=1)
+    body["short_code"] = "ZZZZZZ"
+    response = client.post("/api/racks/claims", json=body)
+
+    assert response.status_code == 422
+    # And nothing was recorded, so the refusal is a refusal and not a row an
+    # admin could still be shown.
+    assert client.get("/api/claims").json() == []
+
+
+def test_the_code_a_real_daemon_derives_is_the_one_this_route_accepts(tmp_path):
+    """The other half, and the reason this check cannot merely be strict.
+
+    A pair spelled the way `ors_daemon.identity._derive` spells it is
+    accepted, and the code the admin is shown is the one the Pi printed. The
+    values are frozen rather than computed from `claim_body`: they are the
+    SHA-256 of `b"shed"` and six characters of its base32, the same pair
+    `web/tests/claims.test.tsx` and the daemon's own suite carry, so a
+    server-side derivation that drifted from the daemon's -- a different
+    alphabet, a different truncation, a `.lower()` -- fails here rather than
+    becoming a rack that can never file at all.
+    """
+    client = logged_in(build(tmp_path))
+
+    body = claim_body(n=1)
+    body["fingerprint"] = "2f3c3e5cf3c63b648b44850ff5e9a88aac1d4498e94e7575f2fe6ad93f35c66b"
+    body["short_code"] = "F46D4X"
+    response = client.post("/api/racks/claims", json=body)
+
+    assert response.status_code == 202, response.text
+    [row] = client.get("/api/claims").json()
+    assert row["short_code"] == "F46D4X"
+
+
+def test_a_fingerprint_that_is_not_a_lowercase_sha256_is_refused(tmp_path):
+    """Shape, and specifically case.
+
+    `bytes.fromhex` accepts either case, so an uppercased fingerprint derives
+    the very same code and would sail through the cross-check above -- while
+    being a *different* string to `claim_pending_fingerprint`, to
+    `claims.deny`'s suppression table and to every `WHERE fingerprint = ?` in
+    this module, because SQLite compares TEXT byte-for-byte. A rack that was
+    just denied could re-file by holding shift. One spelling per digest is
+    what closes that; see `ors_schema.claim.FINGERPRINT_HEX_CHARS`.
+    """
+    client = build(tmp_path)
+
+    body = claim_body(n=1)
+    body["fingerprint"] = body["fingerprint"].upper()
+    assert client.post("/api/racks/claims", json=body).status_code == 422
+
+    # And the ordinary malformations, which used to be accepted too: this
+    # column is a digest, not a free-text label.
+    for bad in ("fp-000001", "abc", "z" * 64, body["fingerprint"].lower() + "00"):
+        wrong = claim_body(n=1)
+        wrong["fingerprint"] = bad
+        assert client.post("/api/racks/claims", json=wrong).status_code == 422, bad
+
+
 def test_a_public_key_that_is_not_base64_is_refused_at_filing(tmp_path):
     client = build(tmp_path)
 
@@ -395,9 +502,9 @@ def test_a_public_key_that_is_not_base64_is_refused_at_filing(tmp_path):
 def test_approving_an_already_denied_fingerprint_answers_404(tmp_path):
     client = logged_in(build(tmp_path))
     client.post("/api/racks/claims", json=claim_body(n=1))
-    client.post("/api/claims/fp-000001/deny")
+    client.post(f"/api/claims/{fingerprint(1)}/deny")
 
-    response = client.post("/api/claims/fp-000001/approve")
+    response = client.post(f"/api/claims/{fingerprint(1)}/approve")
 
     assert response.status_code == 404
 
@@ -466,7 +573,7 @@ def test_a_fingerprint_holding_a_granted_row_and_a_new_pending_one_resolves_to_t
     first_filed = client.post(
         "/api/racks/claims", json=claim_body(n=1, public_key=first_public_key)
     )
-    approve_by_fingerprint(client, "fp-000001")
+    approve_by_fingerprint(client, fingerprint(1))
     first_key = unseal(
         client.get(f"/api/racks/claims/{first_filed.json()['claim_id']}").json(),
         first_private_key,
@@ -477,9 +584,9 @@ def test_a_fingerprint_holding_a_granted_row_and_a_new_pending_one_resolves_to_t
     second_private_key, second_public_key = ephemeral_keypair()
     refiled = client.post("/api/racks/claims", json=claim_body(n=1, public_key=second_public_key))
     assert refiled.status_code == 202, refiled.text
-    assert [row["fingerprint"] for row in client.get("/api/claims").json()] == ["fp-000001"]
+    assert [row["fingerprint"] for row in client.get("/api/claims").json()] == [fingerprint(1)]
 
-    second = approve_by_fingerprint(client, "fp-000001")
+    second = approve_by_fingerprint(client, fingerprint(1))
 
     # The 200 is the finding: without `AND granted_at IS NULL` this is a 404,
     # from `_pending_claim_id` handing `claims.approve` the granted row's id.
@@ -551,7 +658,7 @@ def test_approving_a_claim_records_a_created_event_like_pairing_by_token_does(tm
     client = logged_in(build(tmp_path))
     client.post("/api/racks/claims", json=claim_body(n=1))
 
-    approved = approve_by_fingerprint(client, "fp-000001")
+    approved = approve_by_fingerprint(client, fingerprint(1))
 
     events = client.get(f"/api/events?daemon_id={approved['id']}").json()
     assert [(event["level"], event["kind"]) for event in events] == [("info", "created")]

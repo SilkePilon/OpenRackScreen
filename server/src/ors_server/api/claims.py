@@ -62,8 +62,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from fastapi import APIRouter, HTTPException, Request
-from ors_schema import CLAIM_HKDF_INFO
-from pydantic import BaseModel, Field, field_validator
+from ors_schema import CLAIM_HKDF_INFO, derive_short_code
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ors_server import claims as claim_store
 from ors_server.api.changes import one_row, write_event
@@ -222,8 +222,17 @@ class ClaimRequest(BaseModel):
     """
 
     hostname: str = Field(min_length=1)
-    fingerprint: str = Field(min_length=1)
-    short_code: str = Field(min_length=1)
+    fingerprint: str = Field(
+        min_length=1,
+        description=("The SHA-256 of this rack's identity secret, 64 lowercase hex characters."),
+    )
+    short_code: str = Field(
+        min_length=1,
+        description=(
+            "The first six base32 characters of the fingerprint's digest. Recomputed "
+            "here from `fingerprint`; a pair that does not agree is refused."
+        ),
+    )
     version: str = Field(min_length=1)
     public_key: str = Field(
         min_length=1,
@@ -251,6 +260,61 @@ class ClaimRequest(BaseModel):
         if len(raw) != _PUBLIC_KEY_BYTES:
             raise ValueError(f"public_key must decode to {_PUBLIC_KEY_BYTES} bytes")
         return value
+
+    @field_validator("fingerprint")
+    @classmethod
+    def _fingerprint_is_a_digest(cls, value: str) -> str:
+        """Refuse anything that is not a SHA-256 in lowercase hex.
+
+        Separate from the cross-check below so that a malformed fingerprint
+        says so, rather than reporting a mismatch against a code that could
+        not have been derived at all. `derive_short_code` owns the definition
+        of the shape -- see `ors_schema.claim.FINGERPRINT_HEX_CHARS` for why
+        the *case* is part of it and not a nicety: this string is a database
+        key, `claims.deny` suppresses re-filings by it, and SQLite compares
+        TEXT byte-for-byte, so a claimant free to uppercase its own hex walks
+        out from under a deny it was just given.
+        """
+        derive_short_code(value)
+        return value
+
+    @model_validator(mode="after")
+    def _the_code_is_the_one_the_fingerprint_derives(self) -> ClaimRequest:
+        """**The short code is recomputed, never taken on trust.**
+
+        This is the check design spec S6.4's whole argument assumes and this
+        module did not make until M3c's final review. The dialog an admin
+        clicks through says matching a code already seen on somebody's screen
+        costs about 2^30 hashes; with both fields stored verbatim it cost
+        nothing at all. Anyone who read a code off a rack's display or out of
+        `journalctl -u openrackscreen` could file with that code, their own
+        fingerprint and their own ephemeral key, and sit in the queue
+        indistinguishable from the rack it belongs to -- and being
+        indistinguishable in that queue is the entire gate.
+
+        Recomputing restores the cost the spec claims, and it is exact rather
+        than approximate: to be approved under a seen code an attacker now has
+        to find a *secret* whose SHA-256 begins with the same thirty bits,
+        which is the 2^30 work S6.4 names.
+
+        422 and not 429, deliberately, and it is not a refusal `file_claim`'s
+        indistinguishability rule covers. That rule is about not telling a
+        caller which of two *policy* refusals it met -- a full queue or a
+        suppressed fingerprint -- and both of those are facts about the
+        server's state that a claimant must not learn. This is a fact about
+        the body the claimant just sent, which it already knows; withholding
+        it would leave an honest daemon whose printed code had drifted from
+        the one it files with no way to discover that, which is the second
+        thing this check buys.
+        """
+        expected = derive_short_code(self.fingerprint)
+        if self.short_code != expected:
+            raise ValueError(
+                f"short_code must be the first {len(expected)} base32 characters of the "
+                f"fingerprint's digest ({expected!r} for this fingerprint), not "
+                f"{self.short_code!r}"
+            )
+        return self
 
 
 class ClaimFiled(BaseModel):

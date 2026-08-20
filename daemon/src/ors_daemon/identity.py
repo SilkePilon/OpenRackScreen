@@ -17,18 +17,19 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from ors_schema import SHORT_CODE_CHARS, derive_short_code
+
 IDENTITY_BYTES = 32
 """The secret's length, in bytes. 32 because it is the input to a SHA-256, and
 a shorter input adds nothing while a longer one is hashed down anyway."""
 
-SHORT_CODE_CHARS = 6
-"""How much of the fingerprint a person is asked to compare.
-
-Six base32 characters is 30 bits: about a billion, which is far more than the
-number of racks anyone will ever approve, and few enough to read off a
-terminal without losing your place. It is a check against *confusion*, not
-against a determined collision -- the fingerprint is what the server keys on,
-and this is what the admin looks at."""
+__all__ = ["IDENTITY_BYTES", "SHORT_CODE_CHARS", "Identity", "load_or_create"]
+"""`SHORT_CODE_CHARS` is re-exported rather than defined here. It used to be
+defined here, and that was the shape of the hole M3c's final review found: the
+server took the claimant's `short_code` on trust because there was nothing on
+its side of the wire that could compute one. Both ends now derive it from
+`ors_schema.claim`, which is where this repository keeps things two ends have
+to agree on."""
 
 _VERSION = 1
 
@@ -48,11 +49,15 @@ class Identity:
 
 def _derive(secret: bytes) -> Identity:
     digest = hashlib.sha256(secret).digest()
-    # Base32 and not hex: hex is 4 bits a character, so six characters would be
-    # 24 bits, and it contains no letters past F -- which makes a short code
-    # look like a number and reads worse aloud.
-    code = base64.b32encode(digest).decode("ascii")[:SHORT_CODE_CHARS]
-    return Identity(secret=secret, fingerprint=digest.hex(), short_code=code)
+    fingerprint = digest.hex()
+    # `ors_schema.claim.derive_short_code` and not a local `b32encode`: the
+    # server recomputes exactly this from the fingerprint a claim carries and
+    # refuses the filing if the two disagree (`api/claims.py`'s
+    # `ClaimRequest`), so a second spelling here would be a rack that prints
+    # one code, files another, and is refused with no way to tell why.
+    return Identity(
+        secret=secret, fingerprint=fingerprint, short_code=derive_short_code(fingerprint)
+    )
 
 
 def load_or_create(path: Path) -> Identity:
