@@ -276,6 +276,12 @@ export type Rack = {
   /**
    * The world the specs assert against: a second rack that never connects,
    * carrying two screens, and the night window turned off.
+   *
+   * Idempotent, and a no-op until a password exists. It is called from
+   * `rack.spec.ts`'s `beforeEach` rather than from whichever spec happened to
+   * need it first, so calling it more than once has to be free -- and the
+   * first spec of the story is the one that *sets* the password this signs in
+   * with, so the first call has to do nothing rather than fail.
    */
   arrange(): Promise<void>
   /** When a virtual panel's PNG was last written, or null if it never was. */
@@ -462,7 +468,35 @@ export const test = base.extend<NoPerTestFixtures, Fixtures>({
         return running.session
       }
 
+      /**
+       * Whether `arrange` has already made the world. See `arrange`.
+       *
+       * Worker-scoped like everything else in this closure, so it is per run
+       * and per server: a second worker would have its own temp root, its own
+       * database and its own `false`.
+       */
+      let arranged = false
+
       const arrange = async () => {
+        if (arranged) return
+
+        // **Nothing to arrange until there is a password**, and this is the
+        // first spec's own precondition rather than an edge case: spec 1
+        // asserts a database with no password, and the story cannot set one
+        // for it. `GET /api/auth/me` is the one open route -- it answers 200
+        // either way and reports `password_set`, which is how the interface
+        // itself tells "never set" from "set, and this browser has no
+        // session" -- so this asks it instead of guessing from a 401 that
+        // `api()` would raise on.
+        const anonymous = await request.newContext({ baseURL: origin })
+        try {
+          const me = await anonymous.get("/api/auth/me")
+          if (!me.ok()) throw new Error(`/api/auth/me answered ${me.status()}`)
+          if (((await me.json()) as { password_set?: boolean }).password_set !== true) return
+        } finally {
+          await anonymous.dispose()
+        }
+
         const client = await api()
 
         // **Off, and this is not tidying.** `NightWindow` defaults to enabled
@@ -504,6 +538,10 @@ export const test = base.extend<NoPerTestFixtures, Fixtures>({
           })
           if (!made.ok()) throw new Error(`could not create the screen ${name}: ${made.status()}`)
         }
+
+        // Last, so that a failure part-way through leaves the next call to try
+        // again rather than reporting a world that was never finished.
+        arranged = true
       }
 
       /**

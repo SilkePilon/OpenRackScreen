@@ -203,7 +203,7 @@ so CI and your shell resolve the same one:
 ```bash
 cd web
 pnpm install --frozen-lockfile
-pnpm test        # 159 tests, 14 files
+pnpm test        # 173 tests, 15 files
 pnpm typecheck
 pnpm lint
 pnpm build
@@ -219,14 +219,16 @@ and the whole interface toolchain stops.
 
 ```bash
 pnpm exec playwright install chromium   # once per machine
-pnpm exec playwright test               # 7 specs, about half a minute
+pnpm exec playwright test               # 8 specs, about three quarters of a minute
 ```
 
-It boots a real server and a real daemon with virtual panels and drives the
-whole story through a browser: set a password, pair a rack, run the wizard,
-watch a panel render, edit it, kill the server mid-run and bring it back. Two of
-the seven specs need the server *stopped in the middle*, which is why the
-processes belong to `e2e/fixture.ts` and not to a Playwright `webServer` block.
+It boots a real server and two real daemons with virtual panels and drives the
+whole story through a browser: set a password, watch a freshly installed rack
+ask to join and approve it by its six-character code, pair a second rack with a
+token, run the wizard, watch a panel render, edit it, kill the server mid-run
+and bring it back. Two of the eight specs need the server *stopped in the
+middle*, which is why the processes belong to `e2e/fixture.ts` and not to a
+Playwright `webServer` block.
 
 **The dev loop.** `pnpm dev` in `web/` proxies `/api` and `/ws` to
 `127.0.0.1:8080`, so the interface runs hot-reloaded against a real server on

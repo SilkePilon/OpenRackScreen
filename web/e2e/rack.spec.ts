@@ -106,6 +106,30 @@ async function readPanel(ui: Page, id: number): Promise<Pixels> {
     })
 }
 
+/**
+ * The world these specs run in, made once and before any of them.
+ *
+ * `arrange` is not any one spec's setup. The spare rack it creates is the
+ * negative control the pixel specs read (two panels nothing is running, which
+ * must stay blank while the real one draws) and the reason no two ids in this
+ * file coincide; the night window it turns off is what stops the whole file
+ * failing between 23:00 and 07:00. That belongs to the file, so it lives in a
+ * hook. It used to be the first three lines of spec 2, which quietly made
+ * every later spec depend on spec 2 having run: `--grep "1:|3:"` waited out
+ * `pi-spare is offline` and failed on a rack nothing had created.
+ *
+ * **`beforeEach` rather than a file-scoped `beforeAll`**, for one reason:
+ * `arrange` signs in, and there is no password to sign in with until spec 1
+ * has set one -- a `beforeAll` at file scope runs *before* the first test, not
+ * after it, so it would 401 on every run. `rack.arrange` therefore does
+ * nothing while the database has no password and remembers that it ran, which
+ * makes this hook "as soon as there is a world to arrange, and once": two
+ * cheap requests across the file, and the arranging itself exactly once.
+ */
+test.beforeEach(async ({ rack }) => {
+  await rack.arrange()
+})
+
 // A failure here is usually something the server or the rack said, and neither
 // of them writes to the terminal this reporter owns.
 test.afterEach(async ({ rack }, info) => {
@@ -164,12 +188,11 @@ test("1: a rack with no password asks for one, and takes it", async ({ rack, ui 
  * to `_openrackscreen._tcp.local.`. See `fixture.ts`'s `joinByClaim`.
  */
 test("2: a rack asks to join, and the code it printed is the one approved", async ({ rack, ui }) => {
-  // The spare rack and the two screens on it, plus the night window off. See
-  // `arrange`: this is what stops any two numbers in this file coinciding, and
-  // it has to happen before the rack below is approved for the ids to come out
-  // that way -- approving is what mints the `daemon` row.
-  await rack.arrange()
-
+  // The spare rack and the two screens on it are already there -- the
+  // `beforeEach` above made them, and it had to: approving is what mints this
+  // rack's `daemon` row, so the spare has to exist first for the ids to come
+  // out distinct. That ordering is now the hook's, not this spec's.
+  //
   // The rack comes up unpaired and with no config, files its claim, and waits.
   // What comes back is the line it printed on its own console for whoever is
   // standing in front of it.
@@ -217,7 +240,15 @@ test("2: a rack asks to join, and the code it printed is the one approved", asyn
   // like an identifier. It is deliberately absent from this page
   // (`PendingClaims`'s own docstring), and these two assertions are how a
   // mix-up could not pass unnoticed.
-  expect(claim.fingerprint).not.toBe(claim.short_code)
+  //
+  // The shape assertion is deliberately *this* one and not
+  // `fingerprint.slice(0, 6).toUpperCase() !== short_code`: hex uppercased is
+  // six characters of the base32 alphabet, so that comparison would be a coin
+  // toss on the digest of the day. `not.toBe(short_code)` was worse still --
+  // 64 hex can never equal 6 base32, so it could never fail, and it read as
+  // coverage that was not there. What is left is falsifiable: a server that
+  // put the code in the fingerprint field, or truncated the digest, fails it.
+  expect(claim.fingerprint).toMatch(/^[0-9a-f]{64}$/)
   await expect(card.getByText(claim.fingerprint)).toHaveCount(0)
 
   // The one line on the card the claimant did not write: `file_claim_route`
@@ -538,7 +569,7 @@ test("8: the server comes back and the interface recovers, without a reload", as
 
   // And the panel comes back to life: a fresh socket, this tab's subscriptions
   // replayed on the handshake, the rack's frames arriving again. The red is
-  // spec 5's edit, which the rack has been drawing on its own glass throughout
+  // spec 6's edit, which the rack has been drawing on its own glass throughout
   // -- so this is the whole path, restored, and not merely a page that renders.
   const panel = ui.getByTestId(`panel-${screenId}`)
   await expect(panel).toHaveAttribute("data-state", "live", { timeout: 60_000 })
