@@ -335,6 +335,115 @@ def test_the_release_workflow_grouping_step_refuses_a_missing_distribution(tmp_p
     assert "ors-schema" in result.stderr, result.stderr
 
 
+PUBLISH_ACTION = "pypa/gh-action-pypi-publish"
+"""The action every publish step uses. Named once: a `startswith` against a
+hand-retyped string in eight places is how a test quietly stops finding the
+steps it is supposed to be checking."""
+
+RELEASE_ENVIRONMENTS = {
+    "ors-schema": "release-ors-schema",
+    "ors-render": "release-ors-render",
+    "ors-daemon": "release-ors-daemon",
+    "ors-server": "release-ors-server",
+    "openrackscreen": "release-openrackscreen",
+}
+"""The GitHub environment each package publishes from, spelled out rather than
+derived from `PACKAGES`. These five strings exist twice outside this
+repository -- as environments on the repository itself, and inside the trusted
+publisher PyPI has registered for each project -- and neither copy moves when
+this file is edited. A derived `f"release-{name}"` would follow a renamed
+`PACKAGES` key straight past the one thing that must not change silently.
+`test_every_publish_job_has_its_own_trusted_publishing_identity` still checks
+this dict covers exactly `PACKAGES`, so a sixth package cannot arrive without
+an environment."""
+
+
+def _publish_jobs(document: dict) -> dict[str, dict]:
+    """Every job that uploads to PyPI, keyed by job id.
+
+    The five uploads used to be five steps of one `publish` job, and every
+    test here reached them through `document["jobs"]["publish"]["steps"]`.
+    They are five jobs now -- PyPI keys a pending trusted publisher on the
+    environment name, so five packages need five environments and an
+    environment is a property of a job, not of a step. Found by what they
+    *do* rather than by what they are called, so that a sixth publish job
+    named anything at all is still covered by every test below."""
+    return {
+        name: job
+        for name, job in document["jobs"].items()
+        if any(s.get("uses", "").startswith(PUBLISH_ACTION) for s in job.get("steps", []))
+    }
+
+
+def _publish_steps(job: dict) -> list[dict]:
+    return [s for s in job.get("steps", []) if s.get("uses", "").startswith(PUBLISH_ACTION)]
+
+
+def _package_published_by(job_name: str, job: dict) -> str:
+    """The package a publish job uploads, read off its `packages-dir`.
+
+    Asserts one upload per job rather than taking the first: a job that
+    publishes two packages has one environment for both, which is the exact
+    configuration PyPI refuses, and it would also put two packages at the
+    same position in the dependency graph the tests below check."""
+    steps = _publish_steps(job)
+    assert len(steps) == 1, (
+        f"job {job_name!r} publishes {len(steps)} packages; one job publishes one package, "
+        "because a trusted publisher is keyed on the job's environment"
+    )
+    return steps[0]["with"]["packages-dir"].strip("/").rsplit("/", 1)[-1]
+
+
+def _needs(job: dict) -> list[str]:
+    """`needs:` normalised to a list. A bare string is legal YAML here, and
+    `"build" in needs` against one is a substring match that also accepts a
+    job named `buildx`."""
+    needs = job.get("needs", [])
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
+def _must_run_before(document: dict, job_name: str) -> set[str]:
+    """Every job that has to succeed before `job_name` starts.
+
+    Transitive, not just the direct `needs:`. Ordering used to be step order
+    inside one job and could be read off a list index; it is a graph now, and
+    `ors-render` needing `ors-schema` is what makes `ors-daemon` -- which
+    needs only `ors-render` -- run after both."""
+    jobs = document["jobs"]
+    seen: set[str] = set()
+    frontier = _needs(jobs[job_name])
+    while frontier:
+        name = frontier.pop()
+        assert name in jobs, f"job {job_name!r} needs {name!r}, which is not a job"
+        if name in seen:
+            continue
+        seen.add(name)
+        frontier.extend(_needs(jobs[name]))
+    return seen
+
+
+def _triggers() -> dict:
+    """The workflow's `on:` block.
+
+    YAML 1.1's bareword booleans mean `on:` parses under `yaml.safe_load` to
+    the boolean key `True`, not the string `"on"` -- a trap for anyone reading
+    this trigger back out with `document["on"]`, which raises `KeyError` and
+    checks nothing. A bare `document[True]` is no better: it swaps one
+    unexplained `KeyError` for another, in a file whose own docstring argues
+    against exactly that failure mode. Quoting the key as `"on":` in the
+    workflow -- valid YAML, identical to what GitHub Actions parses, and what
+    `yamllint`'s `truthy` rule tells people to do -- would trip either bare
+    lookup; `.get` against both keys, plus an explaining assert, does not."""
+    document = _release_workflow()
+    trigger = document.get(True, document.get("on"))
+    assert trigger is not None, (
+        "release.yml has no `on:` trigger under either the YAML-1.1 boolean "
+        "key or a literal string 'on' key"
+    )
+    assert isinstance(trigger, dict), f"release.yml's `on:` is {type(trigger).__name__}, not a map"
+    return trigger
+
+
 def test_the_release_workflow_publish_steps_read_the_directories_grouping_creates():
     """Nothing previously tied the publish steps' `packages-dir` to the
     directories the grouping step actually creates, or to the artifact that
@@ -345,15 +454,16 @@ def test_the_release_workflow_publish_steps_read_the_directories_grouping_create
     or looked at `upload-artifact`'s `path`, or the grouping step's own
     existence, all at once. Both failures are loud -- but only against a real
     `v*` tag, which is the one place this project cannot afford to find out.
+
+    Collected across every publishing job rather than out of one job's step
+    list: the five uploads are five jobs now, and a test that kept reading
+    `jobs["publish"]["steps"]` would have raised `KeyError` -- or, worse for a
+    future split, quietly checked four of five.
     """
     document = _release_workflow()
     build_steps = document["jobs"]["build"]["steps"]
-    publish_steps = [
-        step
-        for step in document["jobs"]["publish"]["steps"]
-        if step.get("uses", "").startswith("pypa/gh-action-pypi-publish")
-    ]
-    assert publish_steps, "publish must actually publish something"
+    jobs = _publish_jobs(document)
+    assert jobs, "the release workflow must actually publish something"
 
     group = _find_step(
         build_steps,
@@ -365,9 +475,13 @@ def test_the_release_workflow_publish_steps_read_the_directories_grouping_create
         "not a second, hand-copied list"
     )
 
-    assert {step["with"]["packages-dir"] for step in publish_steps} == {
-        f"dist/{name}/" for name in PACKAGES
-    }, "every publish step's packages-dir must name a directory the grouping step creates"
+    directories = {
+        step["with"]["packages-dir"] for job in jobs.values() for step in _publish_steps(job)
+    }
+    assert directories == {f"dist/{name}/" for name in PACKAGES}, (
+        "every publish step's packages-dir must name a directory the grouping step creates, "
+        "and between them they must name all five"
+    )
 
     upload = _find_step(
         build_steps,
@@ -382,19 +496,82 @@ def test_the_release_workflow_publish_steps_read_the_directories_grouping_create
 def test_the_release_workflow_publish_steps_pin_skip_existing():
     """`skip-existing: true` is what makes a rerun after a partial publish
     failure safe: a package already on PyPI is skipped rather than rejected
-    as a duplicate. Losing it from even one of the five steps turns the
-    resume this workflow depends on into a hard failure the first time it is
-    exercised for real.
+    as a duplicate. Losing it from even one of the five turns the resume this
+    workflow depends on into a hard failure the first time it is exercised for
+    real -- and this release is exercised for real by design, because PyPI
+    allows only three pending trusted publishers at a time and five packages
+    therefore go out in two rounds against the same tag.
+
+    Swept over every publishing job, so dropping the setting from a single
+    job cannot hide behind the other four.
     """
     document = _release_workflow()
-    publish_steps = [
-        step
-        for step in document["jobs"]["publish"]["steps"]
-        if step.get("uses", "").startswith("pypa/gh-action-pypi-publish")
-    ]
-    assert publish_steps, "publish must actually publish something"
-    assert all(step["with"].get("skip-existing") is True for step in publish_steps), (
-        "skip-existing must stay pinned to true on every publish step"
+    jobs = _publish_jobs(document)
+    assert jobs, "the release workflow must actually publish something"
+
+    for name, job in jobs.items():
+        steps = _publish_steps(job)
+        assert steps, f"job {name!r} has no publish step"
+        assert all(step["with"].get("skip-existing") is True for step in steps), (
+            f"job {name!r} must keep skip-existing pinned to true, or round two of a "
+            "split release fails on a duplicate instead of skipping it"
+        )
+
+
+def test_every_publish_job_has_its_own_trusted_publishing_identity():
+    """The constraint that split one publish job into five.
+
+    PyPI keys a *pending* trusted publisher on the whole configuration --
+    owner, repository, workflow filename and environment name -- and that
+    tuple has to be unique, because the OIDC token a workflow presents is
+    identical no matter which package it is uploading: with two pending
+    publishers on one tuple, PyPI cannot tell which project a token is
+    claiming. Registering a second package against a shared `environment:
+    release` is refused outright ("A pending trusted publisher matching this
+    configuration has already been registered for a different project name"),
+    so one environment means exactly one of these five packages can ever be
+    registered. Nothing in this repository said so, and the failure is silent
+    here and loud only at PyPI, on a real tag.
+
+    The names are asserted against `RELEASE_ENVIRONMENTS` literally, because
+    three of them are already registered on PyPI against exactly these
+    strings: renaming one breaks nothing else in this tree, it invalidates a
+    publisher.
+
+    `permissions: id-token: write` is checked in the same place because it is
+    the other half of the same identity, and because it went from one job that
+    needed it to five that each do: a publish job without it has no OIDC token
+    to present and cannot upload at all.
+    """
+    document = _release_workflow()
+    jobs = _publish_jobs(document)
+    assert jobs, "the release workflow must actually publish something"
+    assert set(RELEASE_ENVIRONMENTS) == set(PACKAGES), (
+        "every published package needs its own release environment: "
+        f"{set(PACKAGES) ^ set(RELEASE_ENVIRONMENTS)} is unaccounted for"
+    )
+
+    seen: dict[str, str] = {}
+    for name, job in jobs.items():
+        package = _package_published_by(name, job)
+        environment = job.get("environment")
+        assert environment == RELEASE_ENVIRONMENTS.get(package), (
+            f"job {name!r} publishes {package} from environment {environment!r}, "
+            f"expected {RELEASE_ENVIRONMENTS.get(package)!r}"
+        )
+        assert environment not in seen, (
+            f"jobs {seen.get(environment)!r} and {name!r} share environment "
+            f"{environment!r}; PyPI cannot register a pending publisher for both"
+        )
+        seen[environment] = name
+        assert job.get("permissions", {}).get("id-token") == "write", (
+            f"job {name!r} has no `permissions: id-token: write` and cannot present the "
+            "OIDC token trusted publishing is built on"
+        )
+
+    assert set(seen) == set(RELEASE_ENVIRONMENTS.values()), (
+        f"the publish jobs use {sorted(seen)}, expected exactly "
+        f"{sorted(RELEASE_ENVIRONMENTS.values())}"
     )
 
 
@@ -407,13 +584,20 @@ def test_the_release_workflow_warns_before_a_silent_skip():
     added to make that run's log visibly different: it must run before any
     package is actually published, it must actually query PyPI rather than
     just print a static message, and it must not be able to fail the job --
-    a `publish` step that would otherwise succeed must never be blocked by a
-    PyPI hiccup answering this check.
+    a publish that would otherwise succeed must never be blocked by a PyPI
+    hiccup answering this check.
+
+    The step lives in `build` now, not in a publish job. That is what lets the
+    publish jobs drop `actions/checkout` and `astral-sh/setup-uv` entirely --
+    it was the only thing in them that read the repository -- and it does not
+    weaken "before any package is published": every publishing job has to wait
+    on `build`, which is a stronger statement than a step index inside one
+    job, since it holds for all five at once.
     """
     document = _release_workflow()
-    steps = document["jobs"]["publish"]["steps"]
+    warn_job = "build"
     warn = _find_step(
-        steps,
+        document["jobs"][warn_job]["steps"],
         lambda s: s.get("name") == "Warn about packages already published at this version",
         "pre-publish PyPI check",
     )
@@ -432,37 +616,43 @@ def test_the_release_workflow_warns_before_a_silent_skip():
     assert "SystemExit" not in warn["run"], "the warning step must never fail the job"
     assert "sys.exit" not in warn["run"], "the warning step must never fail the job"
 
-    publish_steps = [
-        step for step in steps if step.get("uses", "").startswith("pypa/gh-action-pypi-publish")
-    ]
-    assert publish_steps, "publish must actually publish something"
-    assert steps.index(warn) < min(steps.index(step) for step in publish_steps), (
-        "the warning must run before any package is published"
-    )
+    jobs = _publish_jobs(document)
+    assert jobs, "the release workflow must actually publish something"
+    for name in jobs:
+        assert warn_job in _must_run_before(document, name), (
+            f"job {name!r} can publish without {warn_job!r} -- and so without the warning -- "
+            "having run first"
+        )
 
 
 def test_every_job_that_runs_uv_or_reads_tools_sets_itself_up_first():
     """A `run:` naming `uv` or `tools` needs a checkout and a `uv` on PATH.
 
-    `publish` had neither, and could not run at all. Its only pre-step was
-    `download-artifact`, so its warning step -- `uv run --no-project ...
-    sys.path.insert(0, "tools"); from version import ...` -- met a bare runner
-    with no `tools/`, no manifests and no `uv`. It carries no
-    `continue-on-error`, so the step's non-zero exit failed the job, and the
+    The old `publish` job had neither and could not run at all. Its only
+    pre-step was `download-artifact`, so its warning step -- `uv run
+    --no-project ... sys.path.insert(0, "tools"); from version import ...` --
+    met a bare runner with no `tools/`, no manifests and no `uv`. It carries
+    no `continue-on-error`, so the step's non-zero exit failed the job and the
     five `pypa/gh-action-pypi-publish` steps under it never ran: a tagged
     release that published nothing.
 
-    `test_a_slow_pypi_does_not_fail_the_release` below could not see it, and
-    says so in its own docstring -- it lifts the script out of the workflow and
-    executes it with cwd set to the repository, which is the one thing the
-    runner does not give it.
+    That step now lives in `build`, where a checkout and a `uv` already exist
+    for the build itself, and the five publish jobs read nothing from the
+    repository at all. This is still deliberately a sweep and not an assertion
+    about one job: it was written as a sweep because the next job to grow a
+    `uv run` line is the next one to have this exact hole, and an edit that
+    moves a script *between* jobs is precisely how one lands in a job with no
+    `uv`. `checked` is asserted non-empty because a sweep that matches nothing
+    is the one way this could pass while holding nothing -- and after this
+    move, `build` is the only job it matches.
 
-    Written as a sweep over every job rather than as an assertion about
-    `publish` because the next job to grow a `uv run` line is the next one to
-    have this exact hole, and there is no reason for the check to be about the
-    two jobs that exist today.
+    `test_a_slow_pypi_does_not_fail_the_release` below could not see the
+    original hole, and says so in its own docstring -- it lifts the script out
+    of the workflow and executes it with cwd set to the repository, which is
+    the one thing the runner did not give it.
     """
     document = _release_workflow()
+    checked = []
 
     for name, job in document["jobs"].items():
         steps = job.get("steps", [])
@@ -471,6 +661,7 @@ def test_every_job_that_runs_uv_or_reads_tools_sets_itself_up_first():
         ]
         if not needs_setup:
             continue
+        checked.append(name)
         uses = [step.get("uses", "") for step in steps]
         assert any(u.startswith("actions/checkout") for u in uses), (
             f"job {name!r} runs a step naming uv or tools with no actions/checkout: "
@@ -481,8 +672,8 @@ def test_every_job_that_runs_uv_or_reads_tools_sets_itself_up_first():
             f"{[step.get('name') for step in needs_setup]}"
         )
         # And in that order relative to the first step that needs them --
-        # `actions/checkout` cleans the workspace, so a checkout *after*
-        # `download-artifact` deletes the `dist/` `publish` exists to upload.
+        # `actions/checkout` cleans the workspace, so a checkout landing after
+        # a step that has already written files deletes them.
         first_need = min(steps.index(step) for step in needs_setup)
         for prefix in ("actions/checkout", "astral-sh/setup-uv"):
             at = min(i for i, u in enumerate(uses) if u.startswith(prefix))
@@ -490,21 +681,49 @@ def test_every_job_that_runs_uv_or_reads_tools_sets_itself_up_first():
                 f"job {name!r}: {prefix} must come before the step that needs it"
             )
 
+    assert checked, (
+        "no job in release.yml runs uv or reads tools/ -- this sweep is checking nothing, "
+        "which is not the same as passing"
+    )
 
-def test_the_publish_job_checks_out_before_it_downloads_the_distributions():
+
+def test_no_publish_job_can_lose_the_distributions_before_uploading_them():
     """`actions/checkout` runs with `clean: true` by default, which wipes the
     workspace. `download-artifact` writes the five packages into `dist/` in
     that same workspace, so checking out afterwards would delete every file
-    this job was created to upload -- and `pypa/gh-action-pypi-publish` over an
+    the job was created to upload -- and `pypa/gh-action-pypi-publish` over an
     empty directory is a workflow that reports green having published nothing.
+
+    The publish jobs carry no checkout at all now: the one step that needed
+    one moved into `build`. That makes the original assertion -- checkout
+    before download -- vacuous rather than false, so it is kept as a
+    conditional (a checkout added back here later must still come first) and
+    joined by the two halves of the same property that are *not* vacuous:
+    every publish job must actually download the artifact, exactly once, and
+    must do it before it uploads. A publish step ahead of the download
+    uploads an empty directory, which is the identical green-and-published-
+    nothing outcome by the other route.
     """
-    steps = _release_workflow()["jobs"]["publish"]["steps"]
-    uses = [step.get("uses", "") for step in steps]
+    document = _release_workflow()
+    jobs = _publish_jobs(document)
+    assert jobs, "the release workflow must actually publish something"
 
-    checkout = min(i for i, u in enumerate(uses) if u.startswith("actions/checkout"))
-    download = min(i for i, u in enumerate(uses) if u.startswith("actions/download-artifact"))
-
-    assert checkout < download
+    for name, job in jobs.items():
+        uses = [step.get("uses", "") for step in job["steps"]]
+        downloads = [i for i, u in enumerate(uses) if u.startswith("actions/download-artifact")]
+        assert len(downloads) == 1, (
+            f"job {name!r} must download the distributions exactly once, found {len(downloads)}"
+        )
+        for at in (i for i, u in enumerate(uses) if u.startswith("actions/checkout")):
+            assert at < downloads[0], (
+                f"job {name!r}: actions/checkout after download-artifact deletes the dist/ "
+                "this job exists to upload"
+            )
+        uploads = [i for i, u in enumerate(uses) if u.startswith(PUBLISH_ACTION)]
+        assert min(uploads) > downloads[0], (
+            f"job {name!r} publishes before it downloads the distributions, which uploads "
+            "an empty directory and reports success"
+        )
 
 
 def test_a_slow_pypi_does_not_fail_the_release(tmp_path: Path):
@@ -516,17 +735,18 @@ def test_a_slow_pypi_does_not_fail_the_release(tmp_path: Path):
     bare `TimeoutError` from the read, which urllib does not wrap. A connect
     refusal and a connect timeout do arrive as `URLError`; a read timeout does
     not. So the single most likely thing to go wrong -- PyPI being slow or
-    rate-limiting a release -- failed the `publish` job on a step whose entire
+    rate-limiting a release -- failed the publish on a step whose entire
     purpose is to print a warning.
 
     Executed rather than asserted about, because that is the only way to see
-    it. The script is pulled out of the live workflow, `urlopen` is replaced
-    before it runs, and the working directory is the repository so the real
-    `tools/version.py` and the real manifests are what it reads. Nothing is
-    written anywhere.
+    it. The script is pulled out of the live workflow -- out of `build` now,
+    which is where it moved to, not out of a publish job -- `urlopen` is
+    replaced before it runs, and the working directory is the repository so
+    the real `tools/version.py` and the real manifests are what it reads.
+    Nothing is written anywhere.
     """
     warn = _find_step(
-        _release_workflow()["jobs"]["publish"]["steps"],
+        _release_workflow()["jobs"]["build"]["steps"],
         lambda s: s.get("name") == "Warn about packages already published at this version",
         "pre-publish PyPI check",
     )
@@ -589,12 +809,12 @@ def test_the_release_workflow_refuses_a_wheel_without_the_interface():
         "the interface check must run before the artifact is uploaded"
     )
 
-    needs = document["jobs"]["publish"]["needs"]
-    needs = [needs] if isinstance(needs, str) else needs
-    # `"build" in needs` alone is a substring match when `needs` is a bare
-    # string: it also accepts a job named `buildx`. Normalise to a list
-    # first, so membership means membership.
-    assert "build" in needs, "publish must not run unless build succeeded"
+    # And the other half of "before any upload", which is now a job boundary
+    # rather than a step index: the gate is in `build`, the uploads are in
+    # five separate jobs, and each of them has to be waiting on `build`.
+    # `"build" in needs` alone would not do it -- `ors-daemon` needs only
+    # `ors-render` -- so this walks the graph.
+    _assert_every_publish_job_waits_for_the_gates(document)
 
 
 def test_the_release_workflow_refuses_a_wheel_with_a_local_path_dependency():
@@ -602,12 +822,18 @@ def test_the_release_workflow_refuses_a_wheel_with_a_local_path_dependency():
     published `Requires-Dist`, but "should" is how a `file://` requirement
     gets published and fails to install for everyone outside this workspace.
     Mirrors the interface gate's test above: asserts the check inspects
-    wheel metadata, and that nothing can silence it -- not merely that a step
-    with a plausible name exists somewhere in the file.
+    wheel metadata, that nothing can silence it, and that it runs before
+    anything is uploaded -- not merely that a step with a plausible name
+    exists somewhere in the file.
     """
     document = _release_workflow()
     steps = document["jobs"]["build"]["steps"]
     check = _find_step(steps, lambda s: "local path" in s.get("name", ""), "local-path gate")
+    upload = _find_step(
+        steps,
+        lambda s: s.get("uses", "").startswith("actions/upload-artifact"),
+        "upload-artifact step",
+    )
 
     assert "continue-on-error" not in check, (
         "the local-path gate must not be allowed to fail silently"
@@ -616,13 +842,37 @@ def test_the_release_workflow_refuses_a_wheel_with_a_local_path_dependency():
     assert "Requires-Dist" in check["run"], (
         "the local-path gate must actually inspect wheel metadata for Requires-Dist"
     )
+    assert steps.index(check) < steps.index(upload), (
+        "the local-path check must run before the artifact is uploaded"
+    )
+    _assert_every_publish_job_waits_for_the_gates(document)
+
+
+def _assert_every_publish_job_waits_for_the_gates(document: dict) -> None:
+    """Both pre-upload gates live in `build`. Before the split there was one
+    `publish` job and `"build" in publish["needs"]` said everything; now there
+    are five, chained to each other, and only `publish-ors-schema` names
+    `build` directly. Reachability is the assertion -- a publish job that
+    dropped out of the chain would still have a `needs:` and would still look
+    fine to a direct-membership check."""
+    jobs = _publish_jobs(document)
+    assert jobs, "the release workflow must actually publish something"
+    for name in jobs:
+        assert "build" in _must_run_before(document, name), (
+            f"job {name!r} can publish without build -- and so without the pre-upload "
+            "gates -- having succeeded"
+        )
 
 
 def test_the_release_workflow_uploads_and_downloads_the_same_artifact_name():
-    """A rename on either side of the `build` / `publish` boundary makes
-    `download-artifact` fetch nothing. `publish` then runs against an empty
-    `dist/`, and `pypa/gh-action-pypi-publish` over zero files is a workflow
-    that reports green having published nothing.
+    """A rename on either side of the `build` / publish boundary makes
+    `download-artifact` fetch nothing. The publish job then runs against an
+    empty `dist/`, and `pypa/gh-action-pypi-publish` over zero files is a
+    workflow that reports green having published nothing.
+
+    Checked for every publishing job: five jobs each download the artifact
+    now, so a rename that was one edit is five, and getting four of them right
+    is the version of this bug that publishes most of a release.
     """
     document = _release_workflow()
     upload = _find_step(
@@ -630,40 +880,59 @@ def test_the_release_workflow_uploads_and_downloads_the_same_artifact_name():
         lambda s: s.get("uses", "").startswith("actions/upload-artifact"),
         "upload-artifact step",
     )
-    download = _find_step(
-        document["jobs"]["publish"]["steps"],
-        lambda s: s.get("uses", "").startswith("actions/download-artifact"),
-        "download-artifact step",
-    )
-    assert upload["with"]["name"] == download["with"]["name"], (
-        "build must upload the exact artifact name publish downloads"
-    )
+    jobs = _publish_jobs(document)
+    assert jobs, "the release workflow must actually publish something"
+
+    for name, job in jobs.items():
+        download = _find_step(
+            job["steps"],
+            lambda s: s.get("uses", "").startswith("actions/download-artifact"),
+            f"download-artifact step in {name}",
+        )
+        assert upload["with"]["name"] == download["with"]["name"], (
+            f"job {name!r} downloads {download['with']['name']!r}, but build uploads "
+            f"{upload['with']['name']!r}"
+        )
 
 
 def test_the_release_workflow_only_triggers_on_version_tags():
-    """YAML 1.1's bareword booleans mean `on:` parses under `yaml.safe_load`
-    to the boolean key `True`, not the string `"on"` -- a trap for anyone
-    reading this trigger back out with `document["on"]`, which raises
-    `KeyError` and checks nothing. A bare `document[True]` is no better: it
-    swaps one unexplained `KeyError` for another, in the same file whose own
-    docstring argues against exactly that failure mode. Quoting the key as
-    `"on":` in the workflow -- valid YAML, identical to what GitHub Actions
-    parses, and what `yamllint`'s `truthy` rule tells people to do -- would
-    trip either bare lookup; `.get` against both keys, plus an explaining
-    assert, does not.
+    """Firing on a branch push instead of a tag push would let CI attempt to
+    publish on every commit merged to a branch, and publishing is irreversible
+    per version. `push:` must carry `tags:` and nothing else -- a `branches:`
+    key added alongside is the whole failure, and it is invisible to a check
+    that only reads `tags`.
 
-    Firing on a branch push instead of a tag push would let CI attempt to
-    publish on every commit merged to a branch, and publishing is
-    irreversible per version.
+    `_triggers()` explains why the `on:` block is not read as `document["on"]`.
     """
-    document = _release_workflow()
-    trigger = document.get(True, document.get("on"))
-    assert trigger is not None, (
-        "release.yml has no `on:` trigger under either the YAML-1.1 boolean "
-        "key or a literal string 'on' key"
-    )
-    assert isinstance(trigger, dict) and trigger.get("push", {}).get("tags") == ["v*"], (
+    trigger = _triggers()
+    assert trigger.get("push", {}).get("tags") == ["v*"], (
         "release must trigger only on pushes of version tags (on: push: tags: ['v*'])"
+    )
+    assert set(trigger["push"]) == {"tags"}, (
+        f"release's push trigger also carries {sorted(set(trigger['push']) - {'tags'})}; "
+        "publishing must not fire on a branch push"
+    )
+
+
+def test_the_release_workflow_can_be_re_run_by_hand_against_the_same_tag():
+    """PyPI caps an account at three *pending* trusted publishers at a time,
+    and this project publishes five packages, so its first release cannot go
+    out in one run: three publish, two fail for want of a publisher, those two
+    get registered, and the same tag has to run again.
+
+    Without `workflow_dispatch` the only way to run a tag again is to delete
+    and re-push it -- which moves the tag off the commit that was actually
+    built, and is exactly the silent-skip case
+    `test_the_release_workflow_warns_before_a_silent_skip` exists for.
+    Dispatching selects a ref, and a tag is a ref, so `GITHUB_REF_NAME` is the
+    tag's short name and the tag/version gate reads the same string a push
+    gives it; `skip-existing: true` makes round two a no-op for everything
+    round one already published.
+    """
+    trigger = _triggers()
+    assert "workflow_dispatch" in trigger, (
+        "release must be runnable by hand against a tag, or round two of a split first "
+        "release has to delete and re-push the tag to happen at all"
     )
 
 
@@ -672,6 +941,12 @@ def test_the_release_workflow_checks_the_tag_matches_the_version_before_publishi
     knows what version every package believes it is. Publishing a tag that
     disagrees with the tree ships a version number the tag on GitHub and the
     version on PyPI will forever disagree about.
+
+    It reads `GITHUB_REF_NAME`, which is the short name of whatever ref
+    started the run -- the tag on a tag push, and the tag again on a
+    `workflow_dispatch` aimed at one, so round two of a split release is
+    gated identically. A dispatch aimed at a branch arrives here with a branch
+    name and fails, which is the correct answer.
     """
     document = _release_workflow()
     check = _find_step(
@@ -682,34 +957,55 @@ def test_the_release_workflow_checks_the_tag_matches_the_version_before_publishi
     assert "read_versions" in check["run"], (
         "the tag/version gate must actually compare against tools.version.read_versions"
     )
+    assert "GITHUB_REF_NAME" in check["run"], (
+        "the tag/version gate must read the ref the run was started against"
+    )
 
 
 def test_the_release_meta_package_publishes_last():
-    """`pypa/gh-action-pypi-publish` runs one `twine upload` per step here,
-    sequentially, aborting on the first failure. `openrackscreen` pins
-    `ors-daemon` and `ors-server`; if it published before either, a failure
-    partway through would leave a meta-package on PyPI pinning a dependency
-    that never made it there -- a version that can never resolve and, once
-    published, can never be re-uploaded. Every package with dependents must
-    publish after all of them.
+    """`openrackscreen` pins `ors-daemon==` and `ors-server==`; if it published
+    before either, a failure partway through would leave a meta-package on
+    PyPI pinning a dependency that never made it there -- a version that can
+    never resolve and, once published, can never be re-uploaded. Every package
+    with dependents must publish after all of them.
+
+    Asserted on the *job* graph, not on step order. The five uploads used to
+    be five sequential steps of one job, where order was a list index; they
+    are five jobs now, one per trusted-publishing environment, and their order
+    is `needs:`. Reachability rather than direct membership, because
+    `publish-ors-daemon` names only `publish-ors-render` and still runs after
+    `publish-ors-schema` through it. The final loop is the other direction of
+    "last": nothing may be waiting on the meta-package, which is what a
+    re-chained graph that merely kept it at the bottom of the file would
+    otherwise pass.
     """
     document = _release_workflow()
-    publish_steps = [
-        step
-        for step in document["jobs"]["publish"]["steps"]
-        if step.get("uses", "").startswith("pypa/gh-action-pypi-publish")
-    ]
-    assert publish_steps, "publish must actually publish something"
+    jobs = _publish_jobs(document)
+    assert jobs, "the release workflow must actually publish something"
 
-    order = [step["with"]["packages-dir"].strip("/").rsplit("/", 1)[-1] for step in publish_steps]
-    assert order[-1] == "openrackscreen", "the meta-package must publish last"
-    assert order.index("ors-schema") < order.index("ors-render"), (
+    by_package = {_package_published_by(name, job): name for name, job in jobs.items()}
+    assert set(by_package) == set(PACKAGES), (
+        f"the publish jobs cover {sorted(by_package)}, expected {sorted(PACKAGES)}"
+    )
+
+    def publishes_after(dependent: str, dependency: str) -> bool:
+        return by_package[dependency] in _must_run_before(document, by_package[dependent])
+
+    assert publishes_after("ors-render", "ors-schema"), (
         "ors-render depends on ors-schema and must publish after it"
     )
     for dependent in ("ors-daemon", "ors-server"):
-        assert order.index("ors-render") < order.index(dependent), (
+        assert publishes_after(dependent, "ors-render"), (
             f"{dependent} depends on ors-render and must publish after it"
         )
-        assert order.index(dependent) < order.index("openrackscreen"), (
+        assert publishes_after("openrackscreen", dependent), (
             f"openrackscreen depends on {dependent} and must publish after it"
+        )
+
+    meta = by_package["openrackscreen"]
+    for package, name in by_package.items():
+        if package == "openrackscreen":
+            continue
+        assert meta not in _must_run_before(document, name), (
+            f"{package} waits on the meta-package; openrackscreen must publish last"
         )

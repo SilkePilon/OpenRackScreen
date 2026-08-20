@@ -10,9 +10,24 @@ name: release
 # version -- so no prerelease tag can pass that check today. That is
 # deliberate: if prereleases are ever wanted, fix the comparison, not this
 # glob.
+#
+# `workflow_dispatch` is not a convenience trigger. PyPI caps an account at
+# three *pending* trusted publishers at a time, so the first release of five
+# packages has to go out in two rounds: push the tag, watch the two packages
+# that have no publisher yet fail, register them, run the same tag again.
+# Without a manual trigger the only way to "run again" is to delete and
+# re-push the tag -- which moves the tag off the commit that was actually
+# built and is exactly the silent-skip case "Warn about packages already
+# published at this version" below exists to make visible. Dispatching picks
+# a ref, and a tag is a ref: `GITHUB_REF_NAME` is then the tag's short name,
+# the same string a tag push gives it (confirmed against a real dispatched
+# run, not assumed), so the tag/version gate reads identically either way.
+# `skip-existing: true` on every publish step makes round two a no-op for
+# everything that already went out in round one.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -33,6 +48,14 @@ jobs:
       # line ran, cold, on every release run, since `enable-cache` is not set
       # on `setup-uv` above. This check needs only `tomllib` (stdlib) and
       # `packaging`, so it asks `uv` for exactly that and nothing else.
+      #
+      # `GITHUB_REF_NAME` is the branch-or-tag short name for whatever ref
+      # started the run, and that includes a `workflow_dispatch` aimed at a
+      # tag -- so a hand-run round two of a release reads the same tag name a
+      # tag push does. A dispatch aimed at a *branch* reaches this step with a
+      # branch name, fails the comparison, and never reaches `uv build`: the
+      # gate that stops a typo'd tag is the same one that stops a dispatch
+      # against `master`.
       - name: Check the tag matches the version in the tree
         run: |
           uv run --no-project --with packaging python - <<'PY'
@@ -107,9 +130,9 @@ jobs:
           print("no wheel names a local path")
           PY
 
-      # Sorted into one directory per package so `publish` below can upload
-      # each package as its own `twine` invocation, in dependency order,
-      # instead of one alphabetical `dist/*` glob. A single glob would upload
+      # Sorted into one directory per package so each `publish-*` job below can
+      # upload exactly its own package, in dependency order, instead of one
+      # alphabetical `dist/*` glob. A single glob would upload
       # `openrackscreen-*` before any `ors_*` file (alphabetically first) and,
       # since twine aborts on the first failure, could leave the meta-package
       # published while pinning two dependencies that never made it to PyPI --
@@ -146,55 +169,31 @@ jobs:
               raise SystemExit(f"built distributions matching no package: {leftover}")
           PY
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: distributions
-          path: dist/
-
-  publish:
-    needs: build
-    runs-on: ubuntu-latest
-    environment: release
-    # Trusted Publishing: PyPI verifies this workflow's OIDC identity, so no API
-    # token is stored in this repository and none can be stolen from it.
-    permissions:
-      id-token: write
-    steps:
-      # Both of these are for the warning step below, and neither is optional
-      # even though the five publishing steps under them need nothing from a
-      # checkout. That step is `uv run ... sys.path.insert(0, "tools"); from
-      # version import ...`, and on a bare runner there is no `tools/`, no
-      # pyproject to read a version out of, and no `uv` on PATH at all -- so it
-      # exited non-zero, and since it carries no `continue-on-error` the whole
-      # job failed and *none* of the five packages published. Its own comment
-      # says "It never fails the job itself", which was true of the script and
-      # false of the step.
+      # This lives in `build`, not in a publish job, and that is the whole
+      # reason the publish jobs below need neither `actions/checkout` nor
+      # `astral-sh/setup-uv`. It is `uv run ... sys.path.insert(0, "tools");
+      # from version import ...`: on a bare runner there is no `tools/`, no
+      # manifest to read a version out of, and no `uv` on PATH at all, so it
+      # exits non-zero -- and it carries no `continue-on-error`, so it failed
+      # the whole job and *none* of the five packages published. It ran in a
+      # job that had a checkout and a `uv` only because those two steps were
+      # added for it. Here both already exist for the build itself, and the
+      # publish jobs get to be a download and an upload and nothing else.
       #
-      # `checkout` before `download-artifact`, not after: `actions/checkout`
-      # cleans the workspace by default, so the other order deletes the `dist/`
-      # this job exists to upload.
-      - uses: actions/checkout@v5
-
-      - uses: astral-sh/setup-uv@v9.0.0
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: distributions
-          path: dist/
-
-      # `skip-existing: true` below (correct: it is what makes a rerun after a
-      # partial failure safe, rather than rejecting an already-published
-      # package as a duplicate) has one silent failure mode of its own:
-      # deleting and re-pushing a `v*` tag at a different commit, to "fix" a
-      # bug in a version that was already fully published, makes every upload
-      # below skip as a duplicate, this job report success, and PyPI keep
-      # serving the old artifacts -- with nothing in this log saying so. This
-      # step cannot stop that -- nothing after a tag exists can -- but it
-      # makes that run's log visibly different from an ordinary publish, by
-      # naming exactly what is about to be skipped and why, before any of the
-      # five uploads below run. It never fails the job itself: a partial
-      # resume, or a PyPI hiccup answering this check, must not block a
-      # publish that would otherwise succeed.
+      # What it is for: `skip-existing: true` below (correct -- it is what
+      # makes a rerun after a partial failure safe, rather than rejecting an
+      # already-published package as a duplicate) has one silent failure mode
+      # of its own. Deleting and re-pushing a `v*` tag at a different commit,
+      # to "fix" a bug in a version that was already fully published, makes
+      # every upload skip as a duplicate, every publish job report success,
+      # and PyPI keep serving the old artifacts -- with nothing in the log
+      # saying so. This step cannot stop that -- nothing after a tag exists
+      # can -- but it makes that run's log visibly different from an ordinary
+      # publish, by naming exactly what is about to be skipped and why, before
+      # the artifact this whole workflow hands to the publish jobs even
+      # exists. It never fails the job itself: a partial resume, or a PyPI
+      # hiccup answering this check, must not block a publish that would
+      # otherwise succeed.
       - name: Warn about packages already published at this version
         run: |
           uv run --no-project --with packaging python - <<'PY'
@@ -241,35 +240,129 @@ jobs:
               print("nothing below is already on PyPI at this version")
           PY
 
-      # One `twine upload` per package, in dependency order, leaves first and
-      # the meta-package last: `ors-daemon` and `ors-server` both pin
-      # `ors-schema` and `ors-render`, and `openrackscreen` pins both of them.
-      # This is not atomic -- nothing here can be, once a tag exists -- but it
-      # means every prefix of a partial run is still a *valid* set: nothing
-      # that depends on an unpublished pin is ever uploaded ahead of it.
-      # `skip-existing` makes a rerun after a partial failure safe: packages
-      # already on PyPI are silently skipped rather than rejected. See the
-      # step above for the silent-skip case that setting cannot cover.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+
+  # One job per package, not one job with five upload steps, and each with its
+  # own `environment:`. This is a PyPI constraint, not a style choice. Trusted
+  # Publishing keys a *pending* publisher on the whole tuple -- owner,
+  # repository, workflow filename, environment name -- and that tuple has to be
+  # unique, because the OIDC token a workflow presents is identical no matter
+  # which package it is uploading. With five pending publishers registered
+  # against one `environment: release`, PyPI cannot tell which project a token
+  # is claiming, so registering the second package is refused outright:
+  # "A pending trusted publisher matching this configuration has already been
+  # registered for a different project name." Five packages therefore need five
+  # environments. The five names below already exist on this repository with no
+  # protection rules, and three of them are already registered on PyPI against
+  # exactly these strings -- renaming one silently invalidates its publisher.
+  #
+  # `needs:` chains them into the dependency order the five sequential steps
+  # used to get for free, and that order is the reason this workflow has
+  # per-package steps at all rather than one `dist/*` glob. `ors-daemon` and
+  # `ors-server` both pin `ors-schema` and `ors-render`; `openrackscreen` pins
+  # `ors-daemon==0.2.0` and `ors-server==0.2.0`. Publishing the meta-package
+  # ahead of either would leave a version on PyPI that can never resolve and,
+  # once published, can never be re-uploaded. This is not atomic -- nothing
+  # here can be, once a tag exists -- but it means every prefix of a partial
+  # run is still a *valid* set: nothing that depends on an unpublished pin is
+  # ever uploaded ahead of it. `skip-existing: true` on every job is what makes
+  # the rerun after a partial failure safe, and it is what makes the two-round
+  # first release safe: round two re-uploads nothing round one already
+  # published. See "Warn about packages already published at this version" in
+  # `build` for the one silent-skip case that setting cannot cover.
+  #
+  # No `actions/checkout` and no `astral-sh/setup-uv` in any of these jobs:
+  # nothing in them reads the repository. `download-artifact` writes `dist/`
+  # into the workspace, and `actions/checkout` cleans that workspace by
+  # default -- so a checkout added here later, after the download, would
+  # delete the very files the job exists to upload.
+  #
+  # Trusted Publishing: PyPI verifies this workflow's OIDC identity, so no API
+  # token is stored in this repository and none can be stolen from it. That is
+  # what `permissions: id-token: write` is for, and it is per-job: a publish
+  # job without it has no token to present and cannot upload at all.
+  publish-ors-schema:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release-ors-schema
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
       - name: Publish ors-schema
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/ors-schema/
           skip-existing: true
+
+  publish-ors-render:
+    needs: publish-ors-schema
+    runs-on: ubuntu-latest
+    environment: release-ors-render
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
       - name: Publish ors-render
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/ors-render/
           skip-existing: true
+
+  publish-ors-daemon:
+    needs: publish-ors-render
+    runs-on: ubuntu-latest
+    environment: release-ors-daemon
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
       - name: Publish ors-daemon
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/ors-daemon/
           skip-existing: true
+
+  publish-ors-server:
+    needs: publish-ors-render
+    runs-on: ubuntu-latest
+    environment: release-ors-server
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
       - name: Publish ors-server
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/ors-server/
           skip-existing: true
+
+  publish-openrackscreen:
+    needs: [publish-ors-daemon, publish-ors-server]
+    runs-on: ubuntu-latest
+    environment: release-openrackscreen
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
       - name: Publish openrackscreen
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
