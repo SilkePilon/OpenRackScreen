@@ -21,6 +21,7 @@ was missing.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import ifaddr
@@ -289,13 +290,29 @@ class StubAnnouncer:
         self.version = version
         self.starts = 0
         self.stops = 0
+        # Whether each call arrived on a thread that had a *running* asyncio
+        # loop in it. See `test_the_lifespan_never_calls_zeroconf_on_the_event
+        # _loop_thread` for why that is the one thing about these calls that
+        # decides whether a real deployment ever announces.
+        self.start_on_loop_thread: bool | None = None
+        self.stop_on_loop_thread: bool | None = None
         StubAnnouncer.built.append(self)
+
+    @staticmethod
+    def _on_loop_thread() -> bool:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        return True
 
     def start(self) -> None:
         self.starts += 1
+        self.start_on_loop_thread = self._on_loop_thread()
 
     def stop(self) -> None:
         self.stops += 1
+        self.stop_on_loop_thread = self._on_loop_thread()
 
 
 @pytest.fixture
@@ -319,6 +336,47 @@ def test_the_app_announces_while_it_is_serving_and_stops_when_it_stops(
         assert (announcers[0].starts, announcers[0].stops) == (1, 0)
 
     assert (announcers[0].starts, announcers[0].stops) == (1, 1)
+
+
+def test_the_lifespan_never_calls_zeroconf_on_the_event_loop_thread(
+    monkeypatch, tmp_path, announcers
+):
+    """The bug that made every real deployment silent while this file stayed green.
+
+    `Announcer.start` calls `Zeroconf.register_service`, which is python-
+    zeroconf's *synchronous* facade. Handed a thread that already has a running
+    asyncio loop -- which is precisely what an `@asynccontextmanager` lifespan
+    is -- zeroconf adopts that loop as its own, then does
+    `asyncio.run_coroutine_threadsafe(...).result(timeout)` from inside it. The
+    call blocks the one loop the coroutine it just scheduled needs in order to
+    run, so registration cannot complete by construction: ~10s later it raises
+    `EventLoopBlocked`, `announce_while_serving` catches it, logs a warning, and
+    the server comes up having announced nothing at all.
+
+    Nothing in this suite could see it, because every test here substitutes the
+    responder. Measured against a real one: 1.7s to register from an ordinary
+    thread, `EventLoopBlocked` every time from inside a running loop -- in a
+    checkout, in the image under `compose.mdns.yaml`, and therefore in the unit
+    `ors-server install` writes, all three of which set `ORS_ANNOUNCE=1` and
+    none of which announced.
+
+    So this asserts the property rather than the mechanism: whatever the
+    lifespan does, the responder must be touched from a thread with no running
+    loop in it. `stop` as well as `start` -- `unregister_service` goes through
+    the same `run_coro_with_timeout`, and a withdrawal that times out leaves a
+    record on the network naming a port nothing is listening on.
+    """
+    monkeypatch.delenv("ORS_ANNOUNCE", raising=False)
+
+    with TestClient(create_app(AppSettings(data_dir=tmp_path, port=9123))) as client:
+        assert client.get("/api/health").status_code == 200
+        assert announcers[0].start_on_loop_thread is False, (
+            "start ran on the event loop thread; zeroconf deadlocks itself there"
+        )
+
+    assert announcers[0].stop_on_loop_thread is False, (
+        "stop ran on the event loop thread; the withdrawal times out the same way"
+    )
 
 
 def test_the_app_announces_the_port_it_was_told_to_serve_on(monkeypatch, tmp_path, announcers):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -319,11 +320,28 @@ async def announce_while_serving(app: FastAPI) -> AsyncIterator[None]:
     URL` on the daemon as its documented alternative, so a failure is a warning
     naming what went wrong and a server that comes up anyway. The same applies
     on the way out, where the process is leaving regardless.
+
+    **`asyncio.to_thread`, and it is not about latency.** `Announcer.start`
+    calls `Zeroconf.register_service` -- python-zeroconf's *synchronous*
+    facade. Called from a thread that already has a running asyncio loop, which
+    is exactly what this function is, zeroconf adopts that loop as its own and
+    then does `asyncio.run_coroutine_threadsafe(...).result(timeout)` from
+    inside it: the call blocks the one loop the coroutine it just scheduled
+    needs in order to run. Registration cannot complete by construction. It
+    raises `EventLoopBlocked` about ten seconds later, the `except` below
+    catches it, and the server comes up having announced nothing -- silently,
+    to everything except a warning nobody reads, in every deployment that turns
+    announcing on. Handing both calls to a worker thread gives zeroconf a
+    thread with no loop in it, where it starts one of its own in the background
+    the way it is designed to; measured, that is 1.7s to register instead of a
+    guaranteed timeout. `stop` goes the same way for the same reason: an
+    `unregister_service` that times out leaves a record on the network naming a
+    port nothing is listening on.
     """
     announcer = getattr(app.state, "announcer", None)
     if announcer is not None:
         try:
-            announcer.start()
+            await asyncio.to_thread(announcer.start)
         except Exception:
             log.warning("could not announce this server over mDNS", exc_info=True)
     try:
@@ -331,7 +349,7 @@ async def announce_while_serving(app: FastAPI) -> AsyncIterator[None]:
     finally:
         if announcer is not None:
             try:
-                announcer.stop()
+                await asyncio.to_thread(announcer.stop)
             except Exception:
                 log.warning("could not withdraw the mDNS announcement", exc_info=True)
 
