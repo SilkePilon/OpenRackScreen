@@ -84,6 +84,28 @@ function waiting(hostname: string) {
   return within(screen.getByRole("region", { name: hostname }))
 }
 
+/**
+ * One `<Fact>`'s `<dt>`/`<dd>` pair, as the element that holds both.
+ *
+ * **Reading a value *under its label* is the thing this suite could not do**,
+ * and it is the one comparison the whole milestone rests on. Every assertion
+ * here used to be a card-scoped `getByText(value)`, which finds the string
+ * wherever in the card it sits -- so swapping the bodies of
+ * `<Fact label="Short code">` and `<Fact label="Daemon version">` in
+ * `PendingClaims.tsx` left 173 of 173 tests passing while the admin read
+ * `0.2.0` under "Short code" and approved a rack against a version number.
+ *
+ * `closest("div")` is the `Fact` wrapper (`<div className="grid gap-0.5">`),
+ * which is the nearest ancestor of both halves; the label itself is a `<dt>`,
+ * so there is no closer one to catch by accident.
+ */
+function fact(card: ReturnType<typeof within>, label: string): HTMLElement {
+  const term = card.getByText(label)
+  const pair = term.closest("div")
+  if (pair === null) throw new Error(`the "${label}" fact has no wrapper`)
+  return pair
+}
+
 afterEach(() => {
   // Real timers first: React Testing Library's automatic cleanup unmounts the
   // tree after this hook, and unmounting under a frozen clock is how a pending
@@ -127,20 +149,45 @@ describe("the racks waiting to join", () => {
 
     expect(await screen.findByRole("heading", { name: /waiting to join/i })).toBeInTheDocument()
 
-    const shed = waiting(SHED.hostname)
-    expect(shed.getByText(SHED.address)).toBeInTheDocument()
-    expect(shed.getByText(SHED.short_code)).toBeInTheDocument()
-    expect(shed.getByText(SHED.version)).toBeInTheDocument()
-    // When it was first seen, as the instant the server recorded, written the
-    // way every other timestamp in this interface is written -- so the row
+    // Each value **under its own label**, not merely somewhere on the card.
+    // The short code is the one an admin compares against the Pi, and a card
+    // that printed the daemon version under that label -- which every
+    // `getByText` here used to accept -- is the whole gate defeated by a
+    // two-line swap. The timestamp is the instant the server recorded, written
+    // the way every other timestamp in this interface is written, so the row
     // lines up with the server's log and the Pi's.
-    expect(shed.getByText("2026-08-20T09:14:07Z")).toBeInTheDocument()
+    const shed = waiting(SHED.hostname)
+    expect(fact(shed, "Short code")).toHaveTextContent(SHED.short_code)
+    expect(fact(shed, "Asked from")).toHaveTextContent(SHED.address)
+    expect(fact(shed, "Daemon version")).toHaveTextContent(SHED.version)
+    expect(fact(shed, "First seen")).toHaveTextContent("2026-08-20T09:14:07Z")
 
     const barn = waiting(BARN.hostname)
-    expect(barn.getByText(BARN.address)).toBeInTheDocument()
-    expect(barn.getByText(BARN.short_code)).toBeInTheDocument()
-    expect(barn.getByText(BARN.version)).toBeInTheDocument()
-    expect(barn.getByText("2026-08-20T09:41:52Z")).toBeInTheDocument()
+    expect(fact(barn, "Short code")).toHaveTextContent(BARN.short_code)
+    expect(fact(barn, "Asked from")).toHaveTextContent(BARN.address)
+    expect(fact(barn, "Daemon version")).toHaveTextContent(BARN.version)
+    expect(fact(barn, "First seen")).toHaveTextContent("2026-08-20T09:41:52Z")
+
+    // And no fact holds a value that belongs to a different one. The four
+    // assertions above are each satisfied by a card that also shows the code
+    // in the version's place, so this is what refuses a permutation: no two
+    // fixture values are equal or substrings of each other (see the fixture).
+    for (const [label, mine] of [
+      ["Short code", SHED.short_code],
+      ["Asked from", SHED.address],
+      ["Daemon version", SHED.version],
+      ["First seen", "2026-08-20T09:14:07Z"],
+    ] as const) {
+      for (const other of [
+        SHED.short_code,
+        SHED.address,
+        SHED.version,
+        "2026-08-20T09:14:07Z",
+      ]) {
+        if (other === mine) continue
+        expect(fact(shed, label)).not.toHaveTextContent(other)
+      }
+    }
 
     // And each entry carries only its own. Two rows drawn from one claim, or
     // from index 0 twice, passes every positive assertion above.
@@ -174,8 +221,28 @@ describe("the racks waiting to join", () => {
     // The code itself -- this claim's, not the other one's. It is the only
     // thing that makes the click mean anything, so its absence is the defect
     // this assertion exists for.
-    expect(dialog.getByText(BARN.short_code)).toBeInTheDocument()
+    const code = dialog.getByText(BARN.short_code)
+    expect(code).toBeInTheDocument()
     expect(dialog.queryByText(SHED.short_code)).not.toBeInTheDocument()
+
+    // **And large.** Spec S7 asks for it "large", and until this assertion
+    // existed that word was pinned by presence alone: replacing
+    // `text-3xl tracking-[0.35em]` with `text-[8px] tracking-normal` left 173
+    // of 173 passing, and six characters set in 8px is not a thing anyone
+    // compares against a Pi across a rack room. Asserted as classes rather
+    // than as computed pixels because Tailwind's stylesheet is not loaded in
+    // jsdom, so a computed `font-size` here would read the browser default for
+    // every possible value and could never fail.
+    expect(code).toHaveClass("text-3xl")
+    expect(code).toHaveClass("tracking-[0.35em]")
+
+    // Under its own label, for `PendingClaims`'s reason: this is the string an
+    // admin compares, and a dialog that put the hostname or the version here
+    // would satisfy every assertion above that only asks whether the code is
+    // somewhere in the dialog.
+    expect(dialog.getByText(/the code this rack sent/i).closest("div")).toHaveTextContent(
+      BARN.short_code,
+    )
 
     // What to do with it, and what happens if you do not. Spec S6.4 asks for
     // this sentence in these words.
@@ -476,6 +543,14 @@ describe("the racks waiting to join", () => {
     expect(screen.queryByRole("region", { name: BARN.hostname })).not.toBeInTheDocument()
     expect(asked).toBe(1)
 
+    // **Ten seconds, the literal.** `CLAIMS_POLL_MS + 500` alone is
+    // tautological -- the test imports the constant, so `10_000 -> 600_000`
+    // survived it and every other test in this suite, while the demonstration
+    // spec S7 describes (an admin with this page open, somebody plugging a Pi
+    // in) waited ten minutes for the card to appear. What the interval *is*
+    // has to be asserted somewhere, and this is the test that depends on it.
+    expect(CLAIMS_POLL_MS).toBe(10_000)
+
     await act(async () => {
       await vi.advanceTimersByTimeAsync(CLAIMS_POLL_MS + 500)
     })
@@ -536,6 +611,11 @@ describe("the racks waiting to join", () => {
     // and long enough that a refetch provoked by the message above would have
     // landed by now.
     filed = true
+    // Two seconds, the literal, for `CLAIMS_POLL_MS`'s reason above: advancing
+    // by `CLAIMS_FRESH_MS + 500` agrees with any value the constant takes, so
+    // the window that decides whether a page load pays for two reads of a
+    // route that writes was pinned by nothing.
+    expect(CLAIMS_FRESH_MS).toBe(2_000)
     await act(async () => {
       await vi.advanceTimersByTimeAsync(CLAIMS_FRESH_MS + 500)
     })
