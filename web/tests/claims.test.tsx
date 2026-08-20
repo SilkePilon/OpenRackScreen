@@ -518,8 +518,23 @@ describe("the racks waiting to join", () => {
     expect(await screen.findByRole("heading", { name: "pi-loft" })).toBeInTheDocument()
     await waitFor(() => expect(asked).toBe(1))
 
+    // First, what the server really does the instant this socket is accepted:
+    // `ws_ui.py` sends `daemons` on open. The list was read on mount a moment
+    // ago, so re-reading it here would make every load of this page pay for two
+    // reads of a route whose first act is the claim table's expiry sweep -- a
+    // SQLite write transaction each. It must not, and this is the pin on that.
+    //
+    // The last socket, not the first: StrictMode builds, closes and replaces
+    // the provider's client before anything a test does.
+    const live = sockets.at(-1)
+    if (live === undefined) throw new Error("the interface dialled nothing")
+    act(() => live.accept())
+    act(() => live.deliver(JSON.stringify({ type: "daemons", online: [17] })))
+
     // The rack files its claim, and the page is still right about what it last
-    // read. Well short of the interval, so nothing below can be the interval.
+    // read. Well short of the interval, so nothing below can be the interval --
+    // and long enough that a refetch provoked by the message above would have
+    // landed by now.
     filed = true
     await act(async () => {
       await vi.advanceTimersByTimeAsync(CLAIMS_FRESH_MS + 500)
@@ -527,12 +542,10 @@ describe("the racks waiting to join", () => {
     expect(screen.queryByRole("region", { name: SHED.hostname })).not.toBeInTheDocument()
     expect(asked).toBe(1)
 
-    // The last socket, not the first: StrictMode builds, closes and replaces
-    // the provider's client before anything a test does.
-    const live = sockets.at(-1)
-    if (live === undefined) throw new Error("the interface dialled nothing")
-    act(() => live.accept())
-    act(() => live.deliver(JSON.stringify({ type: "daemons", online: [17] })))
+    // Now the same message again, with the answer no longer fresh: the rack
+    // that was approved has collected its key and dialled in, which is the
+    // moment this wire exists for.
+    act(() => live.deliver(JSON.stringify({ type: "daemons", online: [17, 61] })))
 
     expect(
       await screen.findByRole("region", { name: SHED.hostname }),
