@@ -3,7 +3,12 @@ import userEvent from "@testing-library/user-event"
 import { http, HttpResponse } from "msw"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import type { Daemon, PendingClaim } from "../src/api/queries"
+import {
+  CLAIMS_FRESH_MS,
+  CLAIMS_POLL_MS,
+  type Daemon,
+  type PendingClaim,
+} from "../src/api/queries"
 import { collectSockets, type FakeSocket } from "./fake-socket"
 import { server } from "./msw"
 import { renderApp } from "./render"
@@ -80,6 +85,10 @@ function waiting(hostname: string) {
 }
 
 afterEach(() => {
+  // Real timers first: React Testing Library's automatic cleanup unmounts the
+  // tree after this hook, and unmounting under a frozen clock is how a pending
+  // effect becomes a test that hangs rather than a test that fails.
+  vi.useRealTimers()
   vi.unstubAllGlobals()
 })
 
@@ -189,13 +198,22 @@ describe("the racks waiting to join", () => {
     expect(dialog.getByText(/already seen/i)).toBeInTheDocument()
   })
 
-  it("approves the claim it named, and that entry leaves the list", async () => {
+  it("approves the claim it named, and that entry becomes a rack on the page", async () => {
     // Two waiting racks, so "it approved a rack" and "it approved *this* rack"
     // are different outcomes. pi-barn is the one confirmed; pi-shed must stay.
     const approved: string[] = []
+    // And the racks the server holds, which an approval really adds to: two
+    // before the click and three after. This is the half that cannot be left
+    // out. An approval that only re-read the claims would make the card vanish
+    // and put nothing in its place -- and nothing else on this page could put
+    // it there afterwards, because `LiveProvider.withOnline` maps over the rows
+    // the cache already holds, so a rack that did not exist a moment ago never
+    // enters the daemon list from the socket. The user would be left looking at
+    // the visible end of this whole flow having silently not happened.
+    const racks = [rack(17, "pi-loft"), rack(42, "pi-cellar")]
     server.use(
       SIGNED_IN,
-      RACKS,
+      http.get("/api/daemons", () => HttpResponse.json(racks)),
       NO_EVENTS,
       // The claim really goes, so the list after the click is the list the
       // invalidation asks for rather than a fixture that pretends.
@@ -206,6 +224,9 @@ describe("the racks waiting to join", () => {
       ),
       http.post("/api/claims/:fingerprint/approve", ({ params }) => {
         approved.push(String(params.fingerprint))
+        // What the route does: creates the rack. From here on the daemon
+        // listing has it, exactly as the server's would.
+        racks.push(rack(61, BARN.hostname))
         return HttpResponse.json({ id: 61, name: BARN.hostname })
       }),
     )
@@ -223,11 +244,119 @@ describe("the racks waiting to join", () => {
     // the other one's, not the hostname, and not the short code, all three of
     // which are strings a component could have reached for instead.
     await waitFor(() => expect(approved).toEqual([BARN.fingerprint]))
-    await waitFor(() =>
-      expect(screen.queryByRole("region", { name: BARN.hostname })).not.toBeInTheDocument(),
-    )
-    expect(screen.getByRole("region", { name: SHED.hostname })).toBeInTheDocument()
+
+    // The rack that claim became, on the page, with nobody navigating. Asked
+    // for as a *rack* card rather than by name: from now on the name is
+    // ambiguous by design -- a claim card and a rack card would both answer to
+    // it -- and `RackCard`'s heading is an `h2` where `ClaimCard`'s is an `h3`.
+    expect(
+      await screen.findByRole("heading", { name: BARN.hostname, level: 2 }),
+    ).toBeInTheDocument()
+
+    // And the entry left the waiting list, which is the other half.
+    const stillWaiting = within(screen.getByRole("region", { name: /waiting to join/i }))
+    expect(stillWaiting.queryByRole("heading", { name: BARN.hostname })).not.toBeInTheDocument()
+    expect(stillWaiting.getByRole("heading", { name: SHED.hostname })).toBeInTheDocument()
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+  })
+
+  it("says what a refusal that is not a name collision actually said", async () => {
+    server.use(
+      SIGNED_IN,
+      RACKS,
+      NO_EVENTS,
+      claims([SHED, BARN]),
+      // Not a 409. There is no remedy behind this one and no rack to go and
+      // rename: something on the server could not write, and the only honest
+      // thing to draw is what it said.
+      http.post("/api/claims/:fingerprint/approve", () =>
+        HttpResponse.json({ detail: "the database is locked" }, { status: 500 }),
+      ),
+    )
+    renderApp({ at: "/daemons" })
+
+    expect(await screen.findByRole("heading", { name: /waiting to join/i })).toBeInTheDocument()
+    await userEvent.click(waiting(SHED.hostname).getByRole("button", { name: "Approve" }))
+    await userEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", {
+        name: "Approve this rack",
+      }),
+    )
+
+    // Something is said at all. A refusal that rendered nothing leaves a dialog
+    // that looks as though the button did not work.
+    const dialog = within(await screen.findByRole("dialog"))
+    const refusal = await dialog.findByRole("alert")
+    expect(refusal).toHaveTextContent("the database is locked")
+
+    // And it is not the collision sentence. That one names a rack to go and
+    // rename, which here would be a rack that does not exist and an admin sent
+    // to do the wrong thing about a database that could not be written.
+    expect(document.body).not.toHaveTextContent(/another rack/i)
+    expect(document.body).not.toHaveTextContent(/rename/i)
+
+    // Still up, still asking about the same claim.
+    expect(dialog.getByRole("button", { name: "Approve this rack" })).toBeInTheDocument()
+    expect(dialog.getByRole("heading", { name: `Approve ${SHED.hostname}?` })).toBeInTheDocument()
+  })
+
+  it("says so when the waiting list cannot be read, rather than looking empty", async () => {
+    server.use(
+      SIGNED_IN,
+      RACKS,
+      NO_EVENTS,
+      http.get("/api/claims", () =>
+        HttpResponse.json({ detail: "the claims table could not be read" }, { status: 500 }),
+      ),
+    )
+    renderApp({ at: "/daemons" })
+
+    // A failed read drawn as nothing is a page that looks exactly like "nothing
+    // is waiting" while the rack somebody is standing next to is invisible.
+    const refusal = await screen.findByRole("alert")
+    expect(refusal).toHaveTextContent("the claims table could not be read")
+    // And it says what the consequence is, rather than only that something broke.
+    expect(refusal).toHaveTextContent(/would not be shown/i)
+
+    // Without promising a section behind it: an `Alert` is a `role="alert"`
+    // div, not a landmark, so there is no "Waiting to join" region to enter.
+    expect(screen.queryByRole("region", { name: /waiting to join/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole("heading", { name: /waiting to join/i })).not.toBeInTheDocument()
+
+    // And the rest of the page is unharmed: the racks that did join are drawn.
+    expect(await screen.findByRole("heading", { name: "pi-loft" })).toBeInTheDocument()
+  })
+
+  it("leaves a refused denial on screen, in the server's own words", async () => {
+    server.use(
+      SIGNED_IN,
+      RACKS,
+      NO_EVENTS,
+      claims([SHED, BARN]),
+      http.post("/api/claims/:fingerprint/deny", () =>
+        HttpResponse.json({ detail: "the claim could not be removed" }, { status: 500 }),
+      ),
+    )
+    renderApp({ at: "/daemons" })
+
+    expect(await screen.findByRole("heading", { name: /waiting to join/i })).toBeInTheDocument()
+    await userEvent.click(waiting(BARN.hostname).getByRole("button", { name: "Deny" }))
+    await userEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "Deny this rack" }),
+    )
+
+    // A dialog that dismissed itself here would leave the claim on the page
+    // with nothing saying why it is still there.
+    const dialog = within(await screen.findByRole("dialog"))
+    expect(await dialog.findByRole("alert")).toHaveTextContent("the claim could not be removed")
+    expect(dialog.getByRole("button", { name: "Deny this rack" })).toBeInTheDocument()
+    expect(dialog.getByRole("heading", { name: `Deny ${BARN.hostname}?` })).toBeInTheDocument()
+    // And the claim is exactly as pending as it was. `hidden: true` because
+    // Radix marks everything behind an open modal `aria-hidden`, so the card is
+    // on the page but out of the accessibility tree until this dialog closes.
+    expect(
+      screen.getByRole("region", { name: BARN.hostname, hidden: true }),
+    ).toBeInTheDocument()
   })
 
   it("names the collision when an approval is refused for the hostname", async () => {
@@ -311,7 +440,56 @@ describe("the racks waiting to join", () => {
     expect(screen.getByRole("region", { name: BARN.hostname })).toBeInTheDocument()
   })
 
-  it("shows a claim that arrives while the page is open, without a reload", async () => {
+  it("shows a claim filed while the page is open, with nothing on the socket", async () => {
+    let filed = false
+    let asked = 0
+    server.use(
+      SIGNED_IN,
+      RACKS,
+      NO_EVENTS,
+      http.get("/api/claims", () => {
+        asked += 1
+        return HttpResponse.json(filed ? [BARN] : [])
+      }),
+    )
+    // The demonstration this section exists for: an admin with the page open, a
+    // network where nothing else is moving, and somebody plugging a Pi in. The
+    // server has no message for that -- `POST /api/racks/claims` is
+    // unauthenticated, touches no hub and wakes no browser, and `ws_ui.py`
+    // encodes only `frame` and `daemons` -- so **no socket is accepted and none
+    // is delivered to anywhere in this test**, and what has to put the entry on
+    // the page is the query's own interval.
+    //
+    // Fake timers, installed before the render so the interval React Query arms
+    // on subscribe is a fake one. `shouldAdvanceTime` keeps the clock moving
+    // with the real one, which is what lets MSW answer and `findBy*` resolve at
+    // all while the timers are frozen.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const sockets: FakeSocket[] = collectSockets()
+    renderApp({ at: "/daemons" })
+
+    expect(await screen.findByRole("heading", { name: "pi-loft" })).toBeInTheDocument()
+    await waitFor(() => expect(asked).toBe(1))
+
+    // The rack files its claim. Nothing on this page has been told.
+    filed = true
+    expect(screen.queryByRole("region", { name: BARN.hostname })).not.toBeInTheDocument()
+    expect(asked).toBe(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CLAIMS_POLL_MS + 500)
+    })
+
+    expect(await screen.findByRole("region", { name: BARN.hostname })).toBeInTheDocument()
+    expect(screen.getByText(BARN.short_code)).toBeInTheDocument()
+    expect(asked).toBeGreaterThan(1)
+    // And nothing arrived on a socket to do it. Every connection the interface
+    // dialled is still unopened, so no message can have been read from one.
+    expect(sockets.length).toBeGreaterThan(0)
+    expect(sockets.every((socket) => socket.state !== "open")).toBe(true)
+  })
+
+  it("re-reads the waiting list when the socket says the connected racks changed", async () => {
     let filed = false
     let asked = 0
     server.use(
@@ -323,6 +501,16 @@ describe("the racks waiting to join", () => {
         return HttpResponse.json(filed ? [SHED] : [])
       }),
     )
+    // The other half of "without a reload", and the one that matters at the end
+    // of this flow: an approved rack collects its key and dials in, the server
+    // says which racks are connected, and the list is re-read at once rather
+    // than up to a tick later.
+    //
+    // Fake timers because what this steps over is `CLAIMS_FRESH_MS`: the
+    // socket's invalidation is filtered on staleness, on purpose, so that the
+    // `daemons` message this socket sends the instant it opens does not make
+    // every load of this page pay for two reads of a route that writes.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
     // Stubbed before the render, because `AppShell` dials on mount.
     const sockets: FakeSocket[] = collectSockets()
     renderApp({ at: "/daemons" })
@@ -330,9 +518,12 @@ describe("the racks waiting to join", () => {
     expect(await screen.findByRole("heading", { name: "pi-loft" })).toBeInTheDocument()
     await waitFor(() => expect(asked).toBe(1))
 
-    // The rack files its claim. Nothing on this page has been told, and nothing
-    // here polls, so the page is still right about what it last read.
+    // The rack files its claim, and the page is still right about what it last
+    // read. Well short of the interval, so nothing below can be the interval.
     filed = true
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CLAIMS_FRESH_MS + 500)
+    })
     expect(screen.queryByRole("region", { name: SHED.hostname })).not.toBeInTheDocument()
     expect(asked).toBe(1)
 
@@ -348,8 +539,9 @@ describe("the racks waiting to join", () => {
     ).toBeInTheDocument()
     // Re-read from the server rather than patched here: no server state is
     // invented by this client, and the socket says nothing about what a claim
-    // contains.
-    expect(asked).toBeGreaterThan(1)
+    // contains. Exactly one further read, and the clock is still nowhere near
+    // the interval, so the message is what caused it.
+    expect(asked).toBe(2)
     expect(screen.getByText(SHED.short_code)).toBeInTheDocument()
   })
 

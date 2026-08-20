@@ -112,31 +112,44 @@ async function askWhetherTheSessionEnded(): Promise<SessionAnswer> {
 /**
  * Re-ask for the racks waiting to join, because something moved on the server.
  *
- * Design spec S7 requires that "a rack that appears while the page is open
- * appears without a reload", and names this socket as what does it. **What
- * carries it is the `daemons` message, because that is the only message this
- * socket has that is not a picture of one panel.** There is no `claim` frame:
- * `ws_ui.py` encodes exactly two types, and the route a rack files a claim
- * through is an unauthenticated `POST` that touches no hub and wakes no browser.
+ * **This is half of design spec S7's "appears without a reload", and the
+ * smaller half.** There is no `claim` message on this socket: `ws_ui.py` encodes
+ * exactly two types, `frame` and `daemons`, and the route a rack files a claim
+ * through is an unauthenticated `POST` that touches no hub and wakes no
+ * browser. So a claim filed on an otherwise quiet network cannot arrive here at
+ * all, and what covers that case is `useClaims`'s own interval. What this
+ * covers is the moment the server's set of connected racks changes -- which
+ * includes the end of this very flow, an approved rack collecting its key and
+ * dialling in -- and it is worth keeping because it makes that arrival
+ * immediate rather than up to one tick away.
  *
- * So this is honest about its reach and it is worth writing down rather than
- * discovering later. What it covers is every moment the server's set of
- * connected racks changes -- which includes the end of this very flow, a rack
- * that was approved collecting its key and dialling in, and every reconnect on
- * a site with more than one rack. What it does not cover is a claim filed on a
- * network where nothing else moves at all; that entry waits for the next
- * `daemons` message, or for this tab to be focused again, which is when React
- * Query re-asks a stale query on its own.
+ * **The `daemons` message is not reused as a claim message and must not be.**
+ * It means "these racks are online" and it is answered above by writing through
+ * `setQueryData` into the daemon cache; making a claim filed by anyone on the
+ * LAN drive that message would let an unauthenticated caller drive that write.
+ * All that happens here is that a list is marked worth re-reading.
  *
  * **Invalidated rather than patched**, for `useMutate`'s reason: no server state
  * is invented by this client. The message says which racks are online and
  * nothing whatever about what is waiting, so the only correct response to it is
- * to go and ask. It costs nothing on the pages that do not show the list --
- * `invalidateQueries` refetches observed queries, and the claims query is
- * mounted only by the Daemons page.
+ * to go and ask.
+ *
+ * **`stale: true`, which is not decoration.** `invalidateQueries` refetches an
+ * active query however old its answer is -- `refetchQueries` calls
+ * `query.fetch` and consults no staleness -- and the server sends a `daemons`
+ * message the moment this socket opens, a few hundred milliseconds after the
+ * Daemons page has already fetched the list on mount. Without the filter every
+ * load of that page pays for two reads of `GET /api/claims`, and each of those
+ * runs the claim table's expiry sweep, which is a SQLite write transaction. The
+ * window is `CLAIMS_FRESH_MS`, and it is short enough that the message this
+ * exists for still lands at once.
+ *
+ * It costs nothing on the pages that do not show the list: `invalidateQueries`
+ * refetches observed queries, and the claims query is mounted only by the
+ * Daemons page.
  */
 function theClaimsAreStale(queryClient: QueryClient): void {
-  void queryClient.invalidateQueries({ queryKey: claimsKey })
+  void queryClient.invalidateQueries({ queryKey: claimsKey, stale: true })
 }
 
 export function LiveProvider({ children }: { children: ReactNode }) {

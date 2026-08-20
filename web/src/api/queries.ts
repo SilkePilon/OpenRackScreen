@@ -76,19 +76,78 @@ export type PendingClaim = components["schemas"]["PendingClaim"]
 /**
  * The racks waiting to join. One key, no rack in it: a claim is not a daemon.
  *
- * Invalidated from three places and never patched: the two writes below, and
- * the live socket in `LiveProvider` -- design spec S7's "a rack that appears
- * while the page is open appears without a reload".
+ * Invalidated from three places and never patched -- the two writes below and
+ * the live socket in `LiveProvider` -- and re-read on an interval besides. Why
+ * it needs all four is `useClaims`.
  */
 export const claimsKey = ["claims"] as const
 
 /**
- * The pending claims, asked of the server.
+ * How long an answer about the racks waiting to join stays current.
  *
- * Nothing polls, here as everywhere else in this interface. `list_pending` runs
- * the claim table's expiry sweep before it reads anything, so every ask is a
- * SQLite write transaction, and an interval per open admin tab would be a
- * write loop for a list that changes when somebody plugs in a Pi.
+ * A de-duplication window rather than a caching policy, and it exists for one
+ * concrete pair of reads. `ws_ui.py` sends a `daemons` message the moment the
+ * socket opens; `LiveProvider` turns that into an invalidation of this key; and
+ * an invalidation refetches an active query however old its answer is
+ * (`refetchQueries` calls `query.fetch` with no staleness check). So a Daemons
+ * page that has just fetched this list fetches it again a few hundred
+ * milliseconds later, and each ask is a SQLite write transaction -- see
+ * `useClaims` for why. `theClaimsAreStale` filters that invalidation on
+ * staleness, and this is the window it reads.
+ *
+ * Two seconds: long enough to cover the gap between a page's first fetch and
+ * its socket handshake, short enough that the message actually worth acting on
+ * -- an approved rack collecting its key and dialling in, seconds or minutes
+ * later -- still re-reads the list at once. It gates the focus refetch too,
+ * which is the same duplicate under a different name.
+ */
+export const CLAIMS_FRESH_MS = 2_000
+
+/**
+ * How often an open Daemons page re-asks for the racks waiting to join.
+ *
+ * Ten seconds. It is the longest wait somebody standing at a Pi will sit
+ * through without deciding the page is broken, and the shortest one worth
+ * paying for given what each ask costs (again, `useClaims`).
+ */
+export const CLAIMS_POLL_MS = 10_000
+
+/**
+ * The pending claims, asked of the server and re-asked on an interval.
+ *
+ * **The one polled query in this interface, and the reason is that nothing else
+ * can carry this one.** Design spec S7 asks that a rack which appears while the
+ * page is open appear without a reload, and the case that matters is the
+ * demonstration: an admin with this page open, a quiet network, somebody
+ * plugging a Pi in. Nothing moves on the server at that moment. `POST
+ * /api/racks/claims` is unauthenticated by necessity, touches no hub and wakes
+ * no browser, and `ws_ui.py` encodes exactly two message types, `frame` and
+ * `daemons`. There is no message on this socket that means "a rack is asking".
+ *
+ * **And the `daemons` message must not be made to mean it.** It means "these
+ * racks are online", and `LiveProvider` answers it by writing through
+ * `setQueryData` into the daemon cache. Letting a claim filed by anyone on the
+ * LAN drive that message would be letting an unauthenticated caller drive a
+ * write into this tab's record of which racks the server holds a socket for.
+ * The socket's invalidation of this key stays -- it is what makes an approved
+ * rack's arrival immediate rather than a tick away -- but it is not what
+ * carries a claim, and this interval is.
+ *
+ * **What the interval costs, measured rather than assumed.** `list_pending`
+ * runs the claim table's expiry sweep before it reads anything, so every ask is
+ * a write transaction. But `get_claim` runs the *identical* sweep on every
+ * daemon poll, and a rack waiting to be approved polls continuously for the
+ * whole 30-minute claim lifetime -- so six writes a minute per open admin tab
+ * is small beside what the other end of this same flow is already writing.
+ * React Query does not run the interval for a tab that is not focused
+ * (`refetchIntervalInBackground` is false by default), and this hook is mounted
+ * only by the Daemons page.
+ *
+ * **The shape to prefer when the socket protocol is next opened**: a bare
+ * `{"type": "claims"}` nudge with no payload. Nothing about a pending claim
+ * would cross the socket, the browser would re-read over the session-guarded
+ * `GET /api/claims` exactly as it does now, and this interval could go. That is
+ * server protocol, which the interface does not get to add on its own.
  */
 export function useClaims() {
   return useQuery<PendingClaim[]>({
@@ -103,6 +162,8 @@ export function useClaims() {
       }
       return data
     },
+    refetchInterval: CLAIMS_POLL_MS,
+    staleTime: CLAIMS_FRESH_MS,
   })
 }
 

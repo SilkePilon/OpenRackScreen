@@ -400,10 +400,32 @@ it was first seen. Two actions:
   Confirming creates the rack and mints the key.
 - **Deny** — removes the claim and suppresses the fingerprint for 24 hours.
 
-The claim list is a query invalidated by the existing `/ws/ui` socket, so a rack
-that appears while the page is open appears without a reload. The existing
-"Add a rack" token flow stays reachable, described as the option for a rack that
-cannot use discovery.
+The claim list refreshes itself while the page is open, so a rack that asks to
+join appears without a reload. Two things do that, and it is worth being exact
+about which does what:
+
+- **A short poll (10 s) on the claim query.** This is what covers the case that
+  matters: an admin with the page open, a quiet network, somebody plugging a Pi
+  in. Nothing moves on the server at that moment -- `POST /api/racks/claims` is
+  unauthenticated, touches no hub and wakes no browser -- so nothing can be
+  pushed to the browser about it.
+- **The existing `/ws/ui` socket's `daemons` message, which invalidates the same
+  query.** That covers the end of this flow: an approved rack collects its key
+  and dials in, and the list is re-read at once rather than up to a tick later.
+
+The socket cannot carry the claim itself. `ws_ui.py` encodes exactly two message
+types, `frame` and `daemons`, and the `daemons` message must not be repurposed:
+it means "these racks are online" and the browser answers it by writing into its
+cache of the racks, which is not a write an unauthenticated LAN caller should be
+able to provoke.
+
+**When the socket protocol is next opened, the better shape is a bare
+`{"type": "claims"}` nudge** -- a message with no payload at all. Nothing about
+a pending claim crosses the socket, the browser re-reads over the
+session-guarded `GET /api/claims` exactly as it does now, and the poll can go.
+
+The existing "Add a rack" token flow stays reachable, described as the option
+for a rack that cannot use discovery.
 
 ---
 

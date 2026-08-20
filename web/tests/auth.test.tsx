@@ -31,12 +31,12 @@ function me(state: { authenticated: boolean; password_set: boolean }) {
 /**
  * The claim list, which the Daemons page asks for whenever it renders.
  *
- * Session-guarded like every other route in `api`, so it is stubbed to say
- * whatever the rest of the session is saying in the test that uses it: an empty
- * list where the session is good, and a 401 where it has just ended. Nothing in
- * this file is about a rack waiting to join -- what is being pinned here is
- * where a refused request sends the browser, and an unstubbed request would
- * fail these tests for a reason that has nothing to do with that.
+ * Stubbed empty, and only ever empty. Nothing in this file is about a rack
+ * waiting to join -- what is being pinned here is where a *refused* request
+ * sends the browser, and the request that is refused is the daemon listing
+ * beside it. This one is stubbed so that it is answered at all: `setup.ts`
+ * starts MSW with `onUnhandledRequest: "error"`, and an unstubbed route would
+ * fail these tests for a reason that has nothing to do with 401s.
  */
 const NO_CLAIMS = http.get("/api/claims", () => HttpResponse.json([]))
 
