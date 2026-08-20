@@ -349,6 +349,15 @@ export const test = base.extend<NoPerTestFixtures, Fixtures>({
           .replaceAll("/", "_"),
         ORS_HOST: "127.0.0.1",
         ORS_PORT: String(port),
+        // **Silent, and this is not tidiness either.** A bare `ors-server`
+        // announces `_openrackscreen._tcp.local.` on every interface it can
+        // reach, so an end-to-end run on a developer's laptop would put a
+        // service record for a throwaway server on an ephemeral port onto the
+        // office LAN -- where a real Pi browsing for one would find it, file a
+        // claim against it, and be told to wait by a process this fixture is
+        // about to kill. Nothing in these specs browses; the daemon is given
+        // `--server` and dials the origin above directly.
+        ORS_ANNOUNCE: "0",
         ORS_WEB_DIR: webDir,
         ORS_LOG_LEVEL: "INFO",
       }
