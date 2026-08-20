@@ -441,6 +441,72 @@ def test_the_release_workflow_warns_before_a_silent_skip():
     )
 
 
+def test_every_job_that_runs_uv_or_reads_tools_sets_itself_up_first():
+    """A `run:` naming `uv` or `tools` needs a checkout and a `uv` on PATH.
+
+    `publish` had neither, and could not run at all. Its only pre-step was
+    `download-artifact`, so its warning step -- `uv run --no-project ...
+    sys.path.insert(0, "tools"); from version import ...` -- met a bare runner
+    with no `tools/`, no manifests and no `uv`. It carries no
+    `continue-on-error`, so the step's non-zero exit failed the job, and the
+    five `pypa/gh-action-pypi-publish` steps under it never ran: a tagged
+    release that published nothing.
+
+    `test_a_slow_pypi_does_not_fail_the_release` below could not see it, and
+    says so in its own docstring -- it lifts the script out of the workflow and
+    executes it with cwd set to the repository, which is the one thing the
+    runner does not give it.
+
+    Written as a sweep over every job rather than as an assertion about
+    `publish` because the next job to grow a `uv run` line is the next one to
+    have this exact hole, and there is no reason for the check to be about the
+    two jobs that exist today.
+    """
+    document = _release_workflow()
+
+    for name, job in document["jobs"].items():
+        steps = job.get("steps", [])
+        needs_setup = [
+            step for step in steps if "uv" in step.get("run", "") or "tools" in step.get("run", "")
+        ]
+        if not needs_setup:
+            continue
+        uses = [step.get("uses", "") for step in steps]
+        assert any(u.startswith("actions/checkout") for u in uses), (
+            f"job {name!r} runs a step naming uv or tools with no actions/checkout: "
+            f"{[step.get('name') for step in needs_setup]}"
+        )
+        assert any(u.startswith("astral-sh/setup-uv") for u in uses), (
+            f"job {name!r} runs a step naming uv or tools with no astral-sh/setup-uv: "
+            f"{[step.get('name') for step in needs_setup]}"
+        )
+        # And in that order relative to the first step that needs them --
+        # `actions/checkout` cleans the workspace, so a checkout *after*
+        # `download-artifact` deletes the `dist/` `publish` exists to upload.
+        first_need = min(steps.index(step) for step in needs_setup)
+        for prefix in ("actions/checkout", "astral-sh/setup-uv"):
+            at = min(i for i, u in enumerate(uses) if u.startswith(prefix))
+            assert at < first_need, (
+                f"job {name!r}: {prefix} must come before the step that needs it"
+            )
+
+
+def test_the_publish_job_checks_out_before_it_downloads_the_distributions():
+    """`actions/checkout` runs with `clean: true` by default, which wipes the
+    workspace. `download-artifact` writes the five packages into `dist/` in
+    that same workspace, so checking out afterwards would delete every file
+    this job was created to upload -- and `pypa/gh-action-pypi-publish` over an
+    empty directory is a workflow that reports green having published nothing.
+    """
+    steps = _release_workflow()["jobs"]["publish"]["steps"]
+    uses = [step.get("uses", "") for step in steps]
+
+    checkout = min(i for i, u in enumerate(uses) if u.startswith("actions/checkout"))
+    download = min(i for i, u in enumerate(uses) if u.startswith("actions/download-artifact"))
+
+    assert checkout < download
+
+
 def test_a_slow_pypi_does_not_fail_the_release(tmp_path: Path):
     """The warning step runs the real script against a PyPI that never answers.
 

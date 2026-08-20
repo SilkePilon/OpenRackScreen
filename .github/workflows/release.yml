@@ -160,6 +160,23 @@ jobs:
     permissions:
       id-token: write
     steps:
+      # Both of these are for the warning step below, and neither is optional
+      # even though the five publishing steps under them need nothing from a
+      # checkout. That step is `uv run ... sys.path.insert(0, "tools"); from
+      # version import ...`, and on a bare runner there is no `tools/`, no
+      # pyproject to read a version out of, and no `uv` on PATH at all -- so it
+      # exited non-zero, and since it carries no `continue-on-error` the whole
+      # job failed and *none* of the five packages published. Its own comment
+      # says "It never fails the job itself", which was true of the script and
+      # false of the step.
+      #
+      # `checkout` before `download-artifact`, not after: `actions/checkout`
+      # cleans the workspace by default, so the other order deletes the `dist/`
+      # this job exists to upload.
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v9.0.0
+
       - uses: actions/download-artifact@v4
         with:
           name: distributions
