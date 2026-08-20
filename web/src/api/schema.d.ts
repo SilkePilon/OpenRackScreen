@@ -169,8 +169,9 @@ export interface paths {
          *     every request and meet no limit at all.
          *
          *     **The limiter is asked before the store is touched, and only ever
-         *     `record`ed after `too_many` has already been asked** -- `limiter.py`'s
-         *     own warning: `record` never prunes, only `too_many` does, so a route that
+         *     `record`ed after `too_many` has already been asked** -- the warning is the
+         *     comment inside `Limiter.too_many` (`limiter.py` has no module docstring):
+         *     `record` never prunes, only `too_many` does, so a route that
          *     recorded without checking first would reopen the unbounded-dict leak
          *     `Limiter` exists to close, driven by anyone on the LAN who can reach this
          *     unauthenticated endpoint.
@@ -185,6 +186,17 @@ export interface paths {
          *     withhold, confirming to anyone probing a fingerprint that it was the one
          *     an admin had denied. Design spec S6.5's own failure table only ever
          *     names 429 for this endpoint's refusals, for the same reason.
+         *
+         *     **The residual, said here because the sentence above overstates it on its
+         *     own.** One response cannot be told from the other; a *pair* of them can. A
+         *     caller chooses its own fingerprint, so it files a fresh random one -- 202
+         *     means the queue has room -- and then the target, where a 429 now means
+         *     suppression. `file_claim`'s own docstring carries the argument for leaving
+         *     that open; briefly, every way of closing it costs a real rack its pairing
+         *     in order to withhold a fact an attacker cannot act on. What this route
+         *     does guarantee is the half that matters: no single answer here
+         *     distinguishes them, so a fingerprint cannot be tested for a denial without
+         *     filing under it.
          *
          *     The `detail` says `"claim refused"` and not `"the claim queue is full"`,
          *     which it used to. Both are equally indistinguishable -- one string for
@@ -211,8 +223,11 @@ export interface paths {
          * Poll Claim
          * @description A rack asks whether it has been let in. Unauthenticated: the claim id
          *     itself is the bearer credential (design spec S6.3 step 4) -- there is no
-         *     session to ask for, and no signature header either (see `claims.py`'s
-         *     module docstring on why an HMAC-over-the-id draft was unimplementable).
+         *     session to ask for, and no signature header either. Why there is nothing
+         *     to sign with is design spec S6.3 step 4 and `ors_daemon.join`'s module
+         *     docstring, not `claims.py`'s, which does not discuss it: the server holds
+         *     only `sha256(secret)`, so it could not verify an HMAC keyed on a rack's
+         *     identity even if one were sent.
          *
          *     **A claim id that is unknown and one that is malformed answer
          *     identically** -- both reach `claim_store.get_claim`, which does a plain
@@ -250,7 +265,8 @@ export interface paths {
          *     **Rate-limited, with its own budget** -- see
          *     `CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS`. Asked before the store is touched
          *     and `record`ed only after `too_many`, exactly as `file_claim_route` does
-         *     and for the identical reason (`limiter.py`: `record` never prunes). It
+         *     and for the identical reason (the comment in `Limiter.too_many`: `record`
+         *     never prunes). It
          *     matters more here than there, because this route writes on every call
          *     whether or not the id is real: `get_claim` runs `_expire`'s `DELETE`s
          *     first, so an unlimited poll is an unauthenticated write loop.
@@ -988,8 +1004,17 @@ export interface components {
          * ClaimApproved
          * @description `POST /api/claims/{fingerprint}/approve`'s body: the rack that now
          *     exists, not the key -- the key reaches the daemon over
-         *     `GET /api/racks/claims/{id}` and nowhere else, sealed, exactly once
-         *     (design spec S6.3 step 5).
+         *     `GET /api/racks/claims/{id}` and nowhere else, sealed (design spec S6.3
+         *     step 5).
+         *
+         *     Not "exactly once", which this said until M3c's final review and which
+         *     contradicts both the module docstring above and `poll_claim` below:
+         *     `claims.approve` stores the ciphertext in `claim.granted_key` and never
+         *     clears it, so every poll of an approved claim answers the *same* blob.
+         *     Delivery is idempotent on purpose -- Tasks 12 and 13 both considered
+         *     discard-on-read and rejected it, because a poll that merely observed or
+         *     guessed a claim id would otherwise consume the one delivery and the
+         *     legitimate daemon could never pair.
          */
         ClaimApproved: {
             /** Id */
@@ -1058,9 +1083,15 @@ export interface components {
         ClaimRequest: {
             /** Hostname */
             hostname: string;
-            /** Fingerprint */
+            /**
+             * Fingerprint
+             * @description The SHA-256 of this rack's identity secret, 64 lowercase hex characters.
+             */
             fingerprint: string;
-            /** Short Code */
+            /**
+             * Short Code
+             * @description The first six base32 characters of the fingerprint's digest. Recomputed here from `fingerprint`; a pair that does not agree is refused.
+             */
             short_code: string;
             /** Version */
             version: string;
