@@ -332,7 +332,23 @@ def test_a_subcommand_typed_at_the_shell_is_actually_read_from_sys_argv(
     import os
     import sys
 
+    class Boom:
+        def run(self, argv: list[str]) -> int:
+            raise AssertionError(f"runner reached: {argv}")
+
+    # Three guards, and none of them optional. The point of this test is that a
+    # broken `argv` default sends `uninstall` somewhere it should never get to,
+    # so every one of those destinations has to raise rather than run: `_serve`
+    # would bind a port, `_real_roots` names `/etc/systemd/system` and
+    # `/var/lib`, and `_SubprocessRunner` would `systemctl stop` this machine's
+    # own units. A test that only asserted the return code would, under exactly
+    # the mutant it exists to catch, reconfigure the machine running it.
     _explode_if_served(monkeypatch)
+    monkeypatch.setattr(
+        "ors_server.__main__._real_roots",
+        lambda prefix: (_ for _ in ()).throw(AssertionError(f"_real_roots reached: {prefix}")),
+    )
+    monkeypatch.setattr("ors_server.__main__._SubprocessRunner", Boom)
     monkeypatch.setenv("ORS_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(sys, "argv", ["ors-server", "uninstall"])
     monkeypatch.setattr(os, "geteuid", lambda: 1000)
