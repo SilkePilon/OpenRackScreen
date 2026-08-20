@@ -25,6 +25,7 @@ import asyncio
 from typing import Any
 
 import ifaddr
+import ors_server
 import pytest
 from fastapi.testclient import TestClient
 from ors_server import announce
@@ -384,7 +385,9 @@ def test_the_app_announces_the_port_it_was_told_to_serve_on(monkeypatch, tmp_pat
     create_app(AppSettings(data_dir=tmp_path, port=9123))
 
     assert announcers[0].port == 9123
-    assert announcers[0].version, "a TXT record with no version is one no rack can read"
+    assert announcers[0].version == ors_server.__version__, (
+        "the TXT record must carry the version this server actually is"
+    )
 
 
 def test_announcing_on_leaves_a_real_announcer_on_the_app(monkeypatch, tmp_path):
@@ -402,7 +405,16 @@ def test_announcing_on_leaves_a_real_announcer_on_the_app(monkeypatch, tmp_path)
 
     assert isinstance(app.state.announcer, Announcer)
     assert app.state.announcer.port == 9123
-    assert app.state.announcer.version, "a TXT record with no version is one no rack can read"
+    # **The value, not merely a truthy one.** `version=__version__` in
+    # `create_app` mutated to `"0.0.0"` survived the whole suite, because both
+    # assertions here only asked whether a version was there at all -- so every
+    # rack browsing the LAN would have been told this server is 0.0.0, and the
+    # TXT record is the one place a rack learns it before it dials. Task 19's
+    # self-referential-version finding, one layer up. `__version__` on both
+    # sides is not circular: `tests/test_packaging.py` pins it against
+    # `server/pyproject.toml`.
+    assert app.state.announcer.version == ors_server.__version__
+    assert ors_server.__version__ != "0.0.0"
     assert app.state.announcer.zeroconf_factory is Zeroconf, (
         "the app's announcer would announce over something that is not a responder"
     )

@@ -243,16 +243,40 @@ def test_a_claim_carries_this_racks_identity_hostname_and_version(tmp_path: Path
 
 def test_the_hostname_and_version_default_to_this_machines(tmp_path: Path) -> None:
     """Nothing in the caller has to look either up; the defaults are what the
-    link's own `hello` already claims (`link.py`'s `_hello`)."""
+    link's own `hello` already claims (`link.py`'s `_hello`).
+
+    **`join_a_server` is called directly, with neither keyword.** This test
+    used to go through the `join` helper above and pass `version=__version__`
+    explicitly, which is the one thing it could not do and still be about the
+    default: `version: str = __version__` mutated to `"0.0.0"` survived the
+    entire daemon suite. The sole production caller
+    (`__main__.join_a_server`) passes neither, and that string becomes
+    `claim.version`, the "Daemon version" on the admin's card, and
+    `daemon.version` after approve -- so on a released rack every one of them
+    would have read `0.0.0` with nothing anywhere saying otherwise. It is
+    Task 19's self-referential-version finding, one layer up.
+
+    `__version__` on both sides is not circular here: `tests/test_packaging.py`
+    pins it against `daemon/pyproject.toml`, so what this asserts is that the
+    filing carries *the module's* version rather than a literal that agrees
+    with nothing.
+    """
     from ors_daemon import __version__
 
     http = FakeHttp([filed("c")], [approving("k")])
 
-    join(tmp_path, http, hostname=None, version=__version__)
+    join_a_server(
+        identity=IDENTITY,
+        servers=lambda: [SERVER],
+        link_path=tmp_path / "link.json",
+        sleeper=Naps(),
+        http=http,
+    )
 
     body = http.posted[0][1]
     assert body["hostname"] == os.uname().nodename
     assert body["version"] == __version__
+    assert __version__ != "0.0.0", "a version nothing published is not a default worth pinning"
 
 
 def test_every_claim_carries_a_fresh_ephemeral_public_key(tmp_path: Path) -> None:
