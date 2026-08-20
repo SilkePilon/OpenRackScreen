@@ -47,7 +47,12 @@ def served(monkeypatch, tmp_path) -> dict[str, Any]:
     monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: captured.append(kwargs))
     monkeypatch.setenv("ORS_DATA_DIR", str(tmp_path))
 
-    assert main() == 0
+    # `[]` and not `None`: `main` parses its argument list now, and `None` means
+    # "read `sys.argv`", which under pytest is pytest's own command line. The
+    # empty list is what the console script's `sys.argv[1:]` actually is when
+    # somebody types `ors-server` -- `test_bare_ors_server_with_no_arguments_
+    # still_runs_the_server` is what pins that the two agree.
+    assert main([]) == 0
 
     return captured[0]
 
@@ -70,7 +75,7 @@ def settings_assembled(monkeypatch, tmp_path) -> AppSettings:
     monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: None)
     monkeypatch.setenv("ORS_DATA_DIR", str(tmp_path))
 
-    assert main() == 0
+    assert main([]) == 0
 
     return captured[0]
 
@@ -264,3 +269,72 @@ def test_the_port_defaults_to_the_one_the_deploy_notes_publish(monkeypatch, tmp_
 
     monkeypatch.delenv("ORS_PORT", raising=False)
     assert settings_assembled(monkeypatch, tmp_path).port == 8080
+
+
+# --- the argument list itself ----------------------------------------------
+#
+# `main` grew an `ArgumentParser` in M3c, for `install` and `uninstall`. Before
+# that it read the environment and called `uvicorn.run`, and every deployment
+# that exists -- the image's `CMD ["ors-server"]`, the `uv tool install`
+# instructions in `server/README.md`, the generated systemd unit's `ExecStart`
+# -- invokes it with no arguments at all. These three tests are what keep the
+# parser from taking that away.
+
+
+def _explode_if_served(monkeypatch) -> None:
+    def boom(app, **kwargs):
+        raise AssertionError("uvicorn.run reached")
+
+    monkeypatch.setattr(uvicorn, "run", boom)
+
+
+def test_bare_ors_server_with_no_arguments_still_runs_the_server(monkeypatch, tmp_path) -> None:
+    """`ors-server`, exactly that, with nothing after it.
+
+    It is what `deploy/Dockerfile`'s `CMD ["ors-server"]` runs, what
+    `server/README.md` documents for a `uv tool install`, and what the
+    `ExecStart=` of the unit `ors-server install` writes names -- there is no
+    `serve` subcommand for any of them to say instead. A parser that made the
+    subcommand required, or that printed usage when none was given, would break
+    every one of those at once, and the container's symptom would be a
+    restarting service with a usage message in its log.
+
+    Driven through `sys.argv` rather than by passing `[]`, because `None` is
+    what the console script actually hands `main` and the fallback from `None`
+    to `sys.argv[1:]` is part of what is being pinned.
+    """
+    import sys
+
+    captured: list[dict[str, Any]] = []
+    monkeypatch.setattr(sys, "argv", ["ors-server"])
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: captured.append(kwargs))
+    monkeypatch.setenv("ORS_DATA_DIR", str(tmp_path))
+
+    assert main() == 0
+    assert captured, "bare `ors-server` did not run the server"
+
+
+def test_help_prints_the_subcommands_instead_of_starting_the_server(monkeypatch, capsys) -> None:
+    """`ors-server --help` used to start the server: `main` did not parse argv
+    at all, so the flag was read by nobody and the process bound a port. It
+    comes back as a plain `0` rather than as `SystemExit`, because `main`
+    promises an `int` to `raise SystemExit(main())` at the bottom of the
+    module."""
+    _explode_if_served(monkeypatch)
+
+    assert main(["--help"]) == 0
+
+    text = capsys.readouterr().out
+    assert "install" in text
+    assert "uninstall" in text
+
+
+def test_an_unknown_flag_is_a_usage_error_rather_than_a_started_server(monkeypatch, capsys) -> None:
+    """Exit 2, the conventional "you typed it wrong" code -- and not a server
+    on 8080 that silently ignored the flag, which is what a `main` with no
+    parser did with anything anybody typed."""
+    _explode_if_served(monkeypatch)
+
+    assert main(["--nope"]) == 2
+
+    assert "nope" in capsys.readouterr().err

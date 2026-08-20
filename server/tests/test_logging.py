@@ -227,7 +227,9 @@ def test_main_installs_logging_before_it_serves(tmp_path, monkeypatch):
     monkeypatch.setenv("ORS_DATA_DIR", str(tmp_path))
     monkeypatch.delenv("ORS_LOG_LEVEL", raising=False)
 
-    assert __main__.main() == 0
+    # `[]` and not `None`: `main` parses its argument list now, and `None` means
+    # "read `sys.argv`", which under pytest is pytest's own command line.
+    assert __main__.main([]) == 0
 
     assert reached and reached[0], "the shipped server had no handler on `ors_server` at all"
     assert logging.getLogger("ors_server.link.hub").isEnabledFor(logging.INFO)

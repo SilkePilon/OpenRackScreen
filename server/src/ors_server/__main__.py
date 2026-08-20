@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import argparse
 import os
+import subprocess
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import uvicorn
 
+from ors_server import __version__
 from ors_server.app import DEFAULT_PORT, AppSettings, create_app
+from ors_server.install import InstallReport, Roots, install, uninstall
 from ors_server.logging import setup_logging
 
 WS_MAX_MESSAGE_BYTES = 512 * 1024
@@ -90,7 +96,181 @@ def resolve_port() -> int:
     return int(os.environ.get("ORS_PORT", str(DEFAULT_PORT)))
 
 
-def main() -> int:
+_USAGE_EXIT = 2
+"""The conventional shell exit code for "you typed it wrong", and argparse's."""
+
+_DEFAULT_PREFIX = Path("/opt/ors-server")
+"""Where `install` builds the venv the unit runs from, unless `--prefix` says so.
+
+Deliberately not `/opt/openrackscreen`, which is `ors-daemon install`'s default:
+`uv venv` on an existing prefix rebuilds it, so a Pi running both halves against
+one shared prefix would have each install quietly replace the other's
+interpreter and packages. It is also what `uninstall` hands `_real_roots`, which
+needs a prefix to build `Roots` and never reads it.
+"""
+
+
+def _parser() -> argparse.ArgumentParser:
+    """`ors-server`, `ors-server install`, `ors-server uninstall`. Nothing else.
+
+    The subcommand is deliberately **not** `required`, and that single word is
+    the whole design of this parser. `ors-server` with no arguments runs the
+    server: it is what `deploy/Dockerfile`'s `CMD ["ors-server"]` invokes, what
+    `server/README.md` documents for a `uv tool install`, and what the
+    `ExecStart=` line `install` writes into the unit names -- there is no
+    `serve` subcommand for any of the three to say instead. A `required=True`
+    added here, or a `print_usage()` when `command` is `None`, breaks all of
+    them at once, and the container's symptom would be a restarting service
+    with a usage message in its log rather than anything that reads as a
+    mistake in this file. `test_bare_ors_server_with_no_arguments_still_runs_
+    the_server` is what holds that shut.
+    """
+    parser = argparse.ArgumentParser(
+        prog="ors-server",
+        description=(
+            "Own the rack's configuration and serve the interface. "
+            "With no subcommand, run the server."
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    install_command = subparsers.add_parser(
+        "install", help="write a systemd unit that runs the server at boot, and start it"
+    )
+    install_command.add_argument(
+        "--prefix",
+        type=Path,
+        default=_DEFAULT_PREFIX,
+        help="where to build the venv the service runs from (default: %(default)s)",
+    )
+    install_command.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help="the port the unit binds, which is also the port the mDNS announcement "
+        "tells racks to dial (default: %(default)s)",
+    )
+
+    uninstall_command = subparsers.add_parser(
+        "uninstall", help="stop the service and remove the systemd unit"
+    )
+    uninstall_command.add_argument(
+        "--purge",
+        action="store_true",
+        help="also delete /var/lib/ors-server, which holds the admin password, the "
+        "secret key and every stored integration credential. Nothing anywhere keeps "
+        "a second copy of that key.",
+    )
+    return parser
+
+
+@dataclass(frozen=True)
+class _SubprocessRunner:
+    """The real `install.Runner`: every argv goes through `subprocess.run`.
+
+    The only implementation of `install.Runner` this project ships that touches
+    the machine it runs on -- every test under `server/tests/` substitutes
+    `FakeRunner`, which is what keeps `install`'s own suite off the machine
+    running it.
+    """
+
+    def run(self, argv: list[str]) -> int:
+        return subprocess.run(argv).returncode
+
+
+def _real_roots(prefix: Path) -> Roots:
+    """`Roots` built from the real filesystem, for the CLI's own use.
+
+    Nothing else in either module names `/var/lib` or `/etc/systemd/system` --
+    `install.install` and `install.uninstall` are parameterised on `Roots`
+    precisely so that only this one function, called from production code and
+    never from a test, has to. Which is also why it needs a test of its own:
+    every other test in `test_install.py` patches it away, so without
+    `test_real_roots_names_the_actual_machine_paths` the three paths a real
+    install lands on would be pinned by nothing at all.
+
+    Pure: it reads nothing and creates nothing.
+    """
+    return Roots(
+        state=Path("/var/lib"),
+        prefix=prefix,
+        systemd=Path("/etc/systemd/system"),
+    )
+
+
+def _print_install_report(report: InstallReport) -> None:
+    """Where the unit went, whether the user was made, and one line that says
+    whether the thing is up.
+
+    `report.failed` alone does not say which of two shapes a failure is, and
+    printing the same way for both would be wrong in one direction or the other
+    -- see `InstallReport.refused`. `refused=True` is the port check, which
+    returns before a directory, a user, a venv or a unit is touched, so
+    `unit:`, `service user:` and a healthcheck would all describe work that
+    never happened -- and the healthcheck would name the very port that was
+    just refused for being impossible. Only the warnings are true there, so
+    only the warnings are printed. `refused=False` with `failed=True` is a
+    failure found mid-run (a `useradd` exiting something other than 0 or 9):
+    `install()` keeps going past it, so the unit really was written and
+    `systemctl` really was called, and withholding those lines would tell the
+    person debugging a half-finished install over SSH the least.
+    """
+    if report.failed and report.refused:
+        if report.warnings:
+            print(report.warnings_text(), file=sys.stderr)
+        print("install did not finish cleanly; see the warnings above.", file=sys.stderr)
+        return
+    if report.failed:
+        print(
+            "install: PARTIAL -- it failed partway through. Everything below is real, "
+            "not undone, and reflects what actually happened."
+        )
+    print(f"unit: {report.unit_path}")
+    print(f"service user: {'created' if report.created_user else 'already existed'}")
+    print(f"data directory: {report.data_dir}")
+    # From `report.port`, never a literal, so the number an operator is told to
+    # probe cannot drift from the one the unit binds.
+    print(f"health: {report.health_command}")
+    if report.warnings:
+        print(report.warnings_text(), file=sys.stderr)
+    if report.failed:
+        print("install did not finish cleanly; see the warnings above.", file=sys.stderr)
+
+
+def _install(args: argparse.Namespace) -> int:
+    """Build the real `Roots` and a real `Runner`, then run `install.install`."""
+    report = install(
+        _real_roots(args.prefix),
+        _SubprocessRunner(),
+        version=__version__,
+        port=args.port,
+    )
+    _print_install_report(report)
+    # A failed install that returned 0 makes `ors-server install && reboot`
+    # proceed on a machine that was never actually configured.
+    return 1 if report.failed else 0
+
+
+def _uninstall(args: argparse.Namespace) -> int:
+    """Build the real `Roots` and a real `Runner`, then run `install.uninstall`.
+
+    `_DEFAULT_PREFIX` and not a flag: `uninstall` removes the unit and (with
+    `--purge`) the data directory, and `install.uninstall` reads `roots.prefix`
+    for neither. Asking for a `--prefix` here would be asking a question whose
+    answer is discarded.
+    """
+    report = uninstall(_real_roots(_DEFAULT_PREFIX), _SubprocessRunner(), purge=args.purge)
+    if report.warnings:
+        print(report.warnings_text(), file=sys.stderr)
+    print(
+        "uninstalled: the service is stopped, disabled and its unit removed. "
+        "The venv this installed (if any) is left on disk; remove its prefix by "
+        "hand if you want it gone too."
+    )
+    return 0
+
+
+def _serve() -> int:
     # First, before anything that can log: `create_app` reports a rebuilt
     # schema, and until this runs the root logger has no handler and every
     # record the server writes is discarded where nobody can see it.
@@ -125,6 +305,43 @@ def main() -> int:
         proxy_headers=True,
     )
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Parse and dispatch. Returns a shell exit code, always.
+
+    `argv` defaults to `None` -- meaning `sys.argv[1:]` -- because that is what
+    the console script hands this function, and the no-argument case has to
+    reach `_serve()` through exactly that path rather than through a shortcut a
+    test would have to know about.
+
+    Nothing here raises for a mistake somebody typed: argparse exits where this
+    function has promised to return an `int`, for `--help` as much as for a bad
+    flag, and a caller handed `SystemExit` out of a function annotated `-> int`
+    has been lied to. `raise SystemExit(main())` at the bottom of this module
+    puts the same code back on the process. Before M3c there was no parser at
+    all, which is why `ors-server --help` used to bind port 8080 and serve the
+    interface instead of printing anything.
+    """
+    try:
+        args = _parser().parse_args(argv)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else _USAGE_EXIT
+
+    if args.command in ("install", "uninstall"):
+        # Checked here rather than inside `install.install`, which is a pure
+        # function over injected roots and must stay callable from a test that
+        # is not root -- which is every test in that suite. Writing into
+        # /etc/systemd/system and creating a system user are not things a
+        # non-root process can do halfway and then report honestly about.
+        if os.geteuid() != 0:
+            print(f"ors-server {args.command} has to run as root.", file=sys.stderr)
+            return _USAGE_EXIT
+        return _install(args) if args.command == "install" else _uninstall(args)
+
+    # `args.command is None`: no subcommand, which is `ors-server` typed bare.
+    # See `_parser` for why that runs the server rather than printing usage.
+    return _serve()
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -215,7 +215,13 @@ def configured(monkeypatch, tmp_path, environment: dict[str, str]) -> AppSetting
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("ORS_DATA_DIR", str(tmp_path))
 
-    assert main() == 0
+    # `[]` and not `None`: `main` parses its argument list now, and `None` means
+    # "read `sys.argv`", which under pytest is pytest's own command line -- which
+    # argparse then rejects as an invalid subcommand. The empty list is what the
+    # console script's `sys.argv[1:]` is when the image's `CMD ["ors-server"]`
+    # runs; `test_main.py`'s `test_bare_ors_server_with_no_arguments_still_runs_
+    # the_server` is what pins that those two agree.
+    assert main([]) == 0
 
     return captured[0]
 
@@ -258,7 +264,8 @@ def served(monkeypatch, tmp_path, environment: dict[str, str]) -> dict[str, Any]
     # rather than in the container's `/var/lib`, which this test cannot create.
     monkeypatch.setenv("ORS_DATA_DIR", str(tmp_path))
 
-    assert main() == 0
+    # `[]` for the reason `settings_assembled` above spells out.
+    assert main([]) == 0
 
     return captured[0]
 
