@@ -1,7 +1,7 @@
 import { defineConfig } from "@playwright/test"
 
 /**
- * The end-to-end run: one browser, one server, one rack, seven specs in order.
+ * The end-to-end run: one browser, one server, two racks, eight specs in order.
  *
  * **No `webServer` block, on purpose.** Playwright's own server manager starts
  * a process before the run and stops it after, and two of these specs need the
@@ -9,11 +9,12 @@ import { defineConfig } from "@playwright/test"
  * the processes belong to `e2e/fixture.ts`, which can start, stop and restart
  * them and can prove afterwards that neither is still running.
  *
- * **`workers: 1` and `fullyParallel: false`**, because the seven specs are
- * seven steps of one story against one database: a password is set, a rack is
- * paired, a screen is added, and the last three do things to the server that a
- * spec running beside them would see. `rack.spec.ts` declares itself serial as
- * well, so the ordering is stated where it is relied on rather than only here.
+ * **`workers: 1` and `fullyParallel: false`**, because the eight specs are
+ * eight steps of one story against one database: a password is set, a rack is
+ * approved, another is paired with a token, a screen is added, and the last
+ * three do things to the server that a spec running beside them would see.
+ * `rack.spec.ts` declares itself serial as well, so the ordering is stated
+ * where it is relied on rather than only here.
  *
  * **No retries.** A retry would re-run the story from the beginning against a
  * fresh temp directory, which would work -- and would turn a flake into a green

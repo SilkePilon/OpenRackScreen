@@ -77,6 +77,36 @@ MUTATES_NOTHING = {
     # server has no row for yet, which is the whole reason they exist.
     "POST /api/daemons/{daemon_id}/detect",
     "POST /api/daemons/{daemon_id}/probe",
+    # The claim protocol (design spec S6.3-S6.5), Task 13. None of the three
+    # mints a rack's *configuration* -- filing and denying touch only the
+    # `claim` table, and approving mints a `daemon` row exactly as
+    # `POST /api/daemons` does, which is `edit.affects_nobody()`'s own case:
+    # a rack with no screens yet has nothing to bump a version for or push a
+    # snapshot to. Unlike `POST /api/daemons`, none of the three can be
+    # wrapped in `async with change(...)`: `claims.file_claim`, `.approve`
+    # and `.deny` (Task 12) each open and commit their own connection --
+    # `approve` under its own `BEGIN IMMEDIATE`, taken before `change`'s
+    # transaction could ever be opened around it -- so there is no
+    # `edit.connection` for any of them to write on. `writes()` reading only
+    # the route's own body and not one call deeper is a documented blind
+    # spot (see `test_the_password_change_writes_a_row_and_so_is_not_an_exemption`
+    # for the same gap on a different route); it is not licence claimed by
+    # accident here, it is the only place these three could be filed once
+    # `change()` was ruled out by `claims.py`'s own transaction shape.
+    #
+    # Approve additionally writes one row this sweep cannot see, and it is
+    # named here rather than left to the blind spot: `changes.write_event`,
+    # the same `info`/`created` history line `POST /api/daemons` records for a
+    # rack paired by token, on the connection the route already opens to read
+    # the new rack's name. It is a `daemon_event`, which is history and not
+    # configuration -- nothing bumps a version for it and no snapshot carries
+    # it -- and `link/ws_daemon.py` writes the same rows outside any `change`
+    # for exactly that reason. What holds that it happens at all is
+    # `test_api_claims.py`'s
+    # `test_approving_a_claim_records_a_created_event_like_pairing_by_token_does`.
+    "POST /api/racks/claims",
+    "POST /api/claims/{fingerprint}/approve",
+    "POST /api/claims/{fingerprint}/deny",
 }
 
 

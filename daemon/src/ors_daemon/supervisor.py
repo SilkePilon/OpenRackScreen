@@ -373,9 +373,21 @@ def _unchanged(
       readings arrive through the store either way, and `_reconfigure_integrations`
       is what puts the new poller behind them. A source *renamed* does change
       `depends_on` above, which is why that case restarts the screen.
-    - `DaemonConfig.timezone`. The clock is built once, in `__main__`, and is
-      shared by every worker and poller; swapping it under a running rack is a
-      change to a component this class is handed rather than one it owns.
+    - `DaemonConfig.timezone`. Out of scope for this class, the same way the
+      night window above is *not*: `Clock` is `Callable[[], datetime]` and
+      `system_clock` a four-line factory, so nothing about rebuilding one is
+      hard, and the night window a few lines up already solves the identical
+      problem -- a worker takes it at construction and never re-reads it -- by
+      restarting the affected workers when the diff says it changed. What
+      actually raises the cost here is that the clock is shared wider than the
+      night window is: it goes to every poller as well as every worker, and
+      `__main__` is the caller with an apply budget an integration cannot
+      always be rebuilt inside. So this is a scope decision, not an
+      impossibility -- see `_diff`'s night-window handling for the precedent a
+      timezone-aware `apply` would follow, and `_snapshot_handler` in
+      `__main__` for where the cost is paid today instead: a pushed timezone
+      stops the rack and lets a restart rebuild the clock, rather than trying
+      to swap it in place.
     - the *system* scenes -- `connecting`, `stale`, `error`, `identify`. A worker
       takes them at construction from `system_scenes()`, which reads
       `load_builtin_templates()["system"]` directly and never looks at the

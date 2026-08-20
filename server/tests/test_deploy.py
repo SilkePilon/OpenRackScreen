@@ -38,6 +38,14 @@ DEPLOY = ROOT / "deploy"
 
 COMPOSE_FILES = ["compose.pi.yaml", "compose.remote.yaml"]
 
+# The override that pulls the published image instead of building the
+# checkout. Kept out of COMPOSE_FILES on purpose: it is not one of the two
+# files an operator brings up on its own, and every test that walks
+# COMPOSE_FILES asserting properties of *the server this container runs*
+# would otherwise have to special-case the one file whose `server` service
+# has no `build:` at all.
+COMPOSE_IMAGE = DEPLOY / "compose.image.yaml"
+
 # Where the database and the key live inside the container, and the one string
 # that has to be the same in three files. Named once here so that a test which
 # disagrees with the Dockerfile is a failure rather than two tests quietly
@@ -207,7 +215,13 @@ def configured(monkeypatch, tmp_path, environment: dict[str, str]) -> AppSetting
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("ORS_DATA_DIR", str(tmp_path))
 
-    assert main() == 0
+    # `[]` and not `None`: `main` parses its argument list now, and `None` means
+    # "read `sys.argv`", which under pytest is pytest's own command line -- which
+    # argparse then rejects as an invalid subcommand. The empty list is what the
+    # console script's `sys.argv[1:]` is when the image's `CMD ["ors-server"]`
+    # runs; `test_main.py`'s `test_bare_ors_server_with_no_arguments_still_runs_
+    # the_server` is what pins that those two agree.
+    assert main([]) == 0
 
     return captured[0]
 
@@ -250,9 +264,41 @@ def served(monkeypatch, tmp_path, environment: dict[str, str]) -> dict[str, Any]
     # rather than in the container's `/var/lib`, which this test cannot create.
     monkeypatch.setenv("ORS_DATA_DIR", str(tmp_path))
 
-    assert main() == 0
+    # `[]` for the reason `settings_assembled` above spells out.
+    assert main([]) == 0
 
     return captured[0]
+
+
+# --------------------------------------------------------------------------
+# `image:` versus `build:`
+# --------------------------------------------------------------------------
+
+
+def test_no_compose_file_names_both_an_image_and_a_build():
+    """Compose prefers `image:`, so naming both never builds your checkout.
+
+    Measured, not theorised: on this machine a 45-hour-old copy of
+    `ghcr.io/silkepilon/openrackscreen:latest` was started instead of the
+    working tree, went `healthy`, answered `/api/health`, and returned 404 for
+    every page -- because it predated the interface being in the image. The
+    README had to grow a paragraph telling people to pass `--build`. This test
+    is that paragraph, enforced.
+    """
+    for name in COMPOSE_FILES:
+        document = compose(name)
+        for service_name, service in document["services"].items():
+            assert not ("image" in service and "build" in service), (
+                f"{name}:{service_name} names both; compose will silently use the image"
+            )
+
+
+def test_the_image_override_pins_the_published_tag():
+    """Pulling a published image stays possible, and stays a thing you ask for."""
+    document = yaml.safe_load(COMPOSE_IMAGE.read_text())
+    service = document["services"]["server"]
+    assert service["image"] == "ghcr.io/silkepilon/openrackscreen:latest"
+    assert "build" not in service
 
 
 # --------------------------------------------------------------------------
@@ -288,6 +334,27 @@ def test_the_directory_that_is_mounted_is_the_one_the_server_writes_to(name, doc
     assert dockerfile_env(dockerfile)["ORS_DATA_DIR"] in mounts, (
         "the volume is mounted somewhere the server never writes; the database is"
         " in the container layer and dies with it, silently"
+    )
+
+
+@pytest.mark.parametrize("name", COMPOSE_FILES)
+def test_both_compose_files_set_the_data_directory_explicitly(name):
+    """The code default moved to the user's state directory in M3c.
+
+    A compose file that relied on the old `/var/lib` default now puts the
+    database somewhere inside the container's root home, and the named volume
+    it mounts is a directory nothing writes to -- so every restart is a fresh
+    server with no password set, and the volume looks healthy and empty.
+    """
+    environment = server_service(name)["environment"]
+
+    assert isinstance(environment, list), (
+        "use the list form; see test_an_unset_key_is_passed_as_absent_rather_than_as_empty"
+    )
+    assert f"ORS_DATA_DIR={DATA_DIR}" in environment, (
+        f"{name} never sets ORS_DATA_DIR; the code default moved off /var/lib in M3c,"
+        " so this compose file's named volume would sit empty while the database"
+        " landed inside the container's own root home"
     )
 
 
@@ -586,6 +653,31 @@ def test_the_workspace_is_installed_into_the_image_and_not_referenced_from_it(do
         assert "--no-editable" in sync, (
             f"`{sync.strip()}` installs ors_server editable, pointing at a /build path"
             " the runtime stage does not have: ModuleNotFoundError at start"
+        )
+
+
+def test_every_workspace_members_pyproject_is_copied_into_the_builder(dockerfile):
+    """`uv sync` loads the whole workspace to resolve `workspace = true`
+    sources, so every member's `pyproject.toml` has to be visible to it --
+    including members this image never installs, like `daemon` and the
+    `openrackscreen` meta-package (see the comment on the `COPY` block
+    itself). Missing one is not a loud failure: `uv sync` inside the builder
+    simply cannot resolve that member's `workspace = true` source, and the
+    build fails on a resolution error naming none of the files actually at
+    fault.
+    """
+    members = sorted((ROOT / "packages").glob("*/pyproject.toml"))
+    members += [ROOT / "daemon" / "pyproject.toml", ROOT / "server" / "pyproject.toml"]
+    assert len(members) >= 5, (
+        "the workspace member glob found suspiciously few pyproject.toml files"
+    )
+
+    builder = copies(stages(dockerfile)[0])
+    copied_sources = {source for copy in builder for source in copy.sources}
+    for member in members:
+        relative = member.relative_to(ROOT).as_posix()
+        assert relative in copied_sources, (
+            f"{relative} is a workspace member's manifest but the builder stage never COPYs it in"
         )
 
 
@@ -1270,3 +1362,26 @@ def test_the_readme_says_the_secret_key_cannot_be_recovered():
     assert "ors_secret_key" in readme
     assert "unrecoverable" in readme or "cannot be recovered" in readme
     assert "systemd" in readme, "the daemon is not in compose and the README has to say so"
+
+
+def test_the_image_does_not_announce_itself_over_mdns(dockerfile: str) -> None:
+    """`ORS_ANNOUNCE=0`, because from a bridge the announcement is worse than none.
+
+    mDNS is link-layer -- multicast to 224.0.0.251 with a TTL of 1 -- and a
+    Docker bridge is a NAT, so the datagram never reaches the LAN whatever
+    address is written in it. What a bridged container would register is
+    loopback and its own bridge address, neither of which names anything a rack
+    can reach.
+
+    That matters more than being merely useless. A rack that finds nothing is
+    told to pass `--server`, which is the message that names the fix; a rack
+    that finds an unreachable entry files a claim that fails instead, and two
+    such entries trip the "more than one server, pair with none" refusal on a
+    LAN that has exactly one.
+
+    `deploy/compose.mdns.yaml` turns it back on alongside `network_mode: host`.
+    Both halves are needed and neither is enough: host networking without the
+    variable is a silent server, and the variable without host networking is
+    the announcement this line exists to suppress.
+    """
+    assert dockerfile_env(dockerfile)["ORS_ANNOUNCE"] == "0"

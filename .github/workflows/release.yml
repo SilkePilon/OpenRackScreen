@@ -1,0 +1,277 @@
+name: release
+
+# A tag, not a branch push: publishing is irreversible per version, and a
+# workflow that fired on every merge would burn version numbers on commits
+# nobody meant to ship.
+#
+# The glob below matches prerelease tags too (`v0.2.0-rc1` satisfies `v*`),
+# but "Check the tag matches the version in the tree" compares the tag
+# verbatim against `read_versions()`, which only ever holds an exact release
+# version -- so no prerelease tag can pass that check today. That is
+# deliberate: if prereleases are ever wanted, fix the comparison, not this
+# glob.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v9.0.0
+
+      # Before anything else costs runner time: a mismatched tag is a typo in
+      # a release command, not a code problem, and reading two TOML files is
+      # cheap. Failing here instead of after the interface build and the
+      # dependency-heavy `uv build` below turns a ~2 minute failure into a
+      # much cheaper one -- but only because of `--no-project --with
+      # packaging`. A plain `uv run python` here would resolve and sync the
+      # whole workspace dev environment first (fastapi, cryptography,
+      # argon2-cffi, four editable member builds) before this script's first
+      # line ran, cold, on every release run, since `enable-cache` is not set
+      # on `setup-uv` above. This check needs only `tomllib` (stdlib) and
+      # `packaging`, so it asks `uv` for exactly that and nothing else.
+      - name: Check the tag matches the version in the tree
+        run: |
+          uv run --no-project --with packaging python - <<'PY'
+          import sys
+          sys.path.insert(0, "tools")
+          import os
+          from version import read_versions
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          versions = set(read_versions().values())
+          if versions != {tag}:
+              raise SystemExit(f"tag {tag!r} does not match {versions}")
+          PY
+
+      # pnpm before node: the store cache is this action's own, and `pnpm` has
+      # to be on PATH before anything can ask it where its store is. Mirrors
+      # the `web` job in ci.yml.
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: web/package.json
+          cache: true
+          cache_dependency_path: web/pnpm-lock.yaml
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # The interface is built first and copied into the server package, so the
+      # wheel built below contains it. Everything after this depends on it
+      # having happened.
+      - name: Build the interface
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Put the interface inside the server package
+        run: |
+          rm -rf server/src/ors_server/web
+          cp -r web/dist server/src/ors_server/web
+
+      - name: Build every distribution
+        run: uv build --all-packages --out-dir dist
+
+      # Before anything is uploaded. A wheel without the interface installs
+      # cleanly and serves no pages, and yanking does not un-install it.
+      - name: Refuse a server wheel with no interface in it
+        run: |
+          uv run python - <<'PY'
+          import pathlib, sys, zipfile
+          wheels = list(pathlib.Path("dist").glob("ors_server-*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one ors_server wheel, found {wheels}")
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          if "ors_server/web/index.html" not in names:
+              raise SystemExit("the server wheel has no interface in it")
+          print(f"{wheels[0].name} carries the interface")
+          PY
+
+      # Spec §9. `[tool.uv.sources]` is uv-only and should never reach a wheel,
+      # but "should" is how a `file://` requirement gets published and fails to
+      # install for everyone who is not in this workspace.
+      - name: Refuse a wheel whose dependencies name a local path
+        run: |
+          uv run python - <<'PY'
+          import email.parser, pathlib, zipfile
+          for wheel in pathlib.Path("dist").glob("*.whl"):
+              archive = zipfile.ZipFile(wheel)
+              [metadata] = [n for n in archive.namelist() if n.endswith(".dist-info/METADATA")]
+              parsed = email.parser.BytesParser().parsebytes(archive.read(metadata))
+              for requirement in parsed.get_all("Requires-Dist") or []:
+                  if "file://" in requirement or "@ /" in requirement:
+                      raise SystemExit(f"{wheel.name} requires a local path: {requirement}")
+          print("no wheel names a local path")
+          PY
+
+      # Sorted into one directory per package so `publish` below can upload
+      # each package as its own `twine` invocation, in dependency order,
+      # instead of one alphabetical `dist/*` glob. A single glob would upload
+      # `openrackscreen-*` before any `ors_*` file (alphabetically first) and,
+      # since twine aborts on the first failure, could leave the meta-package
+      # published while pinning two dependencies that never made it to PyPI --
+      # a version that can never resolve and can never be re-uploaded.
+      #
+      # This step must be total, not best-effort: a build that produces a
+      # distribution matching no `PACKAGES` key (a sixth workspace member, a
+      # `project.name` that drifted from its `PACKAGES` key) used to be moved
+      # nowhere, sit at `dist/`'s top level, get uploaded by `upload-artifact`
+      # below, and never be named by any `publish` step -- a green workflow
+      # that quietly never published it. Symmetrically, a package whose files
+      # all fail to match got an empty directory and a publish step over
+      # nothing. Every package must end up with exactly one sdist and one
+      # wheel, and nothing may be left ungrouped.
+      - name: Group distributions by package
+        run: |
+          uv run python - <<'PY'
+          import pathlib, sys
+          sys.path.insert(0, "tools")
+          from version import PACKAGES
+          dist = pathlib.Path("dist")
+          for name in PACKAGES:
+              target = dist / name
+              target.mkdir(exist_ok=True)
+              matched = list(dist.glob(f"{name.replace('-', '_')}-*"))
+              if len(matched) != 2:
+                  raise SystemExit(
+                      f"{name}: expected one sdist and one wheel, found {[p.name for p in matched]}"
+                  )
+              for path in matched:
+                  path.rename(target / path.name)
+          leftover = sorted(p.name for p in dist.iterdir() if p.suffix in {".whl", ".gz"})
+          if leftover:
+              raise SystemExit(f"built distributions matching no package: {leftover}")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    # Trusted Publishing: PyPI verifies this workflow's OIDC identity, so no API
+    # token is stored in this repository and none can be stolen from it.
+    permissions:
+      id-token: write
+    steps:
+      # Both of these are for the warning step below, and neither is optional
+      # even though the five publishing steps under them need nothing from a
+      # checkout. That step is `uv run ... sys.path.insert(0, "tools"); from
+      # version import ...`, and on a bare runner there is no `tools/`, no
+      # pyproject to read a version out of, and no `uv` on PATH at all -- so it
+      # exited non-zero, and since it carries no `continue-on-error` the whole
+      # job failed and *none* of the five packages published. Its own comment
+      # says "It never fails the job itself", which was true of the script and
+      # false of the step.
+      #
+      # `checkout` before `download-artifact`, not after: `actions/checkout`
+      # cleans the workspace by default, so the other order deletes the `dist/`
+      # this job exists to upload.
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v9.0.0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+
+      # `skip-existing: true` below (correct: it is what makes a rerun after a
+      # partial failure safe, rather than rejecting an already-published
+      # package as a duplicate) has one silent failure mode of its own:
+      # deleting and re-pushing a `v*` tag at a different commit, to "fix" a
+      # bug in a version that was already fully published, makes every upload
+      # below skip as a duplicate, this job report success, and PyPI keep
+      # serving the old artifacts -- with nothing in this log saying so. This
+      # step cannot stop that -- nothing after a tag exists can -- but it
+      # makes that run's log visibly different from an ordinary publish, by
+      # naming exactly what is about to be skipped and why, before any of the
+      # five uploads below run. It never fails the job itself: a partial
+      # resume, or a PyPI hiccup answering this check, must not block a
+      # publish that would otherwise succeed.
+      - name: Warn about packages already published at this version
+        run: |
+          uv run --no-project --with packaging python - <<'PY'
+          import sys
+          import urllib.error
+          import urllib.request
+
+          sys.path.insert(0, "tools")
+          from version import PACKAGES, read_versions
+
+          versions = read_versions()
+          already_published = []
+          for name in PACKAGES:
+              version = versions[name]
+              url = f"https://pypi.org/pypi/{name}/{version}/json"
+              try:
+                  urllib.request.urlopen(url, timeout=10)
+              except urllib.error.HTTPError as exc:
+                  if exc.code == 404:
+                      continue
+                  print(f"::warning::could not check PyPI for {name}=={version}: {exc}")
+                  continue
+              except OSError as exc:
+                  # `OSError`, not `urllib.error.URLError`, which is what this
+                  # caught until a review reproduced the gap. A server that
+                  # accepts the connection and is then slow to answer fails
+                  # the *read* with a bare `TimeoutError`, and urllib does not
+                  # wrap that one. A connect refusal and a connect timeout do
+                  # both arrive as `URLError`; a read timeout does not -- so
+                  # the single most likely thing to go wrong here, PyPI being
+                  # slow or rate-limiting a release, crashed this step and
+                  # failed the publish on a check that exists only to print a
+                  # warning. `URLError`, `TimeoutError` and `ConnectionError`
+                  # are all `OSError`, so this is the narrowest clause that
+                  # covers every one of them.
+                  print(f"::warning::could not check PyPI for {name}=={version}: {exc}")
+                  continue
+              already_published.append(f"{name}=={version}")
+
+          if already_published:
+              names = ", ".join(already_published)
+              print(f"::warning::already on PyPI, this run will skip re-uploading: {names}")
+          else:
+              print("nothing below is already on PyPI at this version")
+          PY
+
+      # One `twine upload` per package, in dependency order, leaves first and
+      # the meta-package last: `ors-daemon` and `ors-server` both pin
+      # `ors-schema` and `ors-render`, and `openrackscreen` pins both of them.
+      # This is not atomic -- nothing here can be, once a tag exists -- but it
+      # means every prefix of a partial run is still a *valid* set: nothing
+      # that depends on an unpublished pin is ever uploaded ahead of it.
+      # `skip-existing` makes a rerun after a partial failure safe: packages
+      # already on PyPI are silently skipped rather than rejected. See the
+      # step above for the silent-skip case that setting cannot cover.
+      - name: Publish ors-schema
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/ors-schema/
+          skip-existing: true
+      - name: Publish ors-render
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/ors-render/
+          skip-existing: true
+      - name: Publish ors-daemon
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/ors-daemon/
+          skip-existing: true
+      - name: Publish ors-server
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/ors-server/
+          skip-existing: true
+      - name: Publish openrackscreen
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/openrackscreen/
+          skip-existing: true

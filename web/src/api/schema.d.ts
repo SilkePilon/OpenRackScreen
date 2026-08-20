@@ -145,6 +145,149 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/racks/claims": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * File Claim Route
+         * @description A rack asks to be paired. Unauthenticated, necessarily -- see the
+         *     module docstring and design spec S6.3 step 1: a daemon that has not been
+         *     approved has no credential, which is the entire point of this route
+         *     existing.
+         *
+         *     **The address is `request.client.host`, never `body`** (`ClaimRequest`
+         *     carries no such field at all) -- the connection is the one thing here a
+         *     claimant cannot lie about, for the reason `auth.py`'s `login` gives for
+         *     the identical choice: `X-Forwarded-For` is written by whoever sends it,
+         *     so trusting a claimed address would let one attacker be a new "rack" on
+         *     every request and meet no limit at all.
+         *
+         *     **The limiter is asked before the store is touched, and only ever
+         *     `record`ed after `too_many` has already been asked** -- the warning is the
+         *     comment inside `Limiter.too_many` (`limiter.py` has no module docstring):
+         *     `record` never prunes, only `too_many` does, so a route that
+         *     recorded without checking first would reopen the unbounded-dict leak
+         *     `Limiter` exists to close, driven by anyone on the LAN who can reach this
+         *     unauthenticated endpoint.
+         *
+         *     **`file_claim`'s `None` is answered 429 either way**, whether the queue
+         *     is full or this fingerprint is still suppressed from a recent deny.
+         *     `file_claim`'s own docstring is explicit that a caller must not be able
+         *     to tell those two refusals apart, the same way `pairing.claim_token`
+         *     answers `None` for a token nobody minted and one already spent without
+         *     distinguishing them -- a route that answered 403 for one and 429 for the
+         *     other would hand back exactly the distinction the store was built to
+         *     withhold, confirming to anyone probing a fingerprint that it was the one
+         *     an admin had denied. Design spec S6.5's own failure table only ever
+         *     names 429 for this endpoint's refusals, for the same reason.
+         *
+         *     **The residual, said here because the sentence above overstates it on its
+         *     own.** One response cannot be told from the other; a *pair* of them can. A
+         *     caller chooses its own fingerprint, so it files a fresh random one -- 202
+         *     means the queue has room -- and then the target, where a 429 now means
+         *     suppression. `file_claim`'s own docstring carries the argument for leaving
+         *     that open; briefly, every way of closing it costs a real rack its pairing
+         *     in order to withhold a fact an attacker cannot act on. What this route
+         *     does guarantee is the half that matters: no single answer here
+         *     distinguishes them, so a fingerprint cannot be tested for a denial without
+         *     filing under it.
+         *
+         *     The `detail` says `"claim refused"` and not `"the claim queue is full"`,
+         *     which it used to. Both are equally indistinguishable -- one string for
+         *     both refusals is the whole requirement, and the requirement stands -- but
+         *     the queue is usually *not* full when a suppressed fingerprint re-files,
+         *     so the old string was a sentence the server knew to be false, printed
+         *     into the Pi's log and the admin's toast. "Refused" is true of both.
+         */
+        post: operations["file_claim_route_api_racks_claims_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/racks/claims/{claim_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Poll Claim
+         * @description A rack asks whether it has been let in. Unauthenticated: the claim id
+         *     itself is the bearer credential (design spec S6.3 step 4) -- there is no
+         *     session to ask for, and no signature header either. Why there is nothing
+         *     to sign with is design spec S6.3 step 4 and `ors_daemon.join`'s module
+         *     docstring, not `claims.py`'s, which does not discuss it: the server holds
+         *     only `sha256(secret)`, so it could not verify an HMAC keyed on a rack's
+         *     identity even if one were sent.
+         *
+         *     **A claim id that is unknown and one that is malformed answer
+         *     identically** -- both reach `claim_store.get_claim`, which does a plain
+         *     lookup and returns `None` for either, and both land on the same 404
+         *     here. Nothing about this path validates the id's shape first, on
+         *     purpose: a route that answered differently for "not base64" than for
+         *     "well-formed but not in the table" would confirm to somebody enumerating
+         *     ids that they were at least guessing the right shape.
+         *
+         *     **The lookup is SQL equality on the primary key, not a scan with
+         *     `hmac.compare_digest`.** An earlier draft of this task called for the
+         *     latter, on the reasoning that a byte-at-a-time comparison of a bearer
+         *     credential leaks its prefix to whoever can time this endpoint. It is not
+         *     followed, for two reasons that are specific to this store rather than
+         *     general. `claims.get_claim` (Task 12, already shipped) is the module's
+         *     own interface for reading one claim and it does `WHERE id = ?`;
+         *     duplicating that read here as `SELECT * FROM claim` plus a Python loop
+         *     would mean this route no longer goes through the store at all, and it
+         *     would still not be constant time -- the loop's length is the number of
+         *     live claims, which is itself a signal, and `_expire` runs a `DELETE`
+         *     ahead of every read on this path whose cost swamps a 43-byte compare.
+         *     What actually keeps a guessed id from being ground out prefix-first is
+         *     not the B-tree, and an earlier version of this paragraph claiming it was
+         *     said something untrue: a leaf comparison in SQLite *is* a `memcmp` and
+         *     *is* prefix-sensitive. It is what the guess gets compared against that
+         *     holds. `claim.id` is `secrets.token_urlsafe(32)` (`claims.file_claim`),
+         *     so the handful of rows a descent touches are other racks' random
+         *     43-character ids, statistically unrelated to the target's; a guess that
+         *     happens to share a longer prefix with one of *those* has learned nothing
+         *     about the one id that would actually work, and the row that would answer
+         *     is the row the descent does not reach until the guess is already right.
+         *     The signal a byte-at-a-time compare against the true value would leak is
+         *     therefore not present to leak.
+         *
+         *     **Rate-limited, with its own budget** -- see
+         *     `CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS`. Asked before the store is touched
+         *     and `record`ed only after `too_many`, exactly as `file_claim_route` does
+         *     and for the identical reason (the comment in `Limiter.too_many`: `record`
+         *     never prunes). It
+         *     matters more here than there, because this route writes on every call
+         *     whether or not the id is real: `get_claim` runs `_expire`'s `DELETE`s
+         *     first, so an unlimited poll is an unauthenticated write loop.
+         *
+         *     **`granted_key` is read with a second query, deliberately.**
+         *     `claims.Claim` -- what `get_claim` returns -- does not carry the sealed
+         *     blob at all; only the row itself does. A `granted_at IS NOT NULL` row
+         *     that goes missing between the two reads (aged past
+         *     `claims.CLAIM_LIFETIME_S`, in the moment between them) is the same 404
+         *     as one that was never granted, not a crash: `row is None` is checked,
+         *     not assumed away.
+         */
+        get: operations["poll_claim_api_racks_claims__claim_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/daemons": {
         parameters: {
             query?: never;
@@ -706,6 +849,103 @@ export interface paths {
         patch: operations["patch_settings_api_settings_patch"];
         trace?: never;
     };
+    "/api/claims": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Claims
+         * @description Design spec S7's "Waiting to join" list. Session-guarded by `api`
+         *     (`app.py`), not by anything declared here.
+         */
+        get: operations["list_claims_api_claims_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/claims/{fingerprint}/approve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve Claim
+         * @description Design spec S7's Approve button: create the rack, mint its key, seal
+         *     the key to the claim's ephemeral public key. The key itself is never in
+         *     this response -- see `ClaimApproved`.
+         *
+         *     **`sqlite3.IntegrityError` is a 409, not a 500.** `claims.approve`'s own
+         *     docstring: a `daemon.name` collision with a rack this claim's fingerprint
+         *     does not own raises out of a transaction that has already rolled back,
+         *     leaving the claim exactly as pending and deniable as it was before this
+         *     call -- loud and recoverable, which is what the route owes the admin who
+         *     just clicked, not a stack trace.
+         *
+         *     **One history event, the same one `POST /api/daemons` writes.** That
+         *     route records `info`/`created` for a rack minted from a pairing token,
+         *     and design spec S7's status panel reads that list; without a line here, a
+         *     rack that joined by claim -- the racks this whole milestone is about --
+         *     showed an empty history for its entire life. It is written here rather
+         *     than inside `claims.approve` on purpose: `ors_server.claims` is the store
+         *     and takes no dependency on this package, its `approve` is called directly
+         *     by `test_claims.py` where a history row is not part of what it is
+         *     testing, and `approve` runs `seal` under `BEGIN IMMEDIATE` with the write
+         *     lock held (its own docstring), which is not a transaction to lengthen
+         *     with a second table's insert and its ring-buffer prune. The cost of that
+         *     choice is exact and small: the event is written after `approve` has
+         *     already committed, on the connection this route opens anyway to read the
+         *     rack's name -- and the cost is *not* the empty event list an earlier
+         *     version of this paragraph named. A crash between the commit and the write
+         *     would indeed leave a real rack with no history, and that is cosmetic; the
+         *     failure worth stating is the other one. Anything that raises after
+         *     `approve` has committed -- `write_event` itself, or the `one_row` name
+         *     read above it -- becomes a 500 for a rack that already exists, already
+         *     holds its key and is already paired, so the admin is told the approval
+         *     failed when it did not, and the obvious retry answers 404 because the
+         *     claim is gone. That is the price of writing the event outside the
+         *     transaction, and it is accepted against holding SQLite's write lock
+         *     across a second table's insert and its ring-buffer prune, which every
+         *     reader of this module pays for.
+         */
+        post: operations["approve_claim_api_claims__fingerprint__approve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/claims/{fingerprint}/deny": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Deny Claim
+         * @description Design spec S7's Deny button: remove the claim, suppress the
+         *     fingerprint for `claims.DENY_SUPPRESSION_S`.
+         */
+        post: operations["deny_claim_api_claims__fingerprint__deny_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -759,6 +999,107 @@ export interface components {
              * @default cyan
              */
             palette: string | (components["schemas"]["GradientPalette"] | components["schemas"]["ThresholdPalette"]);
+        };
+        /**
+         * ClaimApproved
+         * @description `POST /api/claims/{fingerprint}/approve`'s body: the rack that now
+         *     exists, not the key -- the key reaches the daemon over
+         *     `GET /api/racks/claims/{id}` and nowhere else, sealed (design spec S6.3
+         *     step 5).
+         *
+         *     Not "exactly once", which this said until M3c's final review and which
+         *     contradicts both the module docstring above and `poll_claim` below:
+         *     `claims.approve` stores the ciphertext in `claim.granted_key` and never
+         *     clears it, so every poll of an approved claim answers the *same* blob.
+         *     Delivery is idempotent on purpose -- Tasks 12 and 13 both considered
+         *     discard-on-read and rejected it, because a poll that merely observed or
+         *     guessed a claim id would otherwise consume the one delivery and the
+         *     legitimate daemon could never pair.
+         */
+        ClaimApproved: {
+            /** Id */
+            id: number;
+            /** Name */
+            name: string;
+        };
+        /**
+         * ClaimFiled
+         * @description `202`'s body: the claim id, and nothing else.
+         *
+         *     Returned here and nowhere else -- not in `PendingClaim` below, not in any
+         *     log line this module writes -- because it is the bearer credential a
+         *     daemon's later poll authenticates with (design spec S6.3 step 4), and the
+         *     only safe number of places to disclose a bearer credential is one.
+         */
+        ClaimFiled: {
+            /** Claim Id */
+            claim_id: string;
+        };
+        /**
+         * ClaimPollResult
+         * @description `GET /api/racks/claims/{id}`'s body.
+         *
+         *     The three sealed fields are `None` for a claim still `pending`, and
+         *     filled in together for one `approved` -- never independently, because
+         *     `claims.approve` writes `granted_key` in the same guarded `UPDATE` that
+         *     sets `granted_at` (its own docstring), so a row this route can see as
+         *     granted always has the blob to go with it.
+         *
+         *     There is no `denied` status, although design spec S6.3's route table
+         *     names one. `claims.deny` **deletes** the row and records only the
+         *     fingerprint's suppression (`deny`'s own docstring) -- nothing in the
+         *     schema distinguishes "denied" from "expired" from "never filed" once
+         *     that row is gone, and inventing a way to tell them apart here would
+         *     contradict the one guarantee `claims.deny` and `claims.file_claim` both
+         *     document: those refusals must not be tellable apart by whoever asks.
+         *     `poll_claim` below answers 404 for all three, identically.
+         */
+        ClaimPollResult: {
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "approved";
+            /** Ephemeral Public Key */
+            ephemeral_public_key?: string | null;
+            /** Nonce */
+            nonce?: string | null;
+            /** Ciphertext */
+            ciphertext?: string | null;
+        };
+        /**
+         * ClaimRequest
+         * @description `POST /api/racks/claims`'s body (design spec S6.3 step 1).
+         *
+         *     No `address` field, on purpose -- design spec S6.3 step 2 is explicit
+         *     that the source address is recorded by the server from the connection,
+         *     never taken from the body, because a field the claimant fills in is a
+         *     field the claimant chooses. A caller that sends one anyway (an old
+         *     client, or an adversarial one) is not refused for it: pydantic's default
+         *     is to ignore unknown fields, which is what lets
+         *     `test_the_recorded_address_is_the_connections_not_the_bodys` prove the
+         *     field is ignored rather than merely testing that it is rejected.
+         */
+        ClaimRequest: {
+            /** Hostname */
+            hostname: string;
+            /**
+             * Fingerprint
+             * @description The SHA-256 of this rack's identity secret, 64 lowercase hex characters.
+             */
+            fingerprint: string;
+            /**
+             * Short Code
+             * @description The first six base32 characters of the fingerprint's digest. Recomputed here from `fingerprint`; a pair that does not agree is refused.
+             */
+            short_code: string;
+            /** Version */
+            version: string;
+            /**
+             * Public Key
+             * @description An ephemeral X25519 public key: 32 raw bytes, standard base64.
+             */
+            public_key: string;
         };
         /** CommandBody */
         CommandBody: {
@@ -1297,6 +1638,26 @@ export interface components {
             ok: boolean;
             /** Other Sessions Ended */
             other_sessions_ended: number;
+        };
+        /**
+         * PendingClaim
+         * @description One row of `GET /api/claims` -- everything design spec S7 shows an
+         *     admin, and nothing else. `claim.id` is deliberately absent; see the
+         *     module docstring.
+         */
+        PendingClaim: {
+            /** Fingerprint */
+            fingerprint: string;
+            /** Hostname */
+            hostname: string;
+            /** Address */
+            address: string;
+            /** Short Code */
+            short_code: string;
+            /** Version */
+            version: string;
+            /** First Seen */
+            first_seen: number;
         };
         /**
          * ProbeBody
@@ -1986,6 +2347,70 @@ export interface operations {
                     "application/json": {
                         [key: string]: boolean;
                     };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    file_claim_route_api_racks_claims_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ClaimRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClaimFiled"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    poll_claim_api_racks_claims__claim_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                claim_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClaimPollResult"];
                 };
             };
             /** @description Validation Error */
@@ -3033,6 +3458,105 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SettingsView"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_claims_api_claims_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                ors_session?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PendingClaim"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    approve_claim_api_claims__fingerprint__approve_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                fingerprint: string;
+            };
+            cookie?: {
+                ors_session?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClaimApproved"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    deny_claim_api_claims__fingerprint__deny_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                fingerprint: string;
+            };
+            cookie?: {
+                ors_session?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: boolean;
+                    };
                 };
             };
             /** @description Validation Error */

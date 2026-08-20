@@ -2,12 +2,20 @@
  * A real server, a real rack, and the proof that neither is left behind.
  *
  * This is the only file in the repository that starts `ors-server` and
- * `ors-daemon` as processes. Everything the seven specs assert is asserted
+ * `ors-daemon` as processes. Everything the eight specs assert is asserted
  * against those two, through a browser, over HTTP and a WebSocket -- which is
  * the point of the layer: the base64 trap that shipped in M3a passed a green
  * Python test *and* a green component test, because both ends of it were
  * stubbed by the same assumption. Only a real server talking to a real browser
  * has no assumption to share.
+ *
+ * **Two racks are started, because there are two ways in.** `joinByClaim`
+ * files a claim and waits to be approved, which is what a freshly installed Pi
+ * does and what the whole of M3c is about; `startDaemon` spends a pairing
+ * token, which is the path M3a shipped and which is still supported. They are
+ * separate processes with separate state directories, because a rack's
+ * identity is derived from where its pairing lives -- see the directories
+ * below.
  *
  * **Nothing here binds a fixed port.** The port is taken from the kernel and
  * handed to the server, to the interface (as the origin the browser loads) and
@@ -59,8 +67,23 @@ const VENV = join(REPO, ".venv", "bin")
  */
 export const PASSWORD = "a-password-for-the-rack"
 
-/** The rack the daemon runs, and the one that never connects. See `arrange`. */
+/**
+ * The three racks this story has, and each is a different kind of rack.
+ *
+ * `RACK` joins by filing a claim and being approved, and is the one the rest
+ * of the narrative is about: it runs the wizard, draws the panel, and is still
+ * drawing it when the server goes away. Its name is not a label this fixture
+ * chose freely -- a rack that joins by claim is created under the hostname it
+ * filed under (`claims.approve`'s own `INSERT INTO daemon`), so this is the
+ * hostname handed to `virtual_rack.py`, and the two cannot drift apart.
+ *
+ * `TOKEN_RACK` spends a minted token instead, and exists so that path keeps a
+ * real daemon behind it rather than only a dialog.
+ *
+ * `SPARE_RACK` never connects at all. See `arrange`.
+ */
 export const RACK = "pi-cellar"
+export const TOKEN_RACK = "pi-loft"
 export const SPARE_RACK = "pi-spare"
 
 /**
@@ -233,19 +256,32 @@ export type Rack = {
   readonly panelDir: string
   /**
    * Start the server, and return once it answers. Restartable, on the same
-   * port, the same data directory and the same secret -- which is what specs 6
-   * and 7 are made of.
+   * port, the same data directory and the same secret -- which is what specs 7
+   * and 8 are made of.
    */
   startServer(): Promise<void>
   /** Stop it, and prove it is gone and that its port answers nothing. */
   stopServer(): Promise<void>
+  /**
+   * Start the rack that joins by being approved rather than by being told a
+   * token, and answer with the short code it printed. It returns as soon as
+   * that code exists -- the rack is waiting to be let in, which is what the
+   * spec is about to do through the interface.
+   */
+  joinByClaim(): Promise<string>
   /** Pair and run a real daemon with the token the interface just minted. */
-  startDaemon(token: string): Promise<void>
+  startDaemon(name: string, token: string): Promise<void>
   /** An API session of the fixture's own, for arranging what no page arranges. */
   api(): Promise<APIRequestContext>
   /**
    * The world the specs assert against: a second rack that never connects,
    * carrying two screens, and the night window turned off.
+   *
+   * Idempotent, and a no-op until a password exists. It is called from
+   * `rack.spec.ts`'s `beforeEach` rather than from whichever spec happened to
+   * need it first, so calling it more than once has to be free -- and the
+   * first spec of the story is the one that *sets* the password this signs in
+   * with, so the first call has to do nothing rather than fail.
    */
   arrange(): Promise<void>
   /** When a virtual panel's PNG was last written, or null if it never was. */
@@ -261,8 +297,8 @@ type Fixtures = {
    * One page for the whole narrative.
    *
    * Worker-scoped rather than per-test, and that is not a convenience: spec 1
-   * signs in and spec 7 asserts the interface recovered **without a reload**,
-   * which is a claim about one document surviving all seven. A fresh page per
+   * signs in and spec 8 asserts the interface recovered **without a reload**,
+   * which is a claim about one document surviving all eight. A fresh page per
    * spec would sign the session out from under the story and would make "did
    * not reload" unaskable.
    */
@@ -292,9 +328,18 @@ export const test = base.extend<NoPerTestFixtures, Fixtures>({
       const dataDir = join(root, "data")
       const spiRoot = join(root, "dev")
       const panelDir = join(root, "panels")
-      const linkPath = join(root, "link.json")
+      // **A directory per rack, and not two files in one.** A rack's identity
+      // is derived from where its pairing lives -- `join_a_server` reads or
+      // mints `identity.json` beside `--link`, and the cached snapshot goes
+      // beside it too -- so two daemons pointed at one directory would be one
+      // rack twice over: the same fingerprint, the same short code, and a
+      // second claim the server would fold into the first.
+      const claimDir = join(root, RACK)
+      const tokenDir = join(root, TOKEN_RACK)
       const configPath = join(root, "rack.yaml")
-      for (const directory of [dataDir, spiRoot, panelDir]) mkdirSync(directory, { recursive: true })
+      for (const directory of [dataDir, spiRoot, panelDir, claimDir, tokenDir]) {
+        mkdirSync(directory, { recursive: true })
+      }
 
       // Two devices, so that choosing the right one in the wizard is a choice
       // and not the only option -- and neither of them is SPI0.0, whose two
@@ -304,9 +349,14 @@ export const test = base.extend<NoPerTestFixtures, Fixtures>({
       // concerned; nothing opens these.
       for (const device of ["spidev2.0", "spidev3.1"]) writeFileSync(join(spiRoot, device), "")
 
-      // A rack with no screens: valid, and what a Pi that has been paired but
-      // never pushed to runs from. Everything on the glass afterwards comes
-      // from the server's snapshot, which is what the specs are about.
+      // A rack with no screens: valid, and what a standalone Pi runs from.
+      // Only `TOKEN_RACK` is given it. The rack that joins by claim is handed
+      // no `--config` at all, which is not an omission -- `--config` is what
+      // `_run` checks before it will file a claim at all, and a freshly
+      // installed Pi has no such file. It boots row 3 of the daemon's own boot
+      // table instead ("paired, but nothing has ever been pushed"), with no
+      // screens, and everything that reaches its glass afterwards comes from
+      // the server's snapshot.
       writeFileSync(configPath, "version: 1\ntimezone: UTC\nscreens: []\n")
 
       const python = join(VENV, "python")
@@ -334,7 +384,7 @@ export const test = base.extend<NoPerTestFixtures, Fixtures>({
         ORS_DATA_DIR: dataDir,
         // Minted once per run and then **fixed across restarts**, which is the
         // load-bearing half: the secret signs the session cookie, so a server
-        // that generated a new one when spec 7 restarted it would sign the
+        // that generated a new one when spec 8 restarted it would sign the
         // browser out, and "it recovered without a reload" would be untestable
         // for a reason that has nothing to do with the socket.
         //
@@ -349,6 +399,15 @@ export const test = base.extend<NoPerTestFixtures, Fixtures>({
           .replaceAll("/", "_"),
         ORS_HOST: "127.0.0.1",
         ORS_PORT: String(port),
+        // **Silent, and this is not tidiness either.** A bare `ors-server`
+        // announces `_openrackscreen._tcp.local.` on every interface it can
+        // reach, so an end-to-end run on a developer's laptop would put a
+        // service record for a throwaway server on an ephemeral port onto the
+        // office LAN -- where a real Pi browsing for one would find it, file a
+        // claim against it, and be told to wait by a process this fixture is
+        // about to kill. Nothing in these specs browses; the daemon is given
+        // `--server` and dials the origin above directly.
+        ORS_ANNOUNCE: "0",
         ORS_WEB_DIR: webDir,
         ORS_LOG_LEVEL: "INFO",
       }
@@ -365,9 +424,10 @@ export const test = base.extend<NoPerTestFixtures, Fixtures>({
       // making them compile while asserting nothing.
       const running: {
         server: Managed | null
-        daemon: Managed | null
+        claimed: Managed | null
+        tokened: Managed | null
         session: APIRequestContext | null
-      } = { server: null, daemon: null, session: null }
+      } = { server: null, claimed: null, tokened: null, session: null }
 
       const startServer = async () => {
         if (running.server !== null && !running.server.hasExited) {
@@ -408,7 +468,35 @@ export const test = base.extend<NoPerTestFixtures, Fixtures>({
         return running.session
       }
 
+      /**
+       * Whether `arrange` has already made the world. See `arrange`.
+       *
+       * Worker-scoped like everything else in this closure, so it is per run
+       * and per server: a second worker would have its own temp root, its own
+       * database and its own `false`.
+       */
+      let arranged = false
+
       const arrange = async () => {
+        if (arranged) return
+
+        // **Nothing to arrange until there is a password**, and this is the
+        // first spec's own precondition rather than an edge case: spec 1
+        // asserts a database with no password, and the story cannot set one
+        // for it. `GET /api/auth/me` is the one open route -- it answers 200
+        // either way and reports `password_set`, which is how the interface
+        // itself tells "never set" from "set, and this browser has no
+        // session" -- so this asks it instead of guessing from a 401 that
+        // `api()` would raise on.
+        const anonymous = await request.newContext({ baseURL: origin })
+        try {
+          const me = await anonymous.get("/api/auth/me")
+          if (!me.ok()) throw new Error(`/api/auth/me answered ${me.status()}`)
+          if (((await me.json()) as { password_set?: boolean }).password_set !== true) return
+        } finally {
+          await anonymous.dispose()
+        }
+
         const client = await api()
 
         // **Off, and this is not tidying.** `NightWindow` defaults to enabled
@@ -450,12 +538,84 @@ export const test = base.extend<NoPerTestFixtures, Fixtures>({
           })
           if (!made.ok()) throw new Error(`could not create the screen ${name}: ${made.status()}`)
         }
+
+        // Last, so that a failure part-way through leaves the next call to try
+        // again rather than reporting a world that was never finished.
+        arranged = true
       }
 
-      const startDaemon = async (token: string) => {
-        if (running.daemon !== null && !running.daemon.hasExited) {
-          throw new Error("the daemon is already running")
+      /**
+       * How long the rack asking to join may take to say what its code is.
+       *
+       * It is printed before the first claim is filed and before anything is
+       * dialled, so what this actually budgets for is a Python interpreter
+       * importing the daemon -- and, the first time, minting the identity.
+       */
+      const CODE_BUDGET_MS = 30_000
+
+      /**
+       * Start the rack that joins by being approved, and answer with the six
+       * characters it printed for a human to compare.
+       *
+       * **Read off the rack's own console, not out of its identity file.**
+       * The short code is a check against approving a stranger's rack, and the
+       * whole of that check is a person reading one line on a terminal and
+       * comparing it with one line in a browser (`ApproveClaimDialog`'s own
+       * subject). Deriving it here from `identity.json` instead would assert
+       * that two computations of the same digest agree, which is a thing
+       * `daemon/tests/test_identity.py` already pins and which nobody in front
+       * of a rack ever does. This is the line `journalctl -u openrackscreen`
+       * shows, matched as written by `__main__.join_a_server`.
+       *
+       * **`--server`, and no browse anywhere in it.** `run --server URL` is a
+       * first-class path and not a way round one: `join_a_server` turns the
+       * URL into exactly the `Found` record a browse would have answered with,
+       * and every byte after that -- the filing, the claim id, the poll, the
+       * sealed key, the pairing -- is identical. What it avoids is making this
+       * suite depend on whether the machine running it has Avahi, whether its
+       * container carries multicast, and whether anything else on the LAN
+       * answers to `_openrackscreen._tcp.local.`. None of those is a fact
+       * about this project, and `daemon/tests/test_discovery.py` is where the
+       * browse itself is tested.
+       */
+      const joinByClaim = async (): Promise<string> => {
+        if (running.claimed !== null && !running.claimed.hasExited) {
+          throw new Error("the rack that joins by claim is already running")
         }
+        const started = new Managed("ors-daemon (by claim)", python, [
+          join(HERE, "virtual_rack.py"),
+          "run",
+          "--link",
+          join(claimDir, "link.json"),
+          "--server",
+          origin,
+          "--status",
+          join(claimDir, "status.json"),
+        ], { ...daemonEnv, ORS_E2E_HOSTNAME: RACK })
+        running.claimed = started
+
+        let code = ""
+        await until("the rack printed the short code it is asking to be approved by", CODE_BUDGET_MS, async () => {
+          if (started.hasExited) {
+            throw new Error(`ors-daemon exited before it asked to join:\n${started.log()}`)
+          }
+          // Anchored on the alphabet as well as the length, so a line that
+          // said something else six characters long could not stand in for
+          // it. `identity.py` cuts the code out of a base32 digest.
+          const found = /short code is ([A-Z2-7]{6})/.exec(started.log())
+          if (found === null) return false
+          code = found[1]
+          return true
+        })
+        return code
+      }
+
+      /** Pair and run a real daemon with the token the interface just minted. */
+      const startDaemon = async (name: string, token: string) => {
+        if (running.tokened !== null && !running.tokened.hasExited) {
+          throw new Error("the rack that spends a token is already running")
+        }
+        const linkPath = join(tokenDir, "link.json")
         // `connect` opens no socket -- it writes the pairing a `run` dials
         // with -- so it is a synchronous call that either wrote the file or
         // said why on stderr.
@@ -470,7 +630,7 @@ export const test = base.extend<NoPerTestFixtures, Fixtures>({
           linkPath,
         ], { cwd: REPO, env: daemonEnv, stdio: "pipe" })
 
-        const started = new Managed("ors-daemon", python, [
+        const started = new Managed("ors-daemon (by token)", python, [
           join(HERE, "virtual_rack.py"),
           "run",
           "--config",
@@ -478,19 +638,19 @@ export const test = base.extend<NoPerTestFixtures, Fixtures>({
           "--link",
           linkPath,
           "--status",
-          join(root, "status.json"),
+          join(tokenDir, "status.json"),
         ], daemonEnv)
-        running.daemon = started
+        running.tokened = started
 
         const client = await api()
-        await until("the rack reported itself online", START_BUDGET_MS, async () => {
+        await until(`${name} reported itself online`, START_BUDGET_MS, async () => {
           if (started.hasExited) {
             throw new Error(`ors-daemon exited before it connected:\n${started.log()}`)
           }
           const listed = await client.get("/api/daemons")
           if (!listed.ok()) return false
           const racks = (await listed.json()) as { name: string; online: boolean }[]
-          return racks.some((each) => each.name === RACK && each.online)
+          return racks.some((each) => each.name === name && each.online)
         })
       }
 
@@ -501,6 +661,7 @@ export const test = base.extend<NoPerTestFixtures, Fixtures>({
         panelDir,
         startServer,
         stopServer,
+        joinByClaim,
         startDaemon,
         api,
         arrange,
@@ -509,14 +670,22 @@ export const test = base.extend<NoPerTestFixtures, Fixtures>({
           if (!existsSync(path)) return null
           return statSync(path).mtimeMs
         },
-        daemonLog: () => running.daemon?.log() ?? "",
+        // Both of them, each named: a failure in the second half of this
+        // story is as likely to be the rack that spent a token as the one that
+        // was approved, and a log with no label on it would not say which.
+        daemonLog: () =>
+          [running.claimed, running.tokened]
+            .filter((managed) => managed !== null)
+            .map((managed) => `[${managed.label}]\n${managed.log()}`)
+            .join("\n"),
         serverLog: () => running.server?.log() ?? "",
       })
 
-      // The daemon first: it dials the server, and stopping the server under it
-      // would have it spend its backoff on a socket that is going away.
+      // The daemons first: they dial the server, and stopping the server
+      // under them would have them spend their backoff on a socket that is
+      // going away.
       const failures: string[] = []
-      for (const managed of [running.daemon, running.server]) {
+      for (const managed of [running.claimed, running.tokened, running.server]) {
         if (managed === null) continue
         try {
           await stopAndProveGone(managed)

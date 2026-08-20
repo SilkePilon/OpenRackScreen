@@ -1,11 +1,22 @@
 [project]
 name = "ors-daemon"
-version = "0.1.0"
+version = "0.2.0"
 description = "OpenRackScreen daemon: drives rack panels from a local config"
 requires-python = ">=3.11"
 dependencies = [
-    "ors-schema",
-    "ors-render",
+    "ors-schema==0.2.0",
+    "ors-render==0.2.0",
+    # The claim handover's X25519 + HKDF-SHA256 + AES-GCM (design spec S6.3
+    # step 5): without it the minted daemon key would cross the LAN in
+    # cleartext over plain HTTP. Already a server dependency, and floored at
+    # 43 to match `server/pyproject.toml` rather than for any API this uses.
+    # The workspace lock resolves 50.0.0, which publishes cp311-abi3 wheels
+    # for `manylinux_2_17_aarch64`, `manylinux_2_28_aarch64`,
+    # `manylinux_2_34_aarch64` and `manylinux_2_31_armv7l` -- checked, along
+    # with its one dependency `cffi` 2.1.1 (cp311 `manylinux_2_17_aarch64`),
+    # because a Rust toolchain is not something a Pi has and a source build of
+    # this package needs one.
+    "cryptography>=43.0",
     "pydantic>=2.7",
     "pyyaml>=6.0",
     "requests>=2.32",
@@ -17,6 +28,7 @@ dependencies = [
     # There is nothing to build here in any case: the C extension is an optional
     # speedup with a pure-Python fallback.
     "websockets>=13.0",
+    "zeroconf>=0.132",
 ]
 
 [project.scripts]

@@ -7,6 +7,9 @@ node_modules/
 dist/
 web/node_modules
 web/dist
+# Built by `pnpm build` and copied in at release time. Committing it would ship
+# a stale interface from whichever checkout last ran the build.
+server/src/ors_server/web/
 build/
 *.egg-info/
 .pytest_cache/

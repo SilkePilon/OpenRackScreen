@@ -14,16 +14,28 @@ wires them, not what they do once wired.
 from __future__ import annotations
 
 import json
+import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
-from ors_daemon.__main__ import DEFAULT_LINK_PATH, _command_handler, _frame_pump, main
-from ors_daemon.clock import system_clock
+from ors_daemon import identity
+from ors_daemon.__main__ import (
+    _RECLOCK_EXIT,
+    _USAGE_EXIT,
+    DEFAULT_LINK_PATH,
+    _command_handler,
+    _frame_pump,
+    main,
+)
+from ors_daemon.clock import ClockError, system_clock
 from ors_daemon.config import load_cached_snapshot, resolve_screens
+from ors_daemon.discovery import Found
 from ors_daemon.frames import FramePump, FrameStream
+from ors_daemon.link import LinkSettings, write_link_settings
 from ors_daemon.snapshot import SnapshotStore
 from ors_daemon.supervisor import Supervisor
 from ors_schema.daemon import DaemonConfig
@@ -52,13 +64,13 @@ def write_cache(path: Path, version: int = 12, snapshot: Any = None) -> Path:
     return path
 
 
-def write_config(tmp_path: Path, name: str = "LOCAL") -> Path:
+def write_config(tmp_path: Path, name: str = "LOCAL", timezone: str = "UTC") -> Path:
     path = tmp_path / "rack.yaml"
     path.write_text(
         yaml.safe_dump(
             {
                 "version": 1,
-                "timezone": "UTC",
+                "timezone": timezone,
                 "night": {"enabled": False},
                 "screens": [
                     {
@@ -79,6 +91,11 @@ class RecordingSupervisor:
     """Stands in for the real one so `run` returns instead of running forever."""
 
     instances: list[RecordingSupervisor] = []
+    # Set by a test that needs something to happen *during* `run_forever` --
+    # a real one blocks until `stop`, and a push arriving mid-block is exactly
+    # what `_run`'s `_RECLOCK_EXIT` handling needs to observe. This fake
+    # returns at once, so without a hook there is no "during" to speak of.
+    run_forever_hook: Callable[[RecordingSupervisor], None] | None = None
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
@@ -93,6 +110,8 @@ class RecordingSupervisor:
 
     def run_forever(self) -> None:
         self.ran += 1
+        if RecordingSupervisor.run_forever_hook is not None:
+            RecordingSupervisor.run_forever_hook(self)
 
     def stop(self) -> None:
         self.stops += 1
@@ -114,6 +133,20 @@ class _Flag:
 
     def is_set(self) -> bool:
         return self.value
+
+
+class _RecordingHandler(logging.Handler):
+    """Appends every record it sees. See `test_prometheus.py`'s
+    `recorded_warnings` for why this attaches straight to a module's own
+    logger instead of using `caplog`: `setup_logging` sets `propagate = False`
+    on the `ors_daemon` logger, and `caplog`'s handler lives on the root."""
+
+    def __init__(self, records: list[logging.LogRecord]) -> None:
+        super().__init__()
+        self._records = records
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._records.append(record)
 
 
 class FakeLink:
@@ -147,6 +180,7 @@ class FakeLink:
 @pytest.fixture(autouse=True)
 def _fresh_doubles(monkeypatch: pytest.MonkeyPatch) -> None:
     RecordingSupervisor.instances.clear()
+    RecordingSupervisor.run_forever_hook = None
     FakeLink.instances.clear()
     monkeypatch.setattr("ors_daemon.__main__.Supervisor", RecordingSupervisor)
     monkeypatch.setattr("ors_daemon.__main__.LinkClient", FakeLink)
@@ -270,11 +304,78 @@ def test_a_cache_that_is_not_there_is_no_cache(tmp_path: Path) -> None:
     assert load_cached_snapshot(tmp_path / "never-written.json") is None
 
 
+def test_a_cache_that_was_never_written_is_not_warned_about(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Row 4 of the boot table -- every first boot of a freshly installed rack.
+
+    `_run` calls `_boot_from_cache` *before* rows 4/5, so a Pi with no pairing,
+    no `--config` and nothing beside its link path reaches this loader with a
+    `snapshot.json` that was never written, on its way to filing a claim. This
+    used to log `WARNING "ignoring an unusable snapshot cache; this rack boots
+    from its config file"` -- two untruths in one line on the ordinary first
+    boot of the flow M3c exists to create: there is no cache to ignore and
+    there is no config file to boot from. Whoever read `journalctl -u
+    openrackscreen` after an install went looking for a file nobody meant to
+    write.
+    """
+    with caplog.at_level(logging.DEBUG, logger="ors_daemon.config"):
+        assert load_cached_snapshot(tmp_path / "never-written.json") is None
+
+    assert [record.levelno for record in caplog.records] == [logging.DEBUG]
+    assert "not pushed to this rack yet" in caplog.records[0].message
+    assert "config file" not in caplog.records[0].message
+
+
+def test_a_cache_that_exists_and_cannot_be_used_still_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The other half, and the reason the warning exists at all.
+
+    A file that was written and cannot be read back is a rack that had a
+    snapshot and is about to draw something else -- here, the `--config` it
+    falls back to (row 1), which is the case that looks like a working rack
+    from the front and is not. That must stay a warning, and it must not
+    promise a config file either: rows 3 and 4 reach the same line without one.
+    """
+    cache = tmp_path / "snapshot.json"
+    cache.write_text("{ not json")
+    (tmp_path / "rack.yaml").write_text(yaml.safe_dump({"screens": []}))
+
+    with caplog.at_level(logging.DEBUG, logger="ors_daemon.config"):
+        assert load_cached_snapshot(cache) is None
+
+    assert [record.levelno for record in caplog.records] == [logging.WARNING]
+    assert "ignoring an unusable snapshot cache" in caplog.records[0].message
+    assert "what the server last pushed" in caplog.records[0].message
+    assert caplog.records[0].path == str(cache)
+    assert caplog.records[0].error.startswith("JSONDecodeError:")
+
+
 def test_a_cache_path_that_is_a_directory_is_no_cache(tmp_path: Path) -> None:
     directory = tmp_path / "snapshot.json"
     directory.mkdir()
 
     assert load_cached_snapshot(directory) is None
+
+
+def test_a_cache_path_that_is_a_directory_warns_rather_than_going_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`IsADirectoryError` is somebody's mistake, not an ordinary first boot.
+
+    It is an `OSError` like `FileNotFoundError` is, and the quiet path is
+    deliberately spelled as the one exception rather than as the parent class,
+    so a `snapshot.json` that is a directory keeps the line in the journal that
+    tells its owner why the rack ignored it.
+    """
+    directory = tmp_path / "snapshot.json"
+    directory.mkdir()
+
+    with caplog.at_level(logging.DEBUG, logger="ors_daemon.config"):
+        assert load_cached_snapshot(directory) is None
+
+    assert [record.levelno for record in caplog.records] == [logging.WARNING]
 
 
 # --- connect ----------------------------------------------------------------
@@ -479,6 +580,366 @@ def test_connect_needs_no_config_file(tmp_path: Path) -> None:
     assert main(["connect", "--server", "http://s", "--token", "t", "--link", str(link)]) == 0
 
 
+# --- boot without --config: the five-row table's rows 2-5 -------------------
+
+
+def run_no_config(tmp_path: Path, *extra: str) -> int:
+    return main(
+        [
+            "run",
+            "--status",
+            str(tmp_path / "status.json"),
+            "--link",
+            str(tmp_path / "link.json"),
+            *extra,
+        ]
+    )
+
+
+def test_run_boots_from_the_cached_snapshot_with_no_config_file_at_all(tmp_path: Path) -> None:
+    """Row 2: a paired rack that has been pushed to never reads the YAML
+    `--config` used to force it to supply, because `--config` is not on the
+    command line at all here."""
+    link = tmp_path / "link.json"
+    main(["connect", "--server", "http://s", "--token", "t", "--link", str(link)])
+    write_cache(tmp_path / "snapshot.json")
+
+    assert run_no_config(tmp_path) == 0
+    assert [
+        screen.config.name for screen in RecordingSupervisor.instances[-1].kwargs["screens"]
+    ] == ["CPU"]
+
+
+def test_a_paired_rack_with_nothing_pushed_yet_starts_with_no_screens(tmp_path: Path) -> None:
+    """Row 3: not an error, and there is no file to fall back to either -- one
+    was never given. The panels appear when the server's first push lands."""
+    link = tmp_path / "link.json"
+    main(["connect", "--server", "http://s", "--token", "t", "--link", str(link)])
+
+    assert run_no_config(tmp_path) == 0
+    supervisor = RecordingSupervisor.instances[-1]
+    assert supervisor.kwargs["screens"] == []
+    # `0` is a real version -- the one an empty server counts from
+    # (`link.py:699`) -- and `_dispatch` skips a push whose version equals the
+    # claim (`link.py:869`). A row-3 rack claiming `0` instead of `None` could
+    # be left blank forever by a server that starts counting there.
+    assert FakeLink.instances[0].kwargs["config_version"] is None
+
+
+def test_a_freshly_installed_rack_enters_the_join_flow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Row 4: no pairing and no `--config` is the state `install` leaves a
+    machine in, and it is not an error. Before M3c `--config` was required, so
+    this state could not even be booted; this also proves that mutation dead:
+    `run_no_config` never passes `--config` at all, so a required flag would
+    fail this in argparse before `join_a_server` was ever reached.
+
+    `join_a_server` blocks until this rack is paired and writes the pairing to
+    `args.link` -- see its docstring -- so the fake here does the same thing a
+    real implementation must, and `_run` is expected to *continue in-process*
+    from there rather than exit and trust systemd's `Restart=` to bring the
+    process back already paired: run by hand, an exit there would print
+    nothing and leave the panels dark with no explanation at all.
+    """
+    joined: list[Any] = []
+
+    def fake_join(args: Any) -> None:
+        joined.append(True)
+        write_link_settings(
+            args.link,
+            LinkSettings(server_url="http://s", cache_path=tmp_path / "snapshot.json", token="t"),
+        )
+
+    monkeypatch.setattr("ors_daemon.__main__.join_a_server", fake_join)
+
+    assert run_no_config(tmp_path) == 0
+    assert joined == [True]
+    assert RecordingSupervisor.instances != [], (
+        "the caller falls through to _boot once paired, in this same process, "
+        "rather than exiting for a restart to pick it up"
+    )
+    assert RecordingSupervisor.instances[-1].kwargs["screens"] == [], (
+        "row 3: freshly paired, nothing pushed yet"
+    )
+
+
+def test_row_four_with_a_server_url_naming_no_host_fails_cleanly_not_with_a_traceback(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """Row 4 through the *real*, unpatched join flow, by the `--server` branch.
+
+    Unlike every other test of row 4 in this file, nothing here monkeypatches
+    `join_a_server`: what is being asked is whether the wiring around it --
+    `main`, `_run`, the identity, `server_from_url`, `_run`'s own unpaired
+    check -- holds together on a machine in the state `install` leaves.
+
+    The branch it reaches is the bad `--server` one, and the name says so:
+    `rack:8080` names no host at all (`urlsplit` reads `rack` as the scheme),
+    so `join.server_from_url` refuses it before anything is dialled and this
+    test opens no socket. `server_from_url`'s own refusals are covered at unit
+    level in `test_join.py`; what is added here is that the refusal reaches a
+    person. The general shape of row 4 -- no `--server`, so a browse -- is
+    `test_row_four_with_no_server_browses_and_refuses_to_choose_between_two`
+    below.
+
+    This is exactly the state `ors-daemon install` leaves a fresh machine in:
+    both `examples/openrackscreen.service` and the unit `install.py` generates
+    run `ExecStart=... run` with no `--config`, under `Restart=always` and
+    `StartLimitIntervalSec=0`. Anything raising out of the join flow is a
+    Python traceback written to the journal every `RestartSec=5`, forever --
+    which is what the `NotImplementedError` stub this replaced used to do
+    before `_run` learned to catch it, and what the flow itself must now never
+    do.
+    """
+    assert run_no_config(tmp_path, "--server", "rack:8080") == 1
+    error = capsys.readouterr().err
+    assert "Traceback" not in error
+    assert "rack:8080" in error, "the message has to name the thing that is wrong"
+    assert "http://" in error, "and show what a URL it can use looks like"
+    assert "ors-daemon connect" in error, "the message has to name what to do instead"
+    assert RecordingSupervisor.instances == []
+
+
+class _NoHttp:
+    """An HTTP client that fails rather than dials. See its one use below."""
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(f"this path may not reach the network, and it called http.{name}")
+
+
+def test_row_four_with_no_server_browses_and_refuses_to_choose_between_two(
+    tmp_path: Path, capsys: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What an unpaired rack with no `--server` at all does: it browses.
+
+    The one test that pins `__main__`'s choice of `servers`. Replace
+    `discovery.discover` there with anything that answers nothing -- a stub, a
+    lambda, an empty list -- and every other test in this repository still
+    passes, because every other row-4 test either patches `join_a_server` away
+    or hands it a `--server`. The rack this is about is the ordinary one: a
+    fresh Pi on a LAN, nothing typed, which is exactly the path design spec
+    S6.1 describes and the path `conftest.py`'s browse guard otherwise makes
+    unreachable.
+
+    Two servers are the answer that comes back **before any HTTP**, so this
+    needs no client and no sleeper: design spec S8's failure table says both
+    are named and neither is used, and `join_a_server` returns `False` on the
+    first lap. A rack that quietly took the first would pick a different one
+    on the next boot with nothing anywhere recording the choice.
+    """
+    monkeypatch.setattr(
+        "ors_daemon.__main__.discovery.discover",
+        lambda: [
+            Found(host="192.0.2.10", port=8080, scheme="http"),
+            Found(host="198.51.100.77", port=9090, scheme="http"),
+        ],
+    )
+    # The one thing standing in for anything real, and it stands in for a
+    # `requests.Session` with something that refuses to be used: reaching this
+    # decision must not dial, and a client that would open a TCP connection to
+    # either of those addresses is what this says out loud rather than what
+    # this test would otherwise merely be assuming. `_join_client` builds the
+    # session and holds no logic, so nothing under test is patched away.
+    monkeypatch.setattr(
+        "ors_daemon.__main__._join_client",
+        lambda: _NoHttp(),
+    )
+
+    assert run_no_config(tmp_path) == 1
+
+    # Read off stderr rather than out of `caplog`: `main` installs this
+    # daemon's own JSON handler and stops propagating, so what a test can see
+    # is exactly what the journal will hold, which is the point of the line.
+    error = capsys.readouterr().err
+    named = [json.loads(line) for line in error.splitlines() if line.startswith("{")]
+    answered = [record for record in named if "servers" in record]
+    assert answered, "the log has to say which servers answered; it is the only way to choose"
+    assert answered[-1]["servers"] == ["http://192.0.2.10:8080", "http://198.51.100.77:9090"], (
+        "both of them, in full, so the operator can put one of them after --server"
+    )
+    assert "--server" in answered[-1]["message"], "and say what to do with them"
+    assert "Traceback" not in error
+    assert "ors-daemon connect" in error
+    assert RecordingSupervisor.instances == []
+
+
+def test_an_unreadable_identity_stops_the_join_flow_without_a_traceback(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """`identity.load_or_create` refuses a file it cannot parse rather than
+    minting a second identity over it -- the admin would otherwise be looking
+    at a pending claim that had quietly stopped being this rack's. Its
+    `ValueError` reaches row 4, where the audience is somebody over SSH.
+    """
+    (tmp_path / "identity.json").write_text("{ not an identity")
+    (tmp_path / "identity.json").chmod(0o600)
+
+    assert run_no_config(tmp_path, "--server", "http://s:8080") == 1
+    error = capsys.readouterr().err
+    assert "Traceback" not in error
+    assert "identity" in error
+    assert RecordingSupervisor.instances == []
+
+
+def test_the_join_flow_prints_the_short_code_an_admin_has_to_compare(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """Design spec S6.4: the short code is the whole of what makes the
+    approve click meaningful, and it is compared against what the rack says
+    about itself. `install` prints it once, at install time; by the time
+    somebody opens the interface, the console this rack is running on is the
+    only place left that can show it.
+    """
+    assert run_no_config(tmp_path, "--server", "rack:8080") == 1
+
+    code = identity.load_or_create(tmp_path / "identity.json").short_code
+    assert code in capsys.readouterr().err
+
+
+def test_join_a_server_returning_unpaired_fails_cleanly_not_with_an_assert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """MEDIUM-C. `join_a_server`'s own docstring promises it blocks "until
+    either the interface approves it or the operator interrupts the process"
+    -- a clean return with nothing written, on abandonment, is a shape that
+    docstring names rather than rules out. So is a pairing written but then
+    unreadable, which is HIGH 2's own scenario from round 1.
+
+    Both used to fall through to `_boot`'s `assert settings is not None`,
+    which is an `AssertionError` traceback under an ordinary interpreter and
+    silently vanishes under `python -O` into an unrequested row-3 boot.
+    Neither is a message a person over SSH can act on; `_run` has to check
+    this itself, explicitly, right after the re-read.
+
+    Round 3, LOW 7: the message named no remedy ("nothing to run") for the
+    SSH audience this module keeps invoking, and the assertion only checked
+    that a traceback was absent -- deleting the whole `print` while keeping
+    `return 1` (a silent exit 1, the very shape HIGH 1 was raised about) still
+    passed. Now asserts the message names the way out.
+    """
+    monkeypatch.setattr("ors_daemon.__main__.join_a_server", lambda args: None)
+
+    assert run_no_config(tmp_path) == 1
+    error = capsys.readouterr().err
+    assert "Traceback" not in error
+    assert "ors-daemon connect" in error, "the message has to name a remedy, not just say no"
+    assert "--server" in error
+    assert "--token" in error
+    assert RecordingSupervisor.instances == [], "nothing was ever started"
+
+
+@pytest.mark.parametrize("extra_args", [(), ("--no-discovery",)], ids=["default", "--no-discovery"])
+def test_an_unreadable_pairing_still_boots_from_a_good_cached_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_args: tuple[str, ...]
+) -> None:
+    """`load_link_settings` returns `None` for a corrupt or unreadable pairing
+    file exactly the way it does for an absent one -- its own docstring: "a
+    corrupt pairing file is not a reason to leave four panels dark" -- and the
+    common cause is `sudo ors-daemon connect`, which writes link.json
+    root-owned 0600 while the shipped unit runs the daemon as
+    `User=openrackscreen`, so every read of it there is a `PermissionError`.
+
+    Under the shipped unit there is no `--config`, so a rack in this state must
+    not fall into the join flow -- and, before Task 15, into a traceback --
+    while a perfectly good `snapshot.json` sits right beside the pairing it
+    cannot read.
+
+    LOW-E: parametrized over `--no-discovery` too, not only the default. Row
+    5's refusal -- discovery off, no `--server` -- has to be decided *after*
+    trying the cache, not evaluated first with the cache never reached; the
+    reworded `--no-discovery` help text and the README both claim the cache
+    gate applies to row 5 as well, and nothing before this exercised the two
+    together.
+
+    Round 3, LOW 8: also pins `_link`'s `version is not None` branch, which
+    the round-1 report claimed was "covered incidentally by every existing
+    test" with nothing actually asserted about it -- collapsing both of
+    `_link`'s log branches onto the plain "no pairing" message (`if version is
+    not None:` -> `if False:`) passed the whole suite. This scenario -- an
+    unreadable pairing with a usable cache beside it -- is exactly the one the
+    `version is not None` branch exists for, so the pin belongs here rather
+    than in a new test.
+
+    Attached straight to `ors_daemon.__main__`'s own logger rather than using
+    `caplog`: `main()` calls `setup_logging`, which sets `propagate = False`
+    on the `ors_daemon` logger the moment this test runs, and `caplog`'s own
+    handler lives on the root logger -- see `test_prometheus.py`'s
+    `recorded_warnings` for the same workaround, already established in this
+    suite for the same reason.
+    """
+    link = tmp_path / "link.json"
+    link.write_text("{ not valid json")  # load_link_settings returns None for this
+    write_cache(tmp_path / "snapshot.json")
+
+    joined: list[Any] = []
+    monkeypatch.setattr("ors_daemon.__main__.join_a_server", lambda *a, **k: joined.append(True))
+
+    records: list[logging.LogRecord] = []
+    logger = logging.getLogger("ors_daemon.__main__")
+    handler = _RecordingHandler(records)
+    logger.addHandler(handler)
+    previous_level = logger.level
+    logger.setLevel(logging.INFO)
+    try:
+        assert run_no_config(tmp_path, *extra_args) == 0
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+    assert joined == [], "a usable cached snapshot must be tried before giving up on this rack"
+    assert [
+        screen.config.name for screen in RecordingSupervisor.instances[-1].kwargs["screens"]
+    ] == ["CPU"]
+
+    cache_records = [r for r in records if "cached snapshot beside" in r.getMessage()]
+    assert len(cache_records) == 1, (
+        "the pairing-unreadable-but-cache-usable branch has to log its own message, "
+        "not the plain no-pairing one"
+    )
+    assert cache_records[0].config_version == 12, "and it has to name the version it is running"
+
+
+def test_discovery_off_with_no_server_and_no_config_names_every_way_to_fix_it(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """Row 5: the one case with no way to obtain a configuration at all --
+    discovery is off and nothing names a server to dial directly. A message
+    naming every way out, not a traceback: the audience is somebody over SSH,
+    and a traceback tells them about this program rather than about their
+    machine.
+    """
+    assert run_no_config(tmp_path, "--no-discovery") == 1
+    error = capsys.readouterr().err
+    assert "--config" in error
+    assert "--server" in error
+    assert "Traceback" not in error
+    assert RecordingSupervisor.instances == []
+
+
+def test_a_server_flag_still_enters_the_join_flow_with_discovery_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--server` is one of row 5's two ways out even with discovery off: it
+    names a server to dial directly, so there is still a way to get a
+    configuration and this is row 4 again, not row 5."""
+    joined: list[Any] = []
+
+    def fake_join(args: Any) -> None:
+        joined.append(True)
+        write_link_settings(
+            args.link,
+            LinkSettings(
+                server_url="http://s:8080", cache_path=tmp_path / "snapshot.json", token="t"
+            ),
+        )
+
+    monkeypatch.setattr("ors_daemon.__main__.join_a_server", fake_join)
+
+    assert run_no_config(tmp_path, "--no-discovery", "--server", "http://s:8080") == 0
+    assert joined == [True]
+
+
 # --- run --------------------------------------------------------------------
 
 
@@ -601,6 +1062,177 @@ def test_a_pushed_snapshot_reaches_the_supervisor(tmp_path: Path) -> None:
     FakeLink.instances[0].kwargs["on_snapshot"](pushed, 9)
 
     assert RecordingSupervisor.instances[-1].applied == [pushed]
+
+
+def test_a_push_that_changes_the_timezone_stops_the_rack_instead_of_running_it_mismatched(
+    tmp_path: Path,
+) -> None:
+    """`Supervisor.apply` never rebuilds the clock -- `supervisor.py`'s own
+    docstring says why: it is built once in `__main__` and handed to the
+    supervisor as a component it does not own. `NightWindow` defaults to
+    enabled, 23:00-07:00, so applying a push that changes the timezone in place
+    would leave the night window evaluated in the *old* zone for the rest of
+    the process -- a UTC+2 rack sleeping at 01:00 local and waking at 09:00
+    local, silently, until an operator restarts it by hand.
+
+    So a timezone-changing push must not be applied here at all: the
+    supervisor is stopped instead, which the shipped unit's `Restart=always`
+    turns into the restart the mismatch actually needs.
+
+    MEDIUM-D: booted from a *non-UTC* config and pushed `UTC`, deliberately the
+    reverse of the obvious way to write this. Every other test in this suite
+    boots `UTC`, so a mutant that replaced `booted_timezone` at its call site
+    with the literal `"UTC"` still passed the whole daemon suite -- nothing
+    pinned that `_snapshot_handler` is comparing against the timezone the rack
+    actually booted with rather than the schema's own default. Booting
+    `Europe/Amsterdam` and pushing `UTC` fails under that mutant (`"UTC" ==
+    "UTC"` looks like no change at all) exactly where the UTC-booted version of
+    this test cannot tell the difference.
+    """
+    write_config(tmp_path, timezone="Europe/Amsterdam")
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+    supervisor = RecordingSupervisor.instances[-1]
+    pushed = DaemonConfig.model_validate({**SNAPSHOT, "timezone": "UTC"})
+
+    FakeLink.instances[0].kwargs["on_snapshot"](pushed, 9)
+
+    assert supervisor.applied == [], "must not run against a clock built for the old zone"
+    assert supervisor.stops == 1, "left to restart, which is what re-clocks it"
+
+
+def test_a_push_matching_the_timezone_the_rack_actually_booted_with_applies_normally(
+    tmp_path: Path,
+) -> None:
+    """MEDIUM-D's converse, and the other half of the same mutant: a rack
+    booted `Europe/Amsterdam` that gets pushed the exact same zone back has to
+    apply it, not stop -- a rack that cannot tell "same zone" from "different
+    zone" any way but "differs from a hardcoded UTC" would stop on *every*
+    push it was ever sent, forever, once it was ever paired to anything but a
+    UTC-configured server.
+    """
+    write_config(tmp_path, timezone="Europe/Amsterdam")
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+    supervisor = RecordingSupervisor.instances[-1]
+    pushed = DaemonConfig.model_validate({**SNAPSHOT, "timezone": "Europe/Amsterdam"})
+
+    FakeLink.instances[0].kwargs["on_snapshot"](pushed, 9)
+
+    assert supervisor.applied == [pushed], "same timezone as booted; must apply, not stop"
+    assert supervisor.stops == 0
+
+
+def test_a_push_with_an_unresolvable_timezone_is_refused_not_boot_looped(tmp_path: Path) -> None:
+    """MEDIUM-B. `DaemonConfig.timezone` is a bare `str` with no validation
+    against the host's tzdata -- the server has no way to know what any given
+    rack ships -- so `Europe/Amsterdaam`, one letter off, reaches here exactly
+    as easily as a real zone does.
+
+    Treated as an ordinary mismatch -- stop, let `Restart=always` bring it back
+    -- that typo boot-loops a rack that was healthy: the next boot rebuilds the
+    clock from the very same unresolvable name, `_boot_from_cache` raises
+    `ClockError`, falls back to row 3, claims `config_version=None`, and the
+    server reads that as "never got it" and pushes the identical broken value
+    again. Forever, panels dark.
+
+    So this is raised instead of swallowed into a stop. `LinkClient._config`
+    turns any exception out of `on_snapshot` into a `Nack` naming the reason
+    and leaves the running configuration untouched -- refused, not applied,
+    and not stopped either.
+    """
+    write_config(tmp_path)  # timezone: UTC
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+
+    assert run(tmp_path) == 0
+    supervisor = RecordingSupervisor.instances[-1]
+    pushed = DaemonConfig.model_validate({**SNAPSHOT, "timezone": "Europe/Amsterdaam"})
+
+    with pytest.raises(ClockError):
+        FakeLink.instances[0].kwargs["on_snapshot"](pushed, 9)
+
+    assert supervisor.applied == [], "an unresolvable timezone must not be applied either"
+    assert supervisor.stops == 0, "a stop only helps if the next boot could rebuild the clock"
+
+
+def test_a_timezone_reclock_stop_exits_nonzero_not_like_a_clean_stop(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """MEDIUM-A. `run` used to return 0 unconditionally, so a stop caused by a
+    timezone-changing push was indistinguishable from a clean SIGTERM. Only
+    `Restart=always` recovers a rack that exits that way; `Restart=on-failure`,
+    any supervisor that is not systemd, and a rack run by hand at a terminal
+    all read exit 0 as success and never re-clock at all -- the hand-run rack
+    prints nothing and just stops.
+
+    The push has to land *during* `run_forever`, not after `run` has already
+    returned -- `run_forever_hook` is what lets this fake simulate that,
+    calling the link's `on_snapshot` from inside the call `_run` is blocked on
+    in a real process.
+
+    Round 3, HIGH 1: this used to assert `run(tmp_path) == _RECLOCK_EXIT`,
+    importing and comparing against the very constant it was meant to pin --
+    tautological in the value, so `_RECLOCK_EXIT = 0` passed this test (and
+    all 847 others) even though 0 is a clean stop, the one thing this exit
+    code exists to be told apart from. Asserted on the literal below instead,
+    plus a standing guarantee this constant can never again collide with 0,
+    with `_USAGE_EXIT`, or with the plain `1` every other failure in this
+    module returns.
+
+    Round 3, HIGH 2: the stderr line is the entire deliverable for a rack run
+    by hand, and used to be unpinned -- deleting the whole `print` while
+    keeping `return _RECLOCK_EXIT` passed the suite. Asserted below that the
+    message names both the timezone and the restart.
+    """
+
+    def push_a_mismatched_timezone(supervisor: RecordingSupervisor) -> None:
+        pushed = DaemonConfig.model_validate({**SNAPSHOT, "timezone": "Europe/Amsterdam"})
+        FakeLink.instances[-1].kwargs["on_snapshot"](pushed, 9)
+
+    write_config(tmp_path)  # timezone: UTC
+    (tmp_path / "link.json").write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+    RecordingSupervisor.run_forever_hook = push_a_mismatched_timezone
+
+    assert run(tmp_path) == 10, "the literal value, not the constant that names it"
+    assert _RECLOCK_EXIT not in (0, 1, _USAGE_EXIT), (
+        "reserved: 0 is a clean stop, 1 is every plain failure in this module, "
+        "and _USAGE_EXIT is argparse's own -- none may ever also mean "
+        "'restart to re-clock'"
+    )
+    assert RecordingSupervisor.instances[-1].stops == 1
+
+    error = capsys.readouterr().err
+    # The exact wording of `_run`'s own print, not just words that happen to
+    # also appear in the WARNING `_snapshot_handler` logs on the same stderr
+    # (which already contains "timezone" on its own) -- tied to the print
+    # itself so deleting it cannot pass by coincidence.
+    assert "stopped because a push changed the timezone" in error, "names what changed"
+    assert "restart this rack to pick up the new clock" in error, "names the remedy"
+
+
+def test_a_clean_stop_still_exits_zero(tmp_path: Path, capsys: Any) -> None:
+    """The pin for the test above: `_RECLOCK_EXIT` must be reserved for a
+    re-clock, not handed out for an ordinary stop that never touched a push at
+    all.
+
+    Round 3, HIGH 2: also pins that the re-clock stderr line is not printed
+    unconditionally -- an ordinary stop must say nothing on stderr at all. The
+    pairing is written 0600 and a cache is provided, unlike this file's other
+    fixtures, precisely so that stderr is otherwise silent: `link.json` at the
+    default `write_text` mode logs a "readable by more than their owner"
+    warning, and no cache logs one of its own, both unrelated to the thing
+    this test pins and both loud enough to swamp the assertion below.
+    """
+    write_config(tmp_path)
+    link = tmp_path / "link.json"
+    link.write_text(json.dumps({"server_url": "http://s", "key": "k"}))
+    link.chmod(0o600)
+    write_cache(tmp_path / "snapshot.json")
+
+    assert run(tmp_path) == 0
+    assert capsys.readouterr().err == ""
 
 
 def test_the_link_claims_the_version_the_rack_is_actually_running(tmp_path: Path) -> None:

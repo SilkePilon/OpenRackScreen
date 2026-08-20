@@ -12,6 +12,7 @@ from fastapi import Cookie, HTTPException
 from starlette.requests import HTTPConnection
 
 from ors_server.db import Database
+from ors_server.limiter import Limiter
 
 SESSION_COOKIE = "ors_session"
 _PASSWORD_KEY = "admin_password_hash"
@@ -94,11 +95,11 @@ class Sessions:
 
     def __init__(self) -> None:
         self._tokens: set[str] = set()
-        self._attempts: dict[str, list[float]] = {}
-        # A `def` endpoint runs in the threadpool, so several logins really are
-        # concurrent. Set operations are atomic enough on their own; the attempt
-        # bookkeeping is a read, a rebuild and a write, and a failed attempt lost
-        # between them is a failed attempt the limiter did not count.
+        # The window for password guesses specifically -- see `Limiter` for why
+        # it is not shared with the unauthenticated claim endpoint's.
+        self._limiter = Limiter(max_attempts=_MAX_ATTEMPTS, window_seconds=_WINDOW_SECONDS)
+        # Set operations are atomic enough on their own; `_limiter` keeps its
+        # own lock around its bookkeeping.
         self._lock = threading.Lock()
 
     def issue(self) -> str:
@@ -138,28 +139,28 @@ class Sessions:
             return ended
 
     def too_many_attempts(self, client: str, now: float) -> bool:
-        with self._lock:
-            # Every client is swept, not just this one: the keys are addresses
-            # chosen by whoever can reach the port, nothing else deletes them,
-            # and a dict that only grows is a slow leak an unauthenticated
-            # caller controls.
-            self._attempts = {
-                address: recent
-                for address, attempts in self._attempts.items()
-                if (recent := [at for at in attempts if now - at < _WINDOW_SECONDS])
-            }
-            return len(self._attempts.get(client, ())) >= _MAX_ATTEMPTS
+        return self._limiter.too_many(client, now)
 
     def record_attempt(self, client: str, now: float) -> None:
-        with self._lock:
-            self._attempts.setdefault(client, []).append(now)
+        self._limiter.record(client, now)
 
     def clear_attempts(self, client: str) -> None:
         """Called when the password was right, so failures already answered for
         cannot add up to a lockout for the one caller who has proved they know it.
         """
-        with self._lock:
-            self._attempts.pop(client, None)
+        self._limiter.clear(client)
+
+    @property
+    def _attempts(self) -> dict[str, list[float]]:
+        """`_limiter`'s own bookkeeping, exposed under the old name.
+
+        `test_forgotten_clients_do_not_accumulate_forever` in `test_auth.py`
+        reaches in to check that a swept client is really gone, and that test
+        is pinned unchanged by this extraction -- so the attribute it reaches
+        for still has to resolve, even though the dict it names now lives on
+        `Limiter`.
+        """
+        return self._limiter._attempts
 
 
 def require_session(

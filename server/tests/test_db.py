@@ -4,7 +4,17 @@ import sqlite3
 import pytest
 from ors_server.db import SCHEMA_VERSION, Database
 
-TABLES = {"daemon", "screen", "template", "integration", "secret", "setting", "daemon_event"}
+TABLES = {
+    "daemon",
+    "screen",
+    "template",
+    "integration",
+    "secret",
+    "setting",
+    "daemon_event",
+    "claim",
+    "denied_fingerprint",
+}
 TABLE_NAMES = "SELECT name FROM sqlite_master WHERE type='table'"
 SET_TIMEZONE = "INSERT INTO setting (key, value) VALUES ('timezone', 'Europe/Amsterdam')"
 GET_TIMEZONE = "SELECT value FROM setting WHERE key='timezone'"
@@ -104,7 +114,53 @@ def test_the_export_redacts_the_key_a_daemon_reconnects_with(tmp_path):
     text = export.read_text()
 
     assert "5eaf00d" not in text, "an export is a file on disk; it does not carry a key hash"
-    assert json.loads(text)["daemon"][0]["key_hash"] == "<redacted>"
+
+
+def test_the_export_redacts_the_claim_id_and_the_granted_key(tmp_path):
+    """`claim.id` is not derived from a credential -- it *is* one (design spec
+    S6.3 step 4, and `claims.py`'s own comment on the `INSERT` says so): a
+    daemon's poll authenticates with it directly. `claim.granted_key` is
+    `secret.ciphertext`'s case, not `token_hash`'s -- sealed to the claim's
+    ephemeral public key rather than plaintext -- but the same rule applies:
+    encrypted still counts, and a rebuild discards it exactly as it discards
+    `key_hash`.
+    """
+    path = tmp_path / "ors.db"
+    database = Database(path)
+    database.initialise()
+    with database.connect() as connection:
+        connection.execute(
+            "INSERT INTO claim"
+            " (id, hostname, address, fingerprint, short_code, version, public_key,"
+            "  first_seen, granted_key)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "claim-id-is-the-bearer-credential",
+                "rack-pi",
+                "10.0.0.5",
+                "fp-1",
+                "AAAAAA",
+                "1.0.0",
+                "pk-1",
+                0.0,
+                "sealed-blob-not-plaintext",
+            ),
+        )
+        connection.execute("PRAGMA user_version = 0")
+
+    export = Database(path).initialise()
+    text = export.read_text()
+
+    assert "claim-id-is-the-bearer-credential" not in text, (
+        "an export is a file on disk; it does not carry the claim's bearer credential"
+    )
+    assert "sealed-blob-not-plaintext" not in text, (
+        "encrypted still counts -- an export does not carry the sealed key either"
+    )
+    record = json.loads(text)["claim"][0]
+    assert record["id"] == "<redacted>"
+    assert record["granted_key"] == "<redacted>"
+    assert record["hostname"] == "rack-pi", "the rest of the row still exports"
 
 
 def test_foreign_keys_are_enforced(tmp_path):
@@ -211,3 +267,49 @@ def test_redaction_does_not_invent_a_column_the_old_schema_lacked(tmp_path):
     exported = Database(path).export()["daemon"][0]
 
     assert exported == {"id": 1, "name": "old"}, "an export describes the database that existed"
+
+
+def test_a_pre_round_2_claim_table_upgrades_instead_of_crashing_on_start(tmp_path):
+    """Round 2 MEDIUM 4. `36439ba` was a committed, reviewable state on this
+    branch whose `claim` table has no `granted_at` column (`claims.approve`
+    deleted the row instead of keeping it, back then) and stamped
+    `user_version = 4`. If `SCHEMA_VERSION` here were still 4, a database
+    created from that commit would look, to `initialise`, like nothing
+    changed -- version already matches, so it skips the export-and-rebuild
+    branch entirely -- and every later read touching `granted_at` would raise
+    `sqlite3.OperationalError: no such column: granted_at` out of
+    `claims.py`, not out of anything naming a schema mismatch. Bumping to 5
+    makes `initialise` take the ordinary upgrade path instead.
+    """
+    path = tmp_path / "ors.db"
+    with sqlite3.connect(path) as connection:
+        # The exact `claim` DDL committed at 36439ba: `granted_key` and
+        # `daemon_id` exist, `granted_at` does not, and `fingerprint` is a
+        # plain UNIQUE column rather than the later partial index.
+        connection.execute(
+            "CREATE TABLE claim ("
+            " id TEXT PRIMARY KEY, hostname TEXT NOT NULL, address TEXT NOT NULL,"
+            " fingerprint TEXT NOT NULL UNIQUE, short_code TEXT NOT NULL,"
+            " version TEXT NOT NULL, public_key TEXT NOT NULL, first_seen REAL NOT NULL,"
+            " granted_key TEXT, daemon_id INTEGER"
+            ")"
+        )
+        connection.execute(
+            "INSERT INTO claim"
+            " (id, hostname, address, fingerprint, short_code, version, public_key, first_seen)"
+            " VALUES ('claim-a', 'host-a', '10.0.0.1', 'fp-a', 'AAAAAA', '1.0', 'key-a', 0.0)"
+        )
+        connection.execute("PRAGMA user_version = 4")
+
+    # Must not raise -- version 4 no longer matches SCHEMA_VERSION, so
+    # `initialise` exports the old rows and rebuilds with the current schema,
+    # which does have `granted_at`.
+    export = Database(path).initialise()
+
+    assert export is not None
+    exported_claim = json.loads(export.read_text())["claim"][0]
+    assert exported_claim["hostname"] == "host-a"
+    assert "granted_at" not in exported_claim, "the export describes the pre-upgrade schema"
+    with Database(path).connect() as connection:
+        # The column that a stuck-at-4 SCHEMA_VERSION would make unreachable.
+        assert connection.execute("SELECT granted_at FROM claim").fetchall() == []

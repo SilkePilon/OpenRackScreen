@@ -28,6 +28,18 @@ function me(state: { authenticated: boolean; password_set: boolean }) {
   return http.get("/api/auth/me", () => HttpResponse.json(state))
 }
 
+/**
+ * The claim list, which the Daemons page asks for whenever it renders.
+ *
+ * Stubbed empty, and only ever empty. Nothing in this file is about a rack
+ * waiting to join -- what is being pinned here is where a *refused* request
+ * sends the browser, and the request that is refused is the daemon listing
+ * beside it. This one is stubbed so that it is answered at all: `setup.ts`
+ * starts MSW with `onUnhandledRequest: "error"`, and an unstubbed route would
+ * fail these tests for a reason that has nothing to do with 401s.
+ */
+const NO_CLAIMS = http.get("/api/claims", () => HttpResponse.json([]))
+
 describe("getting in", () => {
   it("sends a server with no password to setup", async () => {
     server.use(me({ authenticated: false, password_set: false }))
@@ -50,6 +62,7 @@ describe("getting in", () => {
 
   it("returns to login when a session expires mid-session, and only once", async () => {
     let meCalls = 0
+    let listings = 0
     server.use(
       http.get("/api/auth/me", () => {
         meCalls += 1
@@ -58,9 +71,22 @@ describe("getting in", () => {
       }),
       // The route the expiry is discovered on. `/api/auth/me` never 401s; the
       // session-guarded routes do, and that 401 is what has to be noticed.
-      http.get("/api/daemons", () =>
-        HttpResponse.json({ detail: "not authenticated" }, { status: 401 }),
-      ),
+      //
+      // Answered on the page's own first ask and refused afterwards, in step
+      // with `me` above: *mid*-session is what this test is about, so the page
+      // has to be up before the session goes. A fixture that refused from the
+      // first request instead makes the redirect race the page's first render
+      // -- the heading below then may never be observable, which is a fact
+      // about how many requests a page happens to make at mount rather than
+      // anything about 401s, and it changed the day the Daemons page grew a
+      // second query.
+      http.get("/api/daemons", () => {
+        listings += 1
+        return listings === 1
+          ? HttpResponse.json([])
+          : HttpResponse.json({ detail: "not authenticated" }, { status: 401 })
+      }),
+      NO_CLAIMS,
     )
     const { pushes, path } = renderApp({ at: "/daemons" })
     expect(await screen.findByRole("heading", { name: "Daemons" })).toBeInTheDocument()
@@ -196,6 +222,7 @@ describe("getting in", () => {
       // either: this test is about where the redirect goes, and an unstubbed
       // request would fail it for a reason that has nothing to do with that.
       http.get("/api/daemons", () => HttpResponse.json([])),
+      NO_CLAIMS,
     )
     // Turned away from /screens, not /daemons. The destination after signing in
     // is unconditional (`LoginPage` navigates to /daemons), so starting at
@@ -304,6 +331,7 @@ describe("a refused handshake", () => {
         return HttpResponse.json({ authenticated: meCalls === 1, password_set: true })
       }),
       http.get("/api/daemons", () => HttpResponse.json([])),
+      NO_CLAIMS,
       // The route the question is asked on. It is guarded, so it can say the one
       // thing `GET /api/auth/me` never can.
       http.get("/api/settings", () => {
@@ -332,6 +360,7 @@ describe("a refused handshake", () => {
     server.use(
       me({ authenticated: true, password_set: true }),
       http.get("/api/daemons", () => HttpResponse.json([])),
+      NO_CLAIMS,
       // No server. `HttpResponse.error()` is a `fetch` that rejects, which is
       // what a stopped server gives a browser -- no status, nothing to read.
       http.get("/api/settings", () => {
@@ -385,6 +414,7 @@ describe("a refused handshake", () => {
         return HttpResponse.json({ authenticated: meCalls === 1, password_set: true })
       }),
       http.get("/api/daemons", () => HttpResponse.json([])),
+      NO_CLAIMS,
       http.get("/api/settings", () => {
         asked.push(asked.length)
         return asked.length === 1

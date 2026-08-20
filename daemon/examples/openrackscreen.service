@@ -41,12 +41,25 @@ SupplementaryGroups=spi gpio
 # add `--log-level DEBUG` right after the executable when a panel is misbehaving
 # and the INFO lines are not saying enough. INFO is the default and is what a
 # healthy rack should be left on -- DEBUG on four screens fills a journal.
-ExecStart=/opt/openrackscreen/.venv/bin/ors-daemon run \
-          --config /etc/openrackscreen/rack.yaml \
+
+# /opt/openrackscreen/bin, not .venv/bin: `ors-daemon install` builds this venv
+# with `uv venv /opt/openrackscreen`, which puts binaries in bin/. The nested
+# .venv this line used to name was a `uv sync` in a checkout, which is not how
+# anyone installs this any more.
+#
+# No --config. A paired rack's configuration comes from the server; the flag is
+# optional since M3c and a unit naming a file would make every rack need one.
+ExecStart=/opt/openrackscreen/bin/ors-daemon run \
           --status /run/openrackscreen/status.json
 
 # `always`, not `on-failure`: a clean exit is not something this program is
-# supposed to do, so exiting 0 is as much a reason to come back as crashing.
+# supposed to do, so exiting 0 is as much a reason to come back as crashing --
+# and a push that changes this rack's timezone deliberately stops it to be
+# re-clocked on the way back up, exiting 10 rather than 0 so that a caller
+# which does read exit codes (this line does not; Restart=always recovers
+# both the same way) can tell that apart from a clean stop. A push naming a
+# timezone this host cannot resolve at all does not stop the rack -- it is
+# refused with a Nack back to the server instead, and nothing here restarts.
 Restart=always
 RestartSec=5
 

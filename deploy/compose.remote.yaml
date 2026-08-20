@@ -9,7 +9,6 @@
 # than localhost.
 services:
   server:
-    image: ghcr.io/silkepilon/openrackscreen:latest
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -17,6 +16,11 @@ services:
     ports:
       - "8080:8080"
     environment:
+      # See compose.pi.yaml for why this is set explicitly: the code default
+      # moved to the user's own state directory in M3c, and without this line
+      # the database would land in the image's root home while `ors-data`
+      # below stayed empty.
+      - ORS_DATA_DIR=/var/lib/openrackscreen
       # See compose.pi.yaml for why this is the bare name rather than a
       # `${ORS_SECRET_KEY:-}` substitution. Short version: compose turns an
       # unset variable into an empty one, and the server refuses an empty key.

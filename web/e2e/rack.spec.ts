@@ -1,22 +1,31 @@
 /**
  * The whole thing, once, in order: a blank rack becomes a rack drawing a panel.
  *
- * Seven specs, one browser page, one server and one daemon. They are a
- * narrative rather than seven independent tests, and they are declared serial
+ * Eight specs, one browser page, one server and two racks. They are a
+ * narrative rather than eight independent tests, and they are declared serial
  * because that is what they are -- a password can only be set on a database
- * that has none, a token can only be spent once, and the last two do things to
- * the server that a spec running beside them would see.
+ * that has none, a claim can only be approved once, a token can only be spent
+ * once, and the last two do things to the server that a spec running beside
+ * them would see.
+ *
+ * **Two ways in, and both are walked.** Spec 2 is the one M3c is about: a rack
+ * files a claim, an admin compares six characters and clicks Approve, and the
+ * rack is paired with nobody having typed a credential anywhere. Spec 3 is the
+ * token flow M3a shipped, which is still supported and still has a real daemon
+ * behind it. The rack the rest of the story is about -- the one that runs the
+ * wizard, draws the panel and keeps drawing it when the server goes away -- is
+ * the one that joined by being approved.
  *
  * **What this layer is for.** The base64 trap that shipped in M3a passed a
  * green Python test and a green component test at the same time: pydantic emits
  * the URL-safe alphabet, `atob` throws on it, and `base64.b64decode` accepts
  * either -- so both ends agreed with each other and neither agreed with a
- * browser. Nothing below this file could have caught it. Spec 4 is where it
+ * browser. Nothing below this file could have caught it. Spec 5 is where it
  * would have died: it reads the canvas's own pixels, and a page that showed
  * nothing would have counted zero of them.
  */
 
-import { expect, test, PASSWORD, RACK, SPARE_RACK } from "./fixture"
+import { expect, test, PASSWORD, RACK, SPARE_RACK, TOKEN_RACK } from "./fixture"
 import type { Page } from "@playwright/test"
 
 test.describe.configure({ mode: "serial" })
@@ -28,7 +37,7 @@ const DC = 25
 const RST = 27
 
 /**
- * What is written on the document in spec 6 and read back in spec 7.
+ * What is written on the document in spec 7 and read back in spec 8.
  *
  * On `window` and not on `window.name`, which survives a reload and would make
  * the check pass for the thing it exists to refuse. This is the whole of "it
@@ -97,6 +106,30 @@ async function readPanel(ui: Page, id: number): Promise<Pixels> {
     })
 }
 
+/**
+ * The world these specs run in, made once and before any of them.
+ *
+ * `arrange` is not any one spec's setup. The spare rack it creates is the
+ * negative control the pixel specs read (two panels nothing is running, which
+ * must stay blank while the real one draws) and the reason no two ids in this
+ * file coincide; the night window it turns off is what stops the whole file
+ * failing between 23:00 and 07:00. That belongs to the file, so it lives in a
+ * hook. It used to be the first three lines of spec 2, which quietly made
+ * every later spec depend on spec 2 having run: `--grep "1:|3:"` waited out
+ * `pi-spare is offline` and failed on a rack nothing had created.
+ *
+ * **`beforeEach` rather than a file-scoped `beforeAll`**, for one reason:
+ * `arrange` signs in, and there is no password to sign in with until spec 1
+ * has set one -- a `beforeAll` at file scope runs *before* the first test, not
+ * after it, so it would 401 on every run. `rack.arrange` therefore does
+ * nothing while the database has no password and remembers that it ran, which
+ * makes this hook "as soon as there is a world to arrange, and once": two
+ * cheap requests across the file, and the arranging itself exactly once.
+ */
+test.beforeEach(async ({ rack }) => {
+  await rack.arrange()
+})
+
 // A failure here is usually something the server or the rack said, and neither
 // of them writes to the terminal this reporter owns.
 test.afterEach(async ({ rack }, info) => {
@@ -125,19 +158,141 @@ test("1: a rack with no password asks for one, and takes it", async ({ rack, ui 
   await expect(ui.getByText("No racks yet. Pair one, and its screens can be added afterwards.")).toBeVisible()
 })
 
-test("2: pairing mints a token, shows it once, and the rack dials in", async ({ rack, ui }) => {
-  // The second rack and the two screens on it, plus the night window off. See
-  // `arrange`: this is what stops any two numbers in this file coinciding, and
-  // it has to happen before the rack below is paired for the ids to come out
-  // that way.
-  await rack.arrange()
+/**
+ * **The whole of M3c, with nothing typed anywhere.**
+ *
+ * A Pi is installed, it is on the network, and that is all anybody did to it.
+ * It has no token, no key and no credential of any kind -- which is the entire
+ * reason the claim protocol exists rather than a shared secret -- so it files a
+ * claim, an admin looks at six characters, and clicking Approve is the only
+ * gate in the flow (design spec S6.4). This spec is that sentence, made of
+ * processes: a real daemon files against a real server, a real browser shows
+ * the entry, and the key that comes back is sealed to a public key this daemon
+ * generated for this one claim and opened by nobody else.
+ *
+ * **Why the code is asserted and not merely the entry.** Anyone who can reach
+ * `POST /api/racks/claims` can put a card on that page -- the route is
+ * unauthenticated by necessity -- so "a claim appeared and was approved" is a
+ * spec that a stranger's rack would also pass. What makes the click mean
+ * anything is that the six characters on the screen are the six characters the
+ * rack itself printed, and that is the assertion this spec is built around:
+ * the code is read off the daemon's own console, matched against the card,
+ * against the dialog that asks for the decision, and against what the server
+ * holds for the claim.
+ *
+ * **No mDNS anywhere in it, deliberately.** The daemon is given `--server`,
+ * which is a supported path and not a shortcut past one: `join_a_server` turns
+ * the URL into the same record a browse would have answered with and every
+ * byte after that is identical. Browsing would make this run depend on Avahi,
+ * on multicast surviving a container, and on nothing else on the LAN answering
+ * to `_openrackscreen._tcp.local.`. See `fixture.ts`'s `joinByClaim`.
+ */
+test("2: a rack asks to join, and the code it printed is the one approved", async ({ rack, ui }) => {
+  // The spare rack and the two screens on it are already there -- the
+  // `beforeEach` above made them, and it had to: approving is what mints this
+  // rack's `daemon` row, so the spare has to exist first for the ids to come
+  // out distinct. That ordering is now the hook's, not this spec's.
+  //
+  // The rack comes up unpaired and with no config, files its claim, and waits.
+  // What comes back is the line it printed on its own console for whoever is
+  // standing in front of it.
+  const shortCode = await rack.joinByClaim()
+  // Six characters of base32, which is what `identity.py` cuts out of the
+  // digest -- and not the 64 hex characters of the fingerprint, which is the
+  // other rendering of the same digest and the one the admin routes key on.
+  expect(shortCode).toMatch(/^[A-Z2-7]{6}$/)
 
+  // **Nothing is clicked and nothing is reloaded.** There is no socket message
+  // that means "a rack is asking" -- `ws_ui.py` encodes `frame` and `daemons`
+  // and nothing else, and a claim filed by anyone on the LAN must not be
+  // allowed to drive either -- so the list re-asks on its own ten-second
+  // interval, and this waits that out rather than provoking it.
+  const waiting = ui.getByRole("region", { name: "Waiting to join" })
+  await expect(waiting).toBeVisible({ timeout: 30_000 })
+  const card = waiting.getByRole("region", { name: RACK })
+  await expect(card).toBeVisible()
+
+  // **The comparison the whole milestone rests on.** The card's one `<code>`
+  // is the short code, and it is this rack's, not some rack's.
+  await expect(card.locator("code")).toHaveText(shortCode)
+
+  // Read out of band, so that the browser and the daemon are not being checked
+  // against each other alone with the server taken on trust.
+  const client = await rack.api()
+  const pending = (await (await client.get("/api/claims")).json()) as {
+    fingerprint: string
+    hostname: string
+    short_code: string
+    address: string
+    version: string
+  }[]
+  expect(pending).toHaveLength(1)
+  const [claim] = pending
+  expect(claim.short_code).toBe(shortCode)
+  // The rack joins under its own hostname, and that is the name the `daemon`
+  // row is about to be created with -- so this is where the name the rest of
+  // this file uses comes from.
+  expect(claim.hostname).toBe(RACK)
+
+  // **And the fingerprint is not what is being compared.** It is 64 hex
+  // characters of the same SHA-256 the code is six base32 characters of, so a
+  // card that rendered the wrong one would still render something that looked
+  // like an identifier. It is deliberately absent from this page
+  // (`PendingClaims`'s own docstring), and these two assertions are how a
+  // mix-up could not pass unnoticed.
+  //
+  // The shape assertion is deliberately *this* one and not
+  // `fingerprint.slice(0, 6).toUpperCase() !== short_code`: hex uppercased is
+  // six characters of the base32 alphabet, so that comparison would be a coin
+  // toss on the digest of the day. `not.toBe(short_code)` was worse still --
+  // 64 hex can never equal 6 base32, so it could never fail, and it read as
+  // coverage that was not there. What is left is falsifiable: a server that
+  // put the code in the fingerprint field, or truncated the digest, fails it.
+  expect(claim.fingerprint).toMatch(/^[0-9a-f]{64}$/)
+  await expect(card.getByText(claim.fingerprint)).toHaveCount(0)
+
+  // The one line on the card the claimant did not write: `file_claim_route`
+  // records `request.client.host` and never reads an address out of the body.
+  await expect(card).toContainText("127.0.0.1")
+
+  // Approve, and the dialog says the code once more -- large, before the
+  // button rather than after it, which is where somebody actually reads it.
+  await card.getByRole("button", { name: "Approve" }).click()
+  const approval = ui.getByRole("dialog")
+  await expect(approval.getByRole("heading", { name: `Approve ${RACK}?` })).toBeVisible()
+  await expect(approval.locator("code")).toHaveText(shortCode)
+  await approval.getByRole("button", { name: "Approve this rack" }).click()
+  await expect(approval).toBeHidden()
+
+  // The section draws nothing at all once nothing is waiting -- not a heading
+  // and not an empty state, because a landmark with nothing in it is one a
+  // screen reader can enter and find nothing in.
+  await expect(ui.getByRole("region", { name: "Waiting to join" })).toHaveCount(0)
+
+  // **There is nothing here to show once and forget**, unlike the spec below,
+  // and that is the shape of the difference. The key is minted on the server
+  // and sealed to the ephemeral public key this claim was filed with; it
+  // reaches the rack over `GET /api/racks/claims/{id}` and no other path, and
+  // it was never in this browser at all.
+  //
+  // So the rack collects it on its next poll, opens it with the private half
+  // it has been holding since it filed, writes its pairing and dials in. The
+  // strip is fed by the `daemons` message and by nothing else, so this going
+  // green is the handover working end to end -- X25519, HKDF, AES-GCM and all
+  // -- with no refetch saying so.
+  await expect(ui.getByTestId("rack-strip").getByLabel(`${RACK} is online`)).toBeVisible({
+    timeout: 30_000,
+  })
+  await expect(ui.getByTestId("rack-strip").getByLabel(`${SPARE_RACK} is offline`)).toBeVisible()
+})
+
+test("3: pairing mints a token, shows it once, and the rack dials in", async ({ rack, ui }) => {
   await ui.getByRole("button", { name: "Pair a rack" }).click()
   const dialog = ui.getByRole("dialog")
-  await dialog.getByLabel("Name").fill(RACK)
+  await dialog.getByLabel("Name").fill(TOKEN_RACK)
   await dialog.getByRole("button", { name: "Mint the pairing token" }).click()
 
-  await expect(dialog.getByText(`${RACK} is waiting for its token`)).toBeVisible()
+  await expect(dialog.getByText(`${TOKEN_RACK} is waiting for its token`)).toBeVisible()
   token = (await dialog.locator("code").first().innerText()).trim()
   // A credential, so: long, and nothing a shell would split.
   expect(token).toMatch(/^\S{20,}$/)
@@ -161,18 +316,24 @@ test("2: pairing mints a token, shows it once, and the rack dials in", async ({ 
   await ui.keyboard.press("Escape")
   await expect(ui.getByRole("dialog")).toBeHidden()
 
-  await expect(ui.getByRole("region", { name: RACK })).toContainText("Offline")
+  await expect(ui.getByRole("region", { name: TOKEN_RACK })).toContainText("Offline")
 
-  // Now spend it on a real daemon, which pairs itself and dials back.
-  await rack.startDaemon(token)
+  // Now spend it on a real daemon, which pairs itself and dials back. A second
+  // rack, and a second process: the one from spec 2 is already running and is
+  // what the rest of this file is about, and this path -- `ors-daemon connect
+  // --token`, `pairing.claim_token`, a key handed over in a response body --
+  // shares nothing with the claim flow beyond the socket it ends up on. It is
+  // still supported, so it still has a daemon behind it here rather than only
+  // a dialog.
+  await rack.startDaemon(TOKEN_RACK, token)
 
   // The strip is fed by the `daemons` message and by nothing else, so this
   // going green is the socket working end to end -- no refetch says it.
-  await expect(ui.getByTestId("rack-strip").getByLabel(`${RACK} is online`)).toBeVisible()
+  await expect(ui.getByTestId("rack-strip").getByLabel(`${TOKEN_RACK} is online`)).toBeVisible()
   await expect(ui.getByTestId("rack-strip").getByLabel(`${SPARE_RACK} is offline`)).toBeVisible()
 })
 
-test("3: the wizard detects a device, proves it, and adds the screen", async ({ rack, ui }) => {
+test("4: the wizard detects a device, proves it, and adds the screen", async ({ rack, ui }) => {
   await ui.getByRole("link", { name: "Screens" }).click()
   await expect(ui.getByRole("heading", { name: "Screens", level: 1 })).toBeVisible()
 
@@ -256,7 +417,7 @@ test("3: the wizard detects a device, proves it, and adds the screen", async ({ 
   expect(new Set([mine.id, mine.position, mine.daemon_id, index]).size).toBe(4)
 })
 
-test("4: the panel renders -- the canvas has pixels on it", async ({ rack, ui }) => {
+test("5: the panel renders -- the canvas has pixels on it", async ({ rack, ui }) => {
   const panel = ui.getByTestId(`panel-${screenId}`)
   await expect(panel).toBeVisible()
 
@@ -284,7 +445,7 @@ test("4: the panel renders -- the canvas has pixels on it", async ({ rack, ui })
   expect(rack.panelWrittenAt(SCREEN)).not.toBeNull()
 })
 
-test("5: an edit made here reaches the rendered panel", async ({ ui }) => {
+test("6: an edit made here reaches the rendered panel", async ({ ui }) => {
   const before = await readPanel(ui, screenId)
   // The template starts on the `cyan` palette with the ring at zero, so there
   // is nothing red on the glass to begin with. Asserted rather than assumed:
@@ -313,7 +474,7 @@ test("5: an edit made here reaches the rendered panel", async ({ ui }) => {
   expect((await readPanel(ui, screenId)).blue).toBeLessThan(50)
 })
 
-test("6: the server going away is said honestly, and blamed on nobody", async ({ rack, ui }) => {
+test("7: the server going away is said honestly, and blamed on nobody", async ({ rack, ui }) => {
   await ui.evaluate((mark) => {
     window.orsDocumentMark = mark
   }, MARK)
@@ -378,10 +539,10 @@ test("6: the server going away is said honestly, and blamed on nobody", async ({
  *
  * Two failures it can still catch, and they are the interesting ones: an
  * interface that says nothing (it never reaches /login), and one that treats
- * every dropped socket as an ended session (spec 6, which stops the server and
+ * every dropped socket as an ended session (spec 7, which stops the server and
  * requires that nothing of the kind is said).
  */
-test("7: the server comes back and the interface recovers, without a reload", async ({ rack, ui }) => {
+test("8: the server comes back and the interface recovers, without a reload", async ({ rack, ui }) => {
   await rack.startServer()
 
   // Nothing is clicked and nothing is reloaded. The socket dials again on its
@@ -408,7 +569,7 @@ test("7: the server comes back and the interface recovers, without a reload", as
 
   // And the panel comes back to life: a fresh socket, this tab's subscriptions
   // replayed on the handshake, the rack's frames arriving again. The red is
-  // spec 5's edit, which the rack has been drawing on its own glass throughout
+  // spec 6's edit, which the rack has been drawing on its own glass throughout
   // -- so this is the whole path, restored, and not merely a page that renders.
   const panel = ui.getByTestId(`panel-${screenId}`)
   await expect(panel).toHaveAttribute("data-state", "live", { timeout: 60_000 })

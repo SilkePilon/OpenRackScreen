@@ -50,6 +50,14 @@ function listing(racks: Daemon[]) {
   return http.get("/api/daemons", () => HttpResponse.json(racks))
 }
 
+/**
+ * The claim list, stubbed empty. The Daemons page asks for it on every render,
+ * and nothing in this file is about a rack that has not joined yet -- an empty
+ * answer is what draws no "Waiting to join" section at all. What that section
+ * does with a non-empty one is `claims.test.tsx`'s subject.
+ */
+const NO_CLAIMS = http.get("/api/claims", () => HttpResponse.json([]))
+
 /** The events route, stubbed empty. Every rack card asks it for its own rack. */
 const NO_EVENTS = http.get("/api/events", () => HttpResponse.json([]))
 
@@ -69,6 +77,7 @@ describe("the racks", () => {
     let posted: unknown = null
     server.use(
       SIGNED_IN,
+      NO_CLAIMS,
       listing([]),
       NO_EVENTS,
       http.post("/api/daemons", async ({ request }) => {
@@ -113,6 +122,7 @@ describe("the racks", () => {
     let listings = 0
     server.use(
       SIGNED_IN,
+      NO_CLAIMS,
       http.get("/api/daemons", () => {
         listings += 1
         return HttpResponse.json(racks)
@@ -169,6 +179,7 @@ describe("the racks", () => {
   it("keeps the typed name when the server refuses it as a duplicate", async () => {
     server.use(
       SIGNED_IN,
+      NO_CLAIMS,
       // The name really is taken, which is the case the route refuses.
       listing([rack({ id: 42, name: "pi-rack" })]),
       NO_EVENTS,
@@ -202,6 +213,7 @@ describe("the racks", () => {
     const pushed: number[] = []
     server.use(
       SIGNED_IN,
+      NO_CLAIMS,
       // The push is recorded against the rack by the server, so the rack's
       // events are stale the moment the button is pressed. This answers as the
       // server would: nothing before the push, the recorded line after it.
@@ -272,6 +284,7 @@ describe("the racks", () => {
   it("says which rack did not get an edit, from the header", async () => {
     server.use(
       SIGNED_IN,
+      NO_CLAIMS,
       listing([
         rack({ id: 5, name: "pi-attic" }),
         rack({ id: 17, name: "pi-loft", online: true }),
@@ -310,6 +323,7 @@ describe("the racks", () => {
   it("shows applied_version beside config_version when they differ", async () => {
     server.use(
       SIGNED_IN,
+      NO_CLAIMS,
       listing([
         // Saved at 12, the glass still at 9. The pair the whole page exists for.
         rack({ id: 5, name: "pi-attic", config_version: 12, applied_version: 9 }),
@@ -361,6 +375,7 @@ describe("the racks", () => {
   it("names what a delete takes with it", async () => {
     server.use(
       SIGNED_IN,
+      NO_CLAIMS,
       listing([rack({ id: 17, name: "pi-loft" }), rack({ id: 42, name: "pi-cellar" })]),
       NO_EVENTS,
     )
@@ -386,6 +401,7 @@ describe("the racks", () => {
     const deleted: number[] = []
     server.use(
       SIGNED_IN,
+      NO_CLAIMS,
       // The row really goes, so the list after the delete is the list the
       // invalidation asks for and not a fixture that pretends.
       http.get("/api/daemons", () =>
@@ -434,6 +450,7 @@ describe("the racks", () => {
     const deleted: number[] = []
     server.use(
       SIGNED_IN,
+      NO_CLAIMS,
       http.get("/api/daemons", () => {
         if (deleted.length > 0) {
           return HttpResponse.json({ detail: "the database is locked" }, { status: 500 })
@@ -470,6 +487,7 @@ describe("the racks", () => {
   it("leaves a refused delete on screen, in the server's own words", async () => {
     server.use(
       SIGNED_IN,
+      NO_CLAIMS,
       listing([rack({ id: 17, name: "pi-loft" }), rack({ id: 42, name: "pi-cellar" })]),
       NO_EVENTS,
       // What another tab having already deleted it looks like from here. The
@@ -501,6 +519,7 @@ describe("the racks", () => {
     const asks: string[] = []
     server.use(
       SIGNED_IN,
+      NO_CLAIMS,
       listing([rack({ id: 17, name: "pi-loft" })]),
       http.get("/api/events", ({ request }) => {
         asks.push(request.url)
@@ -566,6 +585,7 @@ describe("the racks", () => {
     const rotated: number[] = []
     server.use(
       SIGNED_IN,
+      NO_CLAIMS,
       listing([rack({ id: 17, name: "pi-loft" }), rack({ id: 42, name: "pi-cellar" })]),
       NO_EVENTS,
       http.post("/api/daemons/:daemon_id/rotate-key", ({ params }) => {

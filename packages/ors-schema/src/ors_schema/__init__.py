@@ -1,5 +1,11 @@
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
+from ors_schema.claim import (
+    CLAIM_HKDF_INFO,
+    FINGERPRINT_HEX_CHARS,
+    SHORT_CODE_CHARS,
+    derive_short_code,
+)
 from ors_schema.daemon import (
     DaemonConfig,
     DisplayConfig,
@@ -62,8 +68,11 @@ from ors_schema.scene import (
 )
 
 __all__ = [
+    "CLAIM_HKDF_INFO",
+    "FINGERPRINT_HEX_CHARS",
     "PALETTE_TOKEN",
     "PROTOCOL_VERSION",
+    "SHORT_CODE_CHARS",
     "Ack",
     "ArcElement",
     "Binding",
@@ -111,6 +120,7 @@ __all__ = [
     "ThresholdEntry",
     "ThresholdPalette",
     "TunnelConfig",
+    "derive_short_code",
     "first_error",
     "parse_daemon_message",
     "parse_server_message",

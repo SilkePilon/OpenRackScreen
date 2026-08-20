@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,7 +18,16 @@ from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
 from ors_server import __version__
+from ors_server.announce import Announcer, announcing_is_enabled
 from ors_server.api.auth import router as auth_router
+from ors_server.api.claims import (
+    CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS,
+    CLAIM_POLL_RATE_LIMIT_WINDOW_S,
+    CLAIM_RATE_LIMIT_MAX_ATTEMPTS,
+    CLAIM_RATE_LIMIT_WINDOW_S,
+)
+from ors_server.api.claims import public_router as claims_public_router
+from ors_server.api.claims import router as claims_router
 from ors_server.api.daemons import router as daemons_router
 from ors_server.api.integrations import query_prometheus
 from ors_server.api.integrations import router as integrations_router
@@ -24,6 +36,7 @@ from ors_server.api.settings import router as settings_router
 from ors_server.api.templates import router as templates_router
 from ors_server.auth import Sessions, require_session
 from ors_server.db import Database
+from ors_server.limiter import Limiter
 from ors_server.link.hub import Hub
 from ors_server.link.ws_daemon import router as daemon_socket_router
 from ors_server.link.ws_ui import router as ui_socket_router
@@ -31,6 +44,17 @@ from ors_server.secrets import SecretStore, load_or_create_key
 from ors_server.snapshot import seed_builtin_templates
 
 log = logging.getLogger(__name__)
+
+
+DEFAULT_PORT = 8080
+"""What this server listens on when nothing says otherwise.
+
+Here rather than in `__main__` because `AppSettings.port` needs a default and
+two numbers that have to agree is one number written twice -- the announcement
+would name 8080 while uvicorn bound something else, and the only symptom is a
+rack that pairs against a port nothing answers on. `__main__.resolve_port` is
+the one reader of `ORS_PORT`, and it falls back to this.
+"""
 
 
 @dataclass(frozen=True)
@@ -44,6 +68,17 @@ class AppSettings:
 
     data_dir: Path
     secret_key: str | None = None
+    port: int = DEFAULT_PORT
+    """The port this process is listening on, for the mDNS announcement to name.
+
+    Carried rather than read here because the app does not bind it -- `__main__`
+    hands the same number to uvicorn and to this, so the announcement cannot
+    name a port the server is not on. It defaults to the same 8080 `__main__`
+    falls back to, which keeps every test that builds an app out of a temp
+    directory unchanged; a deployment that moves the port and forgets this
+    announces a wrong one, which is why `resolve_port` is the single place the
+    environment is read.
+    """
     web_dir: Path | None = None
     """Where the built interface is, or None for the API on its own.
 
@@ -268,6 +303,57 @@ async def validation_error_without_the_body(
     return JSONResponse(status_code=422, content=jsonable_encoder({"detail": stripped}))
 
 
+@asynccontextmanager
+async def announce_while_serving(app: FastAPI) -> AsyncIterator[None]:
+    """Announce this server over mDNS for exactly as long as it is serving.
+
+    Started here and not in `create_app` because "serving" is what the
+    announcement claims: a process that built an app and never bound a port is
+    a process no rack should be told to dial, and every test in this repository
+    is that process.
+
+    **Nothing it does may keep the server from starting.** `zeroconf` binds
+    sockets and joins a multicast group, and there are ordinary hosts where
+    that fails -- a container on a bridge network, a machine whose only
+    interface is down. A server that refused to serve because it could not
+    announce itself would be refusing over the one feature that has `--server
+    URL` on the daemon as its documented alternative, so a failure is a warning
+    naming what went wrong and a server that comes up anyway. The same applies
+    on the way out, where the process is leaving regardless.
+
+    **`asyncio.to_thread`, and it is not about latency.** `Announcer.start`
+    calls `Zeroconf.register_service` -- python-zeroconf's *synchronous*
+    facade. Called from a thread that already has a running asyncio loop, which
+    is exactly what this function is, zeroconf adopts that loop as its own and
+    then does `asyncio.run_coroutine_threadsafe(...).result(timeout)` from
+    inside it: the call blocks the one loop the coroutine it just scheduled
+    needs in order to run. Registration cannot complete by construction. It
+    raises `EventLoopBlocked` about ten seconds later, the `except` below
+    catches it, and the server comes up having announced nothing -- silently,
+    to everything except a warning nobody reads, in every deployment that turns
+    announcing on. Handing both calls to a worker thread gives zeroconf a
+    thread with no loop in it, where it starts one of its own in the background
+    the way it is designed to; measured, that is 1.7s to register instead of a
+    guaranteed timeout. `stop` goes the same way for the same reason: an
+    `unregister_service` that times out leaves a record on the network naming a
+    port nothing is listening on.
+    """
+    announcer = getattr(app.state, "announcer", None)
+    if announcer is not None:
+        try:
+            await asyncio.to_thread(announcer.start)
+        except Exception:
+            log.warning("could not announce this server over mDNS", exc_info=True)
+    try:
+        yield
+    finally:
+        if announcer is not None:
+            try:
+                await asyncio.to_thread(announcer.stop)
+            except Exception:
+                log.warning("could not withdraw the mDNS announcement", exc_info=True)
+
+
 def create_app(settings: AppSettings) -> FastAPI:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -281,8 +367,18 @@ def create_app(settings: AppSettings) -> FastAPI:
         openapi_url="/api/openapi.json",
         redoc_url="/api/redoc",
         swagger_ui_oauth2_redirect_url="/api/docs/oauth2-redirect",
+        lifespan=announce_while_serving,
     )
     app.state.settings = settings
+    # Built here and started by the lifespan above, or not built at all where
+    # the deployment has said it wants no responder: a container on a bridge
+    # network announces a port that is unreachable from the LAN it is
+    # announcing onto, and would be better off silent. Constructing one opens
+    # nothing -- `Announcer.start` is where `zeroconf` is first touched -- so
+    # the whole test suite builds these and none of them transmits.
+    app.state.announcer = (
+        Announcer(port=settings.port, version=__version__) if announcing_is_enabled() else None
+    )
     app.add_exception_handler(RequestValidationError, validation_error_without_the_body)
 
     database = Database(settings.data_dir / "ors.db")
@@ -299,6 +395,21 @@ def create_app(settings: AppSettings) -> FastAPI:
         database, load_or_create_key(settings.data_dir, settings.secret_key)
     )
     app.state.hub = Hub()
+    # A budget of its own, not `sessions`'s -- see `api/claims.py`'s
+    # `CLAIM_RATE_LIMIT_MAX_ATTEMPTS` docstring for why sharing one counter
+    # between an admin's login and an unauthenticated rack's claim filing
+    # would be the wrong kind of "reuse".
+    app.state.claim_limiter = Limiter(
+        max_attempts=CLAIM_RATE_LIMIT_MAX_ATTEMPTS, window_seconds=CLAIM_RATE_LIMIT_WINDOW_S
+    )
+    # And a third, for the poll. Not the filing budget above: a daemon polls
+    # while it waits and files again when its claim expires, so one shared
+    # counter would let a patient rack spend the attempts it needs in order to
+    # re-file. See `api/claims.py`'s `CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS`.
+    app.state.claim_poll_limiter = Limiter(
+        max_attempts=CLAIM_POLL_RATE_LIMIT_MAX_ATTEMPTS,
+        window_seconds=CLAIM_POLL_RATE_LIMIT_WINDOW_S,
+    )
     # The one piece of outbound HTTP this server makes, held here rather than
     # imported at its call site so a test can replace it with a function --
     # which is the only way to exercise the Test button without binding a port.
@@ -321,10 +432,14 @@ def create_app(settings: AppSettings) -> FastAPI:
         return {"status": "ok", "version": __version__}
 
     public.include_router(auth_router)
+    # Unauthenticated by necessity, not by omission: a rack that has not been
+    # approved holds no credential to prove it should be allowed to ask. See
+    # `api/claims.py`'s module docstring.
+    public.include_router(claims_public_router)
 
     # The configuration API, all of it on the guarded router. Nothing here says
     # `Depends(require_session)`: `api` carries it, so a route added to any of
-    # these five files is guarded without anybody remembering to say so, and
+    # these six files is guarded without anybody remembering to say so, and
     # `test_auth.py`'s sweep is what fails if one is ever hung off `public`
     # instead.
     for configuration in (
@@ -333,6 +448,7 @@ def create_app(settings: AppSettings) -> FastAPI:
         templates_router,
         integrations_router,
         settings_router,
+        claims_router,
     ):
         api.include_router(configuration)
 

@@ -6,13 +6,31 @@ on a laptop before a config ever reaches the Pi; `run` and `identify` open
 panels, so they are what runs in front of the rack. `connect` touches neither --
 it writes the pairing a later `run` dials with.
 
-*Where a running rack's configuration comes from.* `run` boots from the last
-snapshot the server pushed if there is a usable one, and from the local file
-otherwise -- in that order, because the server is the source of truth once a
-rack is paired and the file is the fallback that keeps a server outage from
-darkening anything. Neither being usable is the one case with no good answer:
-there is nothing to draw and no panel is open yet, so it is a message and a
-non-zero exit rather than a traceback or a rack that pretends.
+*Where a running rack's configuration comes from.* `--config` is optional on
+`run`: a paired rack's configuration is the server's, not a file an operator
+was forced to hand-author, and `install` leaves a machine paired with nothing
+yet. Five states follow, and `_boot`'s docstring names them as rows: a pushed
+snapshot outranks a config file whenever both exist, because the server is the
+source of truth once a rack is paired; the file is the fallback that keeps a
+server outage from darkening anything, when one was given; a paired rack with
+nothing pushed yet starts with no screens and waits, rather than refusing to
+start; a rack that is neither paired nor handed a file browses for a server to
+join instead of running at all (`join_a_server`), which is not an error -- it
+is the state a freshly installed rack is in; and only when that is also
+impossible -- discovery off, no `--server` -- is there truly no way to obtain a
+configuration, which is a message on stderr and a non-zero exit rather than a
+traceback or a rack that pretends.
+
+Rows 4 and 5 are decided only when there is also no usable cached snapshot:
+`load_link_settings` returns `None` for a pairing file it could not read (a
+`sudo ors-daemon connect` run under the wrong user, most often) exactly as it
+does for one that was never written, and a corrupt pairing is not a reason to
+abandon a perfectly good `snapshot.json` sitting beside it. `join_a_server`
+blocks until this rack is paired, and `_run` continues in-process from there --
+it falls through into `_boot`, the same rows 2/3 a restart would have taken --
+rather than exiting and trusting the unit's `Restart=` to bring it back
+already paired, which left a rack run by hand printing nothing and staying
+dark.
 
 *`render` goes through the renderer, not through a backend.* It is the reason
 the shipped `examples/rack.yaml` -- four GC9A01 panels on two SPI buses -- can
@@ -35,10 +53,16 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import signal
+import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -47,6 +71,7 @@ from ors_render import RenderContext, render_screen
 from ors_schema.daemon import DaemonConfig, DisplayConfig
 from ors_schema.link import Command
 
+from ors_daemon import __version__, discovery, identity, join
 from ors_daemon.clock import Clock, ClockError, system_clock
 from ors_daemon.config import (
     ConfigError,
@@ -56,9 +81,11 @@ from ors_daemon.config import (
     resolve_screens,
     system_scenes,
 )
+from ors_daemon.discovery import Found
 from ors_daemon.displays import DisplayBackend, build_display
 from ors_daemon.frames import FramePump, FrameStream
 from ors_daemon.hardware import SPI_ROOT, detect_handler, probe_handler
+from ors_daemon.install import InstallReport, Roots, install, uninstall
 from ors_daemon.link import (
     LinkClient,
     LinkError,
@@ -108,6 +135,31 @@ error the moment the unit was written."""
 _USAGE_EXIT = 2
 """The conventional shell exit code for "you typed it wrong", and argparse's."""
 
+_RECLOCK_EXIT = 10
+"""`run` returns this, not 0, when a push changed the timezone and stopped the
+rack instead of applying it against a stale clock (see `_snapshot_handler`).
+
+Indistinguishable from 0 used to mean indistinguishable from a clean SIGTERM: a
+supervisor watching for a non-zero exit -- `Restart=on-failure`, anything that
+is not systemd, or nobody at all -- had no way to tell "stopped on purpose" from
+"stopped and needs re-clocking" apart. `Restart=always` still does the actual
+recovery on the shipped unit; this is for every caller that is not it, most of
+all a rack run by hand, which used to print nothing and sit dark with an exit
+code that claimed success.
+
+Not 3, which this used to be. `systemd.exec(5)`'s "Process Exit Codes" table
+(checked against systemd 259) reserves 1-7 for the LSB convention systemd
+itself follows: 1 `EXIT_FAILURE`, 2 `EXIT_INVALIDARGUMENT`, 3
+`EXIT_NOTIMPLEMENTED` ("Unimplemented feature"), 4-7 the rest of it, 200+
+systemd's own. `systemctl status` and `journalctl` would have rendered a
+re-clock stop as `status=3/NOTIMPLEMENTED` -- which in this module reads as
+`join_a_server`'s own `NotImplementedError` stub having fired, the one other
+thing here that is literally "not implemented". Nothing in this repo used 3;
+the collision was with the platform, not with this code. 10 sits in the range
+systemd leaves free for a program's own use (9-63 and 79-199; 64-78 is
+`sysexits.h`'s own range, also worth staying out of).
+"""
+
 _STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 """What systemd sends on `stop`, and what a person at a terminal presses."""
 
@@ -133,6 +185,21 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_LINK_PATH,
         help=f"the pairing written by `connect` (default: {DEFAULT_LINK_PATH}). "
         "Absent means this rack runs from its config file and dials nothing.",
+    )
+    run.add_argument(
+        "--no-discovery",
+        action="store_true",
+        help="do not browse for a server to join when this rack has nothing else to "
+        "run from: no --config, no pairing, and no usable cached snapshot. Refused "
+        "in exactly that state unless --server is also given, because that "
+        "combination is the one case with no way to obtain a configuration at all -- "
+        "it has no effect otherwise, since --config, a pairing or a usable cache "
+        "each already make discovery moot.",
+    )
+    run.add_argument(
+        "--server",
+        help="dial this server directly instead of browsing for one, when this rack "
+        "is neither paired nor given --config",
     )
 
     connect = subparsers.add_parser("connect", help="pair this rack with a server")
@@ -168,15 +235,68 @@ def _parser() -> argparse.ArgumentParser:
         help="seconds to hold the ordinals on the glass (default: until interrupted)",
     )
 
+    install_command = subparsers.add_parser(
+        "install", help="set this machine up to run the daemon as a service"
+    )
+    install_command.add_argument(
+        "--no-spi",
+        action="store_true",
+        help="do not touch /boot/firmware/config.txt. Both SPI buses are enabled by "
+        "default, because SPI1 being off is the most common reason every panel comes "
+        "up unavailable and nothing reports it.",
+    )
+    install_command.add_argument(
+        "--prefix",
+        type=Path,
+        default=Path("/opt/openrackscreen"),
+        help="where to build the venv the service runs from (default: %(default)s)",
+    )
+    install_command.add_argument(
+        "--use-current-interpreter",
+        action="store_true",
+        help="point the unit at the ors-daemon already running instead of building a "
+        "venv. Refused if the service user could not execute it.",
+    )
+    install_command.add_argument(
+        "--upgrade",
+        action="store_true",
+        help="changes nothing: install is already idempotent, so a plain `install` "
+        "re-run is always the upgrade path. This flag exists to say so at the "
+        "command line, not to gate any different behaviour.",
+    )
+
+    uninstall_command = subparsers.add_parser(
+        "uninstall", help="stop the service and remove the systemd unit"
+    )
+    uninstall_command.add_argument(
+        "--purge",
+        action="store_true",
+        help="also delete /var/lib/openrackscreen, which holds the pairing and this "
+        "rack's identity. That costs a re-approval in the interface.",
+    )
+
     # Added last and to every subparser that has a config to read, so `--config`
     # reads the same wherever it appears rather than being positional in one
     # command and not another. `connect` is the exception and deliberately so:
     # pairing happens before a rack has a configuration, and afterwards the
     # configuration comes from the server -- requiring it here would make the
     # first thing an operator runs the one thing they cannot yet supply.
+    # `install` and `uninstall` are exceptions for the same underlying reason:
+    # neither reads a rack.yaml, so requiring one here would make the very
+    # first command anyone runs on a fresh machine ask for a file that has no
+    # reason to exist yet.
+    #
+    # Not `required=True` here, not any more. It used to be, and that hid the
+    # fact that `run` decides its own configuration -- a pushed snapshot
+    # outranks the file, and a rack `install` just set up has neither yet, so
+    # forcing `--config` here made the state a freshly installed machine is in
+    # impossible to start at all. `run`'s own dispatch in `main` says what a
+    # missing `--config` means for it; `validate`, `render` and `identify` have
+    # no other source and check for its absence themselves, once, in one place
+    # rather than three.
     for name, sub in subparsers.choices.items():
-        if name != "connect":
-            sub.add_argument("--config", required=True, type=Path, help="path to rack.yaml")
+        if name not in ("connect", "install", "uninstall"):
+            sub.add_argument("--config", type=Path, help="path to rack.yaml")
     return parser
 
 
@@ -208,6 +328,23 @@ def main(argv: list[str] | None = None) -> int:
         return _connect(args)
     if args.command == "run":
         return _run(args)
+    if args.command in ("install", "uninstall"):
+        # Checked here rather than inside `install.install`, which is a pure
+        # function over injected roots and must stay callable from a test
+        # that is not root -- which is every test in that suite.
+        if os.geteuid() != 0:
+            print(f"ors-daemon {args.command} has to run as root.", file=sys.stderr)
+            return _USAGE_EXIT
+        return _install(args) if args.command == "install" else _uninstall(args)
+
+    if args.config is None:
+        # `validate`, `render` and `identify` describe a document, and unlike
+        # `run` they have no other source to fall back on -- there is no
+        # pushed snapshot to boot from and no pairing to wait on. `--config`
+        # used to be `required=True` here and this is the same refusal, said
+        # once for all three rather than left to argparse.
+        print(f"ors-daemon {args.command}: --config is required", file=sys.stderr)
+        return _USAGE_EXIT
 
     try:
         config = load_config(args.config)
@@ -362,6 +499,178 @@ def _warn_if_the_daemon_will_not_be_able_to_read_it(path: Path) -> None:
     )
 
 
+@dataclass(frozen=True)
+class _SubprocessRunner:
+    """The real `install.Runner`: every argv goes through `subprocess.run`.
+
+    The only implementation of `install.Runner` this module ships that
+    touches the machine it runs on -- everything under `daemon/tests/` uses
+    `FakeRunner` instead, which is what keeps `install`'s own test suite off
+    the machine running it.
+    """
+
+    def run(self, argv: list[str]) -> int:
+        """127, the shell's own code for "command not found", for a binary
+        that is not there.
+
+        Without this the missing binary is a `FileNotFoundError` out of the
+        middle of `install()`, which is the one shape that function is built
+        not to produce: it collects a warning for every step that fails and
+        reports at the end what really happened, and a traceback skips all of
+        that, leaving the rack half-configured with nothing said about it. The
+        realistic case is not exotic -- astral's installer puts `uv` in
+        `~/.local/bin` and `sudo` resets PATH to `secure_path`, so `sudo
+        ors-daemon install` gets past `useradd` (in `/usr/sbin`) and then dies
+        on `uv venv` with a traceback that never names `uv`. `README.md`
+        promises the opposite for that exact scenario, and
+        `--use-current-interpreter` is the documented way past it -- which is
+        advice nobody can follow from a traceback that does not say what was
+        missing.
+
+        127 rather than 1 because `install()` prints the code it got, and 127
+        is the number an operator can look up. It is not otherwise
+        distinguished: every non-zero code takes the same warning path.
+        """
+        try:
+            return subprocess.run(argv).returncode
+        except FileNotFoundError:
+            return 127
+
+
+def _real_roots(prefix: Path) -> Roots:
+    """`Roots` built from the real filesystem, for the CLI's own use.
+
+    Nothing else in this module names `/etc`, `/boot`, `/var/lib` or
+    `/etc/systemd/system` -- `install.install` and `install.uninstall` are
+    parameterised on `Roots` precisely so that only this one function, called
+    from production code and never from a test, has to.
+    """
+    return Roots(
+        etc=Path("/etc"),
+        boot=Path("/boot"),
+        state=Path("/var/lib"),
+        prefix=prefix,
+        systemd=Path("/etc/systemd/system"),
+    )
+
+
+def _print_install_report(report: InstallReport, *, no_spi: bool) -> None:
+    """The short code, the SPI diff and whether a reboot is owed.
+
+    The short code is the one thing a person standing at the rack reads off
+    this terminal and compares against what the web interface shows before
+    approving it -- if this function does not print it, that whole approval
+    gesture has nothing to check against.
+
+    `no_spi` is `args.no_spi`, taken as a separate parameter rather than
+    inferred from `report`: `InstallReport` carries only `reboot_needed`,
+    which reads `False` both when SPI was already on and when `--no-spi`
+    skipped the step entirely -- two different facts to tell an operator, one
+    boolean between them.
+
+    `report.failed` alone does not say which of two shapes a failure is, and
+    printing the same way for both would be wrong in one direction or the
+    other -- see `InstallReport.refused`. `refused=True` is the early
+    `--use-current-interpreter` permission check, which returns before
+    anything else is touched, so `unit:`/`service user:`/an SPI line would
+    describe work that never happened; only the warnings are true, so only
+    the warnings are printed. `refused=False` with `failed=True` is a failure
+    discovered mid-run (`useradd`/`usermod` exiting something other than 0 or
+    9, say) -- `install()` keeps going past that, so the unit may genuinely
+    have been written, `systemctl` genuinely called and the SPI step
+    genuinely attempted. Withholding those lines there is exactly the
+    operator-hostile shape this function used to have: the person most in
+    need of detail, debugging a half-finished install over SSH, would be told
+    the least. Everything printed in that branch is something `install()`
+    provably ran; nothing here claims a step that a `return` upstream
+    prevented from happening.
+    """
+    if report.short_code:
+        print(f"short code: {report.short_code}")
+    if report.failed and report.refused:
+        # Refused before touching anything -- no directories, no user, no
+        # unit, no SPI step ran -- so printing those lines here would report
+        # actions that were never taken. "see the warnings above" is the
+        # honest summary of the whole of it.
+        if report.warnings:
+            print(report.warnings_text(), file=sys.stderr)
+        print("install did not finish cleanly; see the warnings above.", file=sys.stderr)
+        return
+    if report.failed:
+        print(
+            "install: PARTIAL -- it failed partway through. Everything below is real, "
+            "not undone, and the state below reflects what actually happened."
+        )
+    print(f"unit: {report.unit_path}")
+    print(f"service user: {'created' if report.created_user else 'already existed'}")
+    if no_spi:
+        print("SPI: skipped (--no-spi)")
+    elif report.reboot_needed:
+        print("SPI: enabled, reboot needed")
+    elif any(warning.startswith("no config.txt was found") for warning in report.warnings):
+        print("SPI: not attempted (no config.txt found under the boot partition)")
+    else:
+        print("SPI: unchanged (already enabled)")
+    print(f"reboot needed: {'yes' if report.reboot_needed else 'no'}")
+    if report.warnings:
+        print(report.warnings_text(), file=sys.stderr)
+    if report.failed:
+        print("install did not finish cleanly; see the warnings above.", file=sys.stderr)
+
+
+def _install(args: argparse.Namespace) -> int:
+    """Build the real `Roots` and a real `Runner`, then run `install.install`."""
+    executable = None
+    if args.use_current_interpreter:
+        if sys.argv[0].endswith(".py"):
+            # `sudo python -m ors_daemon install --use-current-interpreter`
+            # puts `.../ors_daemon/__main__.py` in `sys.argv[0]` -- a source
+            # file the service user was never going to be able to execute.
+            # `install()` would refuse it too, but with "chmod it", which is
+            # advice aimed at a real executable, not a module entry point.
+            print(
+                "--use-current-interpreter cannot be used with `python -m ors_daemon`: "
+                f"{sys.argv[0]} names a source file, not something the service user "
+                "could run. Install a console script instead (a venv, `pipx`, or "
+                "`uv tool install`), or drop the flag and let install build one.",
+                file=sys.stderr,
+            )
+            return 1
+        # `shutil.which` first: a launcher with no shebang (some wrappers, some
+        # `exec`-less shell scripts) leaves `sys.argv[0]` as the bare name it
+        # was invoked with, and `Path(name).resolve()` would join that to the
+        # current working directory instead of to wherever PATH actually found
+        # it. The common case -- a real shebang -- already gives an absolute
+        # path that `shutil.which` returns unchanged.
+        executable = Path(shutil.which(sys.argv[0]) or sys.argv[0])
+    report = install(
+        _real_roots(args.prefix),
+        _SubprocessRunner(),
+        version=__version__,
+        now=datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
+        enable_spi_step=not args.no_spi,
+        use_current_interpreter=args.use_current_interpreter,
+        executable=executable,
+    )
+    _print_install_report(report, no_spi=args.no_spi)
+    return 1 if report.failed else 0
+
+
+def _uninstall(args: argparse.Namespace) -> int:
+    """Build the real `Roots` and a real `Runner`, then run `install.uninstall`."""
+    report = uninstall(
+        _real_roots(Path("/opt/openrackscreen")), _SubprocessRunner(), purge=args.purge
+    )
+    if report.warnings:
+        print(report.warnings_text(), file=sys.stderr)
+    print(
+        "uninstalled: the service is stopped, disabled and its unit removed. "
+        "The venv this installed (if any) is left on disk; remove its prefix "
+        "by hand if you want it gone too."
+    )
+    return 0
+
+
 def _run(args: argparse.Namespace) -> int:
     """Drive the rack until a signal arrives, taking configuration as it comes.
 
@@ -374,12 +683,91 @@ def _run(args: argparse.Namespace) -> int:
     network may darken the rack -- and a Pi too short of memory to fork one more
     thread is exactly such a failure: the configuration is already loaded and
     perfectly servable.
+
+    *Where a fresh install's rack goes before it has anything.* Neither paired
+    nor handed `--config` is not a state `_boot` answers on its own -- there is
+    no pairing to prefer a snapshot from and no file to fall back to -- unless a
+    usable cached snapshot is sitting beside the pairing anyway (a corrupt or
+    unreadable link.json is not a reason to abandon one: see `_boot_from_cache`).
+    Absent that, it is decided here, before `_boot` is ever called, because it is
+    not about what to run but about what to do instead of running: row 4 of the
+    boot table joins a server, and row 5 -- the one case with truly no way to
+    obtain a configuration -- says so and leaves. See `join_a_server`.
+
+    *Row 4 continues in this same process once paired.* `join_a_server` blocks
+    until it has written a pairing to `args.link`, and this falls through into
+    `_boot` from there rather than returning -- byte-for-byte the rows 2/3 a
+    restart would have taken, without needing one. See `join_a_server`'s
+    docstring for why that is the contract rather than exiting for systemd's
+    `Restart=` to pick back up.
     """
     # Read once and handed on, so the pairing that decides where the cache is
     # and the pairing the link dials with cannot be two different readings of a
     # file somebody is editing.
     settings = load_link_settings(args.link)
-    booted = _boot(args, settings)
+
+    if settings is None and args.config is None:
+        # Tried before rows 4/5, not instead of `_boot`'s own cache-first logic
+        # duplicated: a rack whose pairing is corrupt or unreadable is not
+        # necessarily a rack with nothing to boot from, and the join flow (or
+        # row 5's refusal) is not owed to one that still has a usable snapshot.
+        booted, _cache_error = _boot_from_cache(args, settings)
+        if booted is None:
+            if args.no_discovery and not args.server:
+                # Row 5: discovery is off and nothing names a server to dial
+                # directly, so there is no way left to obtain a configuration
+                # at all. stderr and a non-zero exit, not a traceback: the
+                # audience is somebody over SSH, and a traceback tells them
+                # about this program rather than about their machine.
+                print(
+                    f"{args.link}: this rack is not paired and no --config was given, so "
+                    "there is nothing to run. Pass --config to run it standalone, pair it "
+                    "first with `ors-daemon connect`, or drop --no-discovery (or pass "
+                    "--server) so it can find a server on its own.",
+                    file=sys.stderr,
+                )
+                return 1
+            # Row 4: the state a freshly installed rack is in, and it is not an
+            # error. Browse for a server (or dial --server directly), file a
+            # claim, and wait to be approved in the interface.
+            #
+            # No `try` around it any more. It used to catch the
+            # `NotImplementedError` its own stub raised, before Task 15; what
+            # replaced the stub reports every failure it has as a log line and
+            # a plain return, so a bare `except` here would only be able to
+            # catch a bug -- and the shipped unit runs this under
+            # `Restart=always` with `StartLimitIntervalSec=0`, so a traceback
+            # here is one repeated every `RestartSec=5` forever either way.
+            # The check below is what turns "returned without pairing" into a
+            # message and an exit, and it does not care why.
+            join_a_server(args)
+            # Once paired, the pairing just written is what the rest of this
+            # function needs -- re-read rather than assumed, because
+            # `join_a_server` is the one thing here allowed to have changed it.
+            settings = load_link_settings(args.link)
+            if settings is None:
+                # `join_a_server`'s own docstring promises it blocks "until
+                # either the interface approves it or the operator interrupts
+                # the process" -- a clean return with nothing written, on
+                # abandonment, is a shape it names rather than rules out. The
+                # same file also documents a pairing that was written but
+                # cannot be read back (HIGH 2's own scenario). Checked here,
+                # explicitly, rather than leaving `_boot`'s
+                # `assert settings is not None` to catch it: an assert is a
+                # traceback under `python -u`, and silently vanishes under
+                # `python -O` into a row-3 boot nobody asked for -- neither is
+                # a message a person over SSH can act on.
+                print(
+                    f"{args.link}: still not paired after the join flow returned; nothing to "
+                    "run. Pair it by hand instead: `ors-daemon connect --server ... "
+                    "--token ...`, then run this again.",
+                    file=sys.stderr,
+                )
+                return 1
+            booted = _boot(args, settings)
+    else:
+        booted = _boot(args, settings)
+
     if booted is None:
         return 1
     config, screens, clock, version = booted
@@ -398,7 +786,14 @@ def _run(args: argparse.Namespace) -> int:
         frames=frames,
     )
     _install_signal_handlers(supervisor.stop)
-    link = _link(args, settings, supervisor, clock, version, frames)
+    # Set by `_snapshot_handler` -- and only by it -- when a push stopped the
+    # rack because it changed the timezone, so this is how `run` tells that
+    # apart from an ordinary SIGTERM once `run_forever` returns. See
+    # `_RECLOCK_EXIT`.
+    reclock_requested = threading.Event()
+    link = _link(
+        args, settings, supervisor, clock, version, frames, config.timezone, reclock_requested
+    )
     pump = _frame_pump(frames, supervisor, link)
     try:
         # `run_forever` shuts down from its own `finally`, including when `start`
@@ -421,7 +816,154 @@ def _run(args: argparse.Namespace) -> int:
                 # loud because the only way to get here is the failure the link's
                 # own send watchdog exists for.
                 log.warning("the link thread did not stop; leaving it to the process exit")
+    if reclock_requested.is_set():
+        # Distinct from 0 on purpose -- see `_RECLOCK_EXIT`. `Restart=always`
+        # on the shipped unit does not read this at all; it restarts on any
+        # exit. Everything else that might be running this (`Restart=on-failure`,
+        # a different supervisor, a person at a terminal) does read it, and
+        # used to be told this was a clean stop.
+        print(
+            f"{args.link}: stopped because a push changed the timezone; restart this "
+            "rack to pick up the new clock (systemd's Restart=always already does this "
+            "on its own)",
+            file=sys.stderr,
+        )
+        return _RECLOCK_EXIT
     return 0
+
+
+IDENTITY_FILENAME = "identity.json"
+"""What `install` calls this rack's identity, beside the pairing.
+
+`install.py` writes `<state dir>/identity.json` and `--link` defaults to
+`<state dir>/link.json`, so deriving one from the other keeps a non-default
+`--link` -- a test's `tmp_path`, or a second daemon on one machine -- pointing
+at its own identity rather than at the service's.
+"""
+
+
+def _only(server: Found) -> list[Found]:
+    """`--server URL`'s answer to the question discovery answers by browsing.
+
+    A named function and not a lambda so that `join.join_a_server` sees the
+    same shape either way: something it can call again on every lap, because
+    the list it gets back is allowed to change (`discovery.discover` finds a
+    server that booted after this Pi did; this one never will, which is the
+    whole point of naming it).
+    """
+    return [server]
+
+
+def _join_client() -> Any:  # pragma: no cover - constructs the real HTTP client
+    """The blocking HTTP client the join flow files and polls with.
+
+    Built here rather than inside `ors_daemon.join` so that module takes its
+    client as an argument and every test of it runs without a socket, the same
+    way `discovery` takes its browse.
+    """
+    import requests
+
+    return requests.Session()
+
+
+def join_a_server(args: argparse.Namespace) -> None:
+    """Pair a freshly installed rack with no operator having typed a token.
+
+    `_run` calls this exact name, unconditionally, whenever this rack is
+    neither paired (`settings is None`) nor handed `--config` and has no usable
+    cache: that is row 4 of `_boot`'s docstring, the state `install` leaves a
+    machine in, and the daemon may not take a different path through it.
+
+    This is the wiring; `ors_daemon.join` is the protocol. What happens here is
+    the three things that need a `Namespace` and a terminal: reading (or
+    minting) this rack's identity beside the pairing, turning `--server URL`
+    into the record discovery would have answered with, and telling whoever is
+    watching the console what short code to compare -- because approving
+    without comparing it is approving a stranger's rack (design spec S6.4), and
+    a code that only ever appeared in `install`'s output is one nobody has in
+    front of them by the time the interface asks.
+
+    It is deliberately not expected to also start the rack: nothing here reads
+    a pushed configuration or returns one. Once this returns, `_run` re-reads
+    `args.link` and falls through into `_boot` in this same process -- rows 2
+    or 3 of the boot table, the same ones a restart would have taken -- rather
+    than exiting and trusting the unit's `Restart=` to bring the process back
+    already paired. That used to be the contract: `_run` returned 0 the moment
+    this returned, and relied on systemd. It cost the one case that mattered
+    most for reasoning about this function -- `ors-daemon run` by hand, on a
+    terminal, pairs, prints nothing, exits 0, and the panels stay dark, with
+    nothing anywhere saying why. Continuing in-process needs nothing new from
+    this function beyond what it already promised: block, then write the
+    pairing.
+
+    **Returning without a pairing is a shape, not a bug.** Two servers
+    answered and neither may be chosen, `--server` names nothing dialable, this
+    rack's identity file cannot be read, a key arrived that will not decrypt,
+    or somebody pressed Ctrl-C. Each says so on stderr here or in the log, and
+    `_run`'s own check turns the silence that follows into a message naming
+    `ors-daemon connect` and a non-zero exit. Nothing here raises: the shipped
+    unit runs this under `Restart=always` with `StartLimitIntervalSec=0`, so a
+    traceback is one written to the journal every `RestartSec=5` forever.
+    """
+    link = Path(args.link)
+    try:
+        identity_path = link.with_name(IDENTITY_FILENAME)
+    except ValueError:
+        # `--link /` and `--link .` name no file, so there is no name to put
+        # an identity beside. The same `ValueError` `_cache_beside` exists for.
+        print(
+            f"{link}: --link has to name a file, so that this rack's identity and its "
+            "pairing can live beside each other",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        rack = identity.load_or_create(identity_path)
+    except (OSError, ValueError) as exc:
+        # `load_or_create` refuses an identity file it cannot parse, and one
+        # readable by more than its owner, rather than replacing it -- both
+        # deliberately, both recoverable only by a person. See its docstring.
+        print(f"cannot read this rack's identity: {exc}", file=sys.stderr)
+        return
+
+    # Before `--server` is looked at, not after: the short code is a fact
+    # about this rack and not about any server, and a rack that cannot dial
+    # anything yet is exactly the one whose operator is about to go and read
+    # this line off the console.
+    print(
+        f"this rack is not paired yet. Its short code is {rack.short_code} -- compare it "
+        "in the interface before approving.",
+        file=sys.stderr,
+    )
+
+    if args.server:
+        found = join.server_from_url(args.server)
+        if found is None:
+            print(
+                f"--server {args.server}: not a URL a claim can be filed against. "
+                "It needs a scheme and a host, e.g. http://rack.local:8080",
+                file=sys.stderr,
+            )
+            return
+        servers: Callable[[], list[Found]] = partial(_only, found)
+    else:
+        servers = discovery.discover
+
+    try:
+        join.join_a_server(
+            identity=rack,
+            servers=servers,
+            link_path=link,
+            sleeper=time.sleep,
+            http=_join_client(),
+        )
+    except KeyboardInterrupt:
+        # The one thing in here that can interrupt a wait measured in minutes,
+        # and the operator's own doing. `_run` installs its signal handlers
+        # only once the rack is up, so without this an impatient Ctrl-C during
+        # a backoff is a `KeyboardInterrupt` traceback out of `main`.
+        print("interrupted; this rack is still not paired.", file=sys.stderr)
 
 
 FRAMES_JOIN_TIMEOUT = 1.0
@@ -475,6 +1017,77 @@ at two, and it is a daemon thread either way.
 """
 
 
+def _snapshot_handler(
+    supervisor: Supervisor, booted_timezone: str, reclock_requested: threading.Event
+) -> Callable[[DaemonConfig, int], None]:
+    """Apply a push, unless it would run the rack against the wrong clock.
+
+    `Supervisor.apply` never rebuilds the clock, and `supervisor.py`'s own
+    docstring says why: "the clock is built once, in `__main__`... swapping it
+    under a running rack is a change to a component this class is handed
+    rather than one it owns." `NightWindow` defaults to enabled, 23:00-07:00,
+    so a rack pushed a different timezone than the one it booted with -- most
+    commonly a freshly paired one, which boots row 3's `DaemonConfig()` default
+    of UTC until its first push -- would otherwise evaluate its night window in
+    the wrong zone for the rest of the process: a UTC+2 rack sleeping at 01:00
+    local and waking at 09:00 local, silently, until someone restarts it.
+
+    **Checked before any of that: can the pushed timezone even be resolved.**
+    `DaemonConfig.timezone` is a bare `str` -- nothing on the server or in the
+    schema validates it against the host's tzdata, because the server has no
+    way to know what tzdata any given rack ships -- so `Europe/Amsterdaam`, one
+    letter off, reaches here exactly as easily as a real zone does. Applied the
+    way a real mismatch is applied -- stop, let `Restart=always` bring it back
+    -- that typo is unrecoverable: the next boot rebuilds the clock from the
+    same unresolvable name, `_boot_from_cache` raises `ClockError`, falls back
+    to row 3, claims `config_version=None`, the server reads that as "never
+    got it" and pushes the same value again -- forever, panels dark, on a rack
+    that was healthy before the push landed. So this is raised instead of
+    swallowed into a stop: raising here reaches `LinkClient._config`, which
+    turns any exception out of `on_snapshot` into a `Nack` naming the reason
+    and leaves the supervisor untouched -- the push is refused, the person who
+    typed it sees why in the interface, and the rack keeps running the
+    configuration it already had.
+
+    A timezone that *does* resolve but differs from `booted_timezone` is a
+    different problem with a different fix: not applied here either, but the
+    supervisor is stopped instead of the push being refused, which under the
+    shipped unit's `Restart=always` is exactly the restart the mismatch needs
+    -- `main` rebuilds the clock from the pushed config's own timezone on the
+    way back up. Nothing is lost by not applying it first: `LinkClient._dispatch`
+    still writes the cache and acks the push once this returns without raising,
+    so the next boot reads the new timezone (and everything else in the push)
+    straight out of that same snapshot, without needing to be pushed again.
+    `reclock_requested` is set first, so `run` can tell this stop apart from an
+    ordinary SIGTERM once `run_forever` returns and answer with `_RECLOCK_EXIT`
+    rather than 0 -- see that constant and `run`'s own use of it.
+    """
+
+    def handle(snapshot: DaemonConfig, pushed: int) -> None:
+        if snapshot.timezone != booted_timezone:
+            try:
+                system_clock(snapshot.timezone)
+            except ClockError:
+                log.error(
+                    "a push named a timezone this host cannot resolve; refusing "
+                    "it so the rack keeps running instead of boot-looping into "
+                    "the same failure on every restart",
+                    extra={"was": booted_timezone, "pushed": snapshot.timezone},
+                )
+                raise
+            log.warning(
+                "a push changed the timezone, which a running rack cannot pick up; "
+                "stopping so it comes back clocked correctly",
+                extra={"was": booted_timezone, "now": snapshot.timezone},
+            )
+            reclock_requested.set()
+            supervisor.stop()
+            return
+        supervisor.apply(snapshot)
+
+    return handle
+
+
 def _link(
     args: argparse.Namespace,
     settings: LinkSettings | None,
@@ -482,6 +1095,8 @@ def _link(
     clock: Clock,
     version: int | None,
     frames: FrameStream,
+    booted_timezone: str,
+    reclock_requested: threading.Event,
 ) -> LinkClient | None:
     """The link to the server, if this rack has ever been paired. Raises nothing.
 
@@ -491,17 +1106,41 @@ def _link(
     a configuration that is not on the glass. Claiming it wrongly in the
     optimistic direction is a push the server skips and a rack left showing the
     previous configuration forever.
+
+    `booted_timezone` is `config.timezone` as `_run` booted it, and
+    `reclock_requested` is `_run`'s own event -- both handed on to
+    `_snapshot_handler`, which needs the first for the one thing a push may not
+    do to a running rack (change it) and sets the second when that is why it
+    stopped. See that function's docstring.
+
+    `version` also decides what the log line says when `settings` is `None`,
+    and not only what `config_version` claims. `settings` is `None` here for
+    two different reasons that a flat "no pairing" would conflate: a rack that
+    really was never paired (in which case `version` is `None` too -- nothing
+    to boot from but the file), and a rack whose *pairing* was unreadable
+    while a good cached snapshot sat right beside it (`version` is then the
+    cache's own, not `None`) -- `_boot_from_cache`'s docstring calls this out
+    by name. That second rack is not running from its config file; it may not
+    even have one.
     """
     if settings is None:
-        log.info(
-            "this rack has no pairing; running from its config file", extra={"path": str(args.link)}
-        )
+        if version is not None:
+            log.info(
+                "this rack's pairing could not be read, but a cached snapshot beside "
+                "it was usable; running from that cache, not from a config file",
+                extra={"path": str(args.link), "config_version": version},
+            )
+        else:
+            log.info(
+                "this rack has no pairing; running from its config file",
+                extra={"path": str(args.link)},
+            )
         return None
     try:
         client = LinkClient(
             settings=settings,
             settings_path=Path(args.link),
-            on_snapshot=lambda snapshot, pushed: supervisor.apply(snapshot),
+            on_snapshot=_snapshot_handler(supervisor, booted_timezone, reclock_requested),
             stop=supervisor.stop_event,
             clock=clock,
             config_version=version,
@@ -595,57 +1234,117 @@ def _command_handler(supervisor: Supervisor) -> Callable[[Command], None]:
     return handle
 
 
+def _boot_from_cache(
+    args: argparse.Namespace, settings: LinkSettings | None
+) -> tuple[tuple[DaemonConfig, list[ResolvedScreen], Clock, int | None] | None, str]:
+    """Try the last pushed snapshot. The boot tuple if it is usable, and either
+    way the reason it was not -- empty when it was, since nobody needs a reason
+    for something that worked.
+
+    Split out of `_boot` so `_run` can try the cache on its own, before rows
+    4/5: `load_link_settings` returns `None` for a pairing file it could not
+    read exactly as it does for one that was never written -- most commonly
+    `sudo ors-daemon connect`, which leaves link.json root-owned while the
+    shipped unit reads it as `User=openrackscreen` -- and a corrupt pairing is
+    not a reason to abandon a perfectly good `snapshot.json` sitting beside it
+    for the join flow (or worse, row 5's refusal). `settings` may therefore be
+    `None` here even for a rack that *is* paired, which is exactly why the
+    cache path is derived the same way `_boot` derives it rather than only
+    from `settings.cache_path`.
+
+    "Usable" means resolved and clocked, not merely validated: a snapshot
+    naming a template this build does not ship validates perfectly and then
+    resolves to nothing, and one naming a timezone the host cannot resolve is
+    one the daemon refuses to start on.
+    """
+    cache = Path(settings.cache_path) if settings is not None else _cache_beside(Path(args.link))
+    if cache is None:
+        # `--link /`: a pairing path with no filename, so there is no cache
+        # beside it to boot from. See `_cache_beside`.
+        return None, f"{args.link}: names no file, so there is no snapshot cache beside it"
+
+    cached = load_cached_snapshot(cache)
+    if cached is None:
+        return None, f"{cache}: no usable cached snapshot"
+
+    config, version = cached
+    try:
+        return (config, resolve_screens(config), system_clock(config.timezone), version), ""
+    except (ConfigError, ClockError) as exc:
+        log.error(
+            "the cached snapshot cannot be served; falling back to the config file",
+            extra={"path": str(cache), "error": str(exc)},
+        )
+        return None, f"{cache}: {exc}"
+
+
 def _boot(
     args: argparse.Namespace, settings: LinkSettings | None
 ) -> tuple[DaemonConfig, list[ResolvedScreen], Clock, int | None] | None:
     """What to put on the panels, and which version of it this rack is running.
 
-    The cache first. It is the last thing the server pushed, so it is what the
-    rack was showing when it was last powered down, and preferring the local file
-    would mean every reboot during a server outage silently reverted the rack to
-    a document somebody edited months ago.
+    Answers three of the five-row boot table; the other two -- neither paired
+    nor handed `--config`, and no usable cache either -- are decided by `_run`
+    before this is ever called, because there is nothing here to fall back to
+    in that case: no pairing to prefer a snapshot from, and no file either.
+    This function is never reached with `settings`, `args.config` and a usable
+    cache all empty at once.
 
-    "Usable" means resolved and clocked, not merely validated: a snapshot naming
-    a template this build does not ship validates perfectly and then resolves to
-    nothing, and one naming a timezone the host cannot resolve is one the daemon
-    refuses to start on. Both fall back to the file, because a fallback is what
-    the file is for.
+    The cache first (rows 1 and 2), via `_boot_from_cache` -- it is the last
+    thing the server pushed, so it is what the rack was showing when it was
+    last powered down, and preferring the local file would mean every reboot
+    during a server outage silently reverted the rack to a document somebody
+    edited months ago. If `--config` was given, an unusable cache falls back
+    to it (row 1) -- because a fallback is what the file is for.
 
     Falling back returns a version of None -- see `_link`.
 
-    Neither being usable is the one case with no good answer. Nothing has been
-    opened, so there is nothing to darken and nothing to keep alive; both reasons
-    go to stderr, where `journalctl` will have them after a `systemctl start`
-    that did not take, and the exit code is what makes the unit's `Restart=`
-    keep trying. What must not happen is a traceback.
+    A paired rack with an unusable cache and no `--config` to fall back to
+    (row 3) is not the same failure as an unusable cache *and* an unusable
+    file (the paragraph below): nothing has ever been pushed yet, which is the
+    ordinary state of a rack the moment it finishes pairing, so it starts with
+    no screens at all and waits -- `Supervisor.apply` brings panels up as soon
+    as the first push lands.
+
+    Neither the cache nor a given file being usable is the one case with no
+    good answer. Nothing has been opened, so there is nothing to darken and
+    nothing to keep alive; both reasons go to stderr, where `journalctl` will
+    have them after a `systemctl start` that did not take, and the exit code is
+    what makes the unit's `Restart=` keep trying. What must not happen is a
+    traceback.
     """
-    cache = Path(settings.cache_path) if settings is not None else _cache_beside(Path(args.link))
+    booted, cache_error = _boot_from_cache(args, settings)
+    if booted is not None:
+        # Row 1 (a config file was also given) and row 2 (a paired rack whose
+        # last push is cached): the snapshot outranks everything either way.
+        return booted
 
-    cached = load_cached_snapshot(cache) if cache is not None else None
-    if cache is None:
-        # `--link /`: a pairing path with no filename, so there is no cache
-        # beside it to boot from. Not fatal -- there is a config file, and this
-        # rack is not paired either way. See `_cache_beside`.
-        cache_error = f"{args.link}: names no file, so there is no snapshot cache beside it"
-    elif cached is not None:
-        config, version = cached
+    if args.config is not None:
+        # Row 1: the cache was absent or unusable and `--config` names a file
+        # to fall back to. Unconditional on pairing, and unchanged by this
+        # task -- standalone racks are untouched.
         try:
-            return config, resolve_screens(config), system_clock(config.timezone), version
+            config = load_config(args.config)
+            return config, resolve_screens(config), system_clock(config.timezone), None
         except (ConfigError, ClockError) as exc:
-            log.error(
-                "the cached snapshot cannot be served; falling back to the config file",
-                extra={"path": str(cache), "error": str(exc)},
-            )
-            cache_error = f"{cache}: {exc}"
-    else:
-        cache_error = f"{cache}: no usable cached snapshot"
+            print(f"nothing to run: {cache_error}; {exc}", file=sys.stderr)
+            return None
 
-    try:
-        config = load_config(args.config)
-        return config, resolve_screens(config), system_clock(config.timezone), None
-    except (ConfigError, ClockError) as exc:
-        print(f"nothing to run: {cache_error}; {exc}", file=sys.stderr)
-        return None
+    # Row 3: paired, but nothing usable has ever been pushed, and there is no
+    # file to fall back to -- `_run` only reaches here when `settings` is not
+    # None (either because this rack was already paired, or because
+    # `join_a_server` just paired it and `_run` re-read `args.link`) or
+    # `args.config` is not None, and the branch above already handled the
+    # latter, so this rack is paired. Not an error: a freshly paired rack has
+    # nothing pushed to it yet by definition, and the panels come up dark
+    # rather than the daemon not coming up at all.
+    assert settings is not None, "_run calls _boot only when paired or given --config"
+    log.info(
+        "paired, but nothing has ever been pushed; starting with no screens and waiting",
+        extra={"cache_error": cache_error},
+    )
+    config = DaemonConfig()
+    return config, resolve_screens(config), system_clock(config.timezone), None
 
 
 def _install_signal_handlers(stop: Callable[[], None]) -> bool:

@@ -1,16 +1,26 @@
 [project]
 name = "ors-server"
-version = "0.1.0"
+version = "0.2.0"
 description = "OpenRackScreen server: owns the rack's config and pushes it to daemons"
 requires-python = ">=3.11"
 dependencies = [
-    "ors-schema",
-    "ors-render",
+    "ors-schema==0.2.0",
+    "ors-render==0.2.0",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "pydantic>=2.7",
     "argon2-cffi>=23.1",
     "cryptography>=43.0",
+    "zeroconf>=0.132",
+    # zeroconf's own hard dependency, named here because `announce.py` imports
+    # it directly: it is what enumerates this host's addresses for the A
+    # records of the announcement. zeroconf 0.150 deprecated its own
+    # `get_all_addresses` wrapper and its removal notice says to use `ifaddr`
+    # directly, so relying on the wrapper would make a future zeroconf an
+    # ImportError at server start. Depending on it by name rather than through
+    # zeroconf's resolution is the difference between a dependency and an
+    # accident.
+    "ifaddr>=0.2",
 ]
 
 [project.scripts]
@@ -22,6 +32,24 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ors_server"]
+# `artifacts` is redundant today, measured rather than assumed -- kept anyway.
+# `src/ors_server/web/` ships because `packages` above already includes
+# everything beneath `src/ors_server`, not because of any .gitignore
+# exclusion: the root .gitignore's `server/src/ors_server/web/` line is
+# repo-relative, but hatchling resolves it against paths relative to *this*
+# file's directory (`server/`), so it is matched against
+# `src/ors_server/web/index.html` and never fires -- with or without the
+# `artifacts` line below, `uv build --package ors-server --no-cache` ships the
+# interface. See `server/tests/test_packaging.py` for the four configurations
+# this was built and inspected under.
+#
+# It stays as belt-and-braces: `artifacts` is checked before `exclude` in
+# hatchling's file selection and wins regardless, so the day this path's
+# `.gitignore` pattern (or some future `exclude` entry) is written to actually
+# match, `artifacts` is what keeps the wheel shipping the interface instead of
+# silently dropping it. `server/tests/test_packaging.py` fails if either this
+# line or `packages` above ever stops selecting the built interface.
+artifacts = ["src/ors_server/web/**"]
 
 [tool.uv.sources]
 ors-schema = { workspace = true }

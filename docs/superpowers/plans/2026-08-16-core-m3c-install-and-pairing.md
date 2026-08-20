@@ -204,7 +204,7 @@ PACKAGES = {
 _VERSION = re.compile(r'^version = "[^"]*"$', re.MULTILINE)
 
 
-def _pin(name: str, version: str) -> re.Pattern[str]:
+def _pin(name: str) -> re.Pattern[str]:
     # Anchored on the quote so `ors-schema` cannot match `ors-schema-extra`,
     # and tolerant of an existing pin so the script is re-runnable.
     return re.compile(rf'"{re.escape(name)}(==[^"]*)?"')
@@ -217,7 +217,7 @@ def rewrite(version: str) -> list[Path]:
         text = path.read_text()
         updated = _VERSION.sub(f'version = "{version}"', text, count=1)
         for name in PACKAGES:
-            updated = _pin(name, version).sub(f'"{name}=={version}"', updated)
+            updated = _pin(name).sub(f'"{name}=={version}"', updated)
         if updated != text:
             path.write_text(updated)
             changed.append(path)
@@ -694,11 +694,21 @@ def test_the_release_workflow_refuses_a_wheel_without_the_interface():
     uploads, and this asserts the check is there rather than trusting a
     reviewer to notice its removal.
     """
-    workflow = (ROOT / ".github/workflows/release.yml").read_text()
-    assert "ors_server/web/index.html" in workflow
-    assert "pypi.org" not in workflow.split("index.html")[0], (
-        "the interface check must run before anything is published"
-    )
+    import yaml
+
+    document = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+    build = document["jobs"]["build"]
+    steps = [step.get("name", step.get("uses", "")) for step in build["steps"]]
+    check = next(i for i, name in enumerate(steps) if "no interface" in name)
+    upload = next(i for i, name in enumerate(steps) if "upload-artifact" in name)
+    # Ordering asserted on the job graph and the step list, not on a substring
+    # search of the file. A text search for "pypi.org" passes whatever the
+    # workflow does -- `pypa/gh-action-pypi-publish` does not contain that
+    # string -- which is a test that reads like a gate and is not one.
+    assert check < upload, "the interface check must run before the artifact is uploaded"
+    assert document["jobs"]["publish"]["needs"] == "build" or "build" in document["jobs"][
+        "publish"
+    ]["needs"], "publish must not run unless build succeeded"
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -893,6 +903,19 @@ import stat
 import pytest
 
 from ors_daemon.identity import IDENTITY_BYTES, SHORT_CODE_CHARS, load_or_create
+
+
+def test_the_two_constants_are_the_numbers_they_are_meant_to_be():
+    """Literal, because every other assertion in this file reads the constant.
+
+    `len(secret) == IDENTITY_BYTES` is satisfied by any value of
+    `IDENTITY_BYTES`, including 4 -- the constant is on both sides. 32 is the
+    input to a SHA-256; 6 base32 characters is 30 bits, which is far more than
+    the number of racks anyone approves and few enough to read off a terminal
+    without losing your place.
+    """
+    assert IDENTITY_BYTES == 32
+    assert SHORT_CODE_CHARS == 6
 
 
 def test_a_fresh_identity_is_random_and_persisted(tmp_path):
@@ -2438,9 +2461,19 @@ Cover:
   a reused key is the thing X25519-per-claim exists to avoid.)*
 - On `approved`, the key decrypts and is written to the link file, and the
   function returns `True`.
-- On `denied`, it stops and returns `False` rather than re-filing immediately.
-  *(A denied rack that reappears every five seconds trains people to click
-  Approve.)*
+- **There is no `denied` status, and the client must not pretend there is.**
+  `claims.deny` deletes the row, so a poll after a deny answers **404 —
+  byte-identical to a claim id nobody ever filed**, deliberately, so that a
+  prober cannot confirm a deny. What a denied rack actually does is: poll →
+  404 → file a new claim → **429** (its fingerprint is suppressed, and that
+  429 is byte-identical to the queue-full one) → back off and retry, for
+  `DENY_SUPPRESSION_S` = 24 hours, after which it reappears in the admin's
+  queue. Test that path, not a `denied` branch. *(A denied rack **cannot
+  tell it was denied and retries indefinitely**. That is by design — the
+  alternative is an endpoint that confirms to anyone holding a fingerprint
+  that an admin denied it — so the backoff, not a stop, is what keeps a
+  refused rack from reappearing every five seconds and training people to
+  click Approve.)*
 - A 429 backs off and retries; assert the sleeper was called with increasing
   values.
 - An expired claim (404 on poll) files a **new** claim rather than waiting for

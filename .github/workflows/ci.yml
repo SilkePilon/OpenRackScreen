@@ -74,6 +74,18 @@ jobs:
           # which the runner user cannot create. The key file lands here too and
           # goes away with the runner.
           ORS_DATA_DIR: ${{ runner.temp }}/ors-drift
+          # This server exists to be asked for one OpenAPI document and then
+          # killed, so it has no business telling the network it is here.
+          # `create_app` builds an `Announcer` unless exactly this value says
+          # otherwise, and without it every run of this step multicasts
+          # `_openrackscreen._tcp.local.` onto the runner's network for the life
+          # of the step -- where a rack browsing for a server would find a
+          # throwaway on a machine that is about to disappear, file a claim
+          # against it, and be told to wait by a process nobody will ever
+          # approve from. Same defect the end-to-end fixture had; see
+          # `web/e2e/fixture.ts` and `server/tests/conftest.py`, which is the
+          # autouse fixture that covers pytest.
+          ORS_ANNOUNCE: "0"
         run: |
           uv run ors-server &
           SERVER=$!
