@@ -24,6 +24,28 @@ substituted rather than the configuration: the screen the wizard writes is the
 screen the server stores and pushes, and only the last inch -- the object the
 frame is handed to -- is a directory instead of a panel.
 
+*`join.join_a_server`'s hostname, when `ORS_E2E_HOSTNAME` is set.* This is the
+third substitution and it belongs to the claim flow rather than to the
+hardware. A rack files its claim under `os.uname().nodename`, the server
+creates the daemon under exactly that name (`claims.approve`'s `INSERT INTO
+daemon`), and the interface shows it -- so on a developer's laptop the rack
+that joins is called whatever that laptop is called, which is a name no spec
+can be written against and which differs on every machine the suite runs on.
+`hostname` is already a parameter of `join_a_server`, defaulted rather than
+read from the environment inside it, so this is the seam the function was
+given rather than one this file invents: it is bound to a fixed value and
+nothing else about the filing, the polling, the unsealing or the pairing
+changes.
+
+**Nothing here goes near discovery, and the claim flow is not run through it.**
+`ors-daemon run --server URL` is a first-class path -- `join_a_server` turns
+the URL into the same `Found` record a browse would have answered with and the
+protocol from there is identical -- and it is the one this suite uses. Browsing
+would put the run at the mercy of whether this machine has Avahi, whether the
+container has multicast, and whether something else on the LAN answers to
+`_openrackscreen._tcp.local.`; none of those is a fact about this project.
+`daemon/tests/test_discovery.py` is where the browse is tested.
+
 **What that costs, stated plainly, because it is what the hardware checklist is
 for.** Nothing here proves that a real `/dev` enumerates as expected, that a
 GC9A01 opens on a real bus, that a probe with the wrong DC line raises rather
@@ -37,14 +59,16 @@ from __future__ import annotations
 
 import os
 import sys
+from functools import partial
 from pathlib import Path
 
 
 def main(argv: list[str]) -> int:
-    # Imported inside the function so that the two substitutions below happen
+    # Imported inside the function so that the substitutions below happen
     # against modules this process has just loaded, in one place, with nothing
     # between the import and the patch that could hold a reference to either.
     import ors_daemon.__main__ as entry
+    import ors_daemon.join as join
     import ors_daemon.supervisor as supervisor
     from ors_daemon.displays.virtual import VirtualDisplay
 
@@ -55,6 +79,19 @@ def main(argv: list[str]) -> int:
     # every panel the supervisor opens *and* the one a probe opens, which is the
     # path the wizard's third step walks.
     supervisor.build_display = lambda display, name: VirtualDisplay(panels, name)
+
+    hostname = os.environ.get("ORS_E2E_HOSTNAME")
+    if hostname:
+        # Bound with `partial` rather than by rewriting the call in
+        # `entry.join_a_server`, so that everything that function does around
+        # this -- reading or minting the identity beside `--link`, printing the
+        # short code, turning `--server URL` into a `Found`, catching the
+        # operator's Ctrl-C -- is the daemon's own and runs unmodified.
+        # `entry` reaches the protocol through the module object
+        # (`join.join_a_server(...)`), resolved at call time, so patching the
+        # attribute here is what that call finds.
+        join.join_a_server = partial(join.join_a_server, hostname=hostname)
+
     return entry.main(argv)
 
 
