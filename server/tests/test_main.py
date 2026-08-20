@@ -314,6 +314,33 @@ def test_bare_ors_server_with_no_arguments_still_runs_the_server(monkeypatch, tm
     assert captured, "bare `ors-server` did not run the server"
 
 
+def test_a_subcommand_typed_at_the_shell_is_actually_read_from_sys_argv(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """The other half of the `argv=None` fallback, and the half that was not
+    pinned.
+
+    `test_bare_ors_server_with_no_arguments_still_runs_the_server` drives
+    `sys.argv = ["ors-server"]`, whose `[1:]` is `[]` -- indistinguishable from
+    a `main(argv=())` default that ignores `sys.argv` entirely. Under that
+    mutant `ors-server install --port 9443` typed at a shell silently starts a
+    server on 8080 instead of installing anything. A subcommand is the only
+    argv that tells the two apart, and `uninstall` without root is the shortest
+    one that reaches a distinguishable answer without touching the machine: the
+    root guard returns 2 before a `Roots` is built or a command is run.
+    """
+    import os
+    import sys
+
+    _explode_if_served(monkeypatch)
+    monkeypatch.setenv("ORS_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["ors-server", "uninstall"])
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+
+    assert main() == 2
+    assert "root" in capsys.readouterr().err.lower()
+
+
 def test_help_prints_the_subcommands_instead_of_starting_the_server(monkeypatch, capsys) -> None:
     """`ors-server --help` used to start the server: `main` did not parse argv
     at all, so the flag was read by nobody and the process bound a port. It

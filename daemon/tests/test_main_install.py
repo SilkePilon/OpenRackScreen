@@ -100,6 +100,33 @@ def test_install_prefix_defaults_to_opt_openrackscreen():
     assert _parser().parse_args(["install"]).prefix == Path("/opt/openrackscreen")
 
 
+def test_the_real_runner_hands_argv_to_subprocess_and_returns_its_code(monkeypatch):
+    """`_SubprocessRunner` is production's only conduit to the machine, and the
+    one place the exit codes `install()` reads actually come from -- yet every
+    other test in this file replaces it, so its two-line body was pinned by
+    nothing: `return 0` in place of `subprocess.run(argv).returncode` passed the
+    whole suite while turning every failed command into a silent success.
+
+    `subprocess.run` is replaced rather than given a real command, so this stays
+    inside the sandbox rule the rest of the file is written under.
+    """
+    from ors_daemon.__main__ import _SubprocessRunner
+
+    seen: list[list[str]] = []
+
+    class Completed:
+        returncode = 7
+
+    def fake_run(argv, *args, **kwargs):
+        seen.append(list(argv))
+        return Completed()
+
+    monkeypatch.setattr("ors_daemon.__main__.subprocess.run", fake_run)
+
+    assert _SubprocessRunner().run(["systemctl", "daemon-reload"]) == 7
+    assert seen == [["systemctl", "daemon-reload"]]
+
+
 # -- past the root check --------------------------------------------------
 #
 # Everything below pretends to be root (`os.geteuid` monkeypatched to `0`) to

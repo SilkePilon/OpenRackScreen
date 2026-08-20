@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+from ors_server import __version__
 from ors_server.install import Roots, install, uninstall, unit_text
 
 
@@ -62,7 +63,11 @@ def roots(tmp_path: Path) -> Roots:
 
 
 def _install(roots: Roots, runner: FakeRunner, **kwargs):
-    kwargs.setdefault("version", "0.2.0")
+    # `ors_server.__version__` and not the literal it happens to hold today: a
+    # hardcoded string here is self-referential, and the assertion that
+    # `install` puts the version on the `uv pip install` command line would go
+    # on passing at 0.3.0 while proving only that this file agrees with itself.
+    kwargs.setdefault("version", __version__)
     return install(roots, runner, **kwargs)
 
 
@@ -177,7 +182,7 @@ def test_it_installs_the_server_into_a_predictable_prefix(roots):
     assert "venv" in venv
     assert str(roots.prefix) in " ".join(venv)
     installed = " ".join(" ".join(argv) for argv in runner.argv_for("uv")[1:])
-    assert "ors-server==0.2.0" in installed
+    assert f"ors-server=={__version__}" in installed
 
 
 def test_the_venv_is_not_the_daemons(roots):
@@ -190,6 +195,32 @@ def test_the_venv_is_not_the_daemons(roots):
     joined = " ".join(" ".join(argv) for argv in runner.argv_for("uv"))
     assert "openrackscreen" not in joined
     assert "[hardware]" not in joined
+
+
+def test_a_uv_that_fails_is_reported_and_the_install_is_marked_failed(roots):
+    """`uv venv` or `uv pip install` exiting non-zero is the ordinary failure
+    on a Pi being set up with no network yet, or against an index that 404s the
+    version -- and discarding its code produced `failed=False`, exit 0 and a
+    printed healthcheck for a machine with no server installed on it at all."""
+    runner = FakeRunner(codes={"uv": 1})
+    report = _install(roots, runner)
+    assert report.failed is True
+    assert "uv" in report.warnings_text()
+
+
+def test_a_package_that_did_not_install_is_not_enabled_at_boot(roots):
+    """The unit is `Type=simple` with `Restart=always`, `RestartSec=5` and
+    `StartLimitIntervalSec=0`: the start job completes at fork, so a missing
+    `ExecStart` fails asynchronously and `enable --now` exits 0 regardless, and
+    with no start limit the unit can never latch into `failed`. It re-execs
+    every five seconds forever while `systemctl is-failed` answers no. So the
+    unit is still written -- the next `install` overwrites it -- but nothing
+    enables or starts it, and the report says why."""
+    runner = FakeRunner(codes={"uv": 1})
+    report = _install(roots, runner)
+    assert "systemctl" not in runner.programs()
+    assert report.unit_path.is_file()
+    assert "not enabled" in report.warnings_text()
 
 
 def test_the_unit_points_at_the_prefix(roots):
@@ -274,8 +305,22 @@ def test_the_unit_keeps_the_settings_that_make_it_survive_a_reboot(roots):
     text = _non_comment_lines(report.unit_path.read_text())
     assert "WantedBy=multi-user.target" in text
     assert "Restart=always" in text
+    assert "RestartSec=5" in text
     assert "StartLimitIntervalSec=0" in text
     assert "User=openrackscreen" in text
+    # The hardening block, named line by line rather than sampled: every one of
+    # these is deletable without any other test in this file noticing, and each
+    # deletion loosens the sandbox a network-facing server runs inside.
+    assert "NoNewPrivileges=yes" in text
+    assert "ProtectSystem=full" in text
+    assert "ProtectHome=yes" in text
+    assert "ProtectControlGroups=yes" in text
+    assert "ProtectKernelTunables=yes" in text
+    assert "RestrictSUIDSGID=yes" in text
+    # Without this the journal is where an operator is told to look and nothing
+    # they are looking for is there.
+    assert "StandardOutput=journal" in text
+    assert "StandardError=journal" in text
 
 
 def test_the_unit_keeps_the_state_directory_private_too(roots):
@@ -341,6 +386,17 @@ def test_the_unit_it_enables_is_the_one_it_wrote(roots):
     _install(roots, runner)
     systemctl = [" ".join(argv) for argv in runner.argv_for("systemctl")]
     assert any("ors-server.service" in call for call in systemctl)
+
+
+def test_a_systemctl_that_fails_is_reported_and_the_install_is_marked_failed(roots):
+    """A `daemon-reload` or an `enable --now` that fails leaves a machine whose
+    unit file exists and whose service will not come back after a reboot. The
+    exit code was discarded, so the CLI printed the ordinary success block and
+    returned 0 over exactly that."""
+    runner = FakeRunner(codes={"systemctl": 1})
+    report = _install(roots, runner)
+    assert report.failed is True
+    assert "systemctl" in report.warnings_text()
 
 
 def test_a_second_install_restarts_the_running_service(roots):
@@ -626,6 +682,57 @@ def test_install_honours_the_prefix_flag(monkeypatch, capsys, tmp_path):
     exec_start = next(line for line in text.splitlines() if line.startswith("ExecStart="))
     assert str(prefix) in exec_start
     assert "/opt/ors-server" not in exec_start
+
+
+def test_the_real_runner_hands_argv_to_subprocess_and_returns_its_code(monkeypatch):
+    """`_SubprocessRunner` is production's only conduit to the machine, and the
+    one place the exit codes `install()` reads actually come from -- yet every
+    other test in this file replaces it, so its two-line body was pinned by
+    nothing: `return 0` in place of `subprocess.run(argv).returncode` passed the
+    whole suite while turning every failed command into a silent success.
+
+    `subprocess.run` is replaced rather than given a real command, so this stays
+    inside the sandbox rule the rest of the file is written under.
+    """
+    from ors_server.__main__ import _SubprocessRunner
+
+    seen: list[list[str]] = []
+
+    class Completed:
+        returncode = 7
+
+    def fake_run(argv, *args, **kwargs):
+        seen.append(list(argv))
+        return Completed()
+
+    monkeypatch.setattr("ors_server.__main__.subprocess.run", fake_run)
+
+    assert _SubprocessRunner().run(["systemctl", "daemon-reload"]) == 7
+    assert seen == [["systemctl", "daemon-reload"]]
+
+
+def test_install_installs_the_version_this_command_ships(monkeypatch, capsys, tmp_path):
+    """`version=__version__` mutated to a literal survives everything else: the
+    only other version assertion runs against this file's own `_install`
+    helper, which supplies the version itself. This one reads the argv the CLI
+    actually built."""
+    from ors_server.__main__ import main
+
+    _as_root_with_fake_machine(monkeypatch, tmp_path)
+    recorded: list[list[str]] = []
+
+    class RecordingRunner(FakeRunner):
+        def run(self, argv: list[str]) -> int:
+            recorded.append(list(argv))
+            return super().run(argv)
+
+    monkeypatch.setattr("ors_server.__main__._SubprocessRunner", RecordingRunner)
+
+    assert main(["install", "--prefix", str(tmp_path / "prefix")]) == 0
+    capsys.readouterr()
+    pip = [argv for argv in recorded if argv[:3] == ["uv", "pip", "install"]]
+    assert pip, f"no `uv pip install` reached the runner: {recorded}"
+    assert f"ors-server=={__version__}" in pip[0]
 
 
 def test_install_exits_1_when_the_report_is_failed(monkeypatch, capsys, tmp_path):

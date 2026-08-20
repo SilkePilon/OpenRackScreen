@@ -170,6 +170,33 @@ def test_it_installs_itself_into_a_predictable_prefix(roots):
     assert "ors-daemon[hardware]==0.2.0" in installed
 
 
+def test_a_uv_that_fails_is_reported_and_the_install_is_marked_failed(roots):
+    """`uv venv` or `uv pip install` exiting non-zero is the ordinary failure
+    on a Pi being set up before it has a network, or against an index that 404s
+    the version -- and discarding its code produced `failed=False`, exit 0 and
+    a printed short code for a rack with no daemon installed on it at all."""
+    runner = FakeRunner(codes={"uv": 1})
+    report = _install(roots, runner)
+    assert report.failed is True
+    assert "uv" in report.warnings_text()
+
+
+def test_a_package_that_did_not_install_is_not_enabled_at_boot(roots):
+    """The unit is `Type=simple` with `Restart=always`, `RestartSec=5` and
+    `StartLimitIntervalSec=0`: the start job completes at fork, so a missing
+    `ExecStart` fails asynchronously and `enable --now` exits 0 regardless, and
+    with no start limit the unit can never latch into `failed`. What that
+    installs into the boot path is a rack that stays dark forever, re-execing
+    every five seconds, with `systemctl is-failed` answering no and nothing but
+    journal spam to find it by. The unit is still written -- the next `install`
+    overwrites it -- but nothing enables or starts it."""
+    runner = FakeRunner(codes={"uv": 1})
+    report = _install(roots, runner)
+    assert "systemctl" not in runner.programs()
+    assert report.unit_path.is_file()
+    assert "not enabled" in report.warnings_text()
+
+
 def test_the_unit_points_at_the_prefix(roots):
     report = _install(roots, FakeRunner())
     assert f"ExecStart={roots.prefix}/bin/ors-daemon run" in report.unit_path.read_text()
@@ -302,6 +329,17 @@ def test_it_enables_and_starts_the_service(roots):
     systemctl = [" ".join(argv) for argv in runner.argv_for("systemctl")]
     assert any("daemon-reload" in call for call in systemctl)
     assert any("enable" in call and "--now" in call for call in systemctl)
+
+
+def test_a_systemctl_that_fails_is_reported_and_the_install_is_marked_failed(roots):
+    """A `daemon-reload` or an `enable --now` that fails leaves a rack whose
+    unit file exists and whose daemon will not come back after a reboot. The
+    exit code was discarded, so the CLI printed the ordinary success block --
+    short code and all -- and returned 0 over exactly that."""
+    runner = FakeRunner(codes={"systemctl": 1})
+    report = _install(roots, runner)
+    assert report.failed is True
+    assert "systemctl" in report.warnings_text()
 
 
 def test_a_second_install_restarts_the_running_service(roots):

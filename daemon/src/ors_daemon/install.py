@@ -449,9 +449,18 @@ def install(
             warnings.append(f"usermod -aG {group} exited {code}")
 
     # -- the venv, unless an existing interpreter was named ----------------
+    # 0 when an existing interpreter was named: nothing was installed because
+    # nothing needed to be, which is not a reason to withhold the unit's start.
+    pip_code = 0
     if not use_current_interpreter:
-        runner.run(["uv", "venv", str(roots.prefix)])
-        runner.run(
+        venv_code = runner.run(["uv", "venv", str(roots.prefix)])
+        if venv_code != 0:
+            failed = True
+            warnings.append(
+                f"uv venv exited {venv_code}; there is no interpreter under "
+                f"{roots.prefix} for the unit's ExecStart to run"
+            )
+        pip_code = runner.run(
             [
                 "uv",
                 "pip",
@@ -461,6 +470,13 @@ def install(
                 f"ors-daemon[hardware]=={version}",
             ]
         )
+        if pip_code != 0:
+            failed = True
+            warnings.append(
+                f"uv pip install ors-daemon[hardware]=={version} exited {pip_code}; the "
+                f"daemon is not installed under {roots.prefix} and the unit's ExecStart "
+                "names a binary that does not exist"
+            )
 
     # -- the unit -----------------------------------------------------------
     exec_start = f"{bin_path} run --status /run/openrackscreen/status.json"
@@ -468,16 +484,46 @@ def install(
     unit_path.write_text(unit_text(exec_start))
 
     # -- enable and start ----------------------------------------------------
-    runner.run(["systemctl", "daemon-reload"])
-    runner.run(["systemctl", "enable", "--now", f"{SERVICE_NAME}.service"])
-    # `enable --now` is a no-op on a unit that is already active, so on an
-    # upgrade -- where the venv step above just replaced the interpreter and
-    # packages underneath a running daemon -- nothing here would make the new
-    # version take effect before someone reboots the rack by hand.
-    # `try-restart` is exactly enable --now's complement: it restarts the
-    # unit if it is running, and does nothing (does not start it) if it is
-    # not, so a first install is unaffected.
-    runner.run(["systemctl", "try-restart", f"{SERVICE_NAME}.service"])
+    #
+    # Skipped outright when the package did not install. The unit is
+    # `Type=simple` with `Restart=always`, `RestartSec=5` and
+    # `StartLimitIntervalSec=0`: systemd's start job for a `Type=simple`
+    # service completes at fork, so an `ExecStart` naming a binary that does
+    # not exist fails asynchronously (203/EXEC) and `enable --now` exits 0
+    # anyway -- and with no start limit the unit can never latch into `failed`
+    # either. It sits in `activating (auto-restart)`, re-execs every five
+    # seconds forever, and `systemctl is-failed` answers no. On a rack that is
+    # a screen that stays dark with no failed unit anywhere to find it by, so a
+    # failed `uv pip install` stops here and says so.
+    if pip_code != 0:
+        warnings.append(
+            f"{SERVICE_NAME}.service was written but deliberately not enabled or "
+            "started, because the package it runs was not installed. Fix the reason "
+            "above and re-run `ors-daemon install`."
+        )
+    else:
+        reload_code = runner.run(["systemctl", "daemon-reload"])
+        if reload_code != 0:
+            failed = True
+            warnings.append(
+                f"systemctl daemon-reload exited {reload_code}; systemd has not read {unit_path}"
+            )
+        enable_code = runner.run(["systemctl", "enable", "--now", f"{SERVICE_NAME}.service"])
+        if enable_code != 0:
+            failed = True
+            warnings.append(
+                f"systemctl enable --now {SERVICE_NAME}.service exited {enable_code}; "
+                "the service is not running and will not start at boot"
+            )
+        # `enable --now` is a no-op on a unit that is already active, so on an
+        # upgrade -- where the venv step above just replaced the interpreter and
+        # packages underneath a running daemon -- nothing here would make the new
+        # version take effect before someone reboots the rack by hand.
+        # `try-restart` is exactly enable --now's complement: it restarts the
+        # unit if it is running, and does nothing (does not start it) if it is
+        # not, so a first install is unaffected. Its own exit code is left alone
+        # on purpose: a `try-restart` of a unit that is not running is a no-op.
+        runner.run(["systemctl", "try-restart", f"{SERVICE_NAME}.service"])
 
     # -- SPI ------------------------------------------------------------------
     reboot_needed = False
