@@ -291,18 +291,25 @@ machine paired with nothing yet. What `run` boots from is one of five states:
    back to: boots with no screens at all and waits — not an error, and the
    ordinary state of a rack the moment it finishes pairing. The panels appear
    the moment the first push lands.
-4. Neither paired nor given `--config`, but there *is* a usable cached
-   snapshot beside the pairing (a corrupt or unreadable link.json is not a
-   reason to give up on a good `snapshot.json` next to it — see the
-   permissions note below): boots from the snapshot, same as row 2.
-5. Neither paired, given `--config`, nor sitting on a usable cache: this is
-   the state a freshly installed rack is in. `run` browses for a server to
+4. Neither paired nor given `--config`: this is the state a freshly installed
+   rack is in. A usable cached snapshot beside the pairing is tried first (a
+   corrupt or unreadable link.json is not a reason to give up on a good
+   `snapshot.json` next to it — see the permissions note below) and boots the
+   rack exactly as row 2 does. Failing that, `run` browses for a server to
    join (`--no-discovery` turns that off; `--server URL` dials one directly
    instead of browsing, and works either way) and blocks until it is paired,
-   then continues in this same process rather than needing a restart. The one
-   case with truly no way forward — `--no-discovery` with no `--server` — is a
+   then continues in this same process rather than needing a restart.
+5. The same as row 4 with no way left to reach a server at all —
+   `--no-discovery` and no `--server` — and no cache to fall back on: a
    message on stderr naming every way out, and a non-zero exit, not a
    traceback.
+
+These numbers are the ones the source uses. `_boot`'s docstring, `join.py`,
+`config.py` and the tests all say "row 4" for the join and "row 5" for the
+refusal; the cache is not a row of its own there, because the code tries it
+ahead of both rather than instead of either. This list said otherwise until
+M3c's final review, so a "row 4" read here and a "row 4" read in the code
+named two different states.
 
 A pushed configuration is applied to the running process: only the screens
 that actually changed are stopped and reopened, so a redundant push is not a
@@ -369,7 +376,11 @@ also see above — and needs nothing run by hand either.
 **`ors-daemon install` writes this unit for you.** What it generates and what
 `examples/openrackscreen.service` holds differ only in `ExecStart` — the example
 is the hand-authored copy, kept for anyone installing without the command, and
-both are commented with the reason for every line that is not obvious. The
+both are commented with the reason for every line that is not obvious. That
+claim is compared line for line by
+`test_the_generated_unit_and_the_example_differ_only_in_exec_start`; it was
+prose alone until M3c's final review, and the two had already drifted apart in
+their comments. The
 generated one is rewritten in full by every later `install`, so an edit made in
 it is an edit lost at the next upgrade: change what the command is given
 (`--prefix`), use a systemd drop-in, or take the file over with

@@ -19,6 +19,7 @@ from ors_daemon.install import (
     Roots,
     install,
     uninstall,
+    unit_text,
 )
 
 NOW = "2026-08-16T12:00:00"
@@ -321,6 +322,60 @@ def test_the_generated_unit_and_the_example_do_not_drift(roots):
         }
 
     assert settings(example) <= settings(generated)
+
+
+def test_the_generated_unit_and_the_example_differ_only_in_exec_start():
+    """The stronger half, and the one `install.py` and `daemon/README.md` both
+    *claim*: "comments included", "differ only in `ExecStart`".
+
+    The test above strips comments before comparing, so the comments -- which
+    are most of both files, and which that claim is specifically about -- were
+    pinned by nothing. They had already drifted: the generated unit carried a
+    one-line comment above `Restart=always` where the example carries seven
+    (the timezone push that stops the rack with exit 10), and a `#` where the
+    example has a blank line. Neither is a setting, so neither was visible to
+    any test.
+
+    `unit_text` is called directly rather than through `install`, because what
+    is being compared is the template, not a particular install's paths -- and
+    the example's own `ExecStart` is the argument, so the one line that is
+    allowed to differ is the one this hands in.
+
+    The example spells that line across two with a shell continuation, for a
+    human editing it by hand; a generated file has no reader to wrap it for.
+    That is the one structural difference, and folding it back is the whole of
+    what `_logical_exec_start` does.
+    """
+    example_path = Path(__file__).resolve().parents[1] / "examples" / "openrackscreen.service"
+    example = example_path.read_text()
+
+    def without_exec_start(text: str) -> tuple[list[str], str]:
+        """The file with its `ExecStart=` logical line lifted out, and that
+        line with its continuations folded back into one."""
+        kept: list[str] = []
+        exec_start: list[str] = []
+        collecting = False
+        for line in text.splitlines():
+            if line.startswith("ExecStart="):
+                collecting = True
+            if collecting:
+                exec_start.append(line.rstrip("\\").strip())
+                if not line.rstrip().endswith("\\"):
+                    collecting = False
+                continue
+            kept.append(line)
+        line = " ".join(part for part in exec_start if part)
+        return kept, line.removeprefix("ExecStart=")
+
+    example_lines, example_exec = without_exec_start(example)
+    generated_lines, generated_exec = without_exec_start(unit_text(example_exec))
+
+    assert generated_exec == example_exec
+    assert generated_lines == example_lines, (
+        "the generated unit and the hand-authored example have drifted apart "
+        "somewhere other than ExecStart -- install.py and daemon/README.md both "
+        "say they cannot"
+    )
 
 
 def test_it_enables_and_starts_the_service(roots):

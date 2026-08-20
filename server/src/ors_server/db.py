@@ -14,11 +14,14 @@ There are no migrations: a bump exports the database and rebuilds it empty.
 That is a deliberate trade for a single-file database holding a config you can
 re-enter, and the export is what makes it survivable -- see `initialise`.
 
-5, not 4, even though 4 was never released (no tag, no build on `master` ever
-carried it): it was a committed, reviewable state on this branch (`36439ba`),
-and a database created from *that* commit is version 4 without `granted_at`,
-`granted_key` or `daemon_id` on `claim`. Upgrading such a file today raises
-`sqlite3.OperationalError: no such column: granted_at` out of `claims.py`, not
+6, and the last two bumps are here for one reason. 5, not 4, even though 4
+was never released (no tag, no build on `master` ever carried it): it was a
+committed, reviewable state on this branch (`36439ba`), and a database created
+from *that* commit is version 4 without `granted_at`, `granted_key` or
+`daemon_id` on `claim`. Then 6, not 5, for `daemon.claim_fingerprint`
+(`8d247fe`) -- another column added on this branch, after some checkouts
+already held a version-5 file. Upgrading either such file today raises
+`sqlite3.OperationalError: no such column: ...` out of `claims.py`, not
 out of anything in this module -- the version already matches `SCHEMA_VERSION`,
 so `initialise` takes the "nothing changed" branch and never exports or
 rebuilds. That is an undiagnosable start failure for the exact people most

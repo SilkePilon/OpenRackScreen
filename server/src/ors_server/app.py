@@ -439,7 +439,7 @@ def create_app(settings: AppSettings) -> FastAPI:
 
     # The configuration API, all of it on the guarded router. Nothing here says
     # `Depends(require_session)`: `api` carries it, so a route added to any of
-    # these five files is guarded without anybody remembering to say so, and
+    # these six files is guarded without anybody remembering to say so, and
     # `test_auth.py`'s sweep is what fails if one is ever hung off `public`
     # instead.
     for configuration in (

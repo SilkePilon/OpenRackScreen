@@ -133,9 +133,15 @@ class UninstallReport:
 # lines with a shell continuation for a human editing it by hand, and a
 # generated file has no reader to wrap it for.
 #
-# `daemon/tests/test_install.py::test_the_generated_unit_and_the_example_do_not_drift`
-# asserts every non-comment, non-path setting in the example also appears
-# here, so the two cannot quietly drift apart again.
+# Two tests hold that, and it takes two.
+# `test_the_generated_unit_and_the_example_do_not_drift` asserts every
+# non-comment, non-path setting in the example also appears here.
+# `test_the_generated_unit_and_the_example_differ_only_in_exec_start` compares
+# the two files line for line with only that one line lifted out -- which is
+# what "comments included" above actually claims, and what nothing checked
+# until M3c's final review found the two had already drifted: a one-line
+# comment here where the example carried seven, and a `#` where it has a blank
+# line.
 _TEMPLATE = """# OpenRackScreen daemon.
 #
 #   sudo install -m0644 openrackscreen.service /etc/systemd/system/
@@ -179,7 +185,7 @@ SupplementaryGroups=spi gpio
 # add `--log-level DEBUG` right after the executable when a panel is misbehaving
 # and the INFO lines are not saying enough. INFO is the default and is what a
 # healthy rack should be left on -- DEBUG on four screens fills a journal.
-#
+
 # /opt/openrackscreen/bin, not .venv/bin: `ors-daemon install` builds this venv
 # with `uv venv /opt/openrackscreen`, which puts binaries in bin/. The nested
 # .venv this line used to name was a `uv sync` in a checkout, which is not how
@@ -190,7 +196,13 @@ SupplementaryGroups=spi gpio
 ExecStart=__EXEC_START__
 
 # `always`, not `on-failure`: a clean exit is not something this program is
-# supposed to do, so exiting 0 is as much a reason to come back as crashing.
+# supposed to do, so exiting 0 is as much a reason to come back as crashing --
+# and a push that changes this rack's timezone deliberately stops it to be
+# re-clocked on the way back up, exiting 10 rather than 0 so that a caller
+# which does read exit codes (this line does not; Restart=always recovers
+# both the same way) can tell that apart from a clean stop. A push naming a
+# timezone this host cannot resolve at all does not stop the rack -- it is
+# refused with a Nack back to the server instead, and nothing here restarts.
 Restart=always
 RestartSec=5
 

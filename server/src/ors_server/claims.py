@@ -179,6 +179,26 @@ def file_claim(
     suppressed -- exactly as `pairing.claim_token` answers `None` for a token
     nobody minted and one already spent without distinguishing them.
 
+    **What that buys, stated exactly, because it is less than it reads
+    like.** One answer cannot be told from the other, and that is all: a
+    caller picks its own fingerprint, so it can file a *fresh random* one
+    first -- 202 means the queue is not full -- and then file the target,
+    where a 429 now means suppression. The distinction survives as a
+    two-request probe and no answer this function can give closes it, because
+    the prober learns the queue's state from a filing that is entirely its
+    own business.
+
+    That is recorded rather than fixed, deliberately. Closing it means either
+    refusing the probe's own honest filing (a real rack's first claim, on a
+    server whose queue has room) or making a full queue answer 202 and drop
+    the row -- a rack that believes it is waiting and never will be. Both cost
+    a real rack its pairing to deny an attacker a fact that is worth little on
+    its own: knowing a fingerprint was denied tells you nothing you can act
+    on, since the suppression expires on its own clock either way and the row
+    it protects has already been deleted. What must not happen, and does not,
+    is a *single* response distinguishing them -- that would confirm a denial
+    to anyone who could guess a fingerprint, without ever filing anything.
+
     A second filing under a fingerprint that is still *pending* (`granted_at
     IS NULL`) is **not** a second row: it updates `address`, `version` and
     `public_key` in place and keeps the original `id` and `first_seen`.
@@ -285,10 +305,12 @@ def _seal_not_implemented(key: str, public_key: str) -> str:
     (`approve(..., seal=<the real one>)`) rather than a hardcoded call to
     something that does not exist in this codebase yet, while making it
     impossible to reach production behaviour by omission: nothing here calls
-    `approve` without passing `seal` -- there is no route wired to it yet (see
-    this module's own docstring) -- so the only way to hit this by accident is
-    a future caller that forgets the argument, which is exactly what naming
-    Task 13 in the message is for.
+    `approve` without passing `seal`, so the only way to hit this by accident
+    is a caller that forgets the argument, which is exactly what naming
+    Task 13 in the message is for. That caller now exists --
+    `api.claims.approve_claim` passes `seal=_seal`, and it is the only
+    production one -- so this default is no longer a placeholder for a route
+    that has not been written; it is the guard on the one that has.
     """
     raise NotImplementedError(
         "claims.approve() has no key-sealing primitive: pass seal= (Task 13's"
