@@ -383,8 +383,8 @@ to be, because a pip-installed server has no `/app`. The image therefore sets
   ```
 
   `ORS_ANNOUNCE=0` because announcing is on by default: without it a checkout
-  advertises itself to every machine on your network as a server racks may ask
-  to join, and it can cost several seconds of startup while zeroconf gives up.
+  really does advertise itself to every machine on your network as a server
+  racks may ask to join.
 
   Or don't — `pnpm dev` in `web/` proxies `/api` and `/ws` to `127.0.0.1:8080`,
   which is the better loop while editing.
@@ -452,12 +452,23 @@ Three ways to get discovery, and a rack only needs one of them:
   and the server — plenty do, including most managed switches with IGMP snooping
   and every setup where the two are on different VLANs.
 
-**None of this has ever run on a real network.** `ors_server.announce` and
-`ors_daemon.discovery` are tested against each other and against fakes, and
-`discovery.browse()` has never returned a server that a rack then paired with
-over a LAN. That is why `--server` is documented above as a first-class path and
+**None of this has ever crossed two machines.** Announcing and browsing were
+put against real sockets for the first time while this file was being verified
+— a server logging `announcing <host>._openrackscreen._tcp.local. on port 8080`,
+and `ors_daemon.discovery.discover()` returning it — but both ends were the same
+host. No rack has ever been *paired* over a browse, and multicast between two
+machines through a switch that may be snooping IGMP is exactly the part still
+untested. That is why `--server` is documented above as a first-class path and
 not as a workaround: it is the one of the two that does not depend on multicast
 behaving.
+
+It is also what found the reason none of it worked. The lifespan called
+python-zeroconf's *synchronous* `register_service` from the event loop thread,
+where zeroconf adopts that loop and then blocks it waiting on a coroutine it
+scheduled onto it — a deadlock by construction, `EventLoopBlocked` ten seconds
+later, caught and logged as a warning while the server came up silent. Every
+deployment that set `ORS_ANNOUNCE=1` announced nothing, and the whole test suite
+stayed green because it substitutes the responder.
 
 ## Outbound network
 
@@ -487,7 +498,7 @@ explicitly, which keeps the chosen path visible where it is chosen.
 | `ORS_SECRET_KEY` | generated | see above. Unrecoverable. An empty string is refused at startup rather than read as "unset". |
 | `ORS_WEB_DIR` | the interface **inside the wheel**, `<site-packages>/ors_server/web` | where the built interface is. **Moved in M3c** — it used to be `/app/web`, which is a container path a pip-installed server does not have, so the image now sets that itself. A checkout has no copy inside the package and needs `ORS_WEB_DIR=web/dist`. See [The interface ships with the server](#the-interface-ships-with-the-server). |
 | `ORS_LOG_LEVEL` | `INFO` | one JSON object per line, on stdout. |
-| `ORS_ANNOUNCE` | on in the code, **`0` in the image**, `1` in the unit `ors-server install` writes | `ORS_ANNOUNCE=0`, exactly that value, stops the server announcing itself over mDNS as `_openrackscreen._tcp.local.` — which is how a freshly installed rack finds a server to ask to join. Anything else, including `false`, leaves it on. The image sets it off because the announcement does not reach the LAN from a bridge network at all, and the address in it would be the bridge's; see [mDNS discovery does not cross a Docker bridge](#mdns-discovery-does-not-cross-a-docker-bridge) for the host networking that turns it back on. Worth setting to `0` in a checkout too, so a development server does not advertise itself to every rack on your LAN. A failure to announce is a warning rather than a refusal to start in any case — though it is a warning that can cost several seconds of startup while zeroconf times out. |
+| `ORS_ANNOUNCE` | on in the code, **`0` in the image**, `1` in the unit `ors-server install` writes | `ORS_ANNOUNCE=0`, exactly that value, stops the server announcing itself over mDNS as `_openrackscreen._tcp.local.` — which is how a freshly installed rack finds a server to ask to join. Anything else, including `false`, leaves it on. The image sets it off because the announcement does not reach the LAN from a bridge network at all, and the address in it would be the bridge's; see [mDNS discovery does not cross a Docker bridge](#mdns-discovery-does-not-cross-a-docker-bridge) for the host networking that turns it back on. Worth setting to `0` in a checkout too, so a development server does not advertise itself to every rack on your LAN. A failure to announce is a warning rather than a refusal to start in any case. |
 | `FORWARDED_ALLOW_IPS` | `127.0.0.1` | which proxies' `X-Forwarded-For` to believe. Read only while uvicorn's proxy headers are on, which they are — passed explicitly rather than inherited. |
 
 ## Health

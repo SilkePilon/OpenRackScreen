@@ -75,13 +75,12 @@ Then open <http://127.0.0.1:8080/> and set an admin password.
   `uv tool install` would use.
 - **`ORS_ANNOUNCE=0` keeps your laptop off the LAN's service list.** Announcing
   is *on* by default — that is what lets a rack find a server with nobody
-  typing a URL — so a checkout run without this advertises
+  typing a URL — so a checkout run without this really does advertise
   `_openrackscreen._tcp.local.` to every machine on your network, and a real
-  rack that hears it will file a claim against it. It also costs startup time:
-  on the machine this paragraph was verified on, registering the service timed
-  out after about six seconds and logged a `zeroconf … EventLoopBlocked`
-  traceback as a warning, against 0.45 s to first `/api/health` with
-  `ORS_ANNOUNCE=0`. Exactly the string `0` turns it off; `false` does not.
+  rack that hears it will file a claim against it. Verified in both directions
+  on this machine: the server logs `announcing <host>._openrackscreen._tcp.
+  local. on port 8080`, and `ors_daemon.discovery.discover()` finds it. Exactly
+  the string `0` turns it off; `false` does not.
 
 **Run a rack with no panels.** Copy `daemon/examples/rack.yaml`, switch each
 screen's `display:` to `{ backend: virtual, out_dir: /tmp/ors-panels }`, and:
@@ -390,7 +389,7 @@ interface reads as a red interface.
 
 ```bash
 uv sync --all-packages
-uv run pytest                                    # 2596 passed, 1 skipped
+uv run pytest                                    # 2597 passed, 1 skipped
 uv run ruff check . && uv run ruff format --check .
 ```
 
@@ -487,11 +486,18 @@ repository's own suites:
   project made. The installer's whole surface is exercised against injected
   filesystem roots and a fake command runner, which is what makes it testable
   and is exactly not the same as having been run.
-- **mDNS has never been exercised on a real network.** `announce` and
-  `discovery.browse()` are tested against each other and against fakes;
-  `browse()` has never returned a server that a rack then paired with over a
-  LAN. That is why `--server URL` is documented as a first-class path and not as
-  a workaround.
+- **mDNS has never crossed two machines.** Announce and browse were verified
+  against real sockets for the first time while this README was being checked —
+  a real server announcing, and `discovery.discover()` returning it — but both
+  ends were the same host, and no rack has ever been *paired* over a browse.
+  Multicast between two machines, through a switch that may or may not be
+  snooping IGMP, is the part still untested, and it is why `--server URL` is
+  documented as a first-class path rather than as a workaround.
+
+  That check is also what found the bug that made it not work at all: the
+  lifespan called python-zeroconf's synchronous `register_service` from the
+  event loop thread, where it deadlocks itself and gives up after ten seconds.
+  Every test passed throughout, because every test substitutes the responder.
 
 And the scope that was never in M3c to begin with:
 
