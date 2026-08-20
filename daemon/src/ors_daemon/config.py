@@ -130,17 +130,45 @@ def load_cached_snapshot(path: Path) -> tuple[DaemonConfig, int] | None:
     boot path, and *nothing* it can do is worth the rack going dark. A narrower
     guard buys a diagnosis nobody wants at the cost of the panels.
 
-    The warning is deliberate. An ignored cache is a rack that quietly falls
-    back to its local file and draws the configuration somebody edited months
-    ago, which from the front of the rack looks exactly like a working one.
+    The warning is deliberate, and so is the fact that *a cache that was never
+    written does not get one*. An ignored cache is a rack that had something
+    the server pushed and is now drawing something else, which from the front
+    of the rack looks exactly like a working one -- worth a line in the
+    journal. A cache that is simply not there yet is the ordinary state of a
+    rack that has not been pushed to, which since M3c is every rack on its
+    first boot: `_run` calls this before rows 4/5, so a freshly installed Pi
+    with no pairing and no config file reaches here with nothing beside it and
+    is about to file a claim. Warning there would send whoever reads
+    `journalctl -u openrackscreen` looking for a file nobody meant to write.
+    It is a `debug` line instead, and `None` either way.
+
+    Nor does the warning name what happens next, because this function does
+    not know: `--config` falls back to the file (row 1), a paired rack with
+    nothing pushed starts blank and waits (row 3), an unpaired one joins a
+    server (row 4). All three have in common exactly what it does say.
     """
     path = Path(path)
     try:
         raw = json.loads(path.read_text())
         return DaemonConfig.model_validate(raw["snapshot"]), int(raw["version"])
+    except FileNotFoundError:
+        # Not "unusable" and not "ignored": there is nothing here to ignore.
+        # Only this one exception, and only for the file itself -- a path whose
+        # *parent* is missing raises this too, which is the same story (nothing
+        # has ever been written beside a pairing that was never made). A
+        # directory where the file should be raises `IsADirectoryError` and a
+        # file where a directory should be raises `NotADirectoryError`; both
+        # are somebody's mistake rather than an ordinary first boot, so both
+        # fall to the warning below.
+        log.debug(
+            "no snapshot cache to boot from; the server has not pushed to this rack yet",
+            extra={"path": str(path)},
+        )
+        return None
     except Exception as exc:
         log.warning(
-            "ignoring an unusable snapshot cache; this rack boots from its config file",
+            "ignoring an unusable snapshot cache; "
+            "this rack will not start from what the server last pushed",
             extra={"path": str(path), "error": f"{type(exc).__name__}: {exc}"},
         )
         return None

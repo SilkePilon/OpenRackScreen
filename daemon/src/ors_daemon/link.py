@@ -1158,7 +1158,14 @@ class LinkClient(threading.Thread):
             # cache path with no filename cannot have a temporary derived beside
             # it, and that is a configuration error rather than a disk one.
             log.error(
-                "could not cache the snapshot; this rack boots from its config file",
+                # Not "boots from its config file": since M3c a rack that
+                # joined by claim has no config file at all, and the next boot
+                # of one that lost this write is row 3 -- no screens, waiting
+                # for a push -- rather than a fallback. Say the part that is
+                # true on every row. Same untruth as the one `load_cached_snapshot`
+                # used to log, in the write half rather than the read half.
+                "could not cache the snapshot; the next boot of this rack will not "
+                "start from what the server last pushed",
                 extra={"path": str(path), "error": str(exc)},
             )
             return False

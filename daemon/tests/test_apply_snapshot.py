@@ -304,11 +304,78 @@ def test_a_cache_that_is_not_there_is_no_cache(tmp_path: Path) -> None:
     assert load_cached_snapshot(tmp_path / "never-written.json") is None
 
 
+def test_a_cache_that_was_never_written_is_not_warned_about(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Row 4 of the boot table -- every first boot of a freshly installed rack.
+
+    `_run` calls `_boot_from_cache` *before* rows 4/5, so a Pi with no pairing,
+    no `--config` and nothing beside its link path reaches this loader with a
+    `snapshot.json` that was never written, on its way to filing a claim. This
+    used to log `WARNING "ignoring an unusable snapshot cache; this rack boots
+    from its config file"` -- two untruths in one line on the ordinary first
+    boot of the flow M3c exists to create: there is no cache to ignore and
+    there is no config file to boot from. Whoever read `journalctl -u
+    openrackscreen` after an install went looking for a file nobody meant to
+    write.
+    """
+    with caplog.at_level(logging.DEBUG, logger="ors_daemon.config"):
+        assert load_cached_snapshot(tmp_path / "never-written.json") is None
+
+    assert [record.levelno for record in caplog.records] == [logging.DEBUG]
+    assert "not pushed to this rack yet" in caplog.records[0].message
+    assert "config file" not in caplog.records[0].message
+
+
+def test_a_cache_that_exists_and_cannot_be_used_still_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The other half, and the reason the warning exists at all.
+
+    A file that was written and cannot be read back is a rack that had a
+    snapshot and is about to draw something else -- here, the `--config` it
+    falls back to (row 1), which is the case that looks like a working rack
+    from the front and is not. That must stay a warning, and it must not
+    promise a config file either: rows 3 and 4 reach the same line without one.
+    """
+    cache = tmp_path / "snapshot.json"
+    cache.write_text("{ not json")
+    (tmp_path / "rack.yaml").write_text(yaml.safe_dump({"screens": []}))
+
+    with caplog.at_level(logging.DEBUG, logger="ors_daemon.config"):
+        assert load_cached_snapshot(cache) is None
+
+    assert [record.levelno for record in caplog.records] == [logging.WARNING]
+    assert "ignoring an unusable snapshot cache" in caplog.records[0].message
+    assert "what the server last pushed" in caplog.records[0].message
+    assert caplog.records[0].path == str(cache)
+    assert caplog.records[0].error.startswith("JSONDecodeError:")
+
+
 def test_a_cache_path_that_is_a_directory_is_no_cache(tmp_path: Path) -> None:
     directory = tmp_path / "snapshot.json"
     directory.mkdir()
 
     assert load_cached_snapshot(directory) is None
+
+
+def test_a_cache_path_that_is_a_directory_warns_rather_than_going_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`IsADirectoryError` is somebody's mistake, not an ordinary first boot.
+
+    It is an `OSError` like `FileNotFoundError` is, and the quiet path is
+    deliberately spelled as the one exception rather than as the parent class,
+    so a `snapshot.json` that is a directory keeps the line in the journal that
+    tells its owner why the rack ignored it.
+    """
+    directory = tmp_path / "snapshot.json"
+    directory.mkdir()
+
+    with caplog.at_level(logging.DEBUG, logger="ors_daemon.config"):
+        assert load_cached_snapshot(directory) is None
+
+    assert [record.levelno for record in caplog.records] == [logging.WARNING]
 
 
 # --- connect ----------------------------------------------------------------
