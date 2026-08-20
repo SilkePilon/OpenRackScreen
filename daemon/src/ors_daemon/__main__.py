@@ -510,7 +510,31 @@ class _SubprocessRunner:
     """
 
     def run(self, argv: list[str]) -> int:
-        return subprocess.run(argv).returncode
+        """127, the shell's own code for "command not found", for a binary
+        that is not there.
+
+        Without this the missing binary is a `FileNotFoundError` out of the
+        middle of `install()`, which is the one shape that function is built
+        not to produce: it collects a warning for every step that fails and
+        reports at the end what really happened, and a traceback skips all of
+        that, leaving the rack half-configured with nothing said about it. The
+        realistic case is not exotic -- astral's installer puts `uv` in
+        `~/.local/bin` and `sudo` resets PATH to `secure_path`, so `sudo
+        ors-daemon install` gets past `useradd` (in `/usr/sbin`) and then dies
+        on `uv venv` with a traceback that never names `uv`. `README.md`
+        promises the opposite for that exact scenario, and
+        `--use-current-interpreter` is the documented way past it -- which is
+        advice nobody can follow from a traceback that does not say what was
+        missing.
+
+        127 rather than 1 because `install()` prints the code it got, and 127
+        is the number an operator can look up. It is not otherwise
+        distinguished: every non-zero code takes the same warning path.
+        """
+        try:
+            return subprocess.run(argv).returncode
+        except FileNotFoundError:
+            return 127
 
 
 def _real_roots(prefix: Path) -> Roots:

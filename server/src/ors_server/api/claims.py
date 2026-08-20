@@ -261,23 +261,6 @@ class ClaimRequest(BaseModel):
             raise ValueError(f"public_key must decode to {_PUBLIC_KEY_BYTES} bytes")
         return value
 
-    @field_validator("fingerprint")
-    @classmethod
-    def _fingerprint_is_a_digest(cls, value: str) -> str:
-        """Refuse anything that is not a SHA-256 in lowercase hex.
-
-        Separate from the cross-check below so that a malformed fingerprint
-        says so, rather than reporting a mismatch against a code that could
-        not have been derived at all. `derive_short_code` owns the definition
-        of the shape -- see `ors_schema.claim.FINGERPRINT_HEX_CHARS` for why
-        the *case* is part of it and not a nicety: this string is a database
-        key, `claims.deny` suppresses re-filings by it, and SQLite compares
-        TEXT byte-for-byte, so a claimant free to uppercase its own hex walks
-        out from under a deny it was just given.
-        """
-        derive_short_code(value)
-        return value
-
     @model_validator(mode="after")
     def _the_code_is_the_one_the_fingerprint_derives(self) -> ClaimRequest:
         """**The short code is recomputed, never taken on trust.**
@@ -296,6 +279,19 @@ class ClaimRequest(BaseModel):
         than approximate: to be approved under a seen code an attacker now has
         to find a *secret* whose SHA-256 begins with the same thirty bits,
         which is the 2^30 work S6.4 names.
+
+        **The fingerprint's shape is checked here too, by `derive_short_code`
+        raising**, rather than by a `field_validator` of its own -- one was
+        written and deleted, because it refused exactly the same bodies with
+        exactly the same status and no test could tell the two arrangements
+        apart. What it refuses matters, and the *case* is the part that is not
+        cosmetic: `bytes.fromhex` takes either case, so an uppercased digest
+        derives the very same code and passes the comparison below, while
+        being a different string to `claim_pending_fingerprint`, to
+        `claims.deny`'s suppression and to every `WHERE fingerprint = ?` in
+        this module, because SQLite compares TEXT byte-for-byte. A rack that
+        had just been denied could re-file by holding shift. See
+        `ors_schema.claim.FINGERPRINT_HEX_CHARS`.
 
         422 and not 429, deliberately, and it is not a refusal `file_claim`'s
         indistinguishability rule covers. That rule is about not telling a

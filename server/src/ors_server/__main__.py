@@ -92,8 +92,24 @@ def resolve_port() -> int:
     they stop agreeing is a server announcing 8080 while listening on 8443 --
     which no test on this machine could see and every rack on the network
     would.
+
+    **An empty `ORS_PORT` is the default, not a crash**, which is the rule
+    `resolve_data_dir` and `resolve_web_dir` above already follow (`5d3771c`:
+    "an empty environment variable is a typo, not an answer"). A bare
+    `ORS_PORT=` in a compose file or a systemd drop-in used to raise
+    `ValueError` out of here before a single line was logged, and under the
+    unit this installer generates -- `Restart=always`, `RestartSec=5`,
+    `StartLimitIntervalSec=0` -- that is a five-second restart loop that never
+    latches into `failed` and that `systemctl is-failed` answers no about.
+
+    A value that is *present and not a number* still raises, and deliberately:
+    `ORS_PORT=8O8O` is a typo whose author meant a port, and quietly binding
+    8080 instead would announce one number to every rack on the LAN while the
+    operator read another in their config. Empty is the case where nothing was
+    meant at all.
     """
-    return int(os.environ.get("ORS_PORT", str(DEFAULT_PORT)))
+    from_environment = os.environ.get("ORS_PORT", "").strip()
+    return int(from_environment) if from_environment else DEFAULT_PORT
 
 
 _USAGE_EXIT = 2
@@ -175,7 +191,29 @@ class _SubprocessRunner:
     """
 
     def run(self, argv: list[str]) -> int:
-        return subprocess.run(argv).returncode
+        """127, the shell's own code for "command not found", for a binary
+        that is not there.
+
+        Without this the missing binary is a `FileNotFoundError` out of the
+        middle of `install()`, which is the one shape that function is built
+        not to produce: it collects a warning for every step that fails and
+        reports at the end what really happened, and a traceback skips all of
+        that and leaves the machine half-configured with nothing said about
+        it. The realistic case is not exotic -- astral's installer puts `uv`
+        in `~/.local/bin` and `sudo` resets PATH to `secure_path`, so `sudo
+        ors-server install` finds `useradd` in `/usr/sbin`, creates the system
+        user and `/var/lib/ors-server` at 0700, and then dies on `uv venv`
+        with a traceback that never names `uv`. `README.md` promises the
+        opposite for that exact scenario.
+
+        127 rather than 1 because `install()` prints the code it got, and 127
+        is the number an operator can look up. It is not otherwise
+        distinguished: every non-zero code takes the same warning path.
+        """
+        try:
+            return subprocess.run(argv).returncode
+        except FileNotFoundError:
+            return 127
 
 
 def _real_roots(prefix: Path) -> Roots:
@@ -211,9 +249,20 @@ def _print_install_report(report: InstallReport) -> None:
     just refused for being impossible. Only the warnings are true there, so
     only the warnings are printed. `refused=False` with `failed=True` is a
     failure found mid-run (a `useradd` exiting something other than 0 or 9):
-    `install()` keeps going past it, so the unit really was written and
-    `systemctl` really was called, and withholding those lines would tell the
-    person debugging a half-finished install over SSH the least.
+    `install()` keeps going past it, so the unit really *was* written -- that
+    much is unconditional -- and withholding these lines would tell the person
+    debugging a half-finished install over SSH the least.
+
+    It does not follow that `systemctl` was called, and an earlier version of
+    this paragraph said it did. `install()` skips daemon-reload, `enable
+    --now` and `try-restart` outright when the `uv pip install` failed
+    (`install.py`'s own comment: enabling a unit whose `ExecStart` names a
+    binary that is not there is a five-second restart loop that never latches
+    into `failed`), so `failed=True` covers both "systemctl ran and something
+    it did went wrong" and "systemctl was deliberately never run". The
+    warnings say which, and the `PARTIAL` line above points at them. The
+    daemon's equivalent (`ors_daemon.__main__._print_install_report`) hedges
+    the same way, and for the same reason.
     """
     if report.failed and report.refused:
         if report.warnings:
@@ -292,6 +341,39 @@ def _serve() -> int:
         # application: see `WS_MAX_MESSAGE_BYTES` for what 16 MiB per message
         # costs a server that anyone can open a socket to.
         ws_max_size=WS_MAX_MESSAGE_BYTES,
+        # `access_log` because uvicorn's default is `True` and that default
+        # publishes a bearer credential. `GET /api/racks/claims/{claim_id}` is
+        # a rack collecting its sealed key, and the claim id in that path *is*
+        # what authenticates the poll (design spec S6.3 step 4) -- there is no
+        # session and no signature on that route, by necessity, because a rack
+        # that has not been approved holds nothing to authenticate with. With
+        # the access log on, every poll writes the whole line:
+        #
+        #     INFO: 127.0.0.1:45252 - "GET /api/racks/claims/2POtYYc... 200 OK
+        #
+        # into `StandardOutput=journal` under the generated unit, into `docker
+        # logs` under the image. `ClaimFiled` exists to say that credential
+        # once and `PendingClaim` deliberately omits it on exactly that
+        # principle (`api/claims.py`); an access log said it on a loop, to
+        # everyone who can read a log, for every rack that ever paired.
+        #
+        # **Off rather than redacted.** A `logging.Filter` on `uvicorn.access`
+        # was the alternative and is worse here: it has to keep matching
+        # uvicorn's own access record -- private shape, positional args, not
+        # part of any contract -- and the day that shape moves the filter stops
+        # matching and the credential is back in the log with nothing saying
+        # so. A defence whose failure is silent is the thing this line exists
+        # to remove. Moving the id out of the URL is the other alternative and
+        # is a wire change across two shipped ends, not a fix.
+        #
+        # What is lost is small and covered: `/api/health` answers liveness,
+        # `ors_server.logging` carries everything the application itself
+        # decided (including uvicorn's own startup and error records, which
+        # `access_log` does not touch), and an operator who genuinely wants
+        # per-request lines has a reverse proxy in front -- which is also the
+        # one place this setting cannot reach, so `deploy/README.md` says so
+        # there.
+        access_log=False,
         # `proxy_headers` because it is *already* the default -- uvicorn 0.52's
         # signature is `proxy_headers: bool = True` -- and passing it makes that
         # legible instead of load-bearing and invisible. The deploy notes tell

@@ -153,6 +153,87 @@ def test_the_server_reads_forwarded_headers_from_a_reverse_proxy(monkeypatch, tm
     assert default is True, "uvicorn's default moved; the deploy notes depend on this"
 
 
+def test_the_access_log_is_off_because_a_claim_id_is_a_bearer_credential(
+    monkeypatch, tmp_path
+) -> None:
+    """`GET /api/racks/claims/{claim_id}` puts a bearer credential in a URL.
+
+    That is the design (spec S6.3 step 4): a rack that has not been approved
+    holds nothing to authenticate with, so the claim id in the path *is* the
+    authentication, and `ClaimFiled` says it exactly once for that reason --
+    `PendingClaim` omits it on the same principle. uvicorn's access log
+    defaults to on and said it again on every poll:
+
+        INFO: 127.0.0.1:45252 - "GET /api/racks/claims/2POtYYc... 200 OK
+
+    into `StandardOutput=journal` under the generated unit and into `docker
+    logs` under the image, so anyone who could read a log held the credential
+    of every rack that ever paired.
+
+    The default is asserted alongside, exactly as `ws_max_size` and
+    `proxy_headers` do above: this is only worth passing because it is *not*
+    what uvicorn does on its own, and the day that changes this line is dead
+    weight that reads as a guarantee.
+    """
+    assert served(monkeypatch, tmp_path)["access_log"] is False
+
+    default = inspect.signature(uvicorn.config.Config.__init__).parameters["access_log"].default
+    assert default is True, "uvicorn's default moved; re-read this decision"
+
+
+def test_an_empty_port_is_the_default_and_not_a_restart_loop(monkeypatch, tmp_path) -> None:
+    """`ORS_PORT=` is a typo, not an answer -- the rule the two resolvers above
+    already follow (`5d3771c`).
+
+    It matters more here than there, because of where the failure lands.
+    `int("")` raised out of `resolve_port` before a single line was logged, and
+    the unit `ors-server install` generates is `Restart=always` with
+    `RestartSec=5` and `StartLimitIntervalSec=0`: a service that crashes on
+    every start under that never latches into `failed`, so `systemctl
+    is-failed` answers no and the only symptom is a journal nobody is watching.
+
+    A value that is present and not a number still raises, and that is the
+    other half of this: `ORS_PORT=8O8O` was meant to be a port, and binding
+    8080 instead would announce one number to every rack on the LAN while the
+    operator reads another in their config.
+    """
+    from ors_server.__main__ import resolve_port
+
+    monkeypatch.setenv("ORS_PORT", "")
+    assert resolve_port() == 8080
+    monkeypatch.setenv("ORS_PORT", "   ")
+    assert resolve_port() == 8080
+
+    monkeypatch.setenv("ORS_PORT", "8O8O")
+    with pytest.raises(ValueError):
+        resolve_port()
+
+
+def test_a_missing_binary_is_an_exit_code_and_not_a_traceback(monkeypatch) -> None:
+    """`_SubprocessRunner` is the one `install.Runner` that touches the
+    machine, and it used to raise straight through `install()`.
+
+    Realistic, not exotic: astral's installer puts `uv` in `~/.local/bin` and
+    `sudo` resets PATH to `secure_path`, so `sudo ors-server install` finds
+    `useradd` in `/usr/sbin`, creates the system user and `/var/lib/ors-server`
+    at 0700, and then dies on `uv venv` with a `FileNotFoundError` that never
+    names `uv` -- half-configured, and with none of `install()`'s warnings
+    printed. `README.md` promises the opposite for exactly that scenario.
+
+    `subprocess.run` is replaced with one that raises rather than a real
+    command that is really missing, so this stays inside the rule the rest of
+    this suite is written under: nothing here executes anything.
+    """
+    from ors_server.__main__ import _SubprocessRunner
+
+    def fake_run(argv, *args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+    monkeypatch.setattr("ors_server.__main__.subprocess.run", fake_run)
+
+    assert _SubprocessRunner().run(["uv", "venv", "/opt/ors-server"]) == 127
+
+
 def test_the_web_directory_defaults_to_the_one_inside_the_wheel(monkeypatch):
     """Not `/app/web`, which exists only in the container.
 

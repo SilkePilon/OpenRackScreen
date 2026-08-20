@@ -250,6 +250,14 @@ uvicorn trusts `X-Forwarded-For` only from `127.0.0.1`, so every login appears
 to arrive from the proxy — and the per-IP login limiter then throttles
 *everybody* the first time anyone mistypes a password.
 
+**Turn that proxy's access log off for `/api/racks/claims/`, or keep it
+somewhere you would keep a password.** This server does not write an access log
+— uvicorn's is off, deliberately, because the claim id in
+`GET /api/racks/claims/{id}` *is* the credential a rack's poll authenticates
+with, and a URL in a log is that credential written down for everyone who can
+read the log. Nothing here can reach a proxy's own log, so it is the one place
+that decision has to be made again by hand.
+
 ## Where the key and the database live
 
 Both are inside the volume, at `/var/lib/openrackscreen` in the container:
@@ -509,7 +517,7 @@ explicitly, which keeps the chosen path visible where it is chosen.
 | `ORS_PORT` | `8080` | must match the container side of the published port. It is read once and used twice — uvicorn binds it and the mDNS announcement tells racks to dial it — so the two cannot disagree. `ors-server install --port` writes it into the unit. |
 | `ORS_SECRET_KEY` | generated | see above. Unrecoverable. An empty string is refused at startup rather than read as "unset". |
 | `ORS_WEB_DIR` | the interface **inside the wheel**, `<site-packages>/ors_server/web` | where the built interface is. **Moved in M3c** — it used to be `/app/web`, which is a container path a pip-installed server does not have, so the image now sets that itself. A checkout has no copy inside the package and needs `ORS_WEB_DIR=web/dist`. See [The interface ships with the server](#the-interface-ships-with-the-server). |
-| `ORS_LOG_LEVEL` | `INFO` | one JSON object per line, on stdout. |
+| `ORS_LOG_LEVEL` | `INFO` | one JSON object per line, on stdout. There is no per-request access log at any level: uvicorn's is off, because `GET /api/racks/claims/{id}` carries a bearer credential in its path. See [Behind a reverse proxy](#behind-a-reverse-proxy). |
 | `ORS_ANNOUNCE` | on in the code, **`0` in the image**, `1` in the unit `ors-server install` writes | `ORS_ANNOUNCE=0`, exactly that value, stops the server announcing itself over mDNS as `_openrackscreen._tcp.local.` — which is how a freshly installed rack finds a server to ask to join. Anything else, including `false`, leaves it on. The image sets it off because the announcement does not reach the LAN from a bridge network at all, and the address in it would be the bridge's; see [mDNS discovery does not cross a Docker bridge](#mdns-discovery-does-not-cross-a-docker-bridge) for the host networking that turns it back on. Worth setting to `0` in a checkout too, so a development server does not advertise itself to every rack on your LAN. A failure to announce is a warning rather than a refusal to start in any case. |
 | `FORWARDED_ALLOW_IPS` | `127.0.0.1` | which proxies' `X-Forwarded-For` to believe. Read only while uvicorn's proxy headers are on, which they are — passed explicitly rather than inherited. |
 

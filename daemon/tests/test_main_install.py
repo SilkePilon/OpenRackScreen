@@ -127,6 +127,33 @@ def test_the_real_runner_hands_argv_to_subprocess_and_returns_its_code(monkeypat
     assert seen == [["systemctl", "daemon-reload"]]
 
 
+def test_a_missing_binary_is_an_exit_code_and_not_a_traceback(monkeypatch):
+    """The other half of the test above: a command that is not on PATH at all.
+
+    `subprocess.run` raises `FileNotFoundError` for that, and it used to raise
+    straight through `install()` -- the one shape that function is built not to
+    produce, since it collects a warning per failed step and reports at the end
+    what really happened. Realistic, not exotic: astral's installer puts `uv`
+    in `~/.local/bin` and `sudo` resets PATH to `secure_path`, so `sudo
+    ors-daemon install` gets past `useradd` (in `/usr/sbin`), writes the
+    identity and the directories, and then dies on `uv venv` with a traceback
+    that never names `uv`. The documented way past that is
+    `--use-current-interpreter`, which is advice nobody can follow from a
+    traceback that does not say what was missing.
+
+    Reproduced with `PATH=/nonexistent`, then written this way: the runner is
+    handed a `subprocess.run` that raises, so nothing here executes anything.
+    """
+    from ors_daemon.__main__ import _SubprocessRunner
+
+    def fake_run(argv, *args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+    monkeypatch.setattr("ors_daemon.__main__.subprocess.run", fake_run)
+
+    assert _SubprocessRunner().run(["uv", "venv", "/opt/openrackscreen"]) == 127
+
+
 # -- past the root check --------------------------------------------------
 #
 # Everything below pretends to be root (`os.geteuid` monkeypatched to `0`) to
