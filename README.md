@@ -10,7 +10,7 @@ Three pieces, and they deploy differently on purpose:
 | | what it is | where it runs |
 | --- | --- | --- |
 | **`daemon/`** | a thread per screen, driving the panels over SPI | a systemd unit on the Pi wired to the panels |
-| **`server/`** | FastAPI + SQLite: owns the configuration, talks to each daemon over a WebSocket, serves the interface | a Docker container, on the Pi or anywhere on the LAN |
+| **`server/`** | FastAPI + SQLite: owns the configuration, talks to each daemon over a WebSocket, serves the interface | a Docker container, a `uv tool install`, or its own systemd unit — on the Pi or anywhere on the LAN |
 | **`web/`** | Vite + React + TypeScript, shadcn/ui on the Radix base | inside the server's image; there is no second container |
 
 Plus two shared Python packages: `packages/ors-schema` is the wire contract both
@@ -44,31 +44,44 @@ uv run ors-daemon render --config daemon/examples/rack.yaml --out /tmp/ors-previ
 That writes `CPU.png`, `MEM.png`, `PODS.png` and `HEALTH.png`. Without `--data`
 every screen draws `connecting`, which is exactly what a cold rack shows.
 
-**Bring up the server with its interface.** Two environment variables, and both
-of them matter more than they look:
+**Bring up the server with its interface.** Three environment variables, and
+each of them is there for a reason:
 
 ```bash
 pnpm --dir web install --frozen-lockfile
 pnpm --dir web build
-ORS_DATA_DIR=/tmp/ors-data ORS_WEB_DIR=web/dist uv run ors-server
+ORS_DATA_DIR=/tmp/ors-data ORS_WEB_DIR=web/dist ORS_ANNOUNCE=0 uv run ors-server
 ```
 
 Then open <http://127.0.0.1:8080/> and set an admin password.
 
-- **`ORS_DATA_DIR` defaults to `/var/lib/openrackscreen`**, which is the path
-  inside the container. On a laptop the server dies at startup with
-  `PermissionError: [Errno 13] Permission denied: '/var/lib/openrackscreen'`.
-- **`ORS_WEB_DIR` defaults to `/app/web`**, which is also a container path.
-  Leave it unset in a checkout and the server starts perfectly happily, answers
-  `/api/health`, and returns **404 for every page** — because there is no
-  interface where it looked. It says so once, at startup, and names the variable:
+- **`ORS_WEB_DIR` is the one that decides whether you get a website.** Its
+  default as of M3c is the interface *inside the installed wheel* — which a
+  checkout does not have, because `server/src/ors_server/web/` is built by the
+  release workflow and is gitignored here. Leave it unset in a checkout and the
+  server starts perfectly happily, answers `/api/health`, and returns **404 for
+  every page**. It says so once, at startup, and names the variable:
 
   ```
-  no interface to serve: /app/web holds no index.html. Run `pnpm build` in web/, or point ORS_WEB_DIR at a build.
+  no interface to serve: /…/server/src/ors_server/web holds no index.html. Run `pnpm build` in web/, or point ORS_WEB_DIR at a build.
   ```
 
   This is the single most likely thing to go wrong on a first run from source.
   If the API works and the site is a 404, that line is in the log.
+- **`ORS_DATA_DIR` is optional now, and pointing it at `/tmp` is the point.**
+  Its default also moved in M3c: it is `$XDG_STATE_HOME/openrackscreen`, or
+  `~/.local/state/openrackscreen`, so an installed server needs no root and no
+  variable at all. Setting it here keeps a scratch database out of the one a
+  `uv tool install` would use.
+- **`ORS_ANNOUNCE=0` keeps your laptop off the LAN's service list.** Announcing
+  is *on* by default — that is what lets a rack find a server with nobody
+  typing a URL — so a checkout run without this advertises
+  `_openrackscreen._tcp.local.` to every machine on your network, and a real
+  rack that hears it will file a claim against it. It also costs startup time:
+  on the machine this paragraph was verified on, registering the service timed
+  out after about six seconds and logged a `zeroconf … EventLoopBlocked`
+  traceback as a warning, against 0.45 s to first `/api/health` with
+  `ORS_ANNOUNCE=0`. Exactly the string `0` turns it off; `false` does not.
 
 **Run a rack with no panels.** Copy `daemon/examples/rack.yaml`, switch each
 screen's `display:` to `{ backend: virtual, out_dir: /tmp/ors-panels }`, and:
@@ -103,6 +116,66 @@ checklist for exactly that reason.
 
 ## Run it for real
 
+Three ways to run the server and one way to run the rack. Read
+[Nothing is published yet](#nothing-is-published-yet) at the end of this section
+before you type any of them: **no version of anything here is on PyPI, and no
+image has ever been pushed to ghcr.io**, so today the two paths that work from a
+clean machine are Docker built from a checkout, and from source.
+
+### Install
+
+The shortest path there will be, once there is an index to install from:
+
+```bash
+uv tool install ors-server
+ors-server
+```
+
+`ors-server` with no subcommand runs the server — there is no `serve` word to
+say — and it needs nothing set. It creates `$XDG_STATE_HOME/openrackscreen`
+(`~/.local/state/openrackscreen` when that is unset), generates `secret.key`
+into it at mode `0600` on first boot, and **serves the interface out of the
+wheel**: no `pnpm`, no `ORS_WEB_DIR`, no second process. Open
+<http://127.0.0.1:8080/> and set an admin password.
+
+To survive a reboot without Docker, the same program installs itself as a
+service:
+
+```bash
+sudo ors-server install
+```
+
+Six steps, in this order, and it is safe to re-run — re-running *is* the upgrade
+path. It refuses an impossible `--port` before touching anything; creates
+`/var/lib/ors-server` at `0700`; creates the `openrackscreen` system user
+(shared with the daemon, so either half may be installed first); builds a venv
+at `/opt/ors-server`; writes `/etc/systemd/system/ors-server.service`; and runs
+`systemctl daemon-reload`, `enable --now` and `try-restart`. It prints the unit
+path, whether the user was created, the data directory, and one line to check it
+with:
+
+```
+unit: /etc/systemd/system/ors-server.service
+service user: created
+data directory: /var/lib/ors-server
+health: curl -fsS http://127.0.0.1:8080/api/health
+```
+
+`--prefix` moves the venv and `--port` moves the port — and `--port` reaches
+both `ORS_PORT` and the mDNS announcement from one read, so the port racks are
+told to dial cannot drift from the one uvicorn binds. Two things this unit does
+differently from the container, both deliberate: it sets
+`Environment=ORS_DATA_DIR=/var/lib/ors-server` explicitly, because the code
+default is a *user's* state directory and a service account's home is not a
+place a database should silently appear; and it sets `ORS_ANNOUNCE=1`, because
+unlike the container it is on the host's own link and being findable is the
+whole point.
+
+`sudo ors-server uninstall` stops the service, disables it and removes the unit,
+and **leaves the database alone**. `--purge` deletes `/var/lib/ors-server` —
+with it the admin password, `secret.key`, and therefore the only thing that can
+decrypt the integration credentials in any backup of `ors.db` you already took.
+
 ### Docker
 
 One image, built from the repository root, serving the API and the interface on
@@ -115,19 +188,48 @@ docker compose -f deploy/compose.remote.yaml up -d  # server elsewhere on the LA
 ```
 
 Nothing needs installing or building first; the image builds the interface in a
-Node stage and then discards it, so the ~288 MB that ships has no Node, no pnpm
+Node stage and then discards it, so the ~297 MB that ships has no Node, no pnpm
 and no `node_modules` in it. Both compose files publish `8080` and keep the
-database in a named volume.
+database in a named volume — **`deploy_ors-data`, not `ors-data`**: compose
+prefixes volume names with the project name, and the project name defaults to
+the directory holding the compose file. `docker volume ls` is the authority, and
+`server/README.md`'s backup recipe uses the prefixed name for exactly this
+reason.
 
-**Add `--build` when you are running from a checkout.** Both compose files name
-`image: ghcr.io/silkepilon/openrackscreen:latest` as well as a `build:` block,
-and compose prefers the image: if any copy of that tag is already on the machine
-it is used as-is and your working tree is never built. On this machine a
-two-day-old copy of that tag was picked up in exactly that way, and it predated
-the interface being in the image — so the container came up, passed its
-healthcheck, answered `/api/health`, and returned 404 for every page.
-`docker compose -f deploy/compose.pi.yaml up -d --build` builds the checkout and
-serves the interface.
+**Both compose files carry a `build:` block and no `image:`, on purpose.**
+Compose prefers `image:` over `build:` when a service names both, so a file
+carrying both never builds your working tree — and the symptom is a container
+that starts, goes healthy, answers `/api/health` and 404s every page, which is
+what a stale tag on this machine actually did once. `deploy/compose.image.yaml`
+is the opt-in overlay for the published image, kept separate so that opting in
+is a thing you type:
+
+```bash
+docker compose -f deploy/compose.pi.yaml -f deploy/compose.image.yaml up -d
+```
+
+That names `ghcr.io/silkepilon/openrackscreen:latest`, which **does not exist
+yet** — nothing in `.github/workflows/` builds or pushes an image, and a `pull`
+against it answers `error from registry: denied`. Until something publishes it,
+the overlay is a documented shape and not a working command.
+
+**mDNS does not reach the LAN from either compose file above.** Both use
+`ports:`, which is a bridge, and a bridge is a NAT: mDNS is link-layer multicast
+to `224.0.0.251` with a TTL of 1 and the packet does not cross. So the image
+sets `ORS_ANNOUNCE=0` — an announcement nobody hears is useless, and one
+carrying a bridge address is worse than none, because a rack files a claim
+against an address that does not answer instead of printing "no server found,
+pass `--server`". `deploy/compose.mdns.yaml` is the way to get discovery from a
+container, and it works by giving up the network namespace:
+
+```bash
+docker compose -f deploy/compose.pi.yaml -f deploy/compose.mdns.yaml up -d
+```
+
+`network_mode: host`, `ports: !reset null` and `ORS_ANNOUNCE=1`. Needs Compose
+2.24 or newer for the `!reset`. On a network that drops multicast — most managed
+switches with IGMP snooping, and every setup where rack and server are on
+different VLANs — none of this helps and `--server URL` is the answer instead.
 
 **64-bit Raspberry Pi OS is required.** A `linux/arm/v7` build fails on the
 Dockerfile's first line — `ghcr.io/astral-sh/uv:0.12-python3.12-trixie-slim`
@@ -144,12 +246,63 @@ health checks, and the full environment table.
 
 ### From source
 
-The server is `uv run ors-server` with `ORS_DATA_DIR` and `ORS_WEB_DIR` set, as
-above. The daemon is a systemd unit rather than a container — it needs four
-`/dev/spidev*` nodes, `/dev/gpiochip*`, and the `spi` and `gpio` groups, and
-containerising that buys nothing. `daemon/examples/openrackscreen.service` is the
-unit; `daemon/README.md` owns the SPI wiring, enabling both buses in
-`config.txt`, the `hardware` extra, and all five daemon commands.
+The server is `uv run ors-server` with `ORS_WEB_DIR` pointed at a `pnpm build`,
+as above — and this is the only one of the three paths that runs on a clean
+machine today. The daemon is a systemd unit rather than a container: it needs
+four `/dev/spidev*` nodes, `/dev/gpiochip*`, and the `spi` and `gpio` groups,
+and containerising that buys nothing. `daemon/README.md` owns the SPI wiring,
+the `hardware` extra, `ors-daemon install`, and every command.
+
+### The rack
+
+```bash
+uv tool install "ors-daemon[hardware]"
+sudo ors-daemon install
+```
+
+`install` does the eight things a rack needs and prints a **six-character short
+code** that `First run` below is about: directories, the `openrackscreen` system
+user, membership of `spi` and `gpio`, a venv at `/opt/openrackscreen`, the unit,
+`enable --now`, both SPI buses in `/boot/firmware/config.txt` behind a
+timestamped backup, and this rack's install identity. **A reboot is required**
+afterwards — the SPI change is read by the firmware at boot and nothing else can
+apply it — and the command says `reboot needed: yes` when it made one.
+
+`--no-spi` leaves `config.txt` alone, `--prefix` moves the venv,
+`--use-current-interpreter` points the unit at an `ors-daemon` you already have
+instead of building one, and `--upgrade` changes nothing at all: `install` is
+idempotent and a plain re-run is always the upgrade path, so the flag exists to
+say that out loud. `sudo ors-daemon uninstall` leaves `/var/lib/openrackscreen`
+— and therefore the pairing and the identity — alone; `--purge` removes it, and
+that costs a fresh approval in the interface.
+
+### Nothing is published yet
+
+Every `uv tool install` line above resolves against PyPI, and **none of the five
+distributions has ever been uploaded**: `ors-schema`, `ors-render`,
+`ors-daemon`, `ors-server` and the `openrackscreen` meta-package are built in
+lockstep at one version by `.github/workflows/release.yml`, which fires on a
+`v*` tag and publishes over Trusted Publishing — and Trusted Publishing has to
+be configured by a human, once per project on PyPI, **before** the first tag can
+publish anything. Nobody has done that yet. Today:
+
+```
+$ uv tool install ors-server
+  × No solution found when resolving dependencies:
+  ╰─▶ Because ors-server was not found in the package registry and you require
+      ors-server, we can conclude that your requirements are unsatisfiable.
+```
+
+This reaches further than the two `uv tool install` lines. Both installers build
+their venv with `uv pip install <name>==<version>` against the same index, so
+`sudo ors-server install` and `sudo ors-daemon install` cannot complete on a
+machine with no checkout either. Both handle it the same way and neither leaves
+a rack quietly dark: the unit file is written, and then **deliberately not
+enabled or started**, with a warning naming the failed install and telling you
+to re-run. `ors-daemon install --use-current-interpreter` is the way past it
+today, because it skips the venv step entirely and points the unit at an
+`ors-daemon` that is already on the machine. `ors-server install` has no
+equivalent flag.
 
 ---
 
@@ -158,8 +311,45 @@ unit; `daemon/README.md` owns the SPI wiring, enabling both buses in
 1. **Set an admin password.** There is no default account. Until a password
    exists every configuration route answers `401`, including from `curl`, so a
    half-finished deployment cannot be paired against by accident.
-2. **Pair the rack.** On the Daemons page, add a rack. The server mints a token
-   and shows it **exactly once**, beside the line to paste on the Pi:
+2. **Install the daemon on the Pi**, `sudo ors-daemon install`, and write down
+   the short code it prints:
+
+   ```
+   short code: K7QF2M
+   unit: /etc/systemd/system/openrackscreen.service
+   service user: created
+   SPI: enabled, reboot needed
+   reboot needed: yes
+   ```
+
+   Then reboot, if it asked. The unit starts a rack that is paired with nothing,
+   which is not an error — it is the ordinary state of a rack that has just been
+   installed. It browses for `_openrackscreen._tcp.local.`, finds the server,
+   files a claim, and waits. The same short code goes into its journal every
+   time it starts unpaired, so losing the terminal does not lose the code:
+   `journalctl -u openrackscreen | grep 'short code'`.
+3. **Approve it.** The rack appears under **"Waiting to join"** on the Daemons
+   page, above the rack list. Compare the six characters there against the ones
+   the Pi printed, and click Approve.
+
+   **What that code proves, exactly.** It binds against *confusion*, not against
+   an attacker: with two racks installed the same afternoon, it is what stops
+   you approving the wrong one, and with one rack it is what stops you approving
+   a stranger's. It is derived from this rack's identity and is shown by both
+   ends — so anyone who has already read the Pi's console, or its journal, can
+   read it too, and could file a claim carrying it. It is a check against a
+   mistake, and it is not a secret.
+
+   Denying is not visible to the rack. `deny` deletes the claim and a poll
+   afterwards answers `404`, byte-identical to a claim id nobody ever filed, so
+   that a prober cannot confirm a denial — which means a denied rack keeps
+   trying, with a 24-hour server-side suppression to stop it retraining you to
+   click Approve.
+4. **Or pair it with a token**, which still exists and is a first-class path
+   rather than a fallback. A rack that cannot use discovery — multicast dropped,
+   a different VLAN, a server in a bridged container — is paired the old way:
+   on the Daemons page, add a rack; the server mints a token and shows it
+   **exactly once**, beside the line to paste on the Pi:
 
    ```bash
    sudo -u openrackscreen ors-daemon connect --server http://<host>:8080 --token <token>
@@ -168,7 +358,18 @@ unit; `daemon/README.md` owns the SPI wiring, enabling both buses in
    As the daemon's own user — `sudo ors-daemon connect` writes the pairing
    root-owned and the daemon then cannot read it. Losing a token costs a rotate,
    not a reinstall.
-3. **Add screens.** The wizard runs **detect → wiring → probe → add**.
+
+   Between the two there is a third shape: `ors-daemon run --server URL` skips
+   the browse and files a claim against one named server, so the approval
+   gesture is unchanged on a network where only *discovery* is broken. The unit
+   `install` writes does not carry `--server`, so using it means a systemd
+   drop-in — or the token above, which needs nothing.
+5. **`--config` is optional now.** A paired rack runs from what the server
+   pushed and needs no local YAML at all; a rack with neither a pairing nor a
+   `--config` is the one that goes and asks to join. Standalone file-driven
+   racks are unchanged — pass `--config` and nothing dials anywhere.
+   `daemon/README.md` has the five-row table of what `run` boots from.
+6. **Add screens.** The wizard runs **detect → wiring → probe → add**.
 
    The probe step exists because **a panel cannot introduce itself.** A GC9A01
    has no ID register readable over 4-wire SPI, and DC and RST are plain GPIO
@@ -189,7 +390,7 @@ interface reads as a red interface.
 
 ```bash
 uv sync --all-packages
-uv run pytest                                    # 2177 passed, 1 skipped
+uv run pytest                                    # 2596 passed, 1 skipped
 uv run ruff check . && uv run ruff format --check .
 ```
 
@@ -219,16 +420,16 @@ and the whole interface toolchain stops.
 
 ```bash
 pnpm exec playwright install chromium   # once per machine
-pnpm exec playwright test               # 8 specs, about three quarters of a minute
+pnpm exec playwright test               # 8 tests in one serial spec, about fifty seconds
 ```
 
 It boots a real server and two real daemons with virtual panels and drives the
 whole story through a browser: set a password, watch a freshly installed rack
 ask to join and approve it by its six-character code, pair a second rack with a
 token, run the wizard, watch a panel render, edit it, kill the server mid-run
-and bring it back. Two of the eight specs need the server *stopped in the
-middle*, which is why the processes belong to `e2e/fixture.ts` and not to a
-Playwright `webServer` block.
+and bring it back. Two of the eight need the server *stopped in the middle*,
+which is why the processes belong to `e2e/fixture.ts` and not to a Playwright
+`webServer` block.
 
 **The dev loop.** `pnpm dev` in `web/` proxies `/api` and `/ws` to
 `127.0.0.1:8080`, so the interface runs hot-reloaded against a real server on
@@ -251,7 +452,9 @@ web/               the SPA; tests/ is Vitest, e2e/ is Playwright + a real stack
 packages/
   ors-schema/      the wire contract: scenes, configs, link messages
   ors-render/      the shared renderer: elements, templates, palettes, fonts
-deploy/            Dockerfile and the two compose files
+  openrackscreen/  the meta-package: no modules, pins ors-daemon and ors-server
+deploy/            Dockerfile, two compose files, two overlays (image, mdns)
+tools/             version.py: one version across all five distributions
 docs/superpowers/  the specs and the milestone plans
 ```
 
@@ -262,8 +465,35 @@ Tests live beside what they test — `packages/*/tests`, `daemon/tests`,
 
 ## What is not built yet
 
-Milestone M3b — the interface — is complete. Stated plainly, because a README is
-the easiest place in a repository to imply otherwise:
+Milestone M3c — install and pairing — is complete. Stated plainly, because a
+README is the easiest place in a repository to imply otherwise.
+
+**Four things above this line have never been run at all.** They are written as
+they are designed to work, and every one of them is untested outside this
+repository's own suites:
+
+- **Nothing is on PyPI.** Trusted Publishing is unconfigured, so the first `v*`
+  tag cannot publish, so every `uv tool install` line in this file — and the
+  `uv pip install` step inside both `install` commands — resolves against an
+  index that has never heard of these names. See
+  [Nothing is published yet](#nothing-is-published-yet).
+- **No image has ever been pushed**, to ghcr.io or anywhere else. No workflow
+  builds one, and `deploy/compose.image.yaml` names a tag that answers `denied`.
+- **`linux/arm64` has never been built by anyone**, on this machine or in CI.
+  Everything this README claims about Docker was verified on `linux/amd64`.
+- **No real Raspberry Pi has run `sudo ors-daemon install`.** No system user has
+  been created on real hardware, no real `/boot/firmware/config.txt` has been
+  edited behind its backup, and nothing has rebooted into an SPI change this
+  project made. The installer's whole surface is exercised against injected
+  filesystem roots and a fake command runner, which is what makes it testable
+  and is exactly not the same as having been run.
+- **mDNS has never been exercised on a real network.** `announce` and
+  `discovery.browse()` are tested against each other and against fakes;
+  `browse()` has never returned a server that a rack then paired with over a
+  LAN. That is why `--server URL` is documented as a first-class path and not as
+  a workaround.
+
+And the scope that was never in M3c to begin with:
 
 - **Integrations: Prometheus only.** Jellyfin, the \*arr applications,
   qBittorrent and Grafana are M4, each of them a poller in the daemon and a form
@@ -283,4 +513,4 @@ the easiest place in a repository to imply otherwise:
 
 The design specs and the per-milestone plans are in `docs/superpowers/`; the M3b
 plan's "What M4 picks up" and the M3b spec's "Non-goals" are the authoritative
-versions of the list above.
+versions of the scope list above.

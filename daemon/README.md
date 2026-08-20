@@ -1,24 +1,152 @@
 # ors-daemon
 
-Drives the rack's round GC9A01 panels from one YAML file. One process: a thread
-per screen, a thread per integration, a supervisor over them, and an atomic
-status file so one `cat` over SSH explains a wrong panel.
+Drives the rack's round GC9A01 panels. One process: a thread per screen, a
+thread per integration, a supervisor over them, and an atomic status file so one
+`cat` over SSH explains a wrong panel.
 
-No server is involved. `examples/rack.yaml` is the config the author's rack
-actually runs, and CI validates it on every push.
+A rack runs one of two ways. **Paired**, where the server owns the
+configuration and pushes it — which is what `ors-daemon install` and the
+approval in the interface set up, and which needs no local YAML at all. Or
+**standalone**, from one file, which is what `examples/rack.yaml` is: the config
+the author's rack actually runs, validated by CI on every push. Nothing about
+the standalone path changed in M3c.
 
 ## Install
 
-On anything (laptop, CI) — everything except driving a panel:
+On a rack, one command sets the machine up and a second one is not needed:
+
+```bash
+uv tool install "ors-daemon[hardware]"
+sudo ors-daemon install
+```
+
+**Neither line works today.** Nothing is on PyPI — see
+[Nothing is published yet](../README.md#nothing-is-published-yet) — so the first
+fails to resolve, and `install`'s own venv step fails the same way. `install`
+handles that without leaving a dark rack behind: it writes the unit and then
+**deliberately does not enable or start it**, saying so, because a
+`Type=simple` unit whose `ExecStart` does not exist fails asynchronously,
+`enable --now` exits 0 anyway, and `StartLimitIntervalSec=0` means it can never
+latch into `failed` — it would sit in `activating (auto-restart)` forever with
+`systemctl is-failed` answering no, which on a rack is a dark screen with
+nothing to find it by. `--use-current-interpreter` is the way past it today:
+it skips the venv entirely and points the unit at an `ors-daemon` already on the
+machine (installed from a checkout), refusing up front if the service user could
+not execute it.
+
+### What `install` does
+
+Eight steps, in this order, and every one of them idempotent — re-running
+`install` **is** the upgrade path, which is all `--upgrade` means. It changes no
+behaviour and exists to say so at the command line.
+
+1. If `--use-current-interpreter` was asked for, check the service user could
+   actually run what is about to be named — *before* anything else is touched.
+   `sudo uv tool install ors-daemon` lands in **root's** data directory, which
+   `User=openrackscreen` cannot read, and the rack then comes up dead with a
+   permission error on the interpreter that appears in no daemon log, because
+   the daemon never starts. Refusing here leaves the machine exactly as it was.
+2. `/etc/openrackscreen`, and `/var/lib/openrackscreen` at `0700` — the pairing,
+   the cached snapshot and this rack's install identity live there.
+3. The `openrackscreen` system user (`--system --no-create-home --shell
+   /usr/sbin/nologin`), then `usermod -aG spi` and `usermod -aG gpio`. A
+   `useradd` exit of 9 means the account already exists and is treated as
+   success, which is what makes a second `install` — and a Pi where
+   `ors-server install` created the shared account first — work in either order.
+4. A venv at `/opt/openrackscreen` (`--prefix` moves it) and
+   `uv pip install "ors-daemon[hardware]==<this version>"` into it. Skipped
+   entirely under `--use-current-interpreter`.
+5. `/etc/systemd/system/openrackscreen.service`, whose `ExecStart` is
+   `<prefix>/bin/ors-daemon run --status /run/openrackscreen/status.json` —
+   **no `--config`**, because a paired rack's configuration comes from the
+   server and a rack `install` just set up has neither yet.
+6. `systemctl daemon-reload`, `enable --now`, and `try-restart`. The last is
+   `enable --now`'s complement: on an upgrade, where step 4 just replaced the
+   code underneath a running daemon, `enable --now` is a no-op and nothing would
+   take effect until somebody rebooted by hand. `try-restart` restarts a running
+   unit and does nothing to a stopped one, so a first install is unaffected.
+7. **SPI**, in `/boot/firmware/config.txt`, behind a timestamped backup — see
+   [Enable SPI](#enable-spi) below for what it writes and how to check it.
+   `--no-spi` skips this step.
+8. This rack's install identity, from which the **short code** is derived.
+
+It prints all of that, and the short code first:
+
+```
+short code: K7QF2M
+unit: /etc/systemd/system/openrackscreen.service
+service user: created
+SPI: enabled, reboot needed
+reboot needed: yes
+```
+
+**`reboot needed: yes` means reboot.** The firmware reads `config.txt` at boot
+and there is nothing that can apply an SPI change to a running kernel, so until
+the reboot every panel comes up `unavailable` and the daemon is right to say so.
+The line reads `no` both when SPI was already on and when `--no-spi` skipped the
+step, which is why the `SPI:` line above it distinguishes the three cases —
+`enabled, reboot needed`, `unchanged (already enabled)`, `skipped (--no-spi)`,
+and `not attempted (no config.txt found under the boot partition)`.
+
+A partial install says `install: PARTIAL` and then reports everything that
+really did happen, rather than withholding it: the person debugging a
+half-finished install over SSH is the one who needs the detail most. The exit
+code is 1. The one failure that reports nothing but its warning is the
+`--use-current-interpreter` refusal, because it returns before anything at all
+was touched and every other line would be describing work that never happened.
+
+### The short code, and pairing
+
+The short code is six base32 characters derived from this rack's identity. It is
+what the interface shows under **"Waiting to join"**, and comparing the two
+before clicking Approve is the whole pairing gesture — no token typed anywhere.
+
+Be clear about what it proves: **it binds against confusion, not against
+somebody who has already seen it.** It stops you approving the wrong rack when
+two were installed the same afternoon, and it stops you approving a stranger's
+rack when you only installed one. It is not a secret — both ends display it, and
+anyone with the Pi's console or its journal can read it and could file a claim
+carrying it.
+
+Losing the terminal does not lose the code. An unpaired rack prints it to stderr
+every time `run` starts the join flow, so it is in the journal:
+
+```bash
+journalctl -u openrackscreen | grep 'short code'
+```
+
+The token flow has not gone anywhere and is not a fallback: a rack that cannot
+use discovery — multicast dropped, a different VLAN, a server in a bridged
+container — is paired with `ors-daemon connect --server ... --token ...`, below.
+`ors-daemon run --server URL` is the third shape: it files a claim against one
+named server instead of browsing, so the approval gesture is unchanged where
+only discovery is broken. The unit `install` writes carries no `--server`, so
+using it means a systemd drop-in, or the token, which needs nothing.
+
+### `uninstall`
+
+```bash
+sudo ors-daemon uninstall            # stop, disable, remove the unit
+sudo ors-daemon uninstall --purge    # ...and delete /var/lib/openrackscreen
+```
+
+Without `--purge`, `/var/lib/openrackscreen` is left alone — the pairing, the
+cached snapshot and the identity all survive, so a reinstall rejoins the server
+it already belongs to. `--purge` removes the identity with everything else,
+which means a new short code and **a fresh approval in the interface**. Neither
+form removes the venv at `--prefix`; delete it by hand if you want it gone.
+
+### On a laptop, or in CI
+
+Everything except driving a panel, from a checkout:
 
 ```bash
 uv sync --all-packages
 uv run ors-daemon --help
 ```
 
-On the Pi, add the `hardware` extra. It pulls `luma.lcd` (SPI/GPIO) and `numpy`,
-neither of which builds on x86 CI, which is why it is an extra and not a
-dependency:
+The `hardware` extra pulls `luma.lcd` (SPI/GPIO) and `numpy`, neither of which
+builds on x86 CI, which is why it is an extra and not a dependency:
 
 ```bash
 uv sync --all-packages --extra hardware
@@ -31,7 +159,13 @@ lived with.
 
 ## Enable SPI
 
-Both buses, in `/boot/firmware/config.txt` (`/boot/config.txt` before Bookworm):
+**`ors-daemon install` does this for you**, unless you passed `--no-spi`. This
+section is what it writes, and what to check if it did not.
+
+Both buses, in `/boot/firmware/config.txt` (`/boot/config.txt` before Bookworm —
+`install` looks for `firmware/config.txt` first and falls back to `config.txt`,
+so an upgraded Pi that kept the old file gets the one the firmware actually
+reads):
 
 ```ini
 # SPI0: CE0 on GPIO8, CE1 on GPIO7. Panels 1 and 2, at 40 MHz.
@@ -42,13 +176,32 @@ dtparam=spi=on
 dtoverlay=spi1-2cs
 ```
 
-Reboot, then check that all four devices exist and that the daemon's user can
-reach them:
+Three things `install` does that a hand edit usually does not. It **backs the
+file up first**, to `<config.txt>.ors-<timestamp>`, appending `.1`, `.2` … rather
+than overwriting a backup that is already there — this is the file that decides
+whether the Pi boots, and a backup that clobbers the previous backup is not one.
+It **writes an `[all]` header of its own before the two lines**, because a
+`config.txt` filter section applies until the next header and appending after a
+trailing `[pi3]` or `[none]` block would add lines this Pi never reads while
+`install` reported success — and for the same reason a `dtparam=spi=on` it finds
+under any filter other than `[all]` does not count as already present. And it
+**adds only what is missing**: a file that already has both is a no-op with no
+backup taken, which is what makes `install` safe to re-run. A commented-out
+`#dtparam=spi=on` — the state a Pi ships in — is not present.
+
+Then reboot, and check that all four devices exist and that the daemon's user
+can reach them:
 
 ```bash
 ls -l /dev/spidev0.0 /dev/spidev0.1 /dev/spidev1.0 /dev/spidev1.1
-sudo usermod -aG spi,gpio openrackscreen
+groups openrackscreen        # should list spi and gpio
 ```
+
+If the nodes are missing, the reboot has not happened or the lines are under a
+section header that excludes this model. If they exist but every screen is
+`unavailable`, it is the groups — `install` adds them with `usermod -aG`, and
+that only takes effect for processes started afterwards, which the unit's
+restart handles.
 
 Two things about SPI1 that the wiring in `examples/rack.yaml` already accounts
 for:
@@ -64,10 +217,20 @@ for:
   If you rewire, check that first: a DC line quietly shared with a bus pin looks
   exactly like a dead panel.
 
-## The five commands
+## The seven commands
 
-Every command except `connect` takes `--config`. Two of them need no hardware at
-all, and only `connect` and `run` have anything to do with a server.
+`run`, `connect`, `validate`, `render`, `identify`, `install`, `uninstall`.
+Four of them take `--config` — `connect`, `install` and `uninstall` do not, and
+for the same underlying reason: all three happen before a rack has a
+configuration to be given, or instead of one. `--config` is optional even on
+`run`; see the boot table below. Two commands need no hardware at all, and the
+only two that dial a server are `connect` and `run` — `install` never does; it
+starts the unit that runs `run`, and that is what goes looking.
+
+`install` and `uninstall` are documented above, under
+[Install](#install) — they are the two that have to run as root, and running
+either as an ordinary user prints `ors-daemon <command> has to run as root.` and
+exits 2 rather than failing partway through. The other five:
 
 ```bash
 # Check a config without a rack: parses it, resolves every screen's template,
@@ -203,9 +366,16 @@ also see above — and needs nothing run by hand either.
 
 ## Run it under systemd
 
-`examples/openrackscreen.service` is the unit, commented with the reason for
-every line that is not obvious. The parts that matter for surviving a reboot and
-a cluster outage:
+**`ors-daemon install` writes this unit for you.** What it generates and what
+`examples/openrackscreen.service` holds differ only in `ExecStart` — the example
+is the hand-authored copy, kept for anyone installing without the command, and
+both are commented with the reason for every line that is not obvious. The
+generated one is rewritten in full by every later `install`, so an edit made in
+it is an edit lost at the next upgrade: change what the command is given
+(`--prefix`), use a systemd drop-in, or take the file over with
+`systemctl disable openrackscreen` and hand-author your own.
+
+The parts that matter for surviving a reboot and a cluster outage:
 
 - `WantedBy=multi-user.target` plus `systemctl enable` — comes back after a
   reboot at all.
